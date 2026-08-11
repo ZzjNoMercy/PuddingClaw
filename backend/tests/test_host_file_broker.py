@@ -1195,6 +1195,45 @@ def test_external_directory_command_requires_root_grant_and_uses_ephemeral_backe
     assert denied["status"] == "permission_required"
 
 
+def test_spawn_external_directory_read_does_not_require_host_file_grant(
+    tmp_path: Path,
+) -> None:
+    backend, external, _outside, _run = _setup(tmp_path)
+    execution = _ExternalDirectoryExecutionBackend()
+    execution.mode = "spawn"
+    backend.execution_backend = execution
+    backend.host_file_broker = None
+
+    result = backend.execute_external_directory_command(
+        str(external),
+        "rg --files .",
+        timeout=45,
+    )
+
+    assert result["status"] == "completed"
+    assert execution.calls == [(str(external), "rg --files .", 45)]
+
+
+def test_spawn_builtin_file_tools_read_external_paths_without_grants(
+    tmp_path: Path,
+) -> None:
+    backend, _external, outside, _run = _setup(tmp_path)
+    backend.execution_mode = "spawn"
+    document = outside / "document.txt"
+    document.write_text("puddingclaw spawn host read\n", encoding="utf-8")
+
+    read = backend.read(str(document))
+    listing = backend.ls(str(outside))
+    matches = backend.grep("spawn host", path=str(outside), glob="*.txt")
+
+    assert read.error is None
+    assert "spawn host read" in str((read.file_data or {}).get("content") or "")
+    assert listing.error is None
+    assert [entry["path"] for entry in listing.entries or []] == [str(document)]
+    assert matches.error is None
+    assert [match["path"] for match in matches.matches or []] == [str(document)]
+
+
 def test_writable_external_directory_command_only_mutates_staged_draft(
     tmp_path: Path,
 ) -> None:

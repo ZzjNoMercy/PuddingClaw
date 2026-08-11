@@ -66,3 +66,45 @@ def test_profile_rejects_root_replaced_by_symlink_before_spawn(tmp_path: Path) -
     external.symlink_to(redirected, target_is_directory=True)
 
     assert profile.valid_at_spawn() is False
+
+
+def test_profile_digest_and_spawn_validation_include_denied_roots(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    scratch = tmp_path / "scratch"
+    denied = tmp_path / "denied"
+    for path in (workspace, scratch, denied):
+        path.mkdir()
+
+    profile = SandboxGrantProfile.build(
+        workspace_root=workspace,
+        scratch_root=scratch,
+        external_deny_roots=[denied],
+    )
+    without_deny = SandboxGrantProfile.build(
+        workspace_root=workspace,
+        scratch_root=scratch,
+    )
+
+    assert profile.deny_roots == (denied.resolve(),)
+    assert profile.digest != without_deny.digest
+    assert profile.valid_at_spawn() is True
+
+    denied.rmdir()
+    denied.symlink_to(workspace, target_is_directory=True)
+    assert profile.valid_at_spawn() is False
+
+
+def test_profile_allows_denied_root_inside_writable_root(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    scratch = tmp_path / "scratch"
+    denied = workspace / ".git"
+    workspace.mkdir()
+    scratch.mkdir()
+    denied.mkdir()
+
+    profile = SandboxGrantProfile.build(
+        workspace_root=workspace,
+        scratch_root=scratch,
+        external_deny_roots=[denied],
+    )
+    assert profile.valid_at_spawn() is True

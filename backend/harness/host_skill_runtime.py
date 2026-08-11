@@ -86,9 +86,25 @@ class HostSkillRuntimeBackend:
                 raise ValueError("managed host runtime root must not be a symlink")
 
         self.python = self._python_executable()
+        library_dir = self.python.parent.parent / "lib"
         library_name = str(sysconfig.get_config_var("LDLIBRARY") or "")
-        self.python_library = self.python.parent.parent / "lib" / library_name
-        if not library_name or not self.python_library.is_file():
+        library_candidates = [library_dir / library_name] if library_name else []
+        # Some macOS Python builds report their static archive as LDLIBRARY
+        # even though the embeddable shared library is the usable artifact.
+        # Prefer the reported name, then fall back to the platform's shared
+        # library variants without accepting an arbitrary path.
+        if library_name.endswith(".a"):
+            library_candidates.extend(
+                [
+                    library_dir / (library_name.removesuffix(".a") + ".dylib"),
+                    library_dir / (library_name.removesuffix(".a") + ".so"),
+                ]
+            )
+        self.python_library = next(
+            (candidate for candidate in library_candidates if candidate.is_file()),
+            library_candidates[0] if library_candidates else library_dir / "",
+        )
+        if not self.python_library.is_file():
             raise ValueError("managed host Python shared library is unavailable")
         self.node = self._optional_tool("node")
         self.npm = self._optional_tool("npm")
@@ -234,6 +250,7 @@ class HostSkillRuntimeBackend:
             profile = SandboxGrantProfile.build(
                 workspace_root=candidate,
                 scratch_root=operation,
+                workspace_writable=False,
                 external_read_roots=read_roots,
                 external_write_roots=(self._node_cache, self._python_cache),
                 network_allowed=True,

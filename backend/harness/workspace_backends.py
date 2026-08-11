@@ -1,4 +1,4 @@
-"""Execution-capable workspace backends for Docker and restricted host fallback."""
+"""Execution-capable workspace backends for spawn and kernel execution."""
 
 from __future__ import annotations
 
@@ -24,6 +24,7 @@ from harness.dependency_setup import (
     WorkspaceDependencyPlan,
     detect_workspace_dependency_plan,
 )
+from harness.sandbox_profiles import SandboxGrantProfile
 from runtime_identity.adapters import CredentialStateSpec, ManagedCliRegistry
 from runtime_identity.profiles import validate_credential_archive
 
@@ -166,6 +167,30 @@ def _macos_seatbelt_available() -> bool:
             reason,
         )
     return available
+
+
+def _linux_bwrap_available() -> bool:
+    if sys.platform != "linux":
+        logger.warning("Kernel sandbox unavailable: host is not Linux")
+        return False
+    from harness.kernel_sandbox import LinuxBwrapSeccompRunner
+
+    available, reason = LinuxBwrapSeccompRunner.probe()
+    if not available:
+        logger.warning(
+            "Linux bubblewrap kernel sandbox probe failed; will retry after the short failure TTL: %s",
+            reason,
+        )
+    return available
+
+
+def _kernel_sandbox_available() -> bool:
+    if sys.platform == "darwin":
+        return _macos_seatbelt_available()
+    if sys.platform == "linux":
+        return _linux_bwrap_available()
+    logger.warning("Kernel sandbox unavailable: unsupported host platform %s", sys.platform)
+    return False
 
 
 @dataclass(frozen=True)
@@ -314,10 +339,10 @@ def _bounded_output(
     return f"{truncated}\n\n... Output truncated at {max_output_bytes} bytes.", True
 
 
-class RestrictedHostWorkspaceBackend(FilesystemBackend, SandboxBackendProtocol):
-    """Best-effort host fallback whose commands still require Tool policy."""
+class SpawnWorkspaceBackend(FilesystemBackend, SandboxBackendProtocol):
+    """Host-spawn backend whose commands still require Tool policy."""
 
-    mode = "restricted_host"
+    mode = "spawn"
     _workspace_locks: dict[str, threading.RLock] = {}
     _workspace_locks_guard = threading.Lock()
 
@@ -340,16 +365,21 @@ class RestrictedHostWorkspaceBackend(FilesystemBackend, SandboxBackendProtocol):
             host_root for _virtual_root, host_root in self.managed_readonly_path_aliases
         )
         workspace_digest = hashlib.sha256(str(self.workspace_path).encode("utf-8")).hexdigest()[:16]
-        self._id = f"restricted-host:{workspace_digest}"
+        self._id = f"spawn:{workspace_digest}"
         runtime_dir = self.workspace_path / ".puddingclaw" / "runtime"
         runtime_dir.mkdir(parents=True, exist_ok=True)
+        run_tmp = (
+            self.scratch_path / "tmp"
+            if self.scratch_path is not None
+            else runtime_dir / "tmp"
+        )
         self._env = {
             "PATH": os.environ.get(
                 "PATH",
                 "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
             ),
             "HOME": str(runtime_dir / "host-home"),
-            "TMPDIR": str(runtime_dir / "tmp"),
+            "TMPDIR": str(run_tmp),
             "LANG": os.environ.get("LANG", "C.UTF-8"),
             "LC_ALL": os.environ.get("LC_ALL", ""),
         }
@@ -383,6 +413,11 @@ class RestrictedHostWorkspaceBackend(FilesystemBackend, SandboxBackendProtocol):
             command = re.sub(
                 r"(?<![A-Za-z0-9_./-])/scratch(?=(?:/|\s|$|[\"']))",
                 shlex.quote(str(self.scratch_path)),
+                command,
+            )
+            command = re.sub(
+                r"(?<![A-Za-z0-9_./-])/tmp(?=(?:/|\s|$|[\"']))",
+                shlex.quote(str(self.scratch_path / "tmp")),
                 command,
             )
         command = _rewrite_managed_virtual_paths(
@@ -429,6 +464,65 @@ class RestrictedHostWorkspaceBackend(FilesystemBackend, SandboxBackendProtocol):
                 exit_code=1,
             )
 
+    def execute_external_directory(
+        self,
+        directory_path: str,
+        command: str,
+        *,
+        timeout: int | None = None,
+        writable: bool = False,
+    ) -> ExecuteResponse:
+        """Run a typed external-directory command directly on the host.
+
+        Spawn has no OS filesystem boundary; the exact directory is still
+        canonicalized here so the convenience tool has the same target
+        identity as Kernel. Tool Gate owns the effect decision and draft
+        lease, while this method owns only process lifecycle.
+        """
+
+        del writable  # The caller validates writable drafts and their lease.
+        try:
+            directory = Path(directory_path).expanduser()
+            if not directory.is_absolute() or directory.is_symlink() or not directory.is_dir():
+                raise ValueError("external directory must be an absolute non-symlink directory")
+            directory = directory.resolve(strict=True)
+            if directory == self.workspace_path or self.workspace_path in directory.parents:
+                raise ValueError("external directory must not be inside the workspace")
+            effective_timeout = timeout if timeout is not None else self._default_timeout
+            if not isinstance(effective_timeout, int) or effective_timeout <= 0:
+                raise ValueError("timeout must be a positive integer")
+            with self._workspace_lock(str(directory)):
+                result = subprocess.run(  # noqa: S602
+                    command,
+                    check=False,
+                    shell=True,
+                    cwd=directory,
+                    env={key: value for key, value in self._env.items() if value},
+                    capture_output=True,
+                    text=True,
+                    stdin=subprocess.DEVNULL,
+                    timeout=effective_timeout,
+                    start_new_session=True,
+                )
+            output, truncated = _bounded_output(
+                result.stdout,
+                result.stderr,
+                max_output_bytes=self._max_output_bytes,
+            )
+            if result.returncode != 0:
+                output = f"{output.rstrip()}\n\nExit code: {result.returncode}"
+            return ExecuteResponse(output=output, exit_code=result.returncode, truncated=truncated)
+        except subprocess.TimeoutExpired:
+            return ExecuteResponse(
+                output=f"Error: Command timed out after {timeout or self._default_timeout} seconds.",
+                exit_code=124,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return ExecuteResponse(
+                output=f"Error executing external directory command ({type(exc).__name__}): {exc}",
+                exit_code=1,
+            )
+
     @classmethod
     def _workspace_lock(cls, key: str) -> threading.RLock:
         with cls._workspace_locks_guard:
@@ -453,7 +547,7 @@ class KernelWorkspaceBackend(FilesystemBackend, SandboxBackendProtocol):
         self.scratch_path = scratch_path.expanduser().resolve()
         if not self.workspace_path.is_dir() or not self.scratch_path.is_dir():
             raise ValueError("Kernel workspace and scratch roots must exist")
-        if not _macos_seatbelt_available():
+        if not _kernel_sandbox_available():
             raise RuntimeError("No supported kernel sandbox is available on this host")
         self._default_timeout = timeout
         self.managed_readonly_path_aliases = tuple(managed_readonly_path_aliases)
@@ -463,11 +557,24 @@ class KernelWorkspaceBackend(FilesystemBackend, SandboxBackendProtocol):
         self._host_runtime: Any | None = None
         self._host_runtime_lock = threading.RLock()
         workspace_digest = hashlib.sha256(str(self.workspace_path).encode("utf-8")).hexdigest()[:16]
-        self._id = f"kernel:macos-seatbelt:{workspace_digest}"
+        self._kernel_runner_mode = (
+            "kernel_macos_seatbelt" if sys.platform == "darwin" else "kernel_linux_bwrap_seccomp"
+        )
+        self._id = f"kernel:{self._kernel_runner_mode.removeprefix('kernel_')}:{workspace_digest}"
 
     @property
     def id(self) -> str:
         return self._id
+
+    @property
+    def kernel_runner_mode(self) -> str:
+        return self._kernel_runner_mode
+
+    @property
+    def kernel_runner_binding_digest(self) -> str:
+        from harness.kernel_sandbox import kernel_runner_binding_digest
+
+        return kernel_runner_binding_digest()
 
     def execute(
         self,
@@ -476,7 +583,7 @@ class KernelWorkspaceBackend(FilesystemBackend, SandboxBackendProtocol):
         timeout: int | None = None,
     ) -> ExecuteResponse:
         from harness.execution_context import current_authorized_execution
-        from harness.kernel_sandbox import MacOSSeatbeltRunner
+        from harness.kernel_sandbox import kernel_runner_for_profile
 
         authorized = current_authorized_execution()
         if authorized is None:
@@ -490,10 +597,14 @@ class KernelWorkspaceBackend(FilesystemBackend, SandboxBackendProtocol):
                 output="Error: Execution permit belongs to another workspace.",
                 exit_code=126,
             )
-        runner = MacOSSeatbeltRunner(profile)
+        runner = kernel_runner_for_profile(
+            profile,
+            runtime_root=self.scratch_path / ".kernel-runtime",
+        )
         if not authorized.valid_at_spawn(
             command=command,
             selected_runner=runner.mode,
+            runner_binding_digest=self.kernel_runner_binding_digest,
         ):
             return ExecuteResponse(
                 output="Error: Kernel execution permit became invalid before process spawn.",
@@ -506,9 +617,10 @@ class KernelWorkspaceBackend(FilesystemBackend, SandboxBackendProtocol):
         response = runner.execute(
             execution_command,
             timeout=timeout or self._default_timeout,
-            spawn_guard=lambda: authorized.valid_at_spawn(
+            spawn_guard=lambda: authorized.consume_at_spawn(
                 command=command,
                 selected_runner=runner.mode,
+                runner_binding_digest=self.kernel_runner_binding_digest,
             ),
             environment=dict(authorized.environment),
         )
@@ -526,6 +638,128 @@ class KernelWorkspaceBackend(FilesystemBackend, SandboxBackendProtocol):
             exit_code=response.exit_code,
             truncated=response.truncated,
         )
+
+    def execute_external_directory(
+        self,
+        directory_path: str,
+        command: str,
+        *,
+        timeout: int | None = None,
+        writable: bool = False,
+    ) -> ExecuteResponse:
+        """Run a HostFileBroker-approved command in one exact external root."""
+
+        from harness.kernel_sandbox import kernel_runner_for_profile
+
+        effective_timeout = timeout if timeout is not None else self._default_timeout
+        try:
+            directory = Path(directory_path).expanduser()
+            if not directory.is_absolute() or directory.is_symlink() or not directory.is_dir():
+                raise ValueError("external directory must be an absolute non-symlink directory")
+            directory = directory.resolve(strict=True)
+            if directory == self.workspace_path or self.workspace_path in directory.parents:
+                raise ValueError("external directory must not be inside the workspace")
+            execution_command = command
+            validator_dir = (Path(__file__).resolve().parent / "docker").resolve()
+            external_read_roots: tuple[Path, ...] = (directory,)
+            if "/opt/puddingclaw/bin/validate-html-report-e2e.mjs" in command:
+                if not validator_dir.is_dir() or validator_dir.is_symlink():
+                    raise ValueError("managed HTML validator directory is unavailable")
+                execution_command = _rewrite_managed_virtual_paths(
+                    command,
+                    (("/opt/puddingclaw/bin", validator_dir),),
+                )
+                external_read_roots += (validator_dir,)
+            profile = SandboxGrantProfile.build(
+                workspace_root=self.workspace_path,
+                scratch_root=self.scratch_path,
+                external_read_roots=external_read_roots,
+                external_write_roots=(directory,) if writable else (),
+                workspace_writable=False,
+                network_allowed=False,
+                timeout_seconds=effective_timeout,
+            )
+            runner = kernel_runner_for_profile(
+                profile,
+                runtime_root=(self.scratch_path / ".kernel-runtime" if sys.platform == "linux" else None),
+            )
+            return runner.execute(
+                execution_command,
+                timeout=effective_timeout,
+                cwd=directory,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return ExecuteResponse(
+                output=f"Error executing external directory command ({type(exc).__name__}): {exc}",
+                exit_code=1,
+            )
+
+    def run_html_report_e2e(
+        self,
+        html_path: Path,
+        *,
+        timeout: int,
+    ) -> ExecuteResponse:
+        """Run the fixed browser validator with a narrowly typed kernel profile."""
+
+        from harness.kernel_sandbox import kernel_runner_for_profile
+
+        try:
+            html = Path(html_path).expanduser()
+            if not html.is_absolute() or html.is_symlink() or not html.is_file():
+                raise ValueError("HTML report must be an absolute non-symlink file")
+            html = html.resolve(strict=True)
+            script = (Path(__file__).resolve().parent / "docker" / "validate-html-report-e2e.mjs").resolve(strict=True)
+            if script.is_symlink() or not script.is_file():
+                raise ValueError("managed HTML validator is not a regular file")
+
+            browser_candidates = (
+                Path("/usr/bin/chromium"),
+                Path("/usr/bin/chromium-browser"),
+                Path("/usr/bin/google-chrome"),
+                Path("/opt/homebrew/bin/chromium"),
+                Path("/opt/homebrew/bin/chromium-browser"),
+                Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+            )
+
+
+            browser = next(
+                (
+                    candidate.resolve(strict=True)
+                    for candidate in browser_candidates
+                    if candidate.is_file() and not candidate.is_symlink()
+                ),
+                None,
+            )
+            if browser is None:
+                return ExecuteResponse(
+                    output="Error: no supported Chromium/Chrome executable is installed for HTML browser validation.",
+                    exit_code=1,
+                )
+            profile = SandboxGrantProfile.build(
+                workspace_root=self.workspace_path,
+                scratch_root=self.scratch_path,
+                external_read_roots=(html.parent, script.parent, browser.parent),
+                workspace_writable=False,
+                network_allowed=False,
+                timeout_seconds=timeout,
+            )
+            runner = kernel_runner_for_profile(
+                profile,
+                runtime_root=(self.scratch_path / ".kernel-runtime" if sys.platform == "linux" else None),
+            )
+            command = shlex.join(["node", str(script), html.name])
+            return runner.execute(
+                command,
+                timeout=timeout,
+                cwd=html.parent,
+                environment={"PUPPETEER_EXECUTABLE_PATH": str(browser)},
+            )
+        except Exception as exc:  # noqa: BLE001
+            return ExecuteResponse(
+                output=f"Error executing managed HTML validator ({type(exc).__name__}): {exc}",
+                exit_code=1,
+            )
 
     def _host_runtime_backend(self) -> Any:
         from harness.host_skill_runtime import HostSkillRuntimeBackend
@@ -603,7 +837,98 @@ class KernelWorkspaceBackend(FilesystemBackend, SandboxBackendProtocol):
             return skill_projection
         if not has_node_runtime:
             return skill_projection
+        # The shared Node runtime is only relevant to Backend-owned managed
+        # CLIs. Do not initialize HostSkillRuntimeBackend for ordinary shell
+        # commands such as `pwd`; that would make an unrelated command depend
+        # on the host Python shared-library layout.
+        if not ManagedCliRegistry().claims(command):
+            return skill_projection
         return self._host_runtime_backend().project_cli_execution(command)
+
+
+class DeferredKernelWorkspaceBackend(FilesystemBackend, SandboxBackendProtocol):
+    """Executable DeepAgents backend held at a Kernel-unavailable boundary."""
+
+    mode = "kernel"
+    kernel_unavailable = True
+
+    def __init__(
+        self,
+        *,
+        root_dir: Path,
+        scratch_path: Path,
+        timeout: int,
+        managed_readonly_path_aliases: tuple[tuple[str, Path], ...],
+        reason: str,
+    ) -> None:
+        super().__init__(root_dir=root_dir, virtual_mode=True)
+        self.workspace_path = root_dir.expanduser().resolve()
+        self.scratch_path = scratch_path.expanduser().resolve()
+        self._timeout = timeout
+        self.managed_readonly_path_aliases = tuple(managed_readonly_path_aliases)
+        self.managed_readonly_host_roots = tuple(path for _name, path in self.managed_readonly_path_aliases)
+        self.fallback_reason = reason
+        digest = hashlib.sha256(str(self.workspace_path).encode()).hexdigest()[:16]
+        self._id = f"kernel-unavailable:{digest}"
+        self._delegate: SpawnWorkspaceBackend | None = None
+
+    @property
+    def id(self) -> str:
+        return self._delegate.id if self._delegate is not None else self._id
+
+    @property
+    def effective_mode(self) -> str:
+        return "spawn" if self._delegate is not None else "kernel"
+
+    @property
+    def kernel_runner_mode(self) -> str:
+        return "kernel_macos_seatbelt" if sys.platform == "darwin" else "kernel_linux_bwrap_seccomp"
+
+    @property
+    def kernel_runner_binding_digest(self) -> str:
+        return ""
+
+    def activate_spawn(self) -> None:
+        if self._delegate is None:
+            self._delegate = SpawnWorkspaceBackend(
+                root_dir=self.workspace_path,
+                scratch_path=self.scratch_path,
+                timeout=self._timeout,
+                managed_readonly_path_aliases=self.managed_readonly_path_aliases,
+            )
+        self.kernel_unavailable = False
+
+    def execute(self, command: str, *, timeout: int | None = None) -> ExecuteResponse:
+        if self._delegate is not None:
+            return self._delegate.execute(command, timeout=timeout)
+        return ExecuteResponse(
+            output=f"Error: Kernel execution is unavailable and no explicit fallback was approved: {self.fallback_reason}",
+            exit_code=126,
+        )
+
+    def execute_external_directory(self, directory_path: str, command: str, *, timeout: int | None = None, writable: bool = False) -> ExecuteResponse:
+        if self._delegate is not None:
+            return self._delegate.execute_external_directory(directory_path, command, timeout=timeout, writable=writable)
+        return ExecuteResponse(
+            output="Error: Kernel execution is unavailable; external directory execution is blocked until an explicit Run fallback.",
+            exit_code=126,
+        )
+
+    def run_html_report_e2e(self, html_path: Path, *, timeout: int) -> ExecuteResponse:
+        if self._delegate is not None:
+            return self._delegate.run_html_report_e2e(html_path, timeout=timeout)
+        return ExecuteResponse(
+            output="Error: Kernel HTML validation is unavailable; no implicit host fallback is allowed.",
+            exit_code=126,
+        )
+
+    def __getattr__(self, name: str) -> Any:
+        if name.startswith("_"):
+            raise AttributeError(name)
+        delegate = self.__dict__.get("_delegate")
+        if delegate is not None:
+            return getattr(delegate, name)
+        raise AttributeError(name)
 
 
 class ProjectSandboxManager:
@@ -3500,6 +3825,14 @@ class AdaptiveWorkspaceBackend(FilesystemBackend, SandboxBackendProtocol):
     def id(self) -> str:
         return self._id
 
+    @property
+    def kernel_runner_mode(self) -> str:
+        return self.kernel.kernel_runner_mode
+
+    @property
+    def kernel_runner_binding_digest(self) -> str:
+        return self.kernel.kernel_runner_binding_digest
+
     def _docker_backend(self) -> DockerWorkspaceBackend:
         with self._docker_lock:
             if self._docker is not None:
@@ -3539,25 +3872,11 @@ class AdaptiveWorkspaceBackend(FilesystemBackend, SandboxBackendProtocol):
 
         authorized = current_authorized_execution()
         if authorized is None:
-            # Fixed platform-owned browser validation is already authorized by
-            # its typed Tool Gate and cannot run in the host kernel runtime.
-            if "/opt/puddingclaw/bin/validate-html-report-e2e.mjs" in command:
-                try:
-                    return self._docker_backend().execute(
-                        command,
-                        timeout=timeout,
-                        _trusted_typed=True,
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    return ExecuteResponse(
-                        output=f"Error starting lazy Docker runner ({type(exc).__name__}): {exc}",
-                        exit_code=1,
-                    )
             return ExecuteResponse(
                 output="Error: Adaptive execution requires a Tool Gate execution permit.",
                 exit_code=126,
             )
-        if authorized.permit.selected_runner == "kernel_macos_seatbelt":
+        if authorized.permit.selected_runner.startswith("kernel_"):
             return self.kernel.execute(command, timeout=timeout)
         if authorized.permit.selected_runner != "docker":
             return ExecuteResponse(
@@ -3578,7 +3897,10 @@ class AdaptiveWorkspaceBackend(FilesystemBackend, SandboxBackendProtocol):
             )
 
     def execute_external_directory(self, *args: Any, **kwargs: Any) -> ExecuteResponse:
-        return self._docker_backend().execute_external_directory(*args, **kwargs)
+        return self.kernel.execute_external_directory(*args, **kwargs)
+
+    def run_html_report_e2e(self, *args: Any, **kwargs: Any) -> ExecuteResponse:
+        return self.kernel.run_html_report_e2e(*args, **kwargs)
 
     def _skill_runtime(self, skill_id: str, skill_version: str) -> str:
         from runtime_identity.paths import PuddingClawPaths
@@ -3755,7 +4077,7 @@ class AdaptiveWorkspaceBackend(FilesystemBackend, SandboxBackendProtocol):
 
 @dataclass(frozen=True)
 class WorkspaceBackendSelection:
-    backend: RestrictedHostWorkspaceBackend | KernelWorkspaceBackend | AdaptiveWorkspaceBackend | DockerWorkspaceBackend
+    backend: SpawnWorkspaceBackend | KernelWorkspaceBackend | DeferredKernelWorkspaceBackend | AdaptiveWorkspaceBackend | DockerWorkspaceBackend
     mode: str
     fallback_reason: str | None = None
     dependency_plan: WorkspaceDependencyPlan | None = None
@@ -3765,33 +4087,20 @@ def build_workspace_execution_backend(
     workspace_path: Path,
     terminal_config: dict[str, Any],
 ) -> WorkspaceBackendSelection:
-    """Build the configured kernel-first, kernel-only, or forced-Docker backend."""
+    """Build the configured host-spawn or kernel execution backend."""
 
     timeout = int(terminal_config.get("default_timeout_seconds") or 120)
-    sandbox_mode = str(terminal_config.get("sandbox_mode") or "").strip().lower()
-    if sandbox_mode not in {"", "auto", "kernel", "docker"}:
-        raise ValueError("sandbox_mode must be auto, kernel, or docker")
-    docker_enabled = sandbox_mode == "docker" if sandbox_mode else bool(terminal_config.get("docker_enabled", False))
+    execution_mode = str(terminal_config.get("execution_mode") or "").strip().lower()
+    if execution_mode not in {"spawn", "kernel"}:
+        raise ValueError("execution_mode must be spawn or kernel")
     docker_config = dict(terminal_config.get("docker") or {})
     managed_readonly_aliases = _managed_readonly_path_aliases(docker_config)
     scratch_host_path_raw = str(terminal_config.get("_scratch_host_path") or "").strip()
     scratch_host_path = Path(scratch_host_path_raw) if scratch_host_path_raw else None
-    if sandbox_mode in {"auto", "kernel"}:
+    if execution_mode == "kernel":
         if scratch_host_path is None:
             raise ValueError("Kernel sandbox requires a Harness scratch path")
         try:
-            if sandbox_mode == "auto":
-                adaptive = AdaptiveWorkspaceBackend(
-                    root_dir=workspace_path,
-                    scratch_path=scratch_host_path,
-                    docker_config=docker_config,
-                    timeout=timeout,
-                    managed_readonly_path_aliases=managed_readonly_aliases,
-                )
-                return WorkspaceBackendSelection(
-                    backend=adaptive,
-                    mode="adaptive",
-                )
             return WorkspaceBackendSelection(
                 backend=KernelWorkspaceBackend(
                     root_dir=workspace_path,
@@ -3802,56 +4111,24 @@ def build_workspace_execution_backend(
                 mode="kernel",
             )
         except RuntimeError as exc:
-            if sandbox_mode == "kernel":
-                raise
-            # Auto only touches Docker when the default kernel boundary is
-            # genuinely unavailable. Capability-based lazy upgrades are
-            # handled by the execution router, not during Run construction.
-            logger.warning(
-                "Kernel sandbox unavailable; evaluating Docker fallback: %s",
-                exc,
-            )
-            docker_enabled = True
-            kernel_fallback_reason = str(exc)
-    else:
-        kernel_fallback_reason = None
-    if docker_enabled:
-        manager = ProjectSandboxManager(docker_config)
-        available, reason = manager.probe()
-        if available:
-            try:
-                backend = DockerWorkspaceBackend(
+            logger.warning("Kernel execution mode unavailable; deferring explicit fallback decision: %s", exc)
+            return WorkspaceBackendSelection(
+                backend=DeferredKernelWorkspaceBackend(
                     root_dir=workspace_path,
-                    manager=manager,
                     scratch_path=scratch_host_path,
                     timeout=timeout,
-                )
-                return WorkspaceBackendSelection(
-                    backend=backend,
-                    mode="docker",
-                    fallback_reason=kernel_fallback_reason,
-                    dependency_plan=backend.dependency_plan,
-                )
-            except Exception as exc:
-                reason = f"{type(exc).__name__}: {exc}"
-        if str(terminal_config.get("on_unavailable") or "fallback") == "deny":
-            raise RuntimeError(f"Docker sandbox is unavailable: {reason}")
-        return WorkspaceBackendSelection(
-            backend=RestrictedHostWorkspaceBackend(
-                root_dir=workspace_path,
-                scratch_path=scratch_host_path,
-                timeout=timeout,
-                managed_readonly_path_aliases=managed_readonly_aliases,
-            ),
-            mode="restricted_host",
-            fallback_reason=reason,
-        )
+                    managed_readonly_path_aliases=managed_readonly_aliases,
+                    reason=str(exc),
+                ),
+                mode="kernel",
+                fallback_reason=str(exc),
+            )
     return WorkspaceBackendSelection(
-        backend=RestrictedHostWorkspaceBackend(
+        backend=SpawnWorkspaceBackend(
             root_dir=workspace_path,
             scratch_path=scratch_host_path,
             timeout=timeout,
             managed_readonly_path_aliases=managed_readonly_aliases,
         ),
-        mode="restricted_host",
+        mode="spawn",
     )

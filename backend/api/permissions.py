@@ -29,7 +29,7 @@ class PermissionDenyRequest(BaseModel):
 
 class ToolActionGrantRequest(BaseModel):
     permission_request_id: str
-    scope: str = Field(pattern="^(once|session)$")
+    scope: str = Field(pattern="^(once|session|project)$")
 
 
 class ShellDirectoryGrantRequest(BaseModel):
@@ -388,7 +388,7 @@ async def grant_tool_action_permission(
     session_id: str,
     req: ToolActionGrantRequest,
 ) -> dict[str, Any]:
-    """Approve one managed Tool action once or for this Session."""
+    """Approve one managed Tool action once, for this Session, or this Project."""
 
     pending = permission_resume_registry.get(req.permission_request_id)
     if pending is None:
@@ -437,10 +437,18 @@ async def grant_tool_action_permission(
         raise HTTPException(status_code=400, detail="permission fingerprint missing")
     session_target_kind = str(pending.get("session_target_kind") or "")
     session_target = str(pending.get("session_target") or "")
-    if req.scope == "session" and not (session_target_kind and session_target):
+    if req.scope in {"session", "project"} and not (session_target_kind and session_target):
         raise HTTPException(
             status_code=400,
             detail="This action only supports one-time approval",
+        )
+    if req.scope == "project" and (
+        str(pending.get("tool_name") or "") != "execute"
+        or session_target_kind != "command_pattern"
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Project approval is only available for stable local execute patterns",
         )
     use_reusable_scope = req.scope == "session" and session_target_kind and session_target
     target_kind = session_target_kind if use_reusable_scope else "fingerprint"
@@ -461,6 +469,67 @@ async def grant_tool_action_permission(
     if use_reusable_scope:
         metadata["session_scope_label"] = pending.get("session_scope_label")
         metadata["session_target"] = session_target
+    if req.scope == "project":
+        try:
+            session_metadata = session_manager.get_metadata(session_id)
+            project_id = str(session_metadata.get("project_id") or "").strip()
+            if not project_id:
+                raise ValueError("Project approval requires a Session bound to a Project")
+            from projects.registry import project_registry
+
+            project_policy = project_registry.get_permission_rules(project_id)
+            project_rule = {
+                "tool": "execute",
+                "pattern": session_target,
+                "decision": "allow",
+                "scope": "project",
+                "constraints": {
+                    "network": False,
+                    "credentials": False,
+                    "destructive": False,
+                    "package_install": False,
+                    "write_scope": "workspace_or_scratch",
+                },
+            }
+            project = project_registry.set_permission_rules(
+                project_id,
+                [*list(project_policy.get("rules") or []), project_rule],
+            )
+            grant = session_manager.add_permission_grant(
+                session_id,
+                grant_type="tool_action",
+                target_kind="fingerprint",
+                target=fingerprint,
+                capabilities=capabilities,
+                scope="once",
+                source="user_project_rule",
+                metadata={**metadata, "project_id": project_id},
+                bindings=(dict(pending["grant_bindings"]) if isinstance(pending.get("grant_bindings"), dict) else None),
+            )
+            resumed = permission_resume_registry.resolve(
+                req.permission_request_id,
+                {
+                    "type": "approve",
+                    "grant_id": grant["id"],
+                    "project_id": project_id,
+                    "project_rule_revision": project.permission_rules_revision,
+                },
+            )
+            if not resumed:
+                session_manager.revoke_permission_grant(session_id, grant["id"])
+                raise ValueError("permission request was resolved concurrently")
+            return {
+                "session_id": session_id,
+                "project_id": project_id,
+                "project": project.to_dict(),
+                "grant": grant,
+                "resumed": resumed,
+                "auto_resumed_permission_request_ids": [],
+            }
+        except (FileNotFoundError, KeyError) as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
     try:
         grant = session_manager.add_permission_grant(
             session_id,

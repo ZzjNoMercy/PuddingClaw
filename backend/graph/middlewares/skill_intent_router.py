@@ -36,6 +36,8 @@ class SkillIntentRouterMiddleware(AgentMiddleware):
                 "matched": False,
                 "skill_ids": [],
                 "explicit_skill_ids": [],
+                "required_skill_ids": [],
+                "missing_required_skill_ids": [],
                 "missing_explicit_skill_ids": [],
                 "routing_prompt": "",
             }
@@ -45,12 +47,20 @@ class SkillIntentRouterMiddleware(AgentMiddleware):
         )
         skill_ids = [item.skill_id for item in candidates]
         explicit_skill_ids = [item.skill_id for item in candidates if item.explicit]
+        required_skill_ids = [item.skill_id for item in candidates if item.required]
+        missing_required = [
+            reason.split(":", 1)[1]
+            for reason in profile.reasons
+            if reason.startswith("missing_required_skill:") and reason.split(":", 1)[1]
+        ]
         missing = list(profile.missing_explicit_skill_ids)
-        if not skill_ids and not missing:
+        if not skill_ids and not missing and not missing_required:
             return {
                 "matched": False,
                 "skill_ids": [],
                 "explicit_skill_ids": [],
+                "required_skill_ids": [],
+                "missing_required_skill_ids": [],
                 "missing_explicit_skill_ids": [],
                 "routing_prompt": "",
             }
@@ -58,6 +68,13 @@ class SkillIntentRouterMiddleware(AgentMiddleware):
         missing_notice = (
             f"用户明确指定但当前未安装以下 Skill：{', '.join(missing)}。这是可恢复的安装流程，不是任务失败。"
             if missing
+            else ""
+        )
+        missing_required_notice = (
+            "当前文件类型必须由专用 Skill 处理，但尚未安装："
+            f"{', '.join(missing_required)}。禁止直接读取文件 bytes/Base64 或使用通用工具绕过；"
+            "请明确告知用户当前缺少处理能力。"
+            if missing_required
             else ""
         )
         load_notice = (
@@ -69,8 +86,12 @@ class SkillIntentRouterMiddleware(AgentMiddleware):
             "matched": True,
             "skill_ids": skill_ids,
             "explicit_skill_ids": explicit_skill_ids,
+            "required_skill_ids": required_skill_ids,
+            "missing_required_skill_ids": missing_required,
             "missing_explicit_skill_ids": missing,
-            "routing_prompt": " ".join(item for item in (missing_notice, load_notice) if item),
+            "routing_prompt": " ".join(
+                item for item in (missing_required_notice, missing_notice, load_notice) if item
+            ),
         }
 
     def _profile_payload(self, request: Any) -> dict[str, Any] | None:
@@ -104,12 +125,15 @@ class SkillIntentRouterMiddleware(AgentMiddleware):
             normalized = re.sub(r"[ \t]{2,}", " ", normalized).strip()
         return normalized, removed
 
-    def _pending_explicit_skill_ids(self, request: Any) -> list[str]:
+    def _pending_barrier_skill_ids(self, request: Any) -> list[str]:
         decision = self._routing_decision(self._profile_payload(request))
         if not decision["matched"]:
             return []
         active_skill_ids = {str(item) for item in request.state.get("active_skill_ids") or []}
-        return [skill_id for skill_id in decision["explicit_skill_ids"] if skill_id not in active_skill_ids]
+        barrier_ids = list(
+            dict.fromkeys([*decision["explicit_skill_ids"], *decision["required_skill_ids"]])
+        )
+        return [skill_id for skill_id in barrier_ids if skill_id not in active_skill_ids]
 
     @staticmethod
     def _is_required_skill_read(tool_call: dict[str, Any], pending_skill_ids: list[str]) -> bool:
@@ -122,16 +146,36 @@ class SkillIntentRouterMiddleware(AgentMiddleware):
         return file_path in {f"/skills/{skill_id}/SKILL.md" for skill_id in pending_skill_ids}
 
     def _activation_barrier_message(self, request: ToolCallRequest) -> ToolMessage | None:
-        """Block sibling work until every explicitly requested Skill is activated."""
+        """Block sibling work until every explicit or file-required Skill is active."""
 
-        pending_skill_ids = self._pending_explicit_skill_ids(request)
+        decision = self._routing_decision(self._profile_payload(request))
+        missing_required = decision["missing_required_skill_ids"]
+        tool_name = str(request.tool_call.get("name") or "")
+        if missing_required:
+            return ToolMessage(
+                content=(
+                    "Tool execution was blocked because this file type requires an installed Skill: "
+                    f"{', '.join(missing_required)}. Do not read the file bytes/Base64 or bypass the Skill. "
+                    "Tell the user that the required file-processing Skill is not installed."
+                ),
+                tool_call_id=str(request.tool_call.get("id") or ""),
+                name=tool_name,
+                status="error",
+                additional_kwargs={
+                    "puddingclaw_control_plane": {
+                        "type": "required_skill_missing",
+                        "missing_skill_ids": missing_required,
+                        "original_tool_executed": False,
+                    }
+                },
+            )
+        pending_skill_ids = self._pending_barrier_skill_ids(request)
         if not pending_skill_ids or self._is_required_skill_read(request.tool_call, pending_skill_ids):
             return None
-        tool_name = str(request.tool_call.get("name") or "")
         paths = ", ".join(f"/skills/{skill_id}/SKILL.md" for skill_id in pending_skill_ids)
         return ToolMessage(
             content=(
-                f"Tool `{tool_name}` was not executed because an explicitly requested Skill is not active yet. "
+                f"Tool `{tool_name}` was not executed because a required Skill is not active yet. "
                 f"First call `read_file` for: {paths}. After those reads succeed, reconsider the original task "
                 "and issue any workspace file calls in a new model turn. A slash Skill invocation is not a file path."
             ),
@@ -154,7 +198,7 @@ class SkillIntentRouterMiddleware(AgentMiddleware):
     ) -> ModelResponse:
         """Drop sibling calls when the model already emitted the required Skill read."""
 
-        pending_skill_ids = self._pending_explicit_skill_ids(request)
+        pending_skill_ids = self._pending_barrier_skill_ids(request)
         if not pending_skill_ids:
             return response
         required_read_present = any(
@@ -203,7 +247,12 @@ class SkillIntentRouterMiddleware(AgentMiddleware):
         )
         active_skill_ids = {str(item) for item in request.state.get("active_skill_ids") or []}
         missing_skill_ids = [skill_id for skill_id in decision["skill_ids"] if skill_id not in active_skill_ids]
-        if not missing_skill_ids and not decision["missing_explicit_skill_ids"] and not removed_skill_ids:
+        if (
+            not missing_skill_ids
+            and not decision["missing_explicit_skill_ids"]
+            and not decision["missing_required_skill_ids"]
+            and not removed_skill_ids
+        ):
             return request
         paths = ", ".join(f"/skills/{skill_id}/SKILL.md" for skill_id in missing_skill_ids)
         missing_notice = (
@@ -215,12 +264,20 @@ class SkillIntentRouterMiddleware(AgentMiddleware):
             if decision["missing_explicit_skill_ids"]
             else ""
         )
+        missing_required_notice = (
+            "当前文件类型只能由专用 Skill 处理，但以下 Skill 未安装："
+            f"{', '.join(decision['missing_required_skill_ids'])}。"
+            "禁止读取原始文件、bytes 或 Base64，也不得调用通用工具绕过。"
+            "请直接向用户说明当前缺少该文件处理能力。"
+            if decision["missing_required_skill_ids"]
+            else ""
+        )
         load_notice = (
             "本轮任务已由统一路由器匹配到尚未加载的项目 Skill。"
             + (
-                f"用户显式指定了其中的 {', '.join(decision['explicit_skill_ids'])}；"
-                "在这些 Skill 激活前，本轮只能使用 read_file 读取对应 SKILL.md，不得并行调用其他工具。"
-                if decision["explicit_skill_ids"]
+                "这些 Skill 是用户显式指定或当前文件类型强制要求的；"
+                "在 Skill 激活前，本轮只能使用 read_file 读取对应 SKILL.md，不得并行调用其他工具。"
+                if decision["explicit_skill_ids"] or decision["required_skill_ids"]
                 else ""
             )
             + f"先读取：{paths}。再按其中流程执行；不要猜测尚未加载 Skill 的业务工具。"
@@ -233,7 +290,11 @@ class SkillIntentRouterMiddleware(AgentMiddleware):
             if removed_skill_ids
             else ""
         )
-        routing_prompt = " ".join(item for item in (invocation_notice, missing_notice, load_notice) if item)
+        routing_prompt = " ".join(
+            item
+            for item in (invocation_notice, missing_required_notice, missing_notice, load_notice)
+            if item
+        )
         if bool(
             config.load_config().get("harness", {}).get("prompt_cache", {}).get("tail_routing_message", True)
         ):

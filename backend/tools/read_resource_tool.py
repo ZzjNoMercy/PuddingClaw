@@ -9,6 +9,7 @@ from langchain_core.tools import BaseTool
 from pydantic import BaseModel, Field
 
 from graph.attachment_store import attachment_store
+from graph.host_read_policy import is_sensitive_host_read_path
 from graph.managed_paths import is_managed_resource_path
 from graph.session_manager import session_manager
 from knowledge.paths import get_knowledge_root
@@ -24,7 +25,7 @@ class ReadResourceInput(BaseModel):
             "attachments or the exact non-workspace host path the user provided. "
             "This includes POSIX absolute paths, Windows absolute paths, and home-relative paths. "
             "HTTP(S) URLs are web resources and must be passed to fetch_url, not read_resource. "
-            "Do not pass managed virtual paths such as /workspace, /scratch, /knowledge, /skills, "
+            "Do not pass managed virtual paths such as /workspace, /scratch, /tmp, /knowledge, /skills, "
             "/semantic-assets, /analytics-models, or /sql-guardrails here; use read_file for them."
         )
     )
@@ -37,7 +38,8 @@ class ReadResourceTool(BaseTool):
     description: str = (
         "Read a PuddingClaw resource from a single entry point. Use this for uploaded/pasted attachment refs "
         "(`att_xxx`) and user-provided host paths outside the managed virtual namespaces. "
-        "Use read_file for `/workspace`, `/scratch`, `/knowledge`, `/skills`, `/semantic-assets`, "
+        "This tool does not extract PDF text; activate the PDF Skill and use its extraction flow. "
+        "Use read_file for `/workspace`, `/scratch`, `/tmp`, `/knowledge`, `/skills`, `/semantic-assets`, "
         "`/analytics-models`, `/sql-guardrails`, and `/large_tool_results`."
     )
     args_schema: type[BaseModel] = ReadResourceInput
@@ -45,6 +47,8 @@ class ReadResourceTool(BaseTool):
     session_id: str = ""
     run_id: str = ""
     workspace_path: str = ""
+    backend_mode: str = "kernel"
+    approval_mode: str = "strict"
     allowed_attachment_ids: list[str] = Field(default_factory=list, exclude=True)
     enforce_attachment_allowlist: bool = Field(default=False, exclude=True)
 
@@ -113,7 +117,20 @@ class ReadResourceTool(BaseTool):
         workspace = Path(self.workspace_path).expanduser().resolve() if self.workspace_path else None
         base_dir = Path(__file__).resolve().parent.parent
         if workspace is not None and not self._is_relative_to(path, workspace):
-            if not is_managed_resource_path(path, base_dir) and not session_manager.has_external_file_read_permission(self.session_id, path):
+            smart_ordinary_read = (
+                self.approval_mode == "smart"
+                and self.backend_mode in {"spawn", "kernel"}
+                and not is_sensitive_host_read_path(path)
+            )
+            unrestricted_spawn_read = (
+                self.backend_mode == "spawn" and self.approval_mode != "smart"
+            )
+            if (
+                not unrestricted_spawn_read
+                and not smart_ordinary_read
+                and not is_managed_resource_path(path, base_dir)
+                and not session_manager.has_external_file_read_permission(self.session_id, path)
+            ):
                 return (
                     "🔒 Permission required: this file is outside the current workspace.\n"
                     f"Path: {path}"
@@ -205,7 +222,10 @@ class ReadResourceTool(BaseTool):
             return image_marker
         return ReadExternalFileTool(
             session_id=self.session_id,
+            run_id=self.run_id,
             workspace_path=self.workspace_path,
+            backend_mode=self.backend_mode,
+            approval_mode=self.approval_mode,
         ).invoke({"path": value, "offset": offset, "limit": limit})
 
 

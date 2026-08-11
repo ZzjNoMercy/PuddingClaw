@@ -970,13 +970,14 @@ def test_settings_api_persists_deepagents_context_engineering_without_touching_c
                 "summarization": {
                     "model_id": "deepseek:deepseek-openai:deepseek-v4-flash:llm",
                     "trigger_tokens": 260000,
+                    "keep_tokens": 64000,
                 },
                 "tool_context": {
                     "enabled": False,
                     "immediate_compaction_enabled": True,
                     "single_tool_trigger_tokens": 9000,
                     "background_min_result_tokens": 1100,
-                    "keep_recent_tool_results": 15,
+                    "retain_tool_context_tokens": 48000,
                 },
             }
         }
@@ -991,6 +992,7 @@ def test_settings_api_persists_deepagents_context_engineering_without_touching_c
         "deepseek:deepseek-openai:deepseek-v4-flash:llm"
     )
     assert deepagents["summarization"]["trigger_tokens"] == 260000
+    assert deepagents["summarization"]["keep_tokens"] == 64000
     assert "summary_input_tokens" not in deepagents["summarization"]
     assert deepagents["tool_context"] == {
         **deepagents["tool_context"],
@@ -998,7 +1000,7 @@ def test_settings_api_persists_deepagents_context_engineering_without_touching_c
         "immediate_compaction_enabled": True,
         "single_tool_trigger_tokens": 9000,
         "background_min_result_tokens": 1100,
-        "keep_recent_tool_results": 15,
+        "retain_tool_context_tokens": 48000,
     }
     assert displayed["compression"]["middleware"] == chat_before
 
@@ -1023,6 +1025,30 @@ def test_settings_api_rejects_immediate_tool_threshold_above_offload_boundary(tm
     )
     assert response.status_code == 400
     assert "20,000" in response.json()["detail"]
+
+
+def test_settings_api_rejects_summary_keep_budget_at_or_above_trigger(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.json"
+    config_path.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(config, "CONFIG_FILE", config_path)
+
+    client = TestClient(app)
+    response = client.put(
+        "/api/settings",
+        json={
+            "compression": {
+                "deepagents": {
+                    "summarization": {
+                        "trigger_tokens": 64000,
+                        "keep_tokens": 64000,
+                    }
+                }
+            }
+        },
+    )
+
+    assert response.status_code == 400
+    assert "摘要保留预算" in response.json()["detail"]
 
 
 def test_settings_api_migrates_legacy_subagent_items_to_keyed_config(tmp_path, monkeypatch):
@@ -1533,9 +1559,32 @@ def test_agent_user_content_routes_pasted_absolute_file_path_to_host_file_broker
     assert "[本地文件路径]" in content
     assert "非 workspace 本地路径" in content
     assert "直接对原始绝对路径使用 read_file" in content
-    assert "HostFileBroker 原子落到正式路径" in content
-    assert "文件授权不授予 execute" in content
+    assert "精确写入由 HostFileBroker 原子落到正式路径" in content
+    assert "只提交一次原始操作" in content
+    assert "模型无需编排 Grant" in content
     assert str(external_file) in content
+
+
+def test_agent_user_content_gives_pdf_one_shot_profile_neutral_route(tmp_path):
+    workspace_path = tmp_path / "workspace"
+    workspace_path.mkdir()
+    pdf = tmp_path / "Downloads" / "人脉管理PRD.pdf"
+    pdf.parent.mkdir()
+    pdf.write_bytes(b"%PDF-1.7 fixture")
+
+    content = DeepAgentsAgentManager._build_user_content(
+        f"{pdf} 这个 PDF 说了什么",
+        session_id="session-pdf-route",
+        workspace_path=workspace_path,
+    )
+
+    assert isinstance(content, str)
+    assert "[PDF 文件路径]" in content
+    assert "pdftotext -layout <原路径> -" in content
+    assert "不要预判权限" in content
+    assert "创建再读取临时 txt" in content
+    assert "read_file/read_resource 不解析 PDF" in content
+    assert "HostFileBroker" not in content
 
 
 def test_agent_user_content_preserves_spaced_external_html_target(tmp_path):
@@ -1559,7 +1608,7 @@ def test_agent_user_content_preserves_spaced_external_html_target(tmp_path):
         "直接对原始绝对路径使用 "
         "read_file/write_file/materialize_source_ref/patch_file"
     ) in content
-    assert "HostFileBroker 原子落到正式路径" in content
+    assert "精确写入由 HostFileBroker 原子落到正式路径" in content
     assert "不要创建 /workspace 或 /scratch 影子副本" in content
     assert extract_declared_artifact_targets(f"{external_file} 刷新这个报告到 2026 年") == [str(external_file)]
     source_file = tmp_path / "input data.csv"
@@ -1576,10 +1625,10 @@ def test_artifact_target_parser_handles_compact_chinese_and_negation():
         "/data/jobs/report.py",
         "/srv/queries/latest.sql",
         "/opt/designs/chart.svg",
-        "/tmp/export.zip",
     ):
         assert extract_declared_artifact_targets(f"请修改{target}并交付") == [target]
         assert extract_declared_artifact_targets(f"请勿修改 {target}，只做审查") == []
+    assert extract_declared_artifact_targets("请修改/tmp/export.zip并交付") == []
     assert extract_declared_artifact_targets("请分析 https://example.com/reports/latest.html，不要写入本地") == []
 
 

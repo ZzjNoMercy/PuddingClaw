@@ -12,6 +12,7 @@ from langgraph.runtime import Runtime
 from langgraph.types import interrupt
 
 from graph.effective_grants import EffectiveGrantSet
+from graph.host_read_policy import is_sensitive_host_read_path
 from graph.managed_paths import is_managed_resource_path
 from graph.permission_policy import RunPermissionContext
 from graph.permission_resume import permission_resume_registry
@@ -22,6 +23,32 @@ from graph.virtual_paths import PathAuthority, classify_path_authority, is_virtu
 
 class ExternalFilePermissionMiddleware(AgentMiddleware[StateT, ContextT, ResponseT]):
     """Interrupt unauthorized external-file reads and exact-file writes."""
+
+    def __init__(
+        self,
+        *,
+        backend_mode: str = "kernel",
+        approval_mode: str = "strict",
+    ) -> None:
+        # Spawn is a host execution product mode, not a workspace sandbox.
+        # Keep the default fail-closed for isolated tests and callers that do
+        # not provide an execution snapshot; production always passes the
+        # selected backend mode explicitly.
+        self.backend_mode = str(backend_mode or "kernel")
+        self.approval_mode = str(approval_mode or "strict")
+
+    @property
+    def _spawn_host_reads_enabled(self) -> bool:
+        # Preserve the legacy Strict Spawn contract. Smart uses the shared
+        # ordinary/sensitive read boundary below for both Spawn and Kernel.
+        return self.backend_mode == "spawn" and self.approval_mode != "smart"
+
+    @property
+    def _smart_host_reads_enabled(self) -> bool:
+        return (
+            self.approval_mode == "smart"
+            and self.backend_mode in {"spawn", "kernel"}
+        )
 
     @classmethod
     def _external_write_path(cls, raw_path: str, workspace_path: str) -> Path | None:
@@ -315,7 +342,10 @@ class ExternalFilePermissionMiddleware(AgentMiddleware[StateT, ContextT, Respons
                     continue
                 source = self._external_read_path(source_raw, workspace_path)
                 target = self._external_write_path(target_raw, workspace_path)
-                source_granted = source is None or (
+                source_granted = source is None or self._spawn_host_reads_enabled or (
+                    self._smart_host_reads_enabled
+                    and not is_sensitive_host_read_path(source)
+                ) or (
                     session_manager.has_external_file_read_permission(session_id, source)
                     or self._has_directory_permission_for_path(
                         session_id, source, access="read", run_id=run_id
@@ -476,6 +506,11 @@ class ExternalFilePermissionMiddleware(AgentMiddleware[StateT, ContextT, Respons
                     )
                     else "read"
                 )
+                if (
+                    access == "read"
+                    and self._spawn_host_reads_enabled
+                ):
+                    continue
                 if (
                     access == "read"
                     and tool_name in {"grep", "glob", "ls"}
@@ -686,6 +721,11 @@ class ExternalFilePermissionMiddleware(AgentMiddleware[StateT, ContextT, Respons
                 if requested is None:
                     continue
                 access = "read"
+                if self._spawn_host_reads_enabled or (
+                    self._smart_host_reads_enabled
+                    and not is_sensitive_host_read_path(requested)
+                ):
+                    continue
                 if (
                     session_manager.has_external_file_read_permission(session_id, requested)
                     or self._has_directory_permission_for_path(

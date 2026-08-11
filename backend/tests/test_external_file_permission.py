@@ -751,6 +751,168 @@ def test_permission_middleware_interrupts_misrouted_external_read_file(tmp_path,
     assert request["operation"] == "read_file"
 
 
+def test_spawn_permission_middleware_does_not_interrupt_external_read_file(
+    tmp_path,
+    monkeypatch,
+):
+    from langchain_core.messages import AIMessage
+
+    import graph.permission_middleware as permission_middleware_module
+    from graph.permission_middleware import ExternalFilePermissionMiddleware
+    from graph.session_manager import session_manager
+
+    session_manager.initialize(tmp_path)
+    session_manager.create_session("spawn-external-read-session")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    external = tmp_path / "Downloads" / "document.pdf"
+    external.parent.mkdir()
+    external.write_bytes(b"%PDF-1.7 test fixture")
+
+    def fail_interrupt(_payload):
+        raise AssertionError("Spawn host reads must not create external-file HITL")
+
+    monkeypatch.setattr(permission_middleware_module, "interrupt", fail_interrupt)
+    state = {
+        "messages": [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "read_file",
+                        "args": {"file_path": str(external)},
+                        "id": "call-spawn-read-external",
+                        "type": "tool_call",
+                    }
+                ],
+            )
+        ]
+    }
+    runtime = SimpleNamespace(
+        context={
+            "session_id": "spawn-external-read-session",
+            "query_id": "query-spawn-read",
+            "workspace_path": str(workspace),
+        }
+    )
+
+    assert ExternalFilePermissionMiddleware(backend_mode="spawn").after_model(state, runtime) is None
+
+
+def test_kernel_smart_permission_middleware_allows_ordinary_external_read_file(
+    tmp_path,
+    monkeypatch,
+):
+    from langchain_core.messages import AIMessage
+
+    import graph.permission_middleware as permission_middleware_module
+    from graph.permission_middleware import ExternalFilePermissionMiddleware
+    from graph.session_manager import session_manager
+
+    session_manager.initialize(tmp_path)
+    session_manager.create_session("kernel-smart-external-read-session")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    external = tmp_path / "Downloads" / "document.txt"
+    external.parent.mkdir()
+    external.write_text("ordinary", encoding="utf-8")
+
+    monkeypatch.setattr(
+        permission_middleware_module,
+        "interrupt",
+        lambda _payload: (_ for _ in ()).throw(
+            AssertionError("Kernel Smart ordinary reads must not create HITL")
+        ),
+    )
+    state = {
+        "messages": [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "read_file",
+                        "args": {"file_path": str(external)},
+                        "id": "call-kernel-smart-read",
+                        "type": "tool_call",
+                    }
+                ],
+            )
+        ]
+    }
+    runtime = SimpleNamespace(
+        context={
+            "session_id": "kernel-smart-external-read-session",
+            "query_id": "query-kernel-smart-read",
+            "workspace_path": str(workspace),
+        }
+    )
+
+    async def invoke():
+        return ExternalFilePermissionMiddleware(
+            backend_mode="kernel",
+            approval_mode="smart",
+        ).after_model(state, runtime)
+
+    assert asyncio.run(invoke()) is None
+
+
+def test_kernel_smart_permission_middleware_still_interrupts_sensitive_host_read(
+    tmp_path,
+    monkeypatch,
+):
+    from langchain_core.messages import AIMessage
+
+    import graph.permission_middleware as permission_middleware_module
+    from graph.permission_middleware import ExternalFilePermissionMiddleware
+    from graph.session_manager import session_manager
+
+    session_manager.initialize(tmp_path)
+    session_manager.create_session("kernel-smart-sensitive-read-session")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    sensitive = tmp_path / ".ssh" / "id_rsa"
+    sensitive.parent.mkdir()
+    sensitive.write_text("secret", encoding="utf-8")
+    captured = {}
+    monkeypatch.setattr(
+        permission_middleware_module,
+        "interrupt",
+        lambda payload: captured.update(payload),
+    )
+    state = {
+        "messages": [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "read_file",
+                        "args": {"file_path": str(sensitive)},
+                        "id": "call-kernel-sensitive-read",
+                        "type": "tool_call",
+                    }
+                ],
+            )
+        ]
+    }
+    runtime = SimpleNamespace(
+        context={
+            "session_id": "kernel-smart-sensitive-read-session",
+            "query_id": "query-kernel-sensitive-read",
+            "workspace_path": str(workspace),
+        }
+    )
+
+    async def invoke():
+        return ExternalFilePermissionMiddleware(
+            backend_mode="kernel",
+            approval_mode="smart",
+        ).after_model(state, runtime)
+
+    assert asyncio.run(invoke()) is None
+    assert captured["request"]["path"] == str(sensitive.resolve())
+    assert captured["request"]["type"] == "external_file_read"
+
+
 def test_read_resource_supports_line_pagination(tmp_path):
     from graph.session_manager import session_manager
     from tools.read_resource_tool import ReadResourceTool
@@ -777,6 +939,53 @@ def test_read_resource_supports_line_pagination(tmp_path):
 
     assert content.startswith("line-5\nline-6\nline-7")
     assert "Continue with offset=8" in content
+
+
+def test_kernel_read_resource_consumes_parent_directory_grant(tmp_path):
+    from graph.session_manager import session_manager
+    from harness.models import RunRecord
+    from tools.read_resource_tool import ReadResourceTool
+
+    session_manager.initialize(tmp_path)
+    session_manager.create_session("resource-directory-session")
+    workspace = tmp_path / "workspace"
+    external = tmp_path / "external"
+    workspace.mkdir()
+    external.mkdir()
+    document = external / "report.txt"
+    document.write_text("directory-authorized", encoding="utf-8")
+    run = RunRecord(
+        run_id="run-directory-read",
+        query_id="query-directory-read",
+        session_id="resource-directory-session",
+        objective="read report",
+        config_snapshot={
+            "permissions": {"approval_mode": "smart", "policy_epoch": 1},
+            "execution": {"backend_mode": "kernel", "backend_id": "kernel:test"},
+        },
+    )
+    session_manager.upsert_run_state(
+        "resource-directory-session",
+        run.model_dump(mode="json"),
+    )
+    session_manager.add_permission_grant(
+        "resource-directory-session",
+        grant_type="external_directory_read",
+        target_kind="exact_directory",
+        target=str(external.resolve()),
+        capabilities=["read", "external_path"],
+        scope="run",
+        metadata={"run_id": run.run_id},
+    )
+
+    content = ReadResourceTool(
+        session_id="resource-directory-session",
+        run_id=run.run_id,
+        workspace_path=str(workspace),
+        backend_mode="kernel",
+    ).invoke({"resource": str(document)})
+
+    assert content == "directory-authorized"
 
 
 def test_read_resource_rejects_http_url_as_a_local_path(tmp_path):
@@ -837,6 +1046,40 @@ def test_read_external_file_tool_requires_permission_and_records_trace(tmp_path)
     permission_spans = [span for span in allowed_trace["spans"] if span["type"] == "permission"]
     assert permission_spans[-1]["name"] == "permission.enforce"
     assert permission_spans[-1]["metadata"]["permission"]["outcome"] == "allowed"
+
+
+def test_read_external_file_tool_kernel_smart_allows_ordinary_but_not_sensitive(tmp_path):
+    from graph.session_manager import session_manager
+    from tools.read_external_file_tool import ReadExternalFileTool
+
+    session_manager.initialize(tmp_path)
+    session_manager.create_session("smart-read-tool-session")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    ordinary = tmp_path / "Downloads" / "notes.txt"
+    ordinary.parent.mkdir()
+    ordinary.write_text("ordinary", encoding="utf-8")
+    sensitive = tmp_path / ".ssh" / "id_rsa"
+    sensitive.parent.mkdir()
+    sensitive.write_text("secret", encoding="utf-8")
+    tool = ReadExternalFileTool(
+        session_id="smart-read-tool-session",
+        workspace_path=str(workspace),
+        backend_mode="kernel",
+        approval_mode="smart",
+    )
+
+    assert tool.invoke({"path": str(ordinary)}) == "ordinary"
+    assert "Permission required" in tool.invoke({"path": str(sensitive)})
+
+    spawn_tool = ReadExternalFileTool(
+        session_id="smart-read-tool-session",
+        workspace_path=str(workspace),
+        backend_mode="spawn",
+        approval_mode="smart",
+    )
+    assert spawn_tool.invoke({"path": str(ordinary)}) == "ordinary"
+    assert "Permission required" in spawn_tool.invoke({"path": str(sensitive)})
 
 
 def test_read_resource_tool_reads_attachment_and_keeps_external_permission(tmp_path):

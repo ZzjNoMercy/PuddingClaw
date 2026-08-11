@@ -270,6 +270,7 @@ from api.stats_api import router as stats_router
 from api.tokens import router as tokens_router
 from api.toolchains import router as toolchains_router
 from api.user_input_requests import router as user_input_requests_router
+from api.kernel_fallback_requests import router as kernel_fallback_requests_router
 from api.web_search_config import router as web_search_config_router
 
 app.include_router(chat_router, prefix="/api")  # LEGACY: new conversations use /api/agent.
@@ -296,6 +297,7 @@ app.include_router(dimension_build_rules_router, prefix="/api")
 app.include_router(logical_dataset_rules_router, prefix="/api")
 app.include_router(database_sql_revisions_router, prefix="/api")
 app.include_router(user_input_requests_router, prefix="/api")
+app.include_router(kernel_fallback_requests_router, prefix="/api")
 app.include_router(connectors_router, prefix="/api")
 app.include_router(toolchains_router, prefix="/api")
 app.include_router(brain_schema_router, prefix="/api")

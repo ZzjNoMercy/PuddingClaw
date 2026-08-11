@@ -57,6 +57,127 @@ def test_absolute_workspace_path_is_rewritten_before_read_file(tmp_path):
     assert captured["args"]["file_path"] == "/workspace/reports/dashboard.html"
 
 
+def test_tmp_alias_is_rewritten_to_run_scratch_before_read_file(tmp_path):
+    from graph.middlewares.workspace_path_router import WorkspacePathRouterMiddleware
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    captured = {}
+
+    def handler(request):
+        captured.update(request.tool_call)
+        return ToolMessage(
+            content="current run text",
+            name="read_file",
+            tool_call_id="call-1",
+            status="success",
+        )
+
+    result = WorkspacePathRouterMiddleware().wrap_tool_call(
+        _request("read_file", {"file_path": "/tmp/renmai_prd.txt"}, workspace),
+        handler,
+    )
+
+    assert result.status == "success"
+    assert captured["args"]["file_path"] == "/scratch/tmp/renmai_prd.txt"
+
+
+def test_tmp_read_uses_current_run_scratch_not_stale_host_file(tmp_path):
+    from deepagents.backends import CompositeBackend, FilesystemBackend
+
+    from graph.middlewares.workspace_path_router import WorkspacePathRouterMiddleware
+
+    workspace = tmp_path / "workspace"
+    scratch = tmp_path / "current-run-scratch"
+    host_tmp = tmp_path / "host-tmp"
+    workspace.mkdir()
+    (scratch / "tmp").mkdir(parents=True)
+    host_tmp.mkdir()
+    (scratch / "tmp" / "renmai_prd.txt").write_text("current run", encoding="utf-8")
+    (host_tmp / "renmai_prd.txt").write_text("stale session", encoding="utf-8")
+    backend = CompositeBackend(
+        default=FilesystemBackend(root_dir=workspace, virtual_mode=True),
+        routes={"/scratch/": FilesystemBackend(root_dir=scratch, virtual_mode=True)},
+    )
+
+    def handler(request):
+        path = request.tool_call["args"]["file_path"]
+        result = backend.read(path)
+        return ToolMessage(
+            content=str((result.file_data or {}).get("content") or ""),
+            name="read_file",
+            tool_call_id=request.tool_call["id"],
+            status="error" if result.error else "success",
+        )
+
+    result = WorkspacePathRouterMiddleware(backend).wrap_tool_call(
+        _request("read_file", {"file_path": "/tmp/renmai_prd.txt"}, workspace),
+        handler,
+    )
+
+    assert result.status == "success"
+    assert result.content == "current run"
+
+
+def test_tmp_and_scratch_tmp_backend_routes_share_one_physical_file(tmp_path):
+    from deepagents.backends import FilesystemBackend
+
+    from graph.permissioned_filesystem_backend import PermissionedCompositeBackend
+
+    workspace = tmp_path / "workspace"
+    scratch = tmp_path / "scratch"
+    run_tmp = scratch / "tmp"
+    workspace.mkdir()
+    run_tmp.mkdir(parents=True)
+    workspace_backend = FilesystemBackend(root_dir=workspace, virtual_mode=True)
+    scratch_backend = FilesystemBackend(root_dir=scratch, virtual_mode=True)
+    tmp_backend = FilesystemBackend(root_dir=run_tmp, virtual_mode=True)
+    backend = PermissionedCompositeBackend(
+        default=workspace_backend,
+        routes={
+            "/workspace/": workspace_backend,
+            "/scratch/": scratch_backend,
+            "/tmp/": tmp_backend,
+        },
+        session_id="",
+        workspace_root=workspace,
+    )
+
+    written = backend.write("/tmp/result.txt", "same file")
+    read = backend.read("/scratch/tmp/result.txt")
+
+    assert written.error is None
+    assert read.error is None
+    assert (run_tmp / "result.txt").read_text() == "same file"
+    assert (read.file_data or {}).get("content") == "same file"
+
+
+def test_kernel_smart_reads_exact_ordinary_host_text_without_grant(tmp_path):
+    from graph.middlewares.workspace_path_router import WorkspacePathRouterMiddleware
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    external = tmp_path / "Downloads" / "notes.txt"
+    external.parent.mkdir()
+    external.write_text("ordinary host text", encoding="utf-8")
+
+    class Backend:
+        execution_mode = "kernel"
+
+    result = WorkspacePathRouterMiddleware(
+        Backend(),
+        approval_mode="smart",
+    ).wrap_tool_call(
+        _request("read_file", {"file_path": str(external)}, workspace),
+        lambda _request: (_ for _ in ()).throw(
+            AssertionError("Smart exact host read must use the bounded resource reader")
+        ),
+    )
+
+    assert result.status == "success"
+    assert result.content == "ordinary host text"
+
+
 def test_absolute_managed_knowledge_path_is_rewritten_before_read_file(tmp_path):
     from graph.middlewares.workspace_path_router import WorkspacePathRouterMiddleware
 
@@ -627,6 +748,50 @@ def test_external_read_file_routes_to_read_resource_with_pagination(tmp_path, mo
     assert result.name == "read_resource"
     assert result.status == "success"
     assert captured == {"resource": str(external.resolve()), "offset": 100, "limit": 200}
+
+
+def test_spawn_external_reads_keep_direct_host_route_without_grant(tmp_path):
+    from graph.middlewares.workspace_path_router import WorkspacePathRouterMiddleware
+    from graph.session_manager import session_manager
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    external = tmp_path / "Downloads" / "notes.txt"
+    external.parent.mkdir()
+    external.write_text("spawn direct host read", encoding="utf-8")
+    session_manager.initialize(tmp_path)
+    session_manager.create_session("routing-session")
+
+    class SpawnBackend:
+        execution_mode = "spawn"
+        managed_host_path_aliases = {}
+
+    captured = {}
+
+    def handler(request):
+        captured.update(request.tool_call)
+        return ToolMessage(
+            content="spawn direct host read",
+            name="read_file",
+            tool_call_id="call-1",
+            status="success",
+        )
+
+    middleware = WorkspacePathRouterMiddleware(SpawnBackend())
+    result = middleware.wrap_tool_call(
+        _request("read_file", {"file_path": str(external)}, workspace),
+        handler,
+    )
+    resource = middleware.wrap_tool_call(
+        _request("read_resource", {"resource": str(external)}, workspace, call_id="call-2"),
+        lambda _request: (_ for _ in ()).throw(AssertionError("spawn resource read is bound directly")),
+    )
+
+    assert result.status == "success"
+    assert captured["args"]["file_path"] == str(external.resolve())
+    assert resource.status == "success"
+    assert "spawn direct host read" in str(resource.content)
+    assert session_manager.list_permission_grants("routing-session") == []
 
 
 def test_exact_external_read_resource_is_not_misclassified_as_directory_search(tmp_path):

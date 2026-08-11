@@ -54,6 +54,7 @@ import {
   DatabaseSqlRevisionRequest,
   UserInputRequest,
   SkillSecretRequest,
+  KernelFallbackRequest,
   AgentAttachment,
   HarnessGoal,
   HarnessRun,
@@ -283,6 +284,7 @@ export interface ChatMessage {
   databaseSqlRevisionRequests?: DatabaseSqlRevisionRequest[];
   userInputRequests?: UserInputRequest[];
   skillSecretRequests?: SkillSecretRequest[];
+  kernelFallbackRequests?: KernelFallbackRequest[];
   interrupted?: boolean;
   interruptionNotice?: string;
   errorNotice?: string;
@@ -985,7 +987,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     credentialName: string | null;
   }>>({});
   const llmSelectionSaveChainsRef = useRef<Record<string, Promise<void>>>({});
-  const approvalModesMapRef = useRef<Record<string, ApprovalMode>>({ default: "strict" });
+  const approvalModesMapRef = useRef<Record<string, ApprovalMode>>({ default: "smart" });
   const approvalPolicyEpochsMapRef = useRef<Record<string, number>>({ default: 1 });
   const nextRunGoalModeMapRef = useRef<Record<string, boolean>>({ default: false });
   const createSessionPromisesRef = useRef<Map<string, Promise<string | null>>>(new Map());
@@ -1065,7 +1067,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const [thinkingLevel, setThinkingLevelRaw] = useState<"low" | "high" | "max" | null>(null);
   const [credentialName, setCredentialNameRaw] = useState<string | null>(null);
   const [goalModeEnabled, setGoalModeEnabledRaw] = useState(false);
-  const [approvalMode, setApprovalModeRaw] = useState<ApprovalMode>("strict");
+  const [approvalMode, setApprovalModeRaw] = useState<ApprovalMode>("smart");
   const [approvalModeSaving, setApprovalModeSaving] = useState(false);
   const [approvalModeError, setApprovalModeError] = useState<string | null>(null);
   const [activeGoal, setActiveGoal] = useState<HarnessGoal | null>(null);
@@ -1755,7 +1757,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
               credentialName: session.credential_name ?? null,
             };
           }
-          approvalModesMapRef.current[session.id] = session.approval_mode || "strict";
+          approvalModesMapRef.current[session.id] = session.approval_mode || "smart";
           if (session.policy_epoch) {
             approvalPolicyEpochsMapRef.current[session.id] = session.policy_epoch;
           }
@@ -1865,7 +1867,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         setThinkingLevelRaw(llmSelectionsMapRef.current.default?.thinkingLevel ?? null);
         setCredentialNameRaw(llmSelectionsMapRef.current.default?.credentialName ?? null);
         setGoalModeEnabledRaw(nextRunGoalModeMapRef.current.default ?? false);
-        setApprovalModeRaw(approvalModesMapRef.current.default || "strict");
+        setApprovalModeRaw(approvalModesMapRef.current.default || "smart");
         setApprovalModeSaving(approvalModeSavingSessionsRef.current.has("default"));
         setApprovalModeError(approvalModeErrorsMapRef.current.default ?? null);
         setActiveGoal(null);
@@ -1877,7 +1879,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         setLlmModelIdRaw(llmSelectionsMapRef.current[id]?.modelId ?? null);
         setThinkingLevelRaw(llmSelectionsMapRef.current[id]?.thinkingLevel ?? null);
         setCredentialNameRaw(llmSelectionsMapRef.current[id]?.credentialName ?? null);
-        setApprovalModeRaw(approvalModesMapRef.current[id] || "strict");
+        setApprovalModeRaw(approvalModesMapRef.current[id] || "smart");
         setApprovalModeSaving(approvalModeSavingSessionsRef.current.has(id));
         setApprovalModeError(approvalModeErrorsMapRef.current[id] ?? null);
         const cachedGoal = activeGoalsMapRef.current[id] ?? null;
@@ -2116,7 +2118,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         thinkingLevel: null,
         credentialName: null,
       },
-      approvalMode: (approvalModesMapRef.current[originSessionId] || "strict") as ApprovalMode,
+      approvalMode: (approvalModesMapRef.current[originSessionId] || "smart") as ApprovalMode,
       goalModeEnabled: nextRunGoalModeMapRef.current[originSessionId] ?? false,
       runtimeMode,
       projectId: currentProjectId,
@@ -2168,7 +2170,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         if (originSessionId === "default") {
           analyticsModelIdsMapRef.current.default = null;
           llmSelectionsMapRef.current.default = { modelId: null, thinkingLevel: null, credentialName: null };
-          approvalModesMapRef.current.default = "strict";
+          approvalModesMapRef.current.default = "smart";
           approvalPolicyEpochsMapRef.current.default = 1;
           nextRunGoalModeMapRef.current.default = false;
         }
@@ -3833,6 +3835,28 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             continue;
           }
 
+          if (event.event === "kernel_fallback_required") {
+            updateSessionRunActivity(sendSessionId, {
+              phase: "hitl",
+              label: "Kernel 沙箱不可用，等待你的回退选择",
+            });
+            const targetId = getAssistantId();
+            const request = event.data as unknown as KernelFallbackRequest;
+            updateMsgs((prev) => {
+              const updated = [...prev];
+              const idx = updated.findIndex((message) => message.id === targetId);
+              if (idx === -1) return prev;
+              const message = { ...updated[idx] };
+              const existing = message.kernelFallbackRequests || [];
+              message.kernelFallbackRequests = existing.some((item) => item.id === request.id)
+                ? existing.map((item) => item.id === request.id ? request : item)
+                : [...existing, request];
+              updated[idx] = message;
+              return updated;
+            });
+            continue;
+          }
+
           if (event.event === "skill_secret_required") {
             updateSessionRunActivity(sendSessionId, {
               phase: "hitl",
@@ -3926,6 +3950,27 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
                       decision: event.data.decision as UserInputRequest["decision"],
                     }
                   : request
+              );
+              updated[idx] = message;
+              return updated;
+            });
+            continue;
+          }
+
+          if (event.event === "kernel_fallback_resolved") {
+            updateSessionRunActivity(sendSessionId, {
+              phase: "continuing",
+              label: "已确认执行模式，Agent 正在继续",
+            });
+            const targetId = getAssistantId();
+            const requestId = String(event.data.request_id || "");
+            updateMsgs((prev) => {
+              const updated = [...prev];
+              const idx = updated.findIndex((message) => message.id === targetId);
+              if (idx === -1 || !requestId) return prev;
+              const message = { ...updated[idx] };
+              message.kernelFallbackRequests = (message.kernelFallbackRequests || []).map((request) =>
+                request.id === requestId ? { ...request, status: "resolved" } : request
               );
               updated[idx] = message;
               return updated;

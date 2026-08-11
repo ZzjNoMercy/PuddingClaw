@@ -38,7 +38,13 @@ class AuthorizedExecution:
 
         return self.requirements.execution_command or self.command
 
-    def valid_at_spawn(self, *, command: str, selected_runner: str) -> bool:
+    def valid_at_spawn(
+        self,
+        *,
+        command: str,
+        selected_runner: str,
+        runner_binding_digest: str = "",
+    ) -> bool:
         return self.environment_current() and self.profile.valid_at_spawn() and self.permit.valid_at_spawn(
             tool_call_id=self.permit.tool_call_id,
             command=command,
@@ -46,7 +52,17 @@ class AuthorizedExecution:
             current_permission_revision=self.current_permission_revision(),
             profile_digest=self.profile.digest,
             selected_runner=selected_runner,
+            runner_binding_digest=runner_binding_digest,
         )
+
+    def consume_at_spawn(self, *, command: str, selected_runner: str, runner_binding_digest: str = "") -> bool:
+        """Revalidate and atomically consume the one-process execution handoff."""
+
+        return self.valid_at_spawn(
+            command=command,
+            selected_runner=selected_runner,
+            runner_binding_digest=runner_binding_digest,
+        ) and self.permit.consume_at_spawn()
 
 
 @dataclass(frozen=True)

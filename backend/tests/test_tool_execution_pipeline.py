@@ -43,10 +43,11 @@ from harness.workspace_backends import (
     DEFAULT_SANDBOX_IMAGE,
     RUNTIME_CONTRACT,
     AdaptiveWorkspaceBackend,
+    DeferredKernelWorkspaceBackend,
     DockerWorkspaceBackend,
     KernelWorkspaceBackend,
     ProjectSandboxManager,
-    RestrictedHostWorkspaceBackend,
+    SpawnWorkspaceBackend,
     _canonical_docker_mount_source,
     build_workspace_execution_backend,
 )
@@ -246,9 +247,9 @@ def test_presentation_delta_repair_denies_database_and_enforces_tool_budget(tmp_
     assert "budget_exhausted" in str(exhausted.content)
 
 
-def test_restricted_host_backend_id_is_stable_for_workspace(tmp_path):
-    first = RestrictedHostWorkspaceBackend(root_dir=tmp_path)
-    second = RestrictedHostWorkspaceBackend(root_dir=tmp_path)
+def test_spawn_backend_id_is_stable_for_workspace(tmp_path):
+    first = SpawnWorkspaceBackend(root_dir=tmp_path)
+    second = SpawnWorkspaceBackend(root_dir=tmp_path)
 
     assert first.id == second.id
 
@@ -340,18 +341,25 @@ async def test_permission_interrupt_persists_waiting_and_resume_status(tmp_path,
     coordinator.bind_execution_snapshot(
         run,
         {
-            "backend_mode": "restricted_host",
-            "backend_id": "restricted-host:test",
+            "backend_mode": "spawn",
+            "backend_id": "spawn:test",
             "workspace_id": "workspace:test",
         },
     )
     coordinator.transition(run, RunStatus.RUNNING)
     persisted = session_manager.get_run_state("session-hitl", run.run_id)
     assert persisted is not None
-    context = RunPermissionContext.from_config_snapshot(persisted["config_snapshot"])
+    strict_snapshot = {
+        **persisted["config_snapshot"],
+        "permissions": {
+            **persisted["config_snapshot"]["permissions"],
+            "approval_mode": "strict",
+        },
+    }
+    context = RunPermissionContext.from_config_snapshot(strict_snapshot)
     pipeline = ToolExecutionPipeline(
         known_tools={"execute"},
-        backend_mode="restricted_host",
+        backend_mode="spawn",
         permission_context=context,
     )
     request = ToolCallRequest(
@@ -679,17 +687,17 @@ def test_docker_external_command_uses_same_canonical_paths_as_bind_profile(
         ("uniq input.txt output.txt", PolicyDecision.ASK, "managed_workspace_write:uniq"),
     ],
 )
-def test_restricted_host_shell_policy(command, decision, reason, tmp_path):
+def test_spawn_shell_policy(command, decision, reason, tmp_path):
     result = ShellPolicyAnalyzer(
         workspace_path=str(tmp_path),
-        backend_mode="restricted_host",
+        backend_mode="spawn",
     ).analyze(command)
 
     assert result.decision == decision
     assert result.reason == reason
 
 
-def test_restricted_host_policy_preserves_quoted_paths_with_spaces(tmp_path):
+def test_spawn_policy_preserves_quoted_paths_with_spaces(tmp_path):
     workspace = tmp_path / "project with spaces"
     workspace.mkdir()
     inside = workspace / "report v2.html"
@@ -698,7 +706,7 @@ def test_restricted_host_policy_preserves_quoted_paths_with_spaces(tmp_path):
     outside.write_text("no", encoding="utf-8")
     analyzer = ShellPolicyAnalyzer(
         workspace_path=str(workspace),
-        backend_mode="restricted_host",
+        backend_mode="spawn",
     )
 
     assert analyzer.analyze(f'cat "{inside}"').decision == PolicyDecision.ALLOW
@@ -710,7 +718,7 @@ def test_restricted_host_policy_preserves_quoted_paths_with_spaces(tmp_path):
 def test_shell_policy_allows_virtual_scratch_but_denies_internal_mount(tmp_path):
     analyzer = ShellPolicyAnalyzer(
         workspace_path=str(tmp_path),
-        backend_mode="restricted_host",
+        backend_mode="spawn",
     )
 
     assert analyzer.analyze("cat /scratch/report.html").decision == PolicyDecision.ALLOW
@@ -780,12 +788,12 @@ def test_shell_policy_rejects_workspace_shadow_copy_into_external_draft(tmp_path
     assert result.reason == "external_draft_shadow_import"
 
 
-def test_restricted_host_backend_rejects_scratch_traversal_before_rewrite(tmp_path):
+def test_spawn_backend_rejects_scratch_traversal_before_rewrite(tmp_path):
     workspace = tmp_path / "workspace"
     scratch = tmp_path / "scratch"
     workspace.mkdir()
     scratch.mkdir()
-    backend = RestrictedHostWorkspaceBackend(
+    backend = SpawnWorkspaceBackend(
         root_dir=workspace,
         scratch_path=scratch,
     )
@@ -839,12 +847,12 @@ def test_docker_desktop_mount_source_normalizes_host_mnt_projection():
     )
 
 
-def test_restricted_host_backend_maps_virtual_scratch_outside_workspace(tmp_path):
+def test_spawn_backend_maps_virtual_scratch_outside_workspace(tmp_path):
     workspace = tmp_path / "workspace"
     scratch = tmp_path / "harness-scratch" / "session" / "query"
     workspace.mkdir()
     scratch.mkdir(parents=True)
-    backend = RestrictedHostWorkspaceBackend(root_dir=workspace, scratch_path=scratch)
+    backend = SpawnWorkspaceBackend(root_dir=workspace, scratch_path=scratch)
 
     result = backend.execute("printf scratch > /scratch/result.txt")
 
@@ -853,12 +861,12 @@ def test_restricted_host_backend_maps_virtual_scratch_outside_workspace(tmp_path
     assert not (workspace / "result.txt").exists()
 
 
-def test_restricted_host_backend_maps_quoted_and_assigned_scratch_paths(tmp_path):
+def test_spawn_backend_maps_quoted_and_assigned_scratch_paths(tmp_path):
     workspace = tmp_path / "workspace"
     scratch = tmp_path / "harness-scratch" / "session" / "query"
     workspace.mkdir()
     scratch.mkdir(parents=True)
-    backend = RestrictedHostWorkspaceBackend(root_dir=workspace, scratch_path=scratch)
+    backend = SpawnWorkspaceBackend(root_dir=workspace, scratch_path=scratch)
 
     quoted = backend.execute('printf quoted > "/scratch/quoted.txt"')
     assigned = backend.execute('OUT=/scratch/assigned.txt; printf assigned > "$OUT"')
@@ -869,10 +877,31 @@ def test_restricted_host_backend_maps_quoted_and_assigned_scratch_paths(tmp_path
     assert (scratch / "assigned.txt").read_text() == "assigned"
 
 
+def test_spawn_backend_maps_tmp_to_current_run_scratch(tmp_path):
+    workspace = tmp_path / "workspace"
+    first_scratch = tmp_path / "harness-scratch" / "session-a" / "query-a"
+    second_scratch = tmp_path / "harness-scratch" / "session-b" / "query-b"
+    workspace.mkdir()
+    first_scratch.mkdir(parents=True)
+    second_scratch.mkdir(parents=True)
+    first = SpawnWorkspaceBackend(root_dir=workspace, scratch_path=first_scratch)
+    second = SpawnWorkspaceBackend(root_dir=workspace, scratch_path=second_scratch)
+
+    first_result = first.execute("printf first > /tmp/result.txt")
+    second_result = second.execute("printf second > /tmp/result.txt")
+
+    assert first_result.exit_code == 0
+    assert second_result.exit_code == 0
+    assert (first_scratch / "tmp" / "result.txt").read_text() == "first"
+    assert (second_scratch / "tmp" / "result.txt").read_text() == "second"
+    assert first._env["TMPDIR"] == str(first_scratch / "tmp")
+    assert second._env["TMPDIR"] == str(second_scratch / "tmp")
+
+
 def test_shell_chain_uses_strictest_segment(tmp_path):
     analyzer = ShellPolicyAnalyzer(
         workspace_path=str(tmp_path),
-        backend_mode="restricted_host",
+        backend_mode="spawn",
     )
 
     assert analyzer.analyze("ls && sudo id").decision == PolicyDecision.DENY
@@ -886,7 +915,7 @@ def test_shell_chain_uses_strictest_segment(tmp_path):
     assert ShellPolicyAnalyzer.requires_network("git status") is False
 
 
-def test_restricted_host_denies_symlink_escape_for_reads_and_new_writes(tmp_path):
+def test_spawn_denies_symlink_escape_for_reads_and_new_writes(tmp_path):
     workspace = tmp_path / "workspace"
     outside = tmp_path / "outside"
     workspace.mkdir()
@@ -895,7 +924,7 @@ def test_restricted_host_denies_symlink_escape_for_reads_and_new_writes(tmp_path
     (workspace / "escape").symlink_to(outside, target_is_directory=True)
     analyzer = ShellPolicyAnalyzer(
         workspace_path=str(workspace),
-        backend_mode="restricted_host",
+        backend_mode="spawn",
     )
 
     assert analyzer.analyze("cat escape/secret.txt").decision == PolicyDecision.DENY
@@ -945,7 +974,7 @@ def test_unknown_tool_fails_closed(tmp_path):
     )
     result = ToolExecutionPipeline(
         known_tools={"read_resource"},
-        backend_mode="restricted_host",
+        backend_mode="spawn",
     )._preflight(request)
 
     assert result.decision == PolicyDecision.DENY
@@ -961,7 +990,7 @@ def test_registered_but_unclassified_tool_fails_closed(tmp_path):
     )
     result = ToolExecutionPipeline(
         known_tools={"new_mutating_tool"},
-        backend_mode="restricted_host",
+        backend_mode="spawn",
     )._preflight(request)
 
     assert result.decision == PolicyDecision.DENY
@@ -978,7 +1007,7 @@ def test_loaded_mcp_tool_is_known_but_requires_conservative_approval(tmp_path):
     result = ToolExecutionPipeline(
         known_tools={"zhihuiya_patents_search"},
         mcp_tool_names={"zhihuiya_patents_search"},
-        backend_mode="restricted_host",
+        backend_mode="spawn",
     )._preflight(request)
 
     assert result.decision == PolicyDecision.ASK
@@ -1075,13 +1104,13 @@ def test_network_tool_requires_hitl_and_fingerprints_arguments(tmp_path):
     )
     pipeline = ToolExecutionPipeline(
         known_tools={"fetch_url"},
-        backend_mode="restricted_host",
+        backend_mode="spawn",
     )
 
     result = pipeline._preflight(request)
 
-    assert result.decision == PolicyDecision.ASK
-    assert result.reason == "network_access:fetch_url"
+    assert result.decision == PolicyDecision.ALLOW
+    assert result.reason == "smart_controlled_network:fetch_url"
     assert "example.com/private" in pipeline._action_preview(request)
 
 
@@ -1179,7 +1208,10 @@ def test_lark_cli_network_routing_is_explicit_but_not_silently_trusted(
     result = pipeline._preflight(request)
     assert result.decision == decision
     assert result.reason == reason
-    assert pipeline._session_grant_scope(request) is None
+    if network:
+        assert pipeline._session_grant_scope(request) is None
+    else:
+        assert pipeline._session_grant_scope(request)["target_kind"] == "command_pattern"
 
 
 def test_typed_fetch_grant_cannot_be_reused_by_shell_or_other_origin(tmp_path):
@@ -1267,7 +1299,7 @@ def test_network_tool_session_scope_is_bound_to_surface_and_origin(tmp_path, too
 
     pipeline = ToolExecutionPipeline(
         known_tools={tool_name},
-        backend_mode="restricted_host",
+        backend_mode="spawn",
     )
     assert pipeline._session_grant_scope(request) == expected
     assert pipeline._required_capabilities(request) == ["execute", "network_access"]
@@ -1287,7 +1319,7 @@ def test_execute_curl_is_exact_once_not_session_network_authority(tmp_path):
 
     pipeline = ToolExecutionPipeline(
         known_tools={"execute"},
-        backend_mode="restricted_host",
+        backend_mode="spawn",
     )
     assert pipeline._session_grant_scope(request) is None
 
@@ -1363,7 +1395,7 @@ def test_session_network_scope_does_not_absorb_other_capabilities(tmp_path, comm
         state={},
         runtime=SimpleNamespace(context={"workspace_path": str(tmp_path)}),
     )
-    pipeline = ToolExecutionPipeline(known_tools={"execute"}, backend_mode="restricted_host")
+    pipeline = ToolExecutionPipeline(known_tools={"execute"}, backend_mode="spawn")
 
     assert pipeline._session_grant_scope(request) is None
 
@@ -1657,10 +1689,10 @@ def test_session_network_grant_reuses_different_tools_and_sources(tmp_path):
     )
 
 
-def test_restricted_host_backend_has_sanitized_environment(tmp_path):
+def test_spawn_backend_has_sanitized_environment(tmp_path):
     workspace = tmp_path / "project with spaces"
     workspace.mkdir()
-    backend = RestrictedHostWorkspaceBackend(root_dir=workspace)
+    backend = SpawnWorkspaceBackend(root_dir=workspace)
 
     result = backend.execute(
         'printf \'%s\\n%s\' "$PWD" "$HOME"',
@@ -1672,7 +1704,7 @@ def test_restricted_host_backend_has_sanitized_environment(tmp_path):
     assert lines[1].startswith(str(workspace / ".puddingclaw" / "runtime"))
 
 
-def test_docker_unavailable_falls_back_to_controlled_host(tmp_path, monkeypatch):
+def test_spawn_mode_does_not_probe_docker_or_fallback(tmp_path, monkeypatch):
     monkeypatch.setattr(
         ProjectSandboxManager,
         "probe",
@@ -1682,15 +1714,54 @@ def test_docker_unavailable_falls_back_to_controlled_host(tmp_path, monkeypatch)
     selection = build_workspace_execution_backend(
         tmp_path,
         {
-            "docker_enabled": True,
-            "on_unavailable": "fallback",
+            "execution_mode": "spawn",
             "docker": {},
         },
     )
 
-    assert selection.mode == "restricted_host"
-    assert selection.fallback_reason == "daemon unavailable"
-    assert isinstance(selection.backend, RestrictedHostWorkspaceBackend)
+    assert selection.mode == "spawn"
+    assert isinstance(selection.backend, SpawnWorkspaceBackend)
+
+
+@pytest.mark.parametrize("backend_mode", ["spawn", "kernel"])
+def test_product_execution_modes_do_not_implicitly_construct_managed_cli_service(
+    backend_mode,
+    tmp_path,
+):
+    pipeline = ToolExecutionPipeline(
+        known_tools={"execute"},
+        backend_mode=backend_mode,
+        workspace_backend=object(),
+    )
+
+    assert pipeline.managed_cli_service is None
+
+
+def test_managed_cli_credentials_and_network_require_bound_approval(tmp_path):
+    pipeline = ToolExecutionPipeline(
+        known_tools={"execute"},
+        backend_mode="spawn",
+        workspace_backend=object(),
+    )
+    match = SimpleNamespace(
+        route=SimpleNamespace(value="command"),
+        requires_profile=True,
+        requires_network=True,
+        credential_state=SimpleNamespace(fingerprint="sha256:credential-profile"),
+        workspace_writable=False,
+        destructive=False,
+    )
+
+    result = pipeline._managed_cli_preflight(match)
+    capabilities = pipeline._required_capabilities(
+        SimpleNamespace(tool_call={"name": "execute", "args": {}}, runtime=None),
+        managed_cli=match,
+    )
+
+    assert result.decision == PolicyDecision.ASK
+    assert result.reason == "managed_cli_credential_network_authorization"
+    assert "network_access" in capabilities
+    assert "credential_profile:sha256:credential-profile" in capabilities
 
 
 def test_kernel_mode_selects_kernel_backend_without_docker_probe(tmp_path, monkeypatch):
@@ -1713,7 +1784,7 @@ def test_kernel_mode_selects_kernel_backend_without_docker_probe(tmp_path, monke
     selection = build_workspace_execution_backend(
         workspace,
         {
-            "sandbox_mode": "kernel",
+            "execution_mode": "kernel",
             "_scratch_host_path": str(scratch),
             "docker": {
                 "_managed_readonly_mounts": [
@@ -1730,113 +1801,42 @@ def test_kernel_mode_selects_kernel_backend_without_docker_probe(tmp_path, monke
     assert selection.backend.execute("pwd").exit_code == 126
 
 
-def test_auto_mode_is_kernel_first_and_does_not_touch_docker(tmp_path, monkeypatch):
+def test_kernel_mode_defers_to_explicit_fallback_when_probe_unavailable(tmp_path, monkeypatch):
     from harness import workspace_backends
 
-    workspace = tmp_path / "workspace"
     scratch = tmp_path / "scratch"
-    workspace.mkdir()
     scratch.mkdir()
-    docker_calls = []
-    monkeypatch.setattr(workspace_backends, "_macos_seatbelt_available", lambda: True)
-    monkeypatch.setattr(
-        ProjectSandboxManager,
-        "probe",
-        lambda self: docker_calls.append("probe") or (True, "ok"),
-    )
+    monkeypatch.setattr(workspace_backends, "_kernel_sandbox_available", lambda: False)
 
     selection = build_workspace_execution_backend(
-        workspace,
+        tmp_path,
         {
-            "sandbox_mode": "auto",
-            "docker_enabled": True,
+            "execution_mode": "kernel",
             "_scratch_host_path": str(scratch),
         },
     )
 
-    assert selection.mode == "adaptive"
-    assert isinstance(selection.backend, AdaptiveWorkspaceBackend)
-    assert docker_calls == []
+    assert selection.mode == "kernel"
+    assert isinstance(selection.backend, DeferredKernelWorkspaceBackend)
+    assert selection.backend.effective_mode == "kernel"
+    blocked = selection.backend.execute("pwd")
+    assert blocked.exit_code == 126
+    assert "Kernel execution is unavailable" in blocked.output
+
+    selection.backend.activate_spawn()
+
+    assert selection.backend.effective_mode == "spawn"
+    assert selection.backend.execute("pwd").exit_code == 0
 
 
-def test_forced_docker_backend_keeps_runner_neutral_scratch_root(tmp_path, monkeypatch):
-    workspace = tmp_path / "workspace"
-    scratch = tmp_path / "scratch"
-    workspace.mkdir()
-    scratch.mkdir()
-    monkeypatch.setattr(ProjectSandboxManager, "probe", lambda self: (True, "ok"))
-    monkeypatch.setattr(
-        ProjectSandboxManager,
-        "ensure_container",
-        lambda self, _workspace: ("puddingclaw-test", "spec-hash"),
-    )
-
-    selection = build_workspace_execution_backend(
-        workspace,
-        {
-            "sandbox_mode": "docker",
-            "_scratch_host_path": str(scratch),
-            "docker": {},
-        },
-    )
-
-    assert selection.mode == "docker"
-    assert isinstance(selection.backend, DockerWorkspaceBackend)
-    assert selection.backend.scratch_path == scratch.resolve()
-    pipeline = ToolExecutionPipeline(
-        known_tools={"execute"},
-        backend_mode="docker",
-        workspace_backend=selection.backend,
-    )
-    request = ToolCallRequest(
-        tool_call={"id": "call-forced-docker", "name": "execute", "args": {"command": "pwd"}},
-        tool=None,
-        state={},
-        runtime=SimpleNamespace(context={"workspace_path": str(workspace)}),
-    )
-    authorized = pipeline._compile_kernel_execution(request)
-    assert authorized is not None
-    assert authorized.profile.scratch_root == scratch.resolve()
-    assert authorized.permit.selected_runner == "docker"
+def test_legacy_execution_mode_is_rejected_without_compatibility(tmp_path):
+    with pytest.raises(ValueError, match="execution_mode must be spawn or kernel"):
+        build_workspace_execution_backend(tmp_path, {"sandbox_mode": "auto"})
 
 
-def test_auto_mode_installs_skill_packages_without_constructing_docker(tmp_path, monkeypatch):
-    from harness import workspace_backends
-
-    workspace = tmp_path / "workspace"
-    scratch = tmp_path / "scratch"
-    workspace.mkdir()
-    scratch.mkdir()
-    calls = []
-    monkeypatch.setattr(workspace_backends, "_macos_seatbelt_available", lambda: True)
-    monkeypatch.setattr(
-        ProjectSandboxManager,
-        "probe",
-        lambda self: calls.append("probe") or (True, "ok"),
-    )
-
-    class FakeHostRuntime:
-        def install_packages(self, skill_id, skill_version, ecosystem, packages):
-            calls.append(("host", skill_id, skill_version, ecosystem, tuple(packages)))
-            return ExecuteResponse(output="installed", exit_code=0)
-
-    selection = build_workspace_execution_backend(
-        workspace,
-        {
-            "sandbox_mode": "auto",
-            "_scratch_host_path": str(scratch),
-            "docker": {},
-        },
-    )
-
-    assert calls == []
-    selection.backend._host_runtime = FakeHostRuntime()
-    result = selection.backend.install_packages("demo", "sha256-fixture", "python", ["pandas==2.2.3"])
-
-    assert result.exit_code == 0
-    assert calls == [
-        ("host", "demo", "sha256-fixture", "python", ("pandas==2.2.3",)),
-    ]
+def test_docker_execution_mode_is_rejected_without_compatibility(tmp_path):
+    with pytest.raises(ValueError, match="execution_mode must be spawn or kernel"):
+        build_workspace_execution_backend(tmp_path, {"execution_mode": "docker"})
 
 
 def test_explicit_docker_skill_binding_selects_docker_without_fallback(tmp_path, monkeypatch):
@@ -2380,6 +2380,422 @@ def test_non_overwriting_mv_is_allowed_after_explicit_delete_directory_grant(tmp
     assert pipeline._granted_external_shell_fast_path(request, policy) is None
 
 
+def test_spawn_external_shell_grant_allows_approved_host_read_paths(tmp_path):
+    from graph.permission_policy import ShellDirectoryGrantSpec
+    from harness.coordinators import HarnessRunCoordinator
+    from harness.models import RunStatus
+
+    state = tmp_path / "state"
+    workspace = tmp_path / "workspace"
+    external = tmp_path / "Downloads"
+    for path in (state, workspace, external):
+        path.mkdir()
+    document = external / "人脉管理PRD-20250812.pdf"
+    document.write_text("pdf text fixture", encoding="utf-8")
+    session_manager.initialize(state)
+    session_manager.create_session("spawn-shell-session")
+    coordinator = HarnessRunCoordinator(session_manager)
+    run, _goal = coordinator.start_run(
+        session_id="spawn-shell-session",
+        query_id="query-spawn-shell",
+        objective="read pdf",
+        goal_mode=False,
+        verification_enabled=False,
+    )
+    coordinator.bind_execution_snapshot(
+        run,
+        {
+            "backend_mode": "spawn",
+            "backend_id": "spawn:test",
+            "workspace_id": "workspace:spawn-shell",
+        },
+    )
+    coordinator.transition(run, RunStatus.RUNNING)
+    run_state = session_manager.get_run_state("spawn-shell-session", run.run_id)
+    permission_context = RunPermissionContext.from_config_snapshot(run_state["config_snapshot"])
+    session_manager.add_shell_directory_grants_atomic(
+        "spawn-shell-session",
+        grant_specs=[ShellDirectoryGrantSpec(target=str(external), access="read")],
+        scope="run",
+        run_id=run.run_id,
+        bindings=permission_context.shell_grant_bindings(),
+    )
+
+    def request_for(command: str) -> ToolCallRequest:
+        return ToolCallRequest(
+            tool_call={"id": "call-spawn-shell", "name": "execute", "args": {"command": command}},
+            tool=None,
+            state={},
+            runtime=SimpleNamespace(
+                context={
+                    "session_id": "spawn-shell-session",
+                    "query_id": run.query_id,
+                    "run_id": run.run_id,
+                    "workspace_path": str(workspace),
+                }
+            ),
+        )
+
+    pipeline = ToolExecutionPipeline(
+        known_tools={"execute"},
+        backend_mode="spawn",
+        permission_context=permission_context,
+    )
+
+    simple = pipeline._preflight(request_for(f'cat "{document}"'))
+    assert simple.decision is PolicyDecision.ALLOW
+    assert simple.reason == "safe_read"
+
+    pdf_probe = pipeline._preflight(
+        request_for(
+            f'ls -la "{document}" && python3 -c "import pypdf; print(\'pypdf\')" 2>&1; which pdftotext 2>&1'
+        )
+    )
+    assert not (pdf_probe.decision is PolicyDecision.DENY and pdf_probe.reason == "host_filesystem_access")
+
+
+def test_spawn_smart_allows_read_only_pdf_transform_without_external_grant(tmp_path):
+    workspace = tmp_path / "workspace"
+    downloads = tmp_path / "Downloads"
+    workspace.mkdir()
+    downloads.mkdir()
+    document = downloads / "人脉管理PRD-20250812.pdf"
+    document.write_bytes(b"%PDF-1.7 test fixture")
+    permission_context = RunPermissionContext.from_config_snapshot(
+        {
+            "permissions": {"approval_mode": "smart", "policy_epoch": 1},
+            "execution": {
+                "backend_mode": "spawn",
+                "backend_id": "spawn:test",
+                "workspace_id": "workspace:spawn-pdf",
+            },
+        }
+    )
+    pipeline = ToolExecutionPipeline(
+        known_tools={"execute"},
+        backend_mode="spawn",
+        permission_context=permission_context,
+    )
+    command = (
+        'python3 -c "from pypdf import PdfReader; '
+        f"reader=PdfReader('{document}'); print(len(reader.pages))\""
+    )
+    request = ToolCallRequest(
+        tool_call={"id": "call-spawn-pdf", "name": "execute", "args": {"command": command}},
+        tool=None,
+        state={},
+        runtime=SimpleNamespace(context={"workspace_path": str(workspace)}),
+    )
+
+    result = pipeline._preflight(request)
+
+    assert result.decision is PolicyDecision.ALLOW
+    assert result.reason == "smart_sandbox_execute"
+    assert pipeline._require_external_shell_authority(request) is None
+
+
+def test_spawn_smart_allows_pdf_extract_with_tmp_output_and_local_fallback(tmp_path):
+    workspace = tmp_path / "workspace"
+    downloads = tmp_path / "Downloads"
+    workspace.mkdir()
+    downloads.mkdir()
+    document = downloads / "product.pdf"
+    document.write_bytes(b"%PDF-1.7 test fixture")
+    permission_context = RunPermissionContext.from_config_snapshot(
+        {
+            "permissions": {"approval_mode": "smart", "policy_epoch": 1},
+            "execution": {"backend_mode": "spawn", "backend_id": "spawn:test"},
+        }
+    )
+    pipeline = ToolExecutionPipeline(
+        known_tools={"execute"},
+        backend_mode="spawn",
+        permission_context=permission_context,
+    )
+    command = (
+        'cd /tmp && (command -v pdftotext >/dev/null && '
+        f'pdftotext -layout "{document}" /tmp/product.txt) || '
+        '(python3 -c "from pypdf import PdfReader; '
+        f"r=PdfReader('{document}'); "
+        "open('/tmp/product.txt','w').write(''.join((p.extract_text() or '') for p in r.pages))\"); "
+        "wc -c /tmp/product.txt"
+    )
+    request = ToolCallRequest(
+        tool_call={"id": "call-spawn-pdf-tmp", "name": "execute", "args": {"command": command}},
+        tool=None,
+        state={},
+        runtime=SimpleNamespace(context={"workspace_path": str(workspace)}),
+    )
+
+    result = pipeline._preflight(request)
+
+    assert result.decision is PolicyDecision.ALLOW
+    assert result.reason == "smart_spawn_external_local_execute"
+    assert pipeline._require_external_shell_authority(request) is None
+
+    strict_pipeline = ToolExecutionPipeline(
+        known_tools={"execute"},
+        backend_mode="spawn",
+        permission_context=RunPermissionContext.from_config_snapshot(
+            {
+                "permissions": {"approval_mode": "strict", "policy_epoch": 1},
+                "execution": {"backend_mode": "spawn", "backend_id": "spawn:test"},
+            }
+        ),
+    )
+    strict_result = strict_pipeline._preflight(request)
+    assert strict_result.decision is PolicyDecision.ASK
+    assert strict_result.reason == "spawn_external_dynamic_effect_unprovable"
+
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    kernel_pipeline = ToolExecutionPipeline(
+        known_tools={"execute"},
+        backend_mode="kernel",
+        permission_context=RunPermissionContext.from_config_snapshot(
+            {
+                "permissions": {"approval_mode": "smart", "policy_epoch": 1},
+                "execution": {"backend_mode": "kernel", "backend_id": "kernel:test"},
+            }
+        ),
+        workspace_backend=SimpleNamespace(
+            scratch_path=scratch,
+            kernel_runner_mode="kernel_macos_seatbelt",
+            kernel_runner_binding_digest="test-kernel-runner-binding",
+        ),
+    )
+    kernel_result = kernel_pipeline._preflight(request)
+    assert kernel_result.decision is PolicyDecision.ALLOW
+    assert kernel_result.reason == "smart_kernel_external_local_execute"
+    assert kernel_pipeline._require_external_shell_authority(request) is None
+    authorized = kernel_pipeline._compile_kernel_execution(request)
+    assert authorized is not None
+    assert downloads.resolve() in authorized.profile.read_roots
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend_mode", ["spawn", "kernel"])
+async def test_smart_pdf_stdout_read_never_reaches_probabilistic_reviewer(
+    tmp_path,
+    backend_mode,
+):
+    workspace = tmp_path / "workspace"
+    downloads = tmp_path / "Downloads"
+    workspace.mkdir()
+    downloads.mkdir()
+    document = downloads / "product.pdf"
+    document.write_bytes(b"%PDF-1.7 test fixture")
+    reviewer = _FakePermissionReviewer(
+        PermissionReviewVerdict(
+            decision="ask",
+            risk="high",
+            explanation="An unknown executable would normally require approval.",
+        )
+    )
+    permission_context = RunPermissionContext.from_config_snapshot(
+        {
+            "permissions": {"approval_mode": "smart", "policy_epoch": 1},
+            "execution": {
+                "backend_mode": backend_mode,
+                "backend_id": f"{backend_mode}:test",
+            },
+        }
+    )
+    pipeline = ToolExecutionPipeline(
+        known_tools={"execute"},
+        backend_mode=backend_mode,
+        permission_context=permission_context,
+        reviewer=reviewer,
+    )
+    request = ToolCallRequest(
+        tool_call={
+            "id": f"call-{backend_mode}-pdf-stdout",
+            "name": "execute",
+            "args": {"command": f'pdftotext -layout "{document}" -'},
+        },
+        tool=None,
+        state={},
+        runtime=SimpleNamespace(context={"workspace_path": str(workspace)}),
+    )
+
+    result = await pipeline._apreflight(request)
+
+    assert result.decision is PolicyDecision.ALLOW
+    assert result.reason == f"smart_{backend_mode}_external_local_execute"
+    assert result.source == "deterministic"
+    assert reviewer.calls == []
+    assert pipeline._require_external_shell_authority(request) is None
+
+
+def test_spawn_smart_keeps_sensitive_host_key_read_behind_approval(tmp_path):
+    workspace = tmp_path / "workspace"
+    secret_dir = tmp_path / ".ssh"
+    workspace.mkdir()
+    secret_dir.mkdir()
+    private_key = secret_dir / "id_ed25519"
+    private_key.write_text("secret", encoding="utf-8")
+    pipeline = ToolExecutionPipeline(
+        known_tools={"execute"},
+        backend_mode="spawn",
+        permission_context=RunPermissionContext.from_config_snapshot(
+            {
+                "permissions": {"approval_mode": "smart", "policy_epoch": 1},
+                "execution": {"backend_mode": "spawn", "backend_id": "spawn:test"},
+            }
+        ),
+    )
+    request = ToolCallRequest(
+        tool_call={
+            "id": "call-sensitive-read",
+            "name": "execute",
+            "args": {"command": f'''python3 -c "print(open('{private_key}').read())"'''},
+        },
+        tool=None,
+        state={},
+        runtime=SimpleNamespace(context={"workspace_path": str(workspace)}),
+    )
+
+    result = pipeline._preflight(request)
+
+    assert result.decision is PolicyDecision.ASK
+    assert result.reason == "sensitive_host_read"
+
+    kernel_pipeline = ToolExecutionPipeline(
+        known_tools={"execute"},
+        backend_mode="kernel",
+        permission_context=RunPermissionContext.from_config_snapshot(
+            {
+                "permissions": {"approval_mode": "smart", "policy_epoch": 1},
+                "execution": {"backend_mode": "kernel", "backend_id": "kernel:test"},
+            }
+        ),
+    )
+    kernel_result = kernel_pipeline._preflight(request)
+    assert kernel_result.decision is PolicyDecision.ASK
+    assert kernel_result.reason == "sensitive_host_read"
+
+
+def test_spawn_external_python_write_does_not_use_read_only_fast_path(tmp_path):
+    workspace = tmp_path / "workspace"
+    outside = tmp_path / "outside"
+    workspace.mkdir()
+    outside.mkdir()
+    target = outside / "report.txt"
+    permission_context = RunPermissionContext.from_config_snapshot(
+        {
+            "permissions": {"approval_mode": "smart", "policy_epoch": 1},
+            "execution": {
+                "backend_mode": "spawn",
+                "backend_id": "spawn:test",
+                "workspace_id": "workspace:spawn-write",
+            },
+        }
+    )
+    pipeline = ToolExecutionPipeline(
+        known_tools={"execute"},
+        backend_mode="spawn",
+        permission_context=permission_context,
+    )
+    command = f'''python3 -c "open('{target}', 'w').write('unsafe')"'''
+
+    assert pipeline._spawn_read_only_external_paths(
+        command=command,
+        workspace_path=str(workspace),
+    ) == ()
+
+
+@pytest.mark.parametrize(
+    "program",
+    [
+        "__import__('os').__getattribute__('remove')('{target}')",
+        "__import__('socket').__getattribute__('create_connection')(('example.com',443))",
+        "__import__('subprocess').__getattribute__('run')(['pip','install','evilpkg'])",
+    ],
+)
+def test_spawn_dynamic_python_cannot_masquerade_as_external_read(tmp_path, program):
+    workspace = tmp_path / "workspace"
+    outside = tmp_path / "outside"
+    workspace.mkdir()
+    outside.mkdir()
+    target = outside / "input.pdf"
+    target.write_bytes(b"%PDF")
+    permission_context = RunPermissionContext.from_config_snapshot(
+        {
+            "permissions": {"approval_mode": "smart", "policy_epoch": 1},
+            "execution": {"backend_mode": "spawn", "backend_id": "spawn:test"},
+        }
+    )
+    pipeline = ToolExecutionPipeline(
+        known_tools={"execute"},
+        backend_mode="spawn",
+        permission_context=permission_context,
+    )
+    source = program.format(target=target)
+    command = f'python3 -c "{source}" \'{target}\''
+    request = ToolCallRequest(
+        tool_call={"id": "call-dynamic", "name": "execute", "args": {"command": command}},
+        tool=None,
+        state={},
+        runtime=SimpleNamespace(context={"workspace_path": str(workspace)}),
+    )
+
+    assert pipeline._spawn_read_only_external_paths(
+        command=command,
+        workspace_path=str(workspace),
+    ) == ()
+    result = pipeline._preflight(request)
+    assert result.decision is PolicyDecision.ASK
+    assert result.reason == "spawn_external_dynamic_effect_unprovable"
+    assert pipeline._require_external_shell_authority(request) is None
+
+
+@pytest.mark.parametrize(
+    "command_template",
+    [
+        "env LD_PRELOAD={library} cat {target}",
+        "env PATH={outside} cat {target}",
+        "LD_PRELOAD={library} cat {target}",
+    ],
+)
+def test_spawn_environment_wrapper_cannot_masquerade_as_external_read(
+    tmp_path,
+    command_template,
+):
+    workspace = tmp_path / "workspace"
+    outside = tmp_path / "outside"
+    workspace.mkdir()
+    outside.mkdir()
+    target = outside / "input.pdf"
+    target.write_bytes(b"%PDF")
+    command = command_template.format(
+        library=outside / "evil.so",
+        outside=outside,
+        target=target,
+    )
+    pipeline = ToolExecutionPipeline(
+        known_tools={"execute"},
+        backend_mode="spawn",
+        permission_context=RunPermissionContext.from_config_snapshot(
+            {
+                "permissions": {"approval_mode": "smart", "policy_epoch": 1},
+                "execution": {"backend_mode": "spawn", "backend_id": "spawn:test"},
+            }
+        ),
+    )
+    request = ToolCallRequest(
+        tool_call={"id": "call-env-wrapper", "name": "execute", "args": {"command": command}},
+        tool=None,
+        state={},
+        runtime=SimpleNamespace(context={"workspace_path": str(workspace)}),
+    )
+
+    assert pipeline._spawn_read_only_external_paths(
+        command=command,
+        workspace_path=str(workspace),
+    ) == ()
+    assert pipeline._preflight(request).decision is PolicyDecision.ASK
+
+
 def test_kernel_backend_executes_permit_bound_canonical_command(tmp_path, monkeypatch):
     from harness import workspace_backends
     from harness.kernel_sandbox import MacOSSeatbeltRunner
@@ -2594,6 +3010,7 @@ def test_kernel_execution_projects_trusted_active_skill_for_inline_python(tmp_pa
 
     class Backend:
         scratch_path = scratch
+        kernel_runner_binding_digest = "sha256:fixture-runner"
 
         def prepare_host_execution(self, command, *, active_skill_ids=()):
             observed_active_skills.append(active_skill_ids)
@@ -2738,7 +3155,10 @@ async def test_execute_cp_attaches_server_observed_artifact_evidence(tmp_path):
     pipeline = ToolExecutionPipeline(
         known_tools={"execute"},
         backend_mode="kernel",
-        workspace_backend=SimpleNamespace(scratch_path=scratch),
+        workspace_backend=SimpleNamespace(
+            scratch_path=scratch,
+            kernel_runner_binding_digest="test-kernel-runner-binding",
+        ),
     )
     request = ToolCallRequest(
         tool_call={"id": "call-shell-artifact", "name": "execute", "args": {"command": command}},
@@ -2850,14 +3270,8 @@ async def test_kernel_pipeline_rejects_permission_revision_change_before_spawn(
     assert result.content == "permit invalid"
 
 
-def test_docker_unavailable_can_fail_closed(tmp_path, monkeypatch):
-    monkeypatch.setattr(
-        ProjectSandboxManager,
-        "probe",
-        lambda self: (False, "daemon unavailable"),
-    )
-
-    with pytest.raises(RuntimeError, match="daemon unavailable"):
+def test_legacy_docker_configuration_is_not_interpreted_as_execution_mode(tmp_path):
+    with pytest.raises(ValueError, match="execution_mode must be spawn or kernel"):
         build_workspace_execution_backend(
             tmp_path,
             {
@@ -4001,7 +4415,7 @@ def test_registered_html_e2e_command_requires_explicit_contract_parameter(
     assert pipeline._preflight(request).decision == PolicyDecision.ALLOW
 
 
-def test_external_directory_command_is_denied_outside_docker(tmp_path):
+def test_spawn_external_directory_read_does_not_require_a_sandbox(tmp_path):
     request = ToolCallRequest(
         tool_call={
             "id": "external-directory",
@@ -4014,13 +4428,94 @@ def test_external_directory_command_is_denied_outside_docker(tmp_path):
     )
     pipeline = ToolExecutionPipeline(
         known_tools={"execute_external_directory"},
-        backend_mode="restricted_host",
+        backend_mode="spawn",
     )
 
     decision = pipeline._preflight(request)
 
-    assert decision.decision == PolicyDecision.DENY
-    assert decision.reason == "external_directory_command_requires_docker"
+    assert decision.decision == PolicyDecision.ALLOW
+    assert decision.reason == "spawn_external_directory_read_only"
+
+
+def test_spawn_external_directory_read_only_rejects_dynamic_interpreter(tmp_path):
+    request = ToolCallRequest(
+        tool_call={
+            "id": "external-directory-dynamic",
+            "name": "execute_external_directory",
+            "args": {
+                "directory_path": str(tmp_path),
+                "mode": "read_only",
+                "command": (
+                    "python3 -c \"getattr(__import__('builtins'),'open')"
+                    "('pwned','w').write('x')\""
+                ),
+            },
+        },
+        tool=None,
+        state={},
+        runtime=SimpleNamespace(context={"workspace_path": str(tmp_path / "workspace")}),
+    )
+    pipeline = ToolExecutionPipeline(
+        known_tools={"execute_external_directory"},
+        backend_mode="spawn",
+    )
+
+    decision = pipeline._preflight(request)
+
+    assert decision.decision is PolicyDecision.DENY
+    assert decision.reason == "external_directory_read_only_effect_unprovable"
+
+
+def test_spawn_external_directory_read_only_rejects_rg_pre_hook(tmp_path):
+    request = ToolCallRequest(
+        tool_call={
+            "id": "external-directory-rg-pre",
+            "name": "execute_external_directory",
+            "args": {
+                "directory_path": str(tmp_path),
+                "mode": "read_only",
+                "command": "rg --pre 'sh -c touch\\ pwned' needle .",
+            },
+        },
+        tool=None,
+        state={},
+        runtime=SimpleNamespace(context={"workspace_path": str(tmp_path / "workspace")}),
+    )
+    pipeline = ToolExecutionPipeline(
+        known_tools={"execute_external_directory"},
+        backend_mode="spawn",
+    )
+
+    decision = pipeline._preflight(request)
+
+    assert decision.decision is PolicyDecision.DENY
+    assert decision.reason == "external_directory_read_only_effect_unprovable"
+
+
+def test_spawn_external_directory_read_only_rejects_environment_wrapper(tmp_path):
+    request = ToolCallRequest(
+        tool_call={
+            "id": "external-directory-env",
+            "name": "execute_external_directory",
+            "args": {
+                "directory_path": str(tmp_path),
+                "mode": "read_only",
+                "command": "env LD_PRELOAD=/tmp/evil.so cat input.pdf",
+            },
+        },
+        tool=None,
+        state={},
+        runtime=SimpleNamespace(context={"workspace_path": str(tmp_path / "workspace")}),
+    )
+    pipeline = ToolExecutionPipeline(
+        known_tools={"execute_external_directory"},
+        backend_mode="spawn",
+    )
+
+    decision = pipeline._preflight(request)
+
+    assert decision.decision is PolicyDecision.DENY
+    assert decision.reason == "external_directory_read_only_effect_unprovable"
 
 
 def test_external_directory_command_cannot_enable_network(tmp_path):

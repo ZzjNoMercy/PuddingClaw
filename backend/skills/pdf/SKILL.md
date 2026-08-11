@@ -12,6 +12,22 @@ This guide covers essential PDF processing operations using Python libraries and
 
 ## Quick Start
 
+For ordinary text extraction or summarization, use the installed Poppler command
+directly and emit text to stdout in one call:
+
+```bash
+pdftotext -layout "input.pdf" -
+```
+
+Do not probe Python PDF packages before this command, and do not create a temporary
+text file merely to read it back. The Harness handles output retention/offload. Use
+Python libraries only when the requested operation needs structure that Poppler does
+not provide, such as tables, forms, page manipulation, or custom rendering.
+
+`read_file` and `read_resource` do not parse PDF bytes. For a user-provided host path,
+submit the extraction command once and let Harness enforce the current Profile; do not
+predict or negotiate file approval in reasoning text.
+
 ```python
 from pypdf import PdfReader, PdfWriter
 
@@ -299,7 +315,7 @@ with open("encrypted.pdf", "wb") as output:
 |------|-----------|--------------|
 | Merge PDFs | pypdf | `writer.add_page(page)` |
 | Split PDFs | pypdf | One page per file |
-| Extract text | pdfplumber | `page.extract_text()` |
+| Extract text | pdftotext | `pdftotext -layout input.pdf -` |
 | Extract tables | pdfplumber | `page.extract_tables()` |
 | Create PDFs | reportlab | Canvas or Platypus |
 | Command line merge | qpdf | `qpdf --empty --pages ...` |

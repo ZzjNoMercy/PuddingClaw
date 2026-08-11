@@ -1,12 +1,14 @@
 """Deterministic Tool execution policy and middleware.
 
 The pipeline is the single pre-execution control point for Agent Tool calls.
-It does not treat a Docker container as authorization: policy is evaluated
-before both Docker and restricted-host execution.
+It does not treat an execution runner as authorization: policy is evaluated
+before both spawn and kernel execution. Managed Docker runtime calls are
+separate internal compatibility surfaces.
 """
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import hashlib
 import ipaddress
@@ -30,7 +32,13 @@ from langgraph.types import Command, interrupt
 
 from graph.citations import dedupe_sources, materialize_artifact_citations
 from graph.effective_grants import EffectiveGrantSet, SelectedGrantSet
-from graph.permission_policy import RunPermissionContext
+from graph.host_read_policy import is_sensitive_host_read_path
+from graph.kernel_fallback_resume import kernel_fallback_resume_registry
+from graph.permission_policy import (
+    PermissionRuleDecision,
+    RunPermissionContext,
+    evaluate_permission_rules,
+)
 from graph.permission_resume import permission_resume_registry
 from graph.session_manager import session_manager
 from graph.skill_plan_resume import skill_plan_resume_registry
@@ -256,6 +264,11 @@ _WRAPPERS = frozenset({"command", "env", "timeout", "gtimeout", "nice", "nohup"}
 _SHELLS = frozenset({"sh", "bash", "zsh"})
 _SHELL_META_PATTERN = re.compile(r"(`|\$\(|\$\{|\n|<<)")
 _ENV_ASSIGNMENT_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=.*$", re.DOTALL)
+_CRITICAL_EXECUTION_ENV_OVERRIDE_PATTERN = re.compile(
+    r"(?:^|[;&|()\s])(?:env\s+)?(?:PATH|LD_PRELOAD|DYLD_INSERT_LIBRARIES|"
+    r"PYTHONPATH|PYTHONSTARTUP|NODE_OPTIONS|RUBYOPT|PERL5OPT|BASH_ENV|ENV)\s*=",
+    re.IGNORECASE,
+)
 _NETWORK_URL_PATTERN = re.compile(r"\b(?:https?|wss?)://", re.IGNORECASE)
 _NON_MATERIAL_REDIRECT_SINKS = frozenset(
     {
@@ -301,6 +314,7 @@ _OPAQUE_CRITICAL_ACTION_PATTERN = re.compile(
     r"\b(?:chmod|chown)\b",
     re.IGNORECASE,
 )
+_OPAQUE_DYNAMIC_CODE_PATTERN = re.compile(r"\b__import__\s*\(", re.IGNORECASE)
 _SMART_GIT_WRITE_SUBCOMMANDS = frozenset({"add", "commit", "switch", "stash"})
 _SMART_DOCKER_DESTRUCTIVE_REASONS = frozenset(
     {
@@ -318,9 +332,20 @@ _SMART_DOCKER_DESTRUCTIVE_REASONS = frozenset(
 class ShellPolicyAnalyzer:
     """Conservative shell analyzer: unknown or ambiguous syntax requires HITL."""
 
-    def __init__(self, *, workspace_path: str, backend_mode: str) -> None:
+    def __init__(
+        self,
+        *,
+        workspace_path: str,
+        backend_mode: str,
+        allowed_external_paths: tuple[str | Path, ...] = (),
+    ) -> None:
         self.workspace_path = Path(workspace_path).expanduser().resolve()
         self.backend_mode = backend_mode
+        self.allowed_external_paths = tuple(
+            Path(path).expanduser().resolve(strict=False)
+            for path in allowed_external_paths
+            if str(path)
+        )
 
     def analyze(self, command: str) -> ToolPolicyResult:
         if not isinstance(command, str) or not command.strip():
@@ -1113,16 +1138,19 @@ class ShellPolicyAnalyzer:
                             "scratch_path_traversal",
                             "critical",
                         )
-                    if self.backend_mode != "restricted_host":
+                    if self.backend_mode != "spawn":
                         continue
                     if raw == "/workspace" or raw.startswith("/workspace/"):
                         continue
                     if raw == "/scratch" or raw.startswith("/scratch/"):
                         continue
+                    resolved = Path(raw).expanduser()
                     try:
-                        resolved = Path(raw).expanduser().resolve()
+                        resolved = resolved.resolve()
                         resolved.relative_to(self.workspace_path)
                     except (OSError, ValueError):
+                        if self._external_path_allowed(resolved):
+                            continue
                         return ToolPolicyResult(
                             PolicyDecision.DENY,
                             "host_filesystem_access",
@@ -1228,7 +1256,7 @@ class ShellPolicyAnalyzer:
                         "container_workspace_escape",
                         "critical",
                     )
-                if self.backend_mode != "restricted_host":
+                if self.backend_mode != "spawn":
                     continue
                 if raw == "/workspace":
                     candidate = self.workspace_path
@@ -1242,9 +1270,13 @@ class ShellPolicyAnalyzer:
                     candidate = Path(raw)
                 else:
                     candidate = self.workspace_path / raw
+                resolved_candidate = candidate
                 try:
-                    candidate.resolve().relative_to(self.workspace_path)
+                    resolved_candidate = resolved_candidate.resolve()
+                    resolved_candidate.relative_to(self.workspace_path)
                 except (OSError, ValueError):
+                    if self._external_path_allowed(resolved_candidate):
+                        continue
                     # Resolve every argument, not only explicit "../" paths:
                     # an in-workspace symlink can otherwise redirect reads or
                     # writes to the host filesystem. ``Path.resolve`` also
@@ -1256,6 +1288,23 @@ class ShellPolicyAnalyzer:
                         "critical",
                     )
         return None
+
+    def _external_path_allowed(self, path: str | Path) -> bool:
+        if not self.allowed_external_paths:
+            return False
+        try:
+            candidate = Path(path).expanduser().resolve(strict=False)
+        except OSError:
+            return False
+        for allowed in self.allowed_external_paths:
+            if candidate == allowed:
+                return True
+            try:
+                candidate.relative_to(allowed)
+                return True
+            except ValueError:
+                continue
+        return False
 
     @staticmethod
     def _segments(command: str) -> tuple[list[list[str]], bool]:
@@ -1688,26 +1737,118 @@ class ToolExecutionPipeline(AgentMiddleware):
         self.reviewer = reviewer
         self.workspace_backend = workspace_backend
         self.managed_cli_registry = ManagedCliRegistry()
+        # Managed provider/browser CLIs are a separate control-plane surface.
+        # Do not infer or construct one from the ordinary shell backend: doing
+        # so couples user-selected spawn/kernel execution to Docker-backed
+        # credentials and runtime mounts. Callers that explicitly own the
+        # managed runtime may inject a service here.
         self.managed_cli_service = managed_cli_service
-        if (
-            self.managed_cli_service is None
-            and workspace_backend is not None
-            and backend_mode in {"docker", "adaptive"}
-        ):
-            try:
-                from runtime_identity.service import ManagedCliService
-
-                self.managed_cli_service = ManagedCliService(workspace_backend)
-            except Exception:
-                # Home/Keychain access is deferred until a managed command is
-                # actually invoked; construction failures remain fail-closed.
-                self.managed_cli_service = None
         self.permission_context = permission_context or RunPermissionContext.from_config_snapshot(
             {
-                "permissions": {"approval_mode": "strict"},
+                "permissions": {"approval_mode": "smart"},
                 "execution": {"backend_mode": backend_mode},
             }
         )
+
+    def _effective_backend_mode(self) -> str:
+        """Return the runner actually selected after an explicit fallback."""
+
+        effective = getattr(self.workspace_backend, "effective_mode", None)
+        if isinstance(effective, str) and effective in {"spawn", "kernel"}:
+            return effective
+        return self.backend_mode
+
+    @staticmethod
+    def _kernel_fallback_error(request: ToolCallRequest, *, reason: str) -> ToolMessage:
+        return ToolMessage(
+            content=json.dumps(
+                {
+                    "ok": False,
+                    "error": "kernel_execution_unavailable",
+                    "message": reason,
+                    "requires_explicit_fallback": True,
+                    "tool_call_id": str(request.tool_call.get("id") or ""),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+            name=str(request.tool_call.get("name") or "execute"),
+            tool_call_id=str(request.tool_call.get("id") or ""),
+            status="error",
+        )
+
+    def _kernel_fallback_reason(self) -> str:
+        reason = str(getattr(self.workspace_backend, "fallback_reason", "") or "").strip()
+        return reason or "当前主机未通过 Kernel 沙箱可用性检查。"
+
+    async def _ensure_execution_backend(self, request: ToolCallRequest) -> ToolMessage | None:
+        if (
+            str(request.tool_call.get("name") or "") != "execute"
+            or self._effective_backend_mode() != "kernel"
+            or not bool(getattr(self.workspace_backend, "kernel_unavailable", False))
+        ):
+            return None
+        context = self._context(request)
+        session_id = str(context.get("session_id") or "")
+        run_id = str(context.get("run_id") or "")
+        if not session_id or not run_id:
+            return self._kernel_fallback_error(request, reason=self._kernel_fallback_reason())
+        probe_fingerprint = "sha256:" + hashlib.sha256(
+            json.dumps(
+                {
+                    "backend": str(getattr(self.workspace_backend, "id", "")),
+                    "reason": self._kernel_fallback_reason(),
+                    "runner": str(getattr(self.workspace_backend, "kernel_runner_mode", "")),
+                },
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()
+        request_payload = kernel_fallback_resume_registry.create(
+            session_id=session_id,
+            run_id=run_id,
+            query_id=str(context.get("query_id") or ""),
+            goal_id=str(context.get("goal_id") or ""),
+            goal_revision=context.get("goal_revision"),
+            project_id=(str(context.get("project_id")) if context.get("project_id") else None),
+            tool_call_id=str(request.tool_call.get("id") or ""),
+            workspace_identity="sha256:" + hashlib.sha256(
+                str(context.get("workspace_path") or "").encode("utf-8")
+            ).hexdigest(),
+            configured_mode="kernel",
+            availability_class="stable" if "unsupported" in self._kernel_fallback_reason().lower() else "transient",
+            reason_code="probe_failed",
+            reason=self._kernel_fallback_reason(),
+            probe_fingerprint=probe_fingerprint,
+        )
+        decision = interrupt(
+            {
+                "type": "kernel_fallback_request",
+                "request": request_payload,
+                "decisions": [
+                    {"action": "switch_project_to_spawn"},
+                    {"action": "fallback_once"},
+                    {"action": "reject"},
+                ],
+            }
+        )
+        action = str(decision.get("action") or "") if isinstance(decision, dict) else ""
+        if action in {"switch_project_to_spawn", "fallback_once"}:
+            if action == "switch_project_to_spawn" and context.get("project_id"):
+                from projects.registry import project_registry
+
+                project_registry.set_execution_mode(str(context["project_id"]), "spawn")
+            session_manager.record_run_execution_fallback(
+                session_id,
+                run_id,
+                scope="project" if action == "switch_project_to_spawn" else "run",
+                request=request_payload,
+            )
+            activate = getattr(self.workspace_backend, "activate_spawn", None)
+            if not callable(activate):
+                return self._kernel_fallback_error(request, reason="Kernel fallback target is unavailable.")
+            activate()
+            return None
+        return self._kernel_fallback_error(request, reason="用户拒绝将本次 Kernel 执行切换为宿主执行。")
 
     @staticmethod
     def _permission_resume_decision(value: Any) -> Any:
@@ -1756,6 +1897,272 @@ class ToolExecutionPipeline(AgentMiddleware):
             external_path_candidates=requirements.external_path_candidates,
         )
 
+    def _spawn_read_only_external_paths(
+        self,
+        *,
+        command: str,
+        workspace_path: str,
+    ) -> tuple[str, ...]:
+        """Return host paths whose only detected effect is reading in Spawn.
+
+        Spawn intentionally carries the desktop user's host authority.  The
+        Tool Gate still blocks network, package, write, and destructive
+        effects, but an external pathname alone must not manufacture a second
+        approval for ordinary inspection or a read-only Skill transform.
+        """
+
+        if self._effective_backend_mode() != "spawn":
+            return ()
+        requirements = ShellPolicyAnalyzer.requirements(
+            command,
+            workspace_path=workspace_path,
+        )
+        authority = self._external_authority_requirements(requirements)
+        effects = requirements.capabilities
+        if (
+            not authority.filesystem_intents
+            or effects.network
+            or effects.workspace_write
+            or effects.package_install
+            or effects.destructive
+            or any(intent.access != "read" for intent in authority.filesystem_intents)
+            or not self._provable_spawn_read_command(command)
+        ):
+            return ()
+        return tuple(dict.fromkeys(intent.path for intent in authority.filesystem_intents))
+
+    @staticmethod
+    def _safe_python_external_read(tokens: list[str]) -> bool:
+        """Recognize a deliberately small, side-effect-free PDF/text program.
+
+        Absence of a dangerous regex match is not proof that dynamic code is
+        read-only.  This AST allowlist exists only for the common PDF Skill
+        transform that reads with pypdf and emits text to stdout.  Everything
+        else remains runtime-evaluated and can produce one meaningful ASK.
+        """
+
+        try:
+            code_index = tokens.index("-c")
+            source = tokens[code_index + 1]
+        except (ValueError, IndexError):
+            return False
+        if code_index + 2 != len(tokens):
+            # External paths are normally embedded in the program. Positional
+            # arguments would expand the authority surface and are not needed
+            # by the supported transform.
+            return False
+        try:
+            tree = ast.parse(source, mode="exec")
+        except SyntaxError:
+            return False
+
+        allowed_modules = {"pypdf", "PyPDF2"}
+        imported_call_names: set[str] = set()
+        allowed_name_calls = {
+            "all",
+            "any",
+            "bool",
+            "dict",
+            "enumerate",
+            "float",
+            "int",
+            "len",
+            "list",
+            "max",
+            "min",
+            "print",
+            "range",
+            "round",
+            "set",
+            "sorted",
+            "str",
+            "sum",
+            "tuple",
+            "zip",
+        }
+        allowed_attribute_calls = {
+            "PdfReader",
+            "count",
+            "endswith",
+            "extract_text",
+            "get",
+            "items",
+            "join",
+            "keys",
+            "lower",
+            "lstrip",
+            "replace",
+            "rstrip",
+            "split",
+            "startswith",
+            "strip",
+            "upper",
+            "values",
+        }
+        forbidden_names = {
+            "__import__",
+            "breakpoint",
+            "compile",
+            "delattr",
+            "eval",
+            "exec",
+            "getattr",
+            "globals",
+            "help",
+            "input",
+            "locals",
+            "open",
+            "setattr",
+            "vars",
+        }
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                if any(alias.name.split(".", 1)[0] not in allowed_modules for alias in node.names):
+                    return False
+            elif isinstance(node, ast.ImportFrom):
+                if not node.module or node.module.split(".", 1)[0] not in allowed_modules:
+                    return False
+                imported_call_names.update(alias.asname or alias.name for alias in node.names)
+            elif isinstance(node, ast.Attribute):
+                if node.attr.startswith("_"):
+                    return False
+            elif isinstance(node, ast.Name) and node.id in forbidden_names:
+                return False
+            elif isinstance(node, ast.Call):
+                if isinstance(node.func, ast.Name):
+                    if node.func.id not in allowed_name_calls | imported_call_names:
+                        return False
+                elif isinstance(node.func, ast.Attribute):
+                    if node.func.attr not in allowed_attribute_calls:
+                        return False
+                else:
+                    return False
+        return True
+
+    @classmethod
+    def _provable_spawn_read_command(cls, command: str) -> bool:
+        """Return whether every command segment belongs to a read-only set."""
+
+        try:
+            segments = ShellPolicyAnalyzer.parse_segments(command)
+        except ValueError:
+            return False
+        if not segments:
+            return False
+        for segment in segments:
+            # A wrapper is executable behavior, not syntactic decoration.
+            # Stripping `env PATH=...` or `LD_PRELOAD=...` before proving the
+            # command would let a nominally safe binary resolve to arbitrary
+            # code.  Fast-path reads therefore require an unwrapped runtime
+            # identity and no command-local environment mutation.
+            if any(_ENV_ASSIGNMENT_PATTERN.match(item) for item in segment):
+                return False
+            if segment and Path(segment[0]).name.lower() in _WRAPPERS:
+                return False
+            tokens = ShellPolicyAnalyzer.unwrap_command(segment)
+            if not tokens:
+                return False
+            executable = Path(tokens[0]).name.lower()
+            args = tokens[1:]
+            if executable == "rg" and any(
+                item == "--pre" or item.startswith("--pre=") for item in args
+            ):
+                return False
+            if executable in _SAFE_READ_COMMANDS or executable in {"pdfinfo", "strings"}:
+                continue
+            if executable == "pdftotext":
+                positional = [item for item in args if not item.startswith("-")]
+                if not args or args[-1] != "-" or not positional:
+                    return False
+                continue
+            if executable in {"python", "python3"} and cls._safe_python_external_read(args):
+                continue
+            return False
+        return True
+
+    @staticmethod
+    def _sensitive_host_read(
+        command: str,
+        requirements: ExecutionRequirements,
+    ) -> bool:
+        """Keep credential material outside Spawn Smart's local-work fast path."""
+
+        candidates = [
+            Path(intent.path).expanduser()
+            for intent in requirements.filesystem_intents
+            if intent.access == "read" and intent.path
+        ]
+        if any(is_sensitive_host_read_path(candidate) for candidate in candidates):
+            return True
+
+        # Opaque shell/Python expressions do not always yield a normalized path
+        # candidate. Preserve the same boundary for the common credential roots
+        # and key-file names when they are visible only in source text.
+        lowered = command.lower().replace("\\", "/")
+        if re.search(r"(?:^|[/\s'\"])(?:\.ssh|\.gnupg|\.aws|\.azure|\.kube|\.docker)(?:[/\s'\"]|$)", lowered):
+            return True
+        return bool(
+            re.search(
+                r"(?:^|[/\s'\"])(?:\.env(?:\.[^/\s'\"]+)?|\.netrc|\.npmrc|\.pypirc|"
+                r"id_(?:rsa|dsa|ecdsa|ed25519)|credentials(?:\.json)?|service[-_]account\.json|"
+                r"[^/\s'\"]+\.(?:pem|key|p12|pfx))(?:[/\s'\"]|$)",
+                lowered,
+            )
+        )
+
+    def _smart_external_local_read_allowed(
+        self,
+        command: str,
+        requirements: ExecutionRequirements,
+        authority_requirements: ExecutionRequirements,
+    ) -> bool:
+        """Return whether Smart may treat ordinary host reads as local work."""
+
+        if (
+            not self.permission_context.smart
+            or self._effective_backend_mode() not in {"spawn", "kernel"}
+            or not authority_requirements.filesystem_intents
+            or any(intent.access != "read" for intent in authority_requirements.filesystem_intents)
+            or requirements.capabilities.network
+            or requirements.capabilities.workspace_write
+            or requirements.capabilities.package_install
+            or requirements.capabilities.destructive
+            or self._sensitive_host_read(command, authority_requirements)
+        ):
+            return False
+        return not (
+            _EMBEDDED_DESTRUCTIVE_API_PATTERN.search(command)
+            or _OPAQUE_CRITICAL_ACTION_PATTERN.search(command)
+            or _OPAQUE_DYNAMIC_CODE_PATTERN.search(command)
+            or _CRITICAL_EXECUTION_ENV_OVERRIDE_PATTERN.search(command)
+            or self._contains_credential_literal(command)
+        )
+
+    def _smart_kernel_external_read_roots(
+        self,
+        command: str,
+        requirements: ExecutionRequirements,
+        authority_requirements: ExecutionRequirements,
+    ) -> tuple[Path, ...]:
+        """Project Smart's per-call ordinary reads into the Kernel profile."""
+
+        if self._effective_backend_mode() != "kernel" or not self._smart_external_local_read_allowed(
+            command,
+            requirements,
+            authority_requirements,
+        ):
+            return ()
+        roots: list[Path] = []
+        for intent in authority_requirements.filesystem_intents:
+            try:
+                candidate = Path(intent.path).expanduser().resolve(strict=False)
+                root = candidate if candidate.is_dir() else candidate.parent
+            except OSError:
+                continue
+            if root.is_dir() and not root.is_symlink():
+                roots.append(root.resolve())
+        return tuple(dict.fromkeys(roots))
+
     def _require_external_shell_authority(
         self,
         request: ToolCallRequest,
@@ -1775,6 +2182,28 @@ class ToolExecutionPipeline(AgentMiddleware):
         )
         authority_requirements = self._external_authority_requirements(requirements)
         if not authority_requirements.filesystem_intents:
+            return None
+        if self._spawn_read_only_external_paths(
+            command=command,
+            workspace_path=workspace_path,
+        ):
+            return None
+        if self._smart_external_local_read_allowed(
+            command,
+            requirements,
+            authority_requirements,
+        ):
+            return None
+        if (
+            self._effective_backend_mode() == "spawn"
+            and not requirements.capabilities.network
+            and not requirements.capabilities.workspace_write
+            and not requirements.capabilities.package_install
+            and not requirements.capabilities.destructive
+            and all(intent.access == "read" for intent in authority_requirements.filesystem_intents)
+        ):
+            # Dynamic code whose effects cannot be proved gets one Tool Gate
+            # decision, not a misleading external-directory read Grant first.
             return None
         session_id = str(context.get("session_id") or "")
         query_id = str(context.get("query_id") or "")
@@ -1867,13 +2296,45 @@ class ToolExecutionPipeline(AgentMiddleware):
         )
         return None
 
+    def _authorized_external_shell_paths(self, request: ToolCallRequest) -> tuple[str, ...]:
+        if str(request.tool_call.get("name") or "") != "execute":
+            return ()
+        context = self._context(request)
+        session_id = str(context.get("session_id") or "")
+        run_id = str(context.get("run_id") or "")
+        workspace_path = str(context.get("workspace_path") or "")
+        command = self._command(request)
+        if not session_id or not run_id or not workspace_path or not command:
+            return ()
+        requirements = ShellPolicyAnalyzer.requirements(
+            command,
+            workspace_path=workspace_path,
+        )
+        authority_requirements = self._external_authority_requirements(requirements)
+        if not authority_requirements.filesystem_intents:
+            return ()
+        grants, revision = session_manager.permission_grants_snapshot(session_id)
+        effective = EffectiveGrantSet.resolve(
+            grants,
+            run_id=run_id,
+            current_bindings=self.permission_context.grant_bindings(),
+            current_shell_bindings=self.permission_context.shell_grant_bindings(),
+            permission_revision=revision,
+        )
+        try:
+            SelectedGrantSet.select(effective, authority_requirements)
+        except (PermissionError, ValueError):
+            return ()
+        return tuple(dict.fromkeys(intent.path for intent in authority_requirements.filesystem_intents))
+
     def _compile_kernel_execution(
         self,
         request: ToolCallRequest,
     ) -> AuthorizedExecution | None:
+        backend_mode = self._effective_backend_mode()
         if (
             str(request.tool_call.get("name") or "") != "execute"
-            or self.backend_mode not in {"kernel", "adaptive", "docker"}
+            or backend_mode not in {"kernel", "adaptive", "docker"}
             or self.workspace_backend is None
         ):
             return None
@@ -1907,7 +2368,12 @@ class ToolExecutionPipeline(AgentMiddleware):
             permission_revision=revision,
         )
         authority_requirements = self._external_authority_requirements(requirements)
-        if authority_requirements.filesystem_intents:
+        smart_kernel_read_roots = self._smart_kernel_external_read_roots(
+            command,
+            requirements,
+            authority_requirements,
+        )
+        if authority_requirements.filesystem_intents and not smart_kernel_read_roots:
             # Re-check at permit compilation so a revoked or changed Grant
             # cannot ride the earlier middleware decision.
             SelectedGrantSet.select(effective, authority_requirements)
@@ -1916,15 +2382,17 @@ class ToolExecutionPipeline(AgentMiddleware):
         explicit_docker_skill = bool(
             callable(runtime_for_command) and runtime_for_command(command) == "docker"
         )
+        kernel_runner_mode = str(
+            getattr(self.workspace_backend, "kernel_runner_mode", "kernel_macos_seatbelt")
+        )
         selected_runner = (
             "docker"
-            if self.backend_mode == "docker"
-            or self.backend_mode == "adaptive"
+            if backend_mode == "docker"
+            or backend_mode == "adaptive"
             and (
                 explicit_docker_skill
-                or "/opt/puddingclaw/bin/validate-html-report-e2e.mjs" in command
             )
-            else "kernel_macos_seatbelt"
+            else kernel_runner_mode
         )
         runtime_read_roots: tuple[Path, ...] = ()
         runtime_environment: tuple[tuple[str, str], ...] = ()
@@ -1932,7 +2400,7 @@ class ToolExecutionPipeline(AgentMiddleware):
 
         def runtime_environment_current() -> bool:
             return True
-        if selected_runner == "kernel_macos_seatbelt":
+        if selected_runner.startswith("kernel_"):
             prepare_host = getattr(self.workspace_backend, "prepare_host_execution", None)
             if callable(prepare_host):
                 projection = prepare_host(
@@ -1968,14 +2436,16 @@ class ToolExecutionPipeline(AgentMiddleware):
                 )
         managed_readonly_roots = (
             tuple(getattr(self.workspace_backend, "managed_readonly_host_roots", ()) or ())
-            if selected_runner == "kernel_macos_seatbelt"
+            if selected_runner.startswith("kernel_")
             else ()
         )
         profile = SandboxGrantProfile.build(
             workspace_root=workspace,
             scratch_root=scratch,
+            workspace_writable=requirements.capabilities.workspace_write,
             external_read_roots=(
                 *selected.read_roots,
+                *smart_kernel_read_roots,
                 *managed_readonly_roots,
                 *runtime_read_roots,
             ),
@@ -1983,6 +2453,15 @@ class ToolExecutionPipeline(AgentMiddleware):
             external_delete_roots=selected.delete_roots,
             network_allowed=requirements.capabilities.network,
         )
+        runner_binding_digest = ""
+        if selected_runner.startswith("kernel_"):
+            binding_resolver = getattr(self.workspace_backend, "kernel_runner_binding_digest", None)
+            if callable(binding_resolver):
+                runner_binding_digest = str(binding_resolver() or "")
+            else:
+                runner_binding_digest = str(binding_resolver or "")
+            if not runner_binding_digest:
+                raise RuntimeError("Kernel backend does not expose a runner binding digest")
         tool_call_id = str(request.tool_call.get("id") or "")
         permit = ExecutionPermit.issue(
             tool_call_id=tool_call_id,
@@ -1991,6 +2470,7 @@ class ToolExecutionPipeline(AgentMiddleware):
             permission_revision=revision,
             profile_digest=profile.digest,
             selected_runner=selected_runner,
+            runner_binding_digest=runner_binding_digest,
         )
 
         def current_revision() -> int:
@@ -2576,7 +3056,10 @@ class ToolExecutionPipeline(AgentMiddleware):
                             "ok": False,
                             "managed_by": "managed_cli",
                             "error": "managed_cli_service_unavailable",
-                            "message": "Managed CLI execution requires the Docker runtime.",
+                            "message": (
+                                "Managed CLI execution has no compatible managed command runner "
+                                "in the current execution mode."
+                            ),
                         },
                         ensure_ascii=False,
                         sort_keys=True,
@@ -2851,6 +3334,9 @@ class ToolExecutionPipeline(AgentMiddleware):
             delta_denial = self._delta_repair_denial(request)
             if delta_denial is not None:
                 return delta_denial
+            fallback_error = await self._ensure_execution_backend(request)
+            if fallback_error is not None:
+                return fallback_error
             return await self._invoke_authorized(request, handler, managed_add, managed_cli)
         if result.decision == PolicyDecision.DENY:
             self._record_reviewer_decision(request, result)
@@ -3004,9 +3490,19 @@ class ToolExecutionPipeline(AgentMiddleware):
             delta_denial = self._delta_repair_denial(request)
             if delta_denial is not None:
                 return delta_denial
+            if str(request.tool_call.get("name") or "") == "execute" and bool(
+                getattr(self.workspace_backend, "kernel_unavailable", False)
+            ):
+                return self._kernel_fallback_error(
+                    request,
+                    reason="Kernel fallback requires the interactive Run stream; unattended execution is fail-closed.",
+                )
             if managed_cli is not None:
                 if self.managed_cli_service is None:
-                    return self._managed_cli_rejection(request, "Managed CLI execution requires the Docker runtime.")
+                    return self._managed_cli_rejection(
+                        request,
+                        "Managed CLI execution has no compatible managed command runner in the current execution mode.",
+                    )
                 managed = self.managed_cli_service.execute(managed_cli, self._context(request))
                 return ToolMessage(
                     content=managed.content,
@@ -3327,7 +3823,7 @@ class ToolExecutionPipeline(AgentMiddleware):
                 "managed_skill_write",
             )
         if tool_name == "install_packages":
-            if self.permission_context.backend_mode not in {"kernel", "adaptive"}:
+            if self.permission_context.backend_mode not in {"spawn", "kernel", "adaptive", "docker"}:
                 return ToolPolicyResult(
                     PolicyDecision.DENY,
                     "package_install_requires_host_runtime",
@@ -3351,13 +3847,15 @@ class ToolExecutionPipeline(AgentMiddleware):
                 "high",
             )
         if tool_name == "execute_external_directory":
-            if self.permission_context.backend_mode not in {"docker", "adaptive"} or self.backend_mode not in {
+            if self.permission_context.backend_mode not in {"spawn", "kernel", "docker", "adaptive"} or self._effective_backend_mode() not in {
+                "kernel",
+                "spawn",
                 "docker",
                 "adaptive",
             }:
                 return ToolPolicyResult(
                     PolicyDecision.DENY,
-                    "external_directory_command_requires_docker",
+                    "external_directory_command_requires_sandbox",
                     "critical",
                 )
             command = self._command(request)
@@ -3391,6 +3889,22 @@ class ToolExecutionPipeline(AgentMiddleware):
                     "unsupported_external_directory_mode",
                     "critical",
                 )
+            if self._effective_backend_mode() == "spawn":
+                if (
+                    not effects.workspace_write
+                    and not effects.destructive
+                    and self._provable_spawn_read_command(command)
+                ):
+                    return ToolPolicyResult(
+                        PolicyDecision.ALLOW,
+                        "spawn_external_directory_read_only",
+                        "low",
+                    )
+                return ToolPolicyResult(
+                    PolicyDecision.DENY,
+                    "external_directory_read_only_effect_unprovable",
+                    "critical",
+                )
             if self._registered_external_validator(command):
                 if "/opt/puddingclaw/bin/validate-html-report-e2e.mjs" in command and not self._browser_e2e_required(
                     request
@@ -3417,11 +3931,69 @@ class ToolExecutionPipeline(AgentMiddleware):
                 "critical",
             )
         context = self._context(request)
-        analyzer = ShellPolicyAnalyzer(
-            workspace_path=str(context.get("workspace_path") or "."),
-            backend_mode=self.backend_mode,
-        )
+        workspace_path = str(context.get("workspace_path") or ".")
         command = self._command(request)
+        raw_requirements = ShellPolicyAnalyzer.requirements(
+            command,
+            workspace_path=workspace_path,
+        )
+        raw_authority = self._external_authority_requirements(raw_requirements)
+        if (
+            self._effective_backend_mode() in {"spawn", "kernel"}
+            and raw_authority.filesystem_intents
+            and all(intent.access == "read" for intent in raw_authority.filesystem_intents)
+            and not raw_requirements.capabilities.network
+            and not raw_requirements.capabilities.workspace_write
+            and not raw_requirements.capabilities.package_install
+            and not raw_requirements.capabilities.destructive
+            and not self._provable_spawn_read_command(command)
+        ):
+            if self.permission_context.smart:
+                if self._sensitive_host_read(command, raw_authority):
+                    return ToolPolicyResult(
+                        PolicyDecision.ASK,
+                        "sensitive_host_read",
+                        "high",
+                    )
+                if (
+                    _EMBEDDED_DESTRUCTIVE_API_PATTERN.search(command)
+                    or _OPAQUE_CRITICAL_ACTION_PATTERN.search(command)
+                    or _OPAQUE_DYNAMIC_CODE_PATTERN.search(command)
+                    or _CRITICAL_EXECUTION_ENV_OVERRIDE_PATTERN.search(command)
+                    or self._contains_credential_literal(command)
+                ):
+                    return ToolPolicyResult(
+                        PolicyDecision.ASK,
+                        "spawn_external_dynamic_effect_unprovable",
+                        "high",
+                    )
+                # Spawn + Smart is the trusted-local-work profile. Match the
+                # ergonomics of Codex on-request/OpenCode auto: command shape
+                # alone is not an approval boundary. Explicit destructive,
+                # credential, network, package, and sensitive-read signals are
+                # still handled above or by the normal policy path below.
+                return ToolPolicyResult(
+                    PolicyDecision.ALLOW,
+                    f"smart_{self._effective_backend_mode()}_external_local_execute",
+                    "low",
+                )
+            return ToolPolicyResult(
+                PolicyDecision.ASK,
+                "spawn_external_dynamic_effect_unprovable",
+                "high",
+            )
+        allowed_external_paths = (
+            *self._authorized_external_shell_paths(request),
+            *self._spawn_read_only_external_paths(
+                command=command,
+                workspace_path=workspace_path,
+            ),
+        )
+        analyzer = ShellPolicyAnalyzer(
+            workspace_path=workspace_path,
+            backend_mode=self.backend_mode,
+            allowed_external_paths=allowed_external_paths,
+        )
         result = analyzer.analyze(command)
         external_shell_result = self._granted_external_shell_fast_path(
             request,
@@ -3431,8 +4003,23 @@ class ToolExecutionPipeline(AgentMiddleware):
             return external_shell_result
         effects = analyzer.capabilities(
             command,
-            workspace_path=str(context.get("workspace_path") or "."),
+            workspace_path=workspace_path,
         )
+        credential_network_result = self._credential_network_result(
+            request=request,
+            command=command,
+            effects=effects,
+        )
+        if credential_network_result is not None:
+            return credential_network_result
+        rule_result = self._permission_rule_result(
+            request=request,
+            command=command,
+            result=result,
+            effects=effects,
+        )
+        if rule_result is not None:
+            return rule_result
         if effects.network and result.decision == PolicyDecision.ALLOW:
             return ToolPolicyResult(
                 PolicyDecision.ASK,
@@ -3453,7 +4040,170 @@ class ToolExecutionPipeline(AgentMiddleware):
         )
         if smart_result is not None:
             return smart_result
+        if result.decision is PolicyDecision.ASK and self._smart_external_local_read_allowed(
+            command,
+            raw_requirements,
+            raw_authority,
+        ):
+            # Capability and path analysis has proved an ordinary local read,
+            # while every stronger policy layer above (credential coupling,
+            # typed user rules, network/package/destructive checks, and the
+            # normal Smart sandbox classifier) declined to allow it.  At this
+            # point an executable-name miss is not a reason to invoke a
+            # probabilistic reviewer or interrupt the user.
+            return ToolPolicyResult(
+                PolicyDecision.ALLOW,
+                f"smart_{self._effective_backend_mode()}_external_local_execute",
+                "low",
+            )
         return result
+
+    def _credential_network_result(
+        self,
+        *,
+        request: ToolCallRequest,
+        command: str,
+        effects: ShellCapabilities,
+    ) -> ToolPolicyResult | None:
+        """Keep injected Skill credentials and network authorization atomic."""
+
+        if not effects.network:
+            return None
+        if self._contains_credential_literal(command):
+            return ToolPolicyResult(
+                PolicyDecision.ASK,
+                "credential_network_coupling:literal_secret",
+                "high",
+                explanation="命令同时包含凭证材料并访问网络；必须走一次性耦合审批。",
+            )
+        backend_mode = self._effective_backend_mode()
+        if backend_mode not in {"kernel", "adaptive"} or self.workspace_backend is None:
+            return None
+        context = self._context(request)
+        session_id = str(context.get("session_id") or "")
+        run_id = str(context.get("run_id") or "")
+        if not session_id or not run_id:
+            return None
+        try:
+            active_skill_ids = tuple(
+                dict.fromkeys(
+                    str(item.get("skill_id") or "")
+                    for item in session_manager.get_effective_run_skill_activations(session_id, run_id)
+                    if str(item.get("skill_id") or "")
+                )
+            )
+            if not active_skill_ids:
+                return None
+            prepare_host = getattr(self.workspace_backend, "prepare_host_execution", None)
+            if not callable(prepare_host):
+                return None
+            projection = prepare_host(command, active_skill_ids=active_skill_ids)
+            if not tuple(getattr(projection, "secret_values", ()) or ()):
+                return None
+        except Exception:  # noqa: BLE001
+            # Failing to inspect the credential projection must not turn a
+            # potentially tainted network command into an automatic allow.
+            return ToolPolicyResult(
+                PolicyDecision.ASK,
+                "credential_network_coupling:projection_unavailable",
+                "high",
+                explanation="无法证明本次联网命令未携带 Skill 凭证，必须由用户确认一次。",
+            )
+        return ToolPolicyResult(
+            PolicyDecision.ASK,
+            "credential_network_coupling:skill_secret_injected",
+            "high",
+            explanation="本次命令同时使用 Skill 凭证并访问网络；两项授权必须绑定，不能分别复用。",
+        )
+
+    @staticmethod
+    def _contains_credential_literal(command: str) -> bool:
+        return bool(
+            re.search(
+                r"(?i)(?:authorization\s*:\s*(?:bearer|basic)\s+\S+|"
+                r"(?:cookie|x-api-key|api-key|token|password|passwd|secret)\s*[:=]\s*\S+|"
+                r"--(?:token|password|passwd|api[-_]key|secret)(?:=|\s+)\S+)",
+                str(command or ""),
+            )
+        )
+
+    def _permission_rule_result(
+        self,
+        *,
+        request: ToolCallRequest,
+        command: str,
+        result: ToolPolicyResult,
+        effects: ShellCapabilities,
+    ) -> ToolPolicyResult | None:
+        """Apply typed rules without allowing them to erase hard policy."""
+
+        rules = self.permission_context.rules
+        if not rules:
+            return None
+        tool_name = str(request.tool_call.get("name") or "")
+        pattern = self._command_pattern(command)
+        if pattern is None:
+            return None
+        rule_decision = evaluate_permission_rules(
+            rules,
+            tool=tool_name,
+            pattern=pattern,
+            effects={
+                "network": effects.network,
+                "credentials": self._contains_credential_literal(command),
+                "destructive": effects.destructive,
+                "package_install": effects.package_install,
+                "write_scope": "workspace" if effects.workspace_write else "none",
+            },
+        )
+        if rule_decision is None:
+            return None
+        if rule_decision is PermissionRuleDecision.DENY:
+            return ToolPolicyResult(
+                PolicyDecision.DENY,
+                f"permission_rule_deny:{pattern}",
+                "critical",
+                source="permission_rule",
+            )
+        if rule_decision is PermissionRuleDecision.ASK:
+            return ToolPolicyResult(
+                PolicyDecision.ASK,
+                f"permission_rule_ask:{pattern}",
+                "medium",
+                source="permission_rule",
+            )
+        if result.decision is PolicyDecision.DENY:
+            return None
+        return ToolPolicyResult(
+            PolicyDecision.ALLOW,
+            f"permission_rule_allow:{pattern}",
+            "low" if not (effects.network or effects.package_install or effects.destructive) else "medium",
+            source="permission_rule",
+        )
+
+    @staticmethod
+    def _command_pattern(command: str) -> str | None:
+        """Return a stable user-facing program/subcommand pattern."""
+
+        try:
+            segments = ShellPolicyAnalyzer.parse_segments(command)
+        except ValueError:
+            return None
+        if len(segments) != 1:
+            return None
+        tokens = ShellPolicyAnalyzer.unwrap_command(segments[0])
+        if not tokens:
+            return None
+        executable = Path(tokens[0]).name.lower()
+        prefix = [executable]
+        for token in tokens[1:]:
+            if token.startswith("-"):
+                prefix.append(token)
+                continue
+            if len(prefix) == 1:
+                prefix.append(token)
+            break
+        return " ".join(prefix) + " *"
 
     async def _apreflight(self, request: ToolCallRequest) -> ToolPolicyResult:
         """Run deterministic policy, then review only an eligible smart gray zone."""
@@ -3473,7 +4223,7 @@ class ToolExecutionPipeline(AgentMiddleware):
         )
         verdict = await self.reviewer.review(
             tool_name=str(request.tool_call.get("name") or ""),
-            action=self._review_action(command, context),
+            action=self._redact_shell_preview(self._review_action(command, context)),
             deterministic_reason=result.reason,
             deterministic_risk=result.risk,
             context=context,
@@ -3516,8 +4266,8 @@ class ToolExecutionPipeline(AgentMiddleware):
         if (
             self.reviewer is None
             or not self.permission_context.smart
-            or self.permission_context.backend_mode not in {"docker", "adaptive", "kernel"}
-            or self.backend_mode not in {"docker", "adaptive", "kernel"}
+            or self.permission_context.backend_mode not in {"spawn", "docker", "adaptive", "kernel"}
+            or self.backend_mode not in {"spawn", "docker", "adaptive", "kernel"}
             or result.decision != PolicyDecision.ASK
             or str(request.tool_call.get("name") or "") != "execute"
         ):
@@ -3588,19 +4338,20 @@ class ToolExecutionPipeline(AgentMiddleware):
         result: ToolPolicyResult,
         effects: ShellCapabilities,
     ) -> ToolPolicyResult | None:
-        """Auto-approve ordinary work inside an enforced Kernel/Docker profile.
+        """Auto-approve ordinary work inside the selected execution profile.
 
         Smart mode is intended to remove approval noise for computation,
         validation, and normal project writes.  The deterministic analyzer has
-        already denied host-path escapes, privilege escalation, and Docker
-        control before this hook runs.  Network/package capabilities and
+        already denied privilege escalation and fixed dangerous effects before
+        this hook runs.  Spawn receives the same policy convenience as Kernel;
+        this is not an OS isolation claim. Network/package capabilities and
         explicitly destructive workspace operations remain user-controlled.
         """
 
         if (
             not self.permission_context.smart
-            or self.permission_context.backend_mode not in {"docker", "adaptive", "kernel"}
-            or self.backend_mode not in {"docker", "adaptive", "kernel"}
+            or self.permission_context.backend_mode not in {"spawn", "docker", "adaptive", "kernel"}
+            or self.backend_mode not in {"spawn", "docker", "adaptive", "kernel"}
             or result.decision != PolicyDecision.ASK
         ):
             return None
@@ -3661,8 +4412,8 @@ class ToolExecutionPipeline(AgentMiddleware):
 
         if (
             not self.permission_context.smart
-            or self.permission_context.backend_mode not in {"docker", "adaptive"}
-            or self.backend_mode not in {"docker", "adaptive"}
+            or self.permission_context.backend_mode not in {"spawn", "docker", "adaptive", "kernel"}
+            or self.backend_mode not in {"spawn", "docker", "adaptive", "kernel"}
             or not effects.network
             or effects.package_install
             or effects.destructive
@@ -4031,7 +4782,7 @@ class ToolExecutionPipeline(AgentMiddleware):
     def _action_preview(self, request: ToolCallRequest) -> str:
         tool_name = str(request.tool_call.get("name") or "")
         if tool_name == "execute":
-            return self._command(request)
+            return self._redact_shell_preview(self._command(request))
         args = request.tool_call.get("args") or {}
         if tool_name == "browser" and isinstance(args, dict):
             try:
@@ -4057,6 +4808,28 @@ class ToolExecutionPipeline(AgentMiddleware):
         except (TypeError, ValueError):
             rendered = str(args)
         return rendered[:4000]
+
+    @staticmethod
+    def _redact_shell_preview(command: str) -> str:
+        """Remove literal credentials before an approval/UI/audit boundary."""
+
+        redacted = str(command or "")
+        redacted = re.sub(
+            r"(?i)(\b(?:authorization|proxy-authorization|cookie|set-cookie|x-api-key|api-key|token|password|passwd|secret)\s*[:=]\s*)(?:(?:bearer|basic)\s+)?([^\s,;]+)",
+            r"\1<redacted>",
+            redacted,
+        )
+        redacted = re.sub(
+            r"(?i)(\b(?:bearer|basic)\s+)([^\s'\"]+)",
+            r"\1<redacted>",
+            redacted,
+        )
+        redacted = re.sub(
+            r"(?i)(--?(?:password|passwd|token|api[-_]key|secret)(?:=|\s+))([^\s'\"]+)",
+            r"\1<redacted>",
+            redacted,
+        )
+        return redacted
 
     @staticmethod
     def _permission_fingerprint_command(request: ToolCallRequest, preview: str) -> str:
@@ -4140,6 +4913,33 @@ class ToolExecutionPipeline(AgentMiddleware):
 
         match = getattr(plan, "match", plan)
         route = str(getattr(getattr(match, "route", None), "value", ""))
+        requires_profile = bool(getattr(match, "requires_profile", False))
+        requires_network = bool(getattr(match, "requires_network", False))
+        credential_state = getattr(match, "credential_state", None)
+        if requires_profile and credential_state is None:
+            return ToolPolicyResult(
+                PolicyDecision.DENY,
+                "managed_cli_credential_contract_missing",
+                "critical",
+                explanation="该 Managed CLI 声明需要凭证，但 Adapter 没有提供受约束的凭证状态契约。",
+            )
+        if credential_state is not None and not requires_profile:
+            return ToolPolicyResult(
+                PolicyDecision.DENY,
+                "managed_cli_credential_contract_unexpected",
+                "critical",
+                explanation="Adapter 不能在未声明 profile 需求时注入凭证状态。",
+            )
+        if requires_profile and requires_network:
+            return ToolPolicyResult(
+                PolicyDecision.ASK,
+                "managed_cli_credential_network_authorization",
+                "high",
+                explanation=(
+                    "本次 Managed CLI 同时使用用户凭证和网络；必须由用户批准这对绑定，"
+                    "网络授权或凭证授权不能单独复用。"
+                ),
+            )
         if route == "installer":
             return ToolPolicyResult(
                 PolicyDecision.ASK,
@@ -4173,6 +4973,9 @@ class ToolExecutionPipeline(AgentMiddleware):
             capabilities = ["execute"]
             if bool(getattr(match, "requires_network", False)):
                 capabilities.append("network_access")
+            credential_state = getattr(match, "credential_state", None)
+            if bool(getattr(match, "requires_profile", False)) and credential_state is not None:
+                capabilities.append(f"credential_profile:{credential_state.fingerprint}")
             if route == "installer":
                 capabilities.extend(["package_install", "temporary_network"])
             if bool(getattr(match, "workspace_writable", False)):
@@ -4376,10 +5179,41 @@ class ToolExecutionPipeline(AgentMiddleware):
         if tool_name != "execute":
             return None
 
-        # Raw shell commands have unrestricted bridge egress once approved.
-        # Even a static GET can read workspace/HOME data through program flags
-        # or a replaced executable, so shell networking is always exact-once.
-        return None
+        command = str(request.tool_call.get("args", {}).get("command") or "").strip()
+        if not command:
+            return None
+        try:
+            capabilities = ShellPolicyAnalyzer.capabilities(
+                command,
+                workspace_path=self.base_dir,
+            )
+        except (OSError, RuntimeError, ValueError):
+            return None
+
+        # Pattern reuse is deliberately limited to commands whose effects are
+        # local and non-destructive. Network, credentials, package mutation,
+        # and destructive shell actions remain exact-once even when the
+        # command text looks stable.
+        if (
+            capabilities.network
+            or capabilities.destructive
+            or capabilities.package_install
+        ):
+            return None
+        # A stable-looking interpreter prefix is not a stable effect
+        # identity.  `python/node -c`, a script path, or a shell wrapper can
+        # change arbitrary code while keeping the same executable.  These
+        # actions remain exact-once; typed rules may still ask explicitly.
+        if self._script_entrypoint(command) is not None:
+            return None
+        pattern = self._command_pattern(command)
+        if pattern is None:
+            return None
+        return {
+            "target_kind": "command_pattern",
+            "target": pattern,
+            "label": f"本 Session 允许重复执行命令模式 {pattern}",
+        }
 
     @staticmethod
     def _normalized_network_origin(raw_url: str) -> str | None:

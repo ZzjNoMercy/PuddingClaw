@@ -2,6 +2,7 @@ import hashlib
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 from langchain.agents.middleware.types import ModelRequest, ModelResponse, ToolCallRequest
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
@@ -12,6 +13,7 @@ from graph.middlewares.toolset import (
     discover_skill_toolsets,
 )
 from harness.models import RunRecord, RunTaskProfile, SkillCacheEntry, SkillCandidate
+from harness.task_profiles import TaskProfileClassifier
 from harness.tool_execution import ToolExecutionPipeline
 from tools.toolsets import (
     BUSINESS_TOOLSETS,
@@ -583,6 +585,59 @@ def test_permission_manifest_marks_path_tools_argument_dependent(tmp_path) -> No
     read_policy = next(item for item in manifest.hitl_required if item["tool"] == "read_file")
     assert read_policy["approval_scope"] == "argument_dependent"
     assert any(item["tool"] == "update_todos" for item in manifest.allowed)
+
+
+@pytest.mark.parametrize("backend_mode", ["spawn", "kernel"])
+def test_smart_permission_manifest_marks_host_reads_runtime_evaluated(
+    tmp_path,
+    monkeypatch,
+    backend_mode,
+) -> None:
+    from graph.session_manager import session_manager
+
+    session_manager.initialize(tmp_path)
+    session_manager.create_session("spawn-manifest-session")
+    middleware = ToolsetMiddleware(skills_dir=tmp_path, toolsets_by_skill={})
+    monkeypatch.setattr(
+        "graph.middlewares.toolset.session_manager.get_run_state",
+        lambda _session_id, _run_id: {
+            "config_snapshot": {
+                "permissions": {"approval_mode": "smart", "policy_epoch": 1},
+                "execution": {"backend_mode": backend_mode},
+            }
+        },
+    )
+    monkeypatch.setattr(
+        "graph.middlewares.toolset.session_manager.permission_grants_snapshot",
+        lambda _session_id: ([], 0),
+    )
+    monkeypatch.setattr(
+        "graph.middlewares.toolset.session_manager.get_permission_policy",
+        lambda _session_id: {"policy_epoch": 1},
+    )
+    request = ModelRequest(
+        model=None,
+        messages=[],
+        tools=[{"name": "read_file"}, {"name": "write_file"}, {"name": "execute"}],
+        state={"messages": []},
+        runtime=SimpleNamespace(
+            context={"session_id": "spawn-manifest-session", "run_id": "spawn-manifest-run"}
+        ),
+    )
+
+    manifest = middleware._permission_manifest(request, middleware._visible_tools(request))
+
+    assert not any(item.get("tool") == "read_file" for item in manifest.allowed)
+    assert any(
+        item.get("tool") == "read_file"
+        and item.get("reason")
+        == "ordinary_local_reads_auto_allow_while_sensitive_or_expansive_reads_use_the_gate"
+        for item in manifest.runtime_evaluated
+    )
+    assert not any(item.get("tool") == "read_file" for item in manifest.hitl_required)
+    assert any(item.get("tool") == "write_file" for item in manifest.hitl_required)
+    assert not any(item.get("tool") == "execute" for item in manifest.hitl_required)
+    assert any(item.get("tool") == "execute" for item in manifest.runtime_evaluated)
 
 
 def test_goal_inspection_exposes_only_read_only_tools(tmp_path) -> None:
@@ -1652,8 +1707,10 @@ def _routed_profile(
     *skill_ids: str,
     missing_explicit_skill_ids: list[str] | None = None,
     explicit_skill_ids: set[str] | None = None,
+    required_skill_ids: set[str] | None = None,
 ) -> dict:
     explicit_skill_ids = explicit_skill_ids or set()
+    required_skill_ids = required_skill_ids or set()
     return RunTaskProfile(
         skill_candidates=[
             SkillCandidate(
@@ -1661,6 +1718,7 @@ def _routed_profile(
                 confidence=0.9,
                 evidence="matched by semantic router",
                 explicit=skill_id in explicit_skill_ids,
+                required=skill_id in required_skill_ids,
             )
             for skill_id in skill_ids
         ],
@@ -1668,6 +1726,84 @@ def _routed_profile(
         execution_route=("skill_first" if skill_ids else "missing_skill" if missing_explicit_skill_ids else "native"),
         native_fallback=not bool(missing_explicit_skill_ids),
     ).model_dump(mode="json")
+
+
+def test_pdf_file_route_requires_installed_pdf_skill() -> None:
+    installed = TaskProfileClassifier.classify(
+        message="/Users/pet/Downloads/spec.pdf 说了什么",
+        skill_catalog=[{"skill_id": "pdf", "name": "pdf"}],
+    )
+    candidate = next(item for item in installed.skill_candidates if item.skill_id == "pdf")
+    assert candidate.required is True
+    assert installed.execution_route == "skill_first"
+
+    missing = TaskProfileClassifier.classify(
+        message="/Users/pet/Downloads/spec.pdf 说了什么",
+        skill_catalog=[],
+    )
+    assert missing.execution_route == "missing_skill"
+    assert missing.native_fallback is False
+    assert "missing_required_skill:pdf" in missing.reasons
+
+
+def test_required_pdf_skill_barrier_blocks_direct_file_read() -> None:
+    middleware = SkillIntentRouterMiddleware()
+    request = ToolCallRequest(
+        tool_call={
+            "name": "read_file",
+            "args": {"file_path": "/Users/pet/Downloads/spec.pdf"},
+            "id": "read-pdf-directly",
+            "type": "tool_call",
+        },
+        tool=None,
+        state={
+            "messages": [],
+            "active_skill_ids": [],
+            "task_profile": _routed_profile("pdf", required_skill_ids={"pdf"}),
+        },
+        runtime=None,
+    )
+    executed: list[str] = []
+
+    blocked = middleware.wrap_tool_call(
+        request,
+        lambda tool_request: executed.append(str(tool_request.tool_call["name"])),
+    )
+
+    assert isinstance(blocked, ToolMessage)
+    assert blocked.status == "error"
+    assert blocked.additional_kwargs["puddingclaw_control_plane"]["pending_skill_ids"] == ["pdf"]
+    assert executed == []
+
+
+def test_missing_pdf_skill_blocks_generic_tool_bypass() -> None:
+    middleware = SkillIntentRouterMiddleware()
+    profile = RunTaskProfile(
+        intents=["pdf_document"],
+        execution_route="missing_skill",
+        native_fallback=False,
+        reasons=["missing_required_skill:pdf"],
+    ).model_dump(mode="json")
+    request = ToolCallRequest(
+        tool_call={
+            "name": "execute",
+            "args": {"command": "pdftotext /Users/pet/Downloads/spec.pdf -"},
+            "id": "bypass-pdf-skill",
+            "type": "tool_call",
+        },
+        tool=None,
+        state={"messages": [], "active_skill_ids": [], "task_profile": profile},
+        runtime=None,
+    )
+
+    blocked = middleware.wrap_tool_call(request, lambda _request: None)
+
+    assert isinstance(blocked, ToolMessage)
+    assert blocked.additional_kwargs["puddingclaw_control_plane"] == {
+        "type": "required_skill_missing",
+        "missing_skill_ids": ["pdf"],
+        "original_tool_executed": False,
+    }
 
 
 def test_skill_router_prompt_is_transient_and_preserves_message_identity() -> None:

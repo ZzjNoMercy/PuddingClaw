@@ -13,8 +13,10 @@ import pytest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from graph.middlewares.tool_context_compaction import (
+    LARGE_TOOL_RESULT_ARTIFACT_KEY,
     POLICY_VERSION,
     RAW_OUTPUT_ARTIFACT_KEY,
+    LargeToolResultOffloadMiddleware,
     ToolContextCompactionMiddleware,
     ToolContextCompactionService,
     ToolContextConfig,
@@ -214,14 +216,14 @@ def test_ensure_tool_call_ids_preserves_same_id_from_different_runs(tmp_path: Pa
     ]
 
 
-def test_candidate_scan_preserves_recent_n_and_short_results(tmp_path: Path) -> None:
+def test_candidate_scan_preserves_recent_token_budget_and_short_results(tmp_path: Path) -> None:
     manager = _manager(tmp_path)
     _save_tools(manager, "candidates", count=6, output_chars=5000)
 
     candidates = manager.select_tool_context_candidates(
         "candidates",
         min_result_tokens=1000,
-        keep_recent=2,
+        retain_tokens=3000,
         policy_version=POLICY_VERSION,
     )
     assert [item["tool_call_id"] for item in candidates] == [
@@ -235,7 +237,7 @@ def test_candidate_scan_preserves_recent_n_and_short_results(tmp_path: Path) -> 
         manager.select_tool_context_candidates(
             "candidates",
             min_result_tokens=10000,
-            keep_recent=2,
+            retain_tokens=3000,
             policy_version=POLICY_VERSION,
         )
         == []
@@ -256,10 +258,24 @@ def test_recent_window_uses_completion_time_not_call_list_position(tmp_path: Pat
     candidates = manager.select_tool_context_candidates(
         "completion-order",
         min_result_tokens=100,
-        keep_recent=1,
+        retain_tokens=1500,
         policy_version=POLICY_VERSION,
     )
     assert {item["tool_call_id"] for item in candidates} == {"call-1", "call-2"}
+
+
+def test_single_tool_result_larger_than_retention_budget_is_not_protected(tmp_path: Path) -> None:
+    manager = _manager(tmp_path)
+    _save_tools(manager, "single-over-budget", count=1, output_chars=100_000)
+
+    candidates = manager.select_tool_context_candidates(
+        "single-over-budget",
+        min_result_tokens=1000,
+        retain_tokens=16000,
+        policy_version=POLICY_VERSION,
+    )
+
+    assert [item["tool_call_id"] for item in candidates] == ["call-0"]
 
 
 def test_result_id_raw_reference_keeps_session_fallback(tmp_path: Path) -> None:
@@ -290,7 +306,7 @@ def test_duplicate_tool_ids_fail_closed_without_compaction(tmp_path: Path) -> No
         manager.select_tool_context_candidates(
             "duplicate",
             min_result_tokens=100,
-            keep_recent=0,
+            retain_tokens=0,
             policy_version=POLICY_VERSION,
         )
         == []
@@ -306,7 +322,7 @@ def test_commit_rejects_duplicate_ids_even_if_session_is_corrupted_after_job_sta
     candidates = manager.select_tool_context_candidates(
         "duplicate-after-start",
         min_result_tokens=100,
-        keep_recent=0,
+        retain_tokens=0,
         policy_version=POLICY_VERSION,
     )
     assert manager.begin_tool_context_job(
@@ -344,7 +360,7 @@ def test_job_commit_keeps_id_count_order_and_ui_output(tmp_path: Path) -> None:
     candidates = manager.select_tool_context_candidates(
         "commit",
         min_result_tokens=100,
-        keep_recent=0,
+        retain_tokens=0,
         policy_version=POLICY_VERSION,
     )
     assert (
@@ -385,7 +401,7 @@ def test_same_hash_policy_is_idempotent_and_source_change_becomes_stale(tmp_path
     candidates = manager.select_tool_context_candidates(
         "idempotent",
         min_result_tokens=100,
-        keep_recent=0,
+        retain_tokens=0,
         policy_version=POLICY_VERSION,
     )
     candidate = candidates[0]
@@ -409,7 +425,7 @@ def test_same_hash_policy_is_idempotent_and_source_change_becomes_stale(tmp_path
         manager.select_tool_context_candidates(
             "idempotent",
             min_result_tokens=100,
-            keep_recent=0,
+            retain_tokens=0,
             policy_version=POLICY_VERSION,
         )
         == []
@@ -422,7 +438,7 @@ def test_same_hash_policy_is_idempotent_and_source_change_becomes_stale(tmp_path
     changed = manager.select_tool_context_candidates(
         "idempotent",
         min_result_tokens=100,
-        keep_recent=0,
+        retain_tokens=0,
         policy_version=POLICY_VERSION,
     )
     assert len(changed) == 1
@@ -457,7 +473,7 @@ def test_job_lease_allows_only_one_owner_and_recovers_after_expiry(tmp_path: Pat
     manager = _manager(tmp_path)
     _save_tools(manager, "lease", count=1)
     candidates = manager.select_tool_context_candidates(
-        "lease", min_result_tokens=100, keep_recent=0, policy_version=POLICY_VERSION
+        "lease", min_result_tokens=100, retain_tokens=0, policy_version=POLICY_VERSION
     )
     assert manager.begin_tool_context_job(
         "lease", job_id="lease-1", candidates=candidates, policy_version=POLICY_VERSION
@@ -481,7 +497,7 @@ def test_job_lease_allows_only_one_owner_and_recovers_after_expiry(tmp_path: Pat
 def test_service_compacts_in_background_and_does_not_overwrite_new_message(tmp_path: Path) -> None:
     manager = _manager(tmp_path)
     _save_tools(manager, "service", count=3, output_chars=9000, tool="read_file")
-    cfg = ToolContextConfig(background_min_result_tokens=1000, keep_recent_tool_results=0)
+    cfg = ToolContextConfig(background_min_result_tokens=1000, retain_tool_context_tokens=0)
     service = ToolContextCompactionService(manager=manager)
 
     async def run() -> str:
@@ -523,7 +539,7 @@ def test_two_workers_only_one_can_acquire_same_session_job(tmp_path: Path) -> No
     first_manager = _manager(tmp_path)
     second_manager = _manager(tmp_path)
     _save_tools(first_manager, "two-workers", count=3, output_chars=9000, tool="read_file")
-    cfg = ToolContextConfig(background_min_result_tokens=1000, keep_recent_tool_results=0)
+    cfg = ToolContextConfig(background_min_result_tokens=1000, retain_tool_context_tokens=0)
     first = ToolContextCompactionService(manager=first_manager)
     second = ToolContextCompactionService(manager=second_manager)
 
@@ -549,7 +565,7 @@ def test_service_no_candidate_is_a_true_noop(tmp_path: Path) -> None:
     manager = _manager(tmp_path)
     _save_tools(manager, "service-noop", count=2, output_chars=100)
     service = ToolContextCompactionService(manager=manager)
-    cfg = ToolContextConfig(background_min_result_tokens=1000, keep_recent_tool_results=0)
+    cfg = ToolContextConfig(background_min_result_tokens=1000, retain_tool_context_tokens=0)
 
     assert asyncio.run(service.enqueue("service-noop", cfg)) is None
     assert manager.get_tool_context_status("service-noop")["status"] == "idle"
@@ -563,7 +579,7 @@ def test_disabled_service_returns_before_scan_and_does_not_touch_session(tmp_pat
     cfg = ToolContextConfig(
         enabled=False,
         background_min_result_tokens=1000,
-        keep_recent_tool_results=0,
+        retain_tool_context_tokens=0,
     )
 
     assert asyncio.run(service.enqueue("service-disabled", cfg)) is None
@@ -577,7 +593,7 @@ def test_service_candidate_budget_leaves_remainder_for_next_scan(tmp_path: Path)
     service = ToolContextCompactionService(manager=manager)
     cfg = ToolContextConfig(
         background_min_result_tokens=1000,
-        keep_recent_tool_results=0,
+        retain_tool_context_tokens=0,
         max_candidates_per_job=3,
     )
 
@@ -589,7 +605,7 @@ def test_service_candidate_budget_leaves_remainder_for_next_scan(tmp_path: Path)
     remainder = manager.select_tool_context_candidates(
         "service-budget",
         min_result_tokens=1000,
-        keep_recent=0,
+        retain_tokens=0,
         policy_version=POLICY_VERSION,
     )
     assert len(remainder) == 2
@@ -607,7 +623,7 @@ def test_candidate_budget_deprioritizes_error_and_user_referenced_results(tmp_pa
     candidates = manager.select_tool_context_candidates(
         "service-priority",
         min_result_tokens=1000,
-        keep_recent=0,
+        retain_tokens=0,
         policy_version=POLICY_VERSION,
     )
     assert [item["tool_call_id"] for item in candidates] == ["call-2", "call-0", "call-1"]
@@ -635,7 +651,7 @@ def test_llm_fallback_keeps_tool_metadata_and_raw_reference(tmp_path: Path) -> N
         manager=manager,
         model_factory=lambda: fake_model,
     )
-    cfg = ToolContextConfig(background_min_result_tokens=1000, keep_recent_tool_results=0)
+    cfg = ToolContextConfig(background_min_result_tokens=1000, retain_tool_context_tokens=0)
 
     async def run() -> None:
         assert await service.enqueue("service-llm", cfg)
@@ -677,7 +693,7 @@ def test_enqueue_returns_while_background_summary_is_still_running(tmp_path: Pat
             manager=manager,
             model_factory=lambda: BlockingSummaryModel(),
         )
-        cfg = ToolContextConfig(background_min_result_tokens=1000, keep_recent_tool_results=0)
+        cfg = ToolContextConfig(background_min_result_tokens=1000, retain_tool_context_tokens=0)
         job_id = await service.enqueue("service-nonblocking", cfg)
         assert job_id
         await asyncio.wait_for(started.wait(), timeout=1)
@@ -714,7 +730,7 @@ def test_cancelled_background_job_releases_candidate_lease_and_keeps_raw_output(
             manager=manager,
             model_factory=lambda: BlockingSummaryModel(),
         )
-        cfg = ToolContextConfig(background_min_result_tokens=1000, keep_recent_tool_results=0)
+        cfg = ToolContextConfig(background_min_result_tokens=1000, retain_tool_context_tokens=0)
         assert await service.enqueue("service-cancelled", cfg)
         await asyncio.wait_for(started.wait(), timeout=1)
         task = service._tasks["service-cancelled"]
@@ -732,7 +748,7 @@ def test_cancelled_background_job_releases_candidate_lease_and_keeps_raw_output(
     assert manager.select_tool_context_candidates(
         "service-cancelled",
         min_result_tokens=1000,
-        keep_recent=0,
+        retain_tokens=0,
         policy_version=POLICY_VERSION,
     )
 
@@ -765,6 +781,116 @@ def test_immediate_guard_only_compacts_single_oversized_result_and_keeps_id() ->
     assert guarded.artifact[RAW_OUTPUT_ARTIFACT_KEY] == raw
     assert "important-line" in str(guarded.content)
     assert "final-line" in str(guarded.content)
+
+
+def test_puddingclaw_offloads_oversized_read_file_without_deepagents_allowlist(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    manager = _manager(tmp_path)
+    middleware = LargeToolResultOffloadMiddleware(
+        manager=manager,
+        workspace_path=workspace,
+        session_id="session-large",
+        query_id="query-large",
+    )
+    raw = "PDF_BASE64:" + ("x" * 80_000)
+
+    async def invoke() -> ToolMessage:
+        request = SimpleNamespace(
+            tool_call={"id": "call/read.file", "name": "read_file"},
+            runtime=None,
+        )
+
+        async def handler(_request: Any) -> ToolMessage:
+            return ToolMessage(content=raw, tool_call_id="call/read.file", name="read_file")
+
+        result = await middleware.awrap_tool_call(request, handler)
+        assert isinstance(result, ToolMessage)
+        return result
+
+    offloaded = asyncio.run(invoke())
+    artifact = (
+        workspace
+        / ".puddingclaw"
+        / "large_tool_results"
+        / "session-large"
+        / "query-large"
+        / "call_read_file"
+    )
+    assert artifact.read_text(encoding="utf-8") == raw
+    assert "/large_tool_results/call_read_file" in str(offloaded.content)
+    assert len(str(offloaded.content)) < 10_000
+    assert offloaded.additional_kwargs["puddingclaw_query_id"] == "query-large"
+    assert offloaded.artifact[LARGE_TOOL_RESULT_ARTIFACT_KEY]["estimated_tokens"] > 20_000
+    assert RAW_OUTPUT_ARTIFACT_KEY not in offloaded.artifact
+    raw_ref = manager._tool_context_raw_ref(
+        "session-large",
+        "call/read.file",
+        str(offloaded.content),
+        offloaded.additional_kwargs["puddingclaw_tool_source_hash"],
+        source_query_id="query-large",
+        workspace_path=str(workspace),
+    )
+    assert raw_ref["kind"] == "deepagents_large_tool_result"
+    assert raw_ref["artifact_name"] == "call_read_file"
+
+
+def test_puddingclaw_keeps_tool_result_at_20k_boundary_inline(tmp_path: Path) -> None:
+    middleware = LargeToolResultOffloadMiddleware(
+        manager=_manager(tmp_path),
+        workspace_path=tmp_path / "workspace",
+        session_id="session-boundary",
+        query_id="query-boundary",
+    )
+    raw = "x" * 80_000
+
+    async def invoke() -> ToolMessage:
+        request = SimpleNamespace(
+            tool_call={"id": "call-boundary", "name": "read_file"},
+            runtime=None,
+        )
+
+        async def handler(_request: Any) -> ToolMessage:
+            return ToolMessage(content=raw, tool_call_id="call-boundary", name="read_file")
+
+        result = await middleware.awrap_tool_call(request, handler)
+        assert isinstance(result, ToolMessage)
+        return result
+
+    inline = asyncio.run(invoke())
+    assert inline.content == raw
+    assert not (tmp_path / "workspace" / ".puddingclaw").exists()
+
+
+def test_puddingclaw_preserves_raw_result_when_offload_fails(tmp_path: Path, monkeypatch) -> None:
+    manager = _manager(tmp_path)
+    middleware = LargeToolResultOffloadMiddleware(
+        manager=manager,
+        workspace_path=tmp_path / "workspace",
+        session_id="session-failure",
+        query_id="query-failure",
+    )
+    raw = "x" * 80_001
+
+    def fail_materialization(**_kwargs: Any) -> dict[str, Any]:
+        raise OSError("disk unavailable")
+
+    monkeypatch.setattr(manager, "materialize_large_tool_result", fail_materialization)
+
+    async def invoke() -> ToolMessage:
+        request = SimpleNamespace(
+            tool_call={"id": "call-failure", "name": "read_file"},
+            runtime=None,
+        )
+
+        async def handler(_request: Any) -> ToolMessage:
+            return ToolMessage(content=raw, tool_call_id="call-failure", name="read_file")
+
+        result = await middleware.awrap_tool_call(request, handler)
+        assert isinstance(result, ToolMessage)
+        return result
+
+    fallback = asyncio.run(invoke())
+    assert fallback.content == raw
 
 
 def test_immediate_guard_is_disabled_by_default() -> None:
@@ -962,7 +1088,7 @@ def test_model_route_uses_only_ready_entries_without_waiting(tmp_path: Path) -> 
     manager = _manager(tmp_path)
     _save_tools(manager, "model-route", count=2)
     candidates = manager.select_tool_context_candidates(
-        "model-route", min_result_tokens=100, keep_recent=0, policy_version=POLICY_VERSION
+        "model-route", min_result_tokens=100, retain_tokens=0, policy_version=POLICY_VERSION
     )
     assert manager.begin_tool_context_job(
         "model-route", job_id="route-job", candidates=candidates, policy_version=POLICY_VERSION
@@ -1101,7 +1227,7 @@ def test_effective_context_meter_applies_ready_delta_only_when_enabled(tmp_path:
         ],
     )
     candidates = manager.select_tool_context_candidates(
-        "meter", min_result_tokens=100, keep_recent=0, policy_version=POLICY_VERSION
+        "meter", min_result_tokens=100, retain_tokens=0, policy_version=POLICY_VERSION
     )
     assert manager.begin_tool_context_job(
         "meter", job_id="meter-job", candidates=candidates, policy_version=POLICY_VERSION
@@ -1143,7 +1269,7 @@ def test_deepagents_tool_context_switch_isolated_from_chat_config(tmp_path: Path
                         "immediate_compaction_enabled": True,
                         "single_tool_trigger_tokens": 9000,
                         "background_min_result_tokens": 1200,
-                        "keep_recent_tool_results": 9,
+                        "retain_tool_context_tokens": 9000,
                     },
                 }
             }
@@ -1170,6 +1296,7 @@ def test_disabled_switch_means_middleware_is_not_registered(tmp_path: Path, monk
     )
     disabled = manager._build_middlewares(project_id=None)
     assert not any(isinstance(item, ToolContextCompactionMiddleware) for item in disabled)
+    assert len([item for item in disabled if isinstance(item, LargeToolResultOffloadMiddleware)]) == 1
 
     monkeypatch.setattr(
         config,
@@ -1178,9 +1305,10 @@ def test_disabled_switch_means_middleware_is_not_registered(tmp_path: Path, monk
             "enabled": True,
             "single_tool_trigger_tokens": 8000,
             "background_min_result_tokens": 1000,
-            "keep_recent_tool_results": 12,
+            "retain_tool_context_tokens": 32000,
         },
     )
     enabled = manager._build_middlewares(project_id=None)
     mounted = [item for item in enabled if isinstance(item, ToolContextCompactionMiddleware)]
     assert len(mounted) == 1
+    assert len([item for item in enabled if isinstance(item, LargeToolResultOffloadMiddleware)]) == 1

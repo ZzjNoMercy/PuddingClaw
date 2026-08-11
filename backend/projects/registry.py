@@ -25,6 +25,9 @@ class ProjectRecord:
     created_at: float
     updated_at: float
     pinned: bool = False
+    execution_mode: str | None = None
+    permission_rules: tuple[dict[str, Any], ...] = ()
+    permission_rules_revision: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -34,6 +37,9 @@ class ProjectRecord:
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "pinned": self.pinned,
+            "execution_mode": self.execution_mode,
+            "permission_rules": [dict(rule) for rule in self.permission_rules],
+            "permission_rules_revision": self.permission_rules_revision,
         }
 
 
@@ -112,6 +118,9 @@ class ProjectRegistry:
             created_at=created_at,
             updated_at=now,
             pinned=bool(existing.get("pinned") or False),
+            execution_mode=(str(existing.get("execution_mode")) if existing.get("execution_mode") in {"spawn", "kernel"} else None),
+            permission_rules=self._normalize_permission_rules(existing.get("permission_rules")),
+            permission_rules_revision=int(existing.get("permission_rules_revision") or 0),
         )
         assert self._base_dir is not None
         ensure_project_context(resolved, self._base_dir)
@@ -135,13 +144,16 @@ class ProjectRegistry:
                         created_at=float(raw.get("created_at") or 0),
                         updated_at=float(raw.get("updated_at") or 0),
                         pinned=bool(raw.get("pinned") or False),
+                        execution_mode=(str(raw.get("execution_mode")) if raw.get("execution_mode") in {"spawn", "kernel"} else None),
+                        permission_rules=self._normalize_permission_rules(raw.get("permission_rules")),
+                        permission_rules_revision=int(raw.get("permission_rules_revision") or 0),
                     )
                 )
             except Exception:
                 continue
         return sorted(projects, key=lambda item: (not item.pinned, -item.updated_at))
 
-    def update(self, project_id: str, *, name: str | None = None, pinned: bool | None = None) -> ProjectRecord:
+    def update(self, project_id: str, *, name: str | None = None, pinned: bool | None = None, execution_mode: str | None = None) -> ProjectRecord:
         records = self._read_all()
         raw = records.get(project_id)
         if not raw:
@@ -155,6 +167,10 @@ class ProjectRegistry:
             next_raw["name"] = next_name
         if pinned is not None:
             next_raw["pinned"] = pinned
+        if execution_mode is not None:
+            if execution_mode not in {"spawn", "kernel"}:
+                raise ValueError("execution_mode must be spawn or kernel")
+            next_raw["execution_mode"] = execution_mode
         next_raw["updated_at"] = time.time()
         records[project_id] = next_raw
         self._write_all(records)
@@ -165,7 +181,88 @@ class ProjectRegistry:
             created_at=float(next_raw.get("created_at") or 0),
             updated_at=float(next_raw.get("updated_at") or 0),
             pinned=bool(next_raw.get("pinned") or False),
+            execution_mode=(str(next_raw.get("execution_mode")) if next_raw.get("execution_mode") in {"spawn", "kernel"} else None),
+            permission_rules=self._normalize_permission_rules(next_raw.get("permission_rules")),
+            permission_rules_revision=int(next_raw.get("permission_rules_revision") or 0),
         )
+
+    @staticmethod
+    def _normalize_permission_rules(raw_rules: Any) -> tuple[dict[str, Any], ...]:
+        """Validate project rules without importing the policy module at load time."""
+
+        if raw_rules in (None, []):
+            return ()
+        from graph.permission_policy import compile_permission_rules
+
+        compiled = compile_permission_rules(raw_rules, source="project")
+        return tuple(
+            {
+                "tool": rule.tool,
+                "pattern": rule.pattern,
+                "decision": rule.decision.value,
+                "scope": "project",
+                "constraints": rule.constraint_map(),
+                "source": "project",
+                "revision": rule.revision,
+            }
+            for rule in compiled
+        )
+
+    def get_permission_rules(self, project_id: str | None) -> dict[str, Any]:
+        if not project_id:
+            return {"rules": [], "revision": 0}
+        raw = self._read_all().get(project_id)
+        if not isinstance(raw, dict):
+            raise KeyError(f"Unknown project_id: {project_id}")
+        return {
+            "rules": [dict(rule) for rule in self._normalize_permission_rules(raw.get("permission_rules"))],
+            "revision": int(raw.get("permission_rules_revision") or 0),
+        }
+
+    def set_permission_rules(self, project_id: str, rules: list[dict[str, Any]]) -> ProjectRecord:
+        """Replace the project rule set and advance its invalidation revision."""
+
+        normalized = self._normalize_permission_rules(rules)
+        records = self._read_all()
+        raw = records.get(project_id)
+        if not isinstance(raw, dict):
+            raise KeyError(f"Unknown project_id: {project_id}")
+        revision = int(raw.get("permission_rules_revision") or 0) + 1
+        persisted = []
+        for rule in normalized:
+            item = dict(rule)
+            item["revision"] = revision
+            persisted.append(item)
+        raw = dict(raw)
+        raw["permission_rules"] = persisted
+        raw["permission_rules_revision"] = revision
+        raw["updated_at"] = time.time()
+        records[project_id] = raw
+        self._write_all(records)
+        return self._record_from_raw(project_id, raw)
+
+    def _record_from_raw(self, project_id: str, raw: dict[str, Any]) -> ProjectRecord:
+        return ProjectRecord(
+            project_id=project_id,
+            name=str(raw.get("name") or project_id),
+            path=str(raw["path"]),
+            created_at=float(raw.get("created_at") or 0),
+            updated_at=float(raw.get("updated_at") or 0),
+            pinned=bool(raw.get("pinned") or False),
+            execution_mode=(str(raw.get("execution_mode")) if raw.get("execution_mode") in {"spawn", "kernel"} else None),
+            permission_rules=self._normalize_permission_rules(raw.get("permission_rules")),
+            permission_rules_revision=int(raw.get("permission_rules_revision") or 0),
+        )
+
+    def get_execution_mode(self, project_id: str | None) -> str | None:
+        if not project_id:
+            return None
+        raw = self._read_all().get(project_id)
+        value = raw.get("execution_mode") if isinstance(raw, dict) else None
+        return str(value) if value in {"spawn", "kernel"} else None
+
+    def set_execution_mode(self, project_id: str, execution_mode: str) -> ProjectRecord:
+        return self.update(project_id, execution_mode=execution_mode)
 
     def remove(self, project_id: str) -> None:
         records = self._read_all()

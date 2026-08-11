@@ -2523,8 +2523,8 @@ def test_runtime_inventory_exposes_effective_execution_backend(tmp_path):
     manager = DeepAgentsAgentManager()
     manager.initialize(tmp_path)
     backend = SimpleNamespace(
-        execution_mode="restricted_host",
-        execution_backend_id="restricted-host-test",
+        execution_mode="spawn",
+        execution_backend_id="spawn-test",
         execution_fallback_reason="docker unavailable",
     )
 
@@ -2537,8 +2537,8 @@ def test_runtime_inventory_exposes_effective_execution_backend(tmp_path):
     )
 
     assert inventory["execution"] == {
-        "mode": "restricted_host",
-        "backend_id": "restricted-host-test",
+        "mode": "spawn",
+        "backend_id": "spawn-test",
         "fallback_reason": "docker unavailable",
         "workspace_path": str(tmp_path),
         "policy": "ToolExecutionPipeline",
@@ -4971,7 +4971,7 @@ def test_deepagents_summarization_uses_agent_only_configured_policy(monkeypatch)
         lambda: {
             "enabled": True,
             "trigger_tokens": 500000,
-            "keep_messages": 20,
+            "keep_tokens": 120000,
             "summary_input_tokens": 400000,
         },
     )
@@ -4984,8 +4984,90 @@ def test_deepagents_summarization_uses_agent_only_configured_policy(monkeypatch)
     assert middleware is not None
     assert middleware.name == "PuddingClawSummarizationMiddleware"
     assert middleware._lc_helper.trigger == ("tokens", 500000)
-    assert middleware._lc_helper.keep == ("messages", 20)
+    assert middleware._lc_helper.keep == ("tokens", 120000)
     assert middleware._lc_helper.trim_tokens_to_summarize == 400000
+
+
+def test_token_retention_compacts_a_single_closed_oversized_tool_turn(monkeypatch):
+    from deepagents.backends import StateBackend
+
+    from graph import deepagents_manager as manager_module
+    from llm.model_client import ModelClientChatModel
+
+    monkeypatch.setattr(
+        manager_module.config,
+        "get_deepagents_summarization_config",
+        lambda: {
+            "enabled": True,
+            "trigger_tokens": 10000,
+            "keep_tokens": 1000,
+            "summary_input_tokens": 20000,
+        },
+    )
+    middleware = manager_module._build_deepagents_summarization(
+        ModelClientChatModel(),
+        StateBackend(),
+    )
+    assert middleware is not None
+    messages = [
+        HumanMessage(content="读取这个文件"),
+        AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "id": "call-large-file",
+                    "name": "read_file",
+                    "args": {"file_path": "/tmp/large.pdf"},
+                }
+            ],
+        ),
+        ToolMessage(
+            content="x" * 20000,
+            tool_call_id="call-large-file",
+            name="read_file",
+        ),
+    ]
+
+    assert middleware._determine_cutoff_index(messages) == len(messages)
+
+
+def test_agent_user_content_requires_pdf_skill_before_external_read(tmp_path):
+    from graph.deepagents_manager import DeepAgentsAgentManager
+
+    workspace_path = tmp_path / "workspace"
+    workspace_path.mkdir()
+    external_pdf = tmp_path / "Downloads" / "spec.pdf"
+    external_pdf.parent.mkdir()
+    external_pdf.write_bytes(b"%PDF-1.7")
+
+    content = DeepAgentsAgentManager._build_user_content(
+        f"{external_pdf} 说了什么",
+        session_id="session-pdf-skill-route",
+        workspace_path=workspace_path,
+    )
+
+    assert isinstance(content, str)
+    assert "[PDF 文件路径]" in content
+    assert "/skills/pdf/SKILL.md" in content
+    assert "禁止 read_file/read_resource/execute 读取原始文件" in content
+    assert "以上非 workspace 本地路径请直接调用 read_file" not in content
+
+
+def test_pdf_attachment_type_hint_routes_without_extension_in_user_text():
+    from graph.deepagents_manager import DeepAgentsAgentManager
+
+    manager = DeepAgentsAgentManager()
+    hints = manager._required_attachment_file_type_hints(
+        [{"id": "att-spec", "name": "产品需求", "type": "pdf"}]
+    )
+    profile = manager._build_preflight_task_profile(
+        objective="看看这个附件\n[服务端可信附件类型] " + ", ".join(hints),
+        analytics_model_id=None,
+        skill_catalog=[{"skill_id": "pdf", "name": "pdf"}],
+    )
+
+    candidate = next(item for item in profile.skill_candidates if item.skill_id == "pdf")
+    assert candidate.required is True
 
 
 def test_deepagents_summarization_uses_dedicated_non_thinking_model(monkeypatch):
@@ -5008,7 +5090,7 @@ def test_deepagents_summarization_uses_dedicated_non_thinking_model(monkeypatch)
             "enabled": True,
             "model_id": "deepseek:deepseek-openai:deepseek-v4-flash:llm",
             "trigger_tokens": 160000,
-            "keep_messages": 20,
+            "keep_tokens": 80000,
             "summary_input_tokens": 800000,
         },
     )
@@ -5284,7 +5366,7 @@ def test_deepagents_manager_uses_backend_execute_instead_of_custom_terminal(tmp_
     assert "terminal" not in by_name
     backend = runtime._build_backend(workspace, session_id="session-1")  # noqa: SLF001
     assert isinstance(backend.default, SandboxBackendProtocol)
-    assert backend.execution_mode == "restricted_host"
+    assert backend.execution_mode == "spawn"
     assert "fetch_url" in by_name
     assert "database_knowledge_query" not in by_name
     assert "database_sql_generate" in by_name

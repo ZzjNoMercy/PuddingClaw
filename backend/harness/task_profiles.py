@@ -108,6 +108,13 @@ INTENT_REGISTRY: dict[str, dict[str, Any]] = {
         "keywords": ["excel", "xlsx", "csv", "tsv", "上险量", "表格分析", "数据分析"],
         "packs": ["core", "analytics"],
     },
+    "pdf_document": {
+        "keywords": [".pdf", " pdf", "pdf文件", "pdf文档"],
+        "patterns": [r"(?:^|[\\/\s])[^\s]+\.pdf(?:$|[\s，,。.!！?？；;])"],
+        "packs": ["core"],
+        "skill_ids": ["pdf"],
+        "required_skill": True,
+    },
     "knowledge_search": {
         "keywords": ["知识库", "白皮书", "文档检索", "pdf", "markdown"],
         "packs": ["core", "web_research"],
@@ -208,6 +215,7 @@ _PRIMARY_PRIORITY = (
     "code",
     "ai_insights",
     "web_research",
+    "pdf_document",
     "knowledge_search",
     "artifact",
 )
@@ -409,6 +417,7 @@ class TaskProfileClassifier:
                 confidence=1.0,
                 evidence=f"确定性任务意图 {intent_id}",
                 explicit=False,
+                required=bool(INTENT_REGISTRY[intent_id].get("required_skill")),
             )
             for intent_id in intents
             for skill_id in INTENT_REGISTRY[intent_id].get("skill_ids", [])
@@ -431,12 +440,32 @@ class TaskProfileClassifier:
                 ),
             ],
         )
-        return cls.with_explicit_skill_requests(
+        resolved = cls.with_explicit_skill_requests(
             profile,
             message=message,
             skill_catalog=skill_catalog or [],
             explicit_skill_hints=explicit_skill_hints,
         )
+        required_skill_ids = {
+            skill_id
+            for intent_id in intents
+            if INTENT_REGISTRY[intent_id].get("required_skill")
+            for skill_id in INTENT_REGISTRY[intent_id].get("skill_ids", [])
+        }
+        selected_skill_ids = {item.skill_id for item in resolved.skill_candidates}
+        missing_required = sorted(required_skill_ids - selected_skill_ids)
+        if missing_required:
+            resolved.execution_route = "missing_skill"
+            resolved.native_fallback = False
+            resolved.reasons = list(
+                dict.fromkeys(
+                    [
+                        *resolved.reasons,
+                        *(f"missing_required_skill:{skill_id}" for skill_id in missing_required),
+                    ]
+                )
+            )
+        return resolved
 
     @staticmethod
     def extract_explicit_skill_requests(
@@ -533,11 +562,13 @@ class TaskProfileClassifier:
                     continue
                 missing.append(requested)
                 continue
+            existing = candidates_by_id.get(skill_id)
             candidates_by_id[skill_id] = SkillCandidate(
                 skill_id=skill_id,
                 confidence=1.0,
                 evidence=f"用户显式提示 {requested}",
                 explicit=True,
+                required=bool(existing.required) if existing is not None else False,
             )
         if list(candidates_by_id.values()) == profile.skill_candidates and not missing:
             return profile

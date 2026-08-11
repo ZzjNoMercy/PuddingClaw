@@ -254,7 +254,7 @@ async def test_manual_compaction_prefers_configured_summary_model(monkeypatch):
         "get_deepagents_summarization_config",
         lambda: {
             "model_id": "deepseek:deepseek-openai:deepseek-v4-flash:llm",
-            "keep_messages": 2,
+            "keep_tokens": 4000,
             "summary_input_tokens": 800000,
         },
     )

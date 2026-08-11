@@ -3303,7 +3303,7 @@ export interface GraphStructure {
 export interface PermissionGrant {
   id: string;
   type: string;
-  scope: "once" | "session" | string;
+  scope: "once" | "session" | "project" | string;
   target_kind: "exact_file" | "all_external_files" | string;
   target: string;
   capabilities: string[];
@@ -3371,6 +3371,44 @@ export interface PermissionRequest {
   options?: string[];
   change_preview?: Record<string, string>;
   status?: string;
+}
+
+export interface KernelFallbackRequest {
+  id: string;
+  request_id?: string;
+  version: number;
+  type: "kernel_fallback" | string;
+  session_id: string;
+  run_id: string;
+  query_id?: string;
+  project_id?: string | null;
+  configured_mode: "kernel";
+  fallback_runner: "spawn";
+  platform?: string;
+  availability_class: "stable" | "transient";
+  reason_code: string;
+  reason: string;
+  probe_fingerprint: string;
+  options?: Array<"switch_project_to_spawn" | "fallback_once" | "reject" | string>;
+  status?: string;
+}
+
+export async function resolveKernelFallbackRequest(
+  sessionId: string,
+  requestId: string,
+  requestVersion: number,
+  action: "switch_project_to_spawn" | "fallback_once" | "reject",
+): Promise<void> {
+  const response = await fetch(
+    `${API_BASE}/sessions/${encodeURIComponent(sessionId)}/kernel-fallback-requests/${encodeURIComponent(requestId)}/resolve`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ request_version: requestVersion, action }),
+    },
+  );
+  const text = await response.text();
+  if (!response.ok) throw new Error(apiErrorMessage(text, `处理 Kernel 回退请求失败：${response.status}`));
 }
 
 export interface DimensionBuildInputCandidate {
@@ -3932,6 +3970,7 @@ export interface ProjectMeta {
   created_at: number;
   updated_at: number;
   pinned?: boolean;
+  execution_mode?: "spawn" | "kernel" | null;
 }
 
 export interface ProjectContextDocument {
@@ -3979,7 +4018,7 @@ export async function openLocalFile(path: string, sessionId: string): Promise<vo
 
 export async function updateProject(
   projectId: string,
-  update: { name?: string; pinned?: boolean }
+  update: { name?: string; pinned?: boolean; execution_mode?: "spawn" | "kernel" }
 ): Promise<ProjectMeta> {
   const resp = await fetch(`${API_BASE}/projects/${encodeURIComponent(projectId)}`, {
     method: "PATCH",
@@ -4051,7 +4090,7 @@ export async function grantExternalFilePermission(
 export async function grantToolActionPermission(
   sessionId: string,
   permissionRequestId: string,
-  scope: "once" | "session",
+  scope: "once" | "session" | "project",
 ): Promise<PermissionGrant> {
   const resp = await fetch(
     `${API_BASE}/sessions/${encodeURIComponent(sessionId)}/permissions/tool-actions`,

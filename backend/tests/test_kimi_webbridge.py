@@ -315,11 +315,11 @@ def test_browser_snapshot_ref_alias_is_canonicalized_before_policy_and_authoriza
     assert command.args == {"selector": "@e1", "value": "codex重置"}
 
     context = RunPermissionContext.from_config_snapshot(
-        {"permissions": {"approval_mode": "full_access", "policy_epoch": 1}}
+        {"permissions": {"approval_mode": "smart", "policy_epoch": 1}}
     )
     pipeline = ToolExecutionPipeline(
         known_tools={"browser"},
-        backend_mode="restricted_host",
+        backend_mode="spawn",
         permission_context=context,
     )
     for call_id, action, args in (
@@ -623,11 +623,11 @@ def test_close_tab_dispatches_only_after_unambiguous_live_preflight(tmp_path):
 
 def test_harness_uses_browser_preflight_and_hard_denies_daemon_shell_bypass():
     context = RunPermissionContext.from_config_snapshot(
-        {"permissions": {"approval_mode": "full_access", "policy_epoch": 1}}
+        {"permissions": {"approval_mode": "smart", "policy_epoch": 1}}
     )
     pipeline = ToolExecutionPipeline(
         known_tools={"browser", "execute"},
-        backend_mode="restricted_host",
+        backend_mode="spawn",
         permission_context=context,
     )
     request = ToolCallRequest(
@@ -823,11 +823,11 @@ def test_adapter_textarea_workaround_protocol_failures_are_outcome_unknown():
 
 def test_browser_policy_requires_human_confirmation_for_interactions_and_active_tab():
     context = RunPermissionContext.from_config_snapshot(
-        {"permissions": {"approval_mode": "full_access", "policy_epoch": 1}}
+        {"permissions": {"approval_mode": "smart", "policy_epoch": 1}}
     )
     pipeline = ToolExecutionPipeline(
         known_tools={"browser"},
-        backend_mode="restricted_host",
+        backend_mode="spawn",
         permission_context=context,
     )
     for call_id, action, args in (
@@ -850,7 +850,7 @@ def test_smart_mode_auto_authorizes_click_and_fill_but_not_other_browser_gates()
     )
     pipeline = ToolExecutionPipeline(
         known_tools={"browser"},
-        backend_mode="restricted_host",
+        backend_mode="spawn",
         permission_context=context,
     )
     for call_id, action, args in (
@@ -2343,11 +2343,11 @@ def test_service_rejects_side_effect_without_harness_authorization(tmp_path):
 
 def test_shell_bypass_variants_are_denied():
     context = RunPermissionContext.from_config_snapshot(
-        {"permissions": {"approval_mode": "full_access", "policy_epoch": 1}}
+        {"permissions": {"approval_mode": "smart", "policy_epoch": 1}}
     )
     pipeline = ToolExecutionPipeline(
         known_tools={"execute"},
-        backend_mode="restricted_host",
+        backend_mode="spawn",
         permission_context=context,
     )
     commands = (

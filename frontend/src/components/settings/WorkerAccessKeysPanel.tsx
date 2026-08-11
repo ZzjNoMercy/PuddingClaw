@@ -213,9 +213,9 @@ export default function WorkerAccessKeysPanel() {
             />
             <select value={profile} onChange={(event) => setProfile(event.target.value)} className="form-input">
               <option value="smart">SMART</option>
-              <option value="workspace">FULL_ACCESS · workspace</option>
-              <option value="workspace_network">FULL_ACCESS · workspace + network</option>
-              <option value="workspace_package_install">FULL_ACCESS · workspace + package</option>
+              <option value="workspace">workspace</option>
+              <option value="workspace_network">workspace + network</option>
+              <option value="workspace_package_install">workspace + package</option>
             </select>
             <button type="button" onClick={create} disabled={busy} className="inline-flex items-center justify-center gap-2 rounded-xl bg-[#002fa7] px-4 py-2 text-xs font-medium text-white hover:bg-[#001f7a] disabled:opacity-50">
               {busy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <KeyRound className="h-3.5 w-3.5" />}

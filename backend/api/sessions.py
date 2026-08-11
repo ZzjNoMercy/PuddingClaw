@@ -47,7 +47,7 @@ class SessionCreateRequest(BaseModel):
     llm_model_id: str | None = None
     thinking_level: Literal["low", "high", "max"] | None = None
     credential_name: str | None = None
-    approval_mode: Literal["strict", "smart"] = "strict"
+    approval_mode: Literal["strict", "smart"] = "smart"
     runtime_mode: Literal["chat", "agent"] = "agent"
     project_id: str | None = None
 

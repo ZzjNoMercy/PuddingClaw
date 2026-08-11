@@ -585,7 +585,7 @@ def test_skill_management_policy_requires_network_then_one_time_managed_write(tm
     plan = service.prepare(action="install", source="https://example.com/demo/")
     pipeline = ToolExecutionPipeline(
         known_tools={"prepare_skill_install", "install_skill"},
-        backend_mode="restricted_host",
+        backend_mode="spawn",
         base_dir=tmp_path,
     )
     prepare = ToolCallRequest(

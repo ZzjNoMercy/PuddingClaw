@@ -163,14 +163,14 @@ export interface CompressionSettings {
       enabled?: boolean;
       model_id?: string;
       trigger_tokens?: number;
-      keep_messages?: number;
+      keep_tokens?: number;
     };
     tool_context?: {
       enabled?: boolean;
       immediate_compaction_enabled?: boolean;
       single_tool_trigger_tokens?: number;
       background_min_result_tokens?: number;
-      keep_recent_tool_results?: number;
+      retain_tool_context_tokens?: number;
     };
   };
 }
@@ -213,41 +213,11 @@ export interface HarnessSettings {
     max_rounds?: number;
   };
   terminal?: {
-    sandbox_mode?: "auto" | "kernel" | "docker";
-    docker_enabled?: boolean;
-    on_unavailable?: "fallback" | "deny";
+    execution_mode?: "spawn" | "kernel";
     default_timeout_seconds?: number;
-    docker?: {
-      connection?: string;
-      context?: string;
-      image?: string;
-      cpu_limit?: string;
-      memory_limit_mb?: number;
-      pids_limit?: number;
-      network_enabled?: boolean;
-      dependency_setup_enabled?: boolean;
-      dependency_setup_opt_in_version?: number;
-      lifecycle?: "project";
-      idle_stop_minutes?: number;
-    };
   };
 }
 
-export async function probeHarnessDocker(input: {
-  connection?: string;
-  context?: string;
-}): Promise<{ available: boolean; detail: string }> {
-  const resp = await fetch(`${API_BASE}/settings/harness/docker/probe`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      connection: input.connection || "",
-      context: input.context || "",
-    }),
-  });
-  if (!resp.ok) throw new Error(`Failed to probe Docker: ${resp.status}`);
-  return resp.json();
-}
 
 export interface SubAgentItem {
   enabled: boolean;

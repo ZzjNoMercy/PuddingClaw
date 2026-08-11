@@ -6,6 +6,7 @@ import hashlib
 import json
 from collections.abc import Mapping
 from dataclasses import dataclass
+from fnmatch import fnmatchcase
 from enum import StrEnum
 from typing import Any
 
@@ -15,15 +16,188 @@ class ApprovalMode(StrEnum):
 
     STRICT = "strict"
     SMART = "smart"
-    FULL_ACCESS = "full_access"
 
 
-DEFAULT_APPROVAL_MODE = ApprovalMode.STRICT
+DEFAULT_APPROVAL_MODE = ApprovalMode.SMART
 PERMISSION_POLICY_VERSION = "tool-execution-v4"
 PERMISSION_BINDING_SCHEMA_VERSION = 2
 SHELL_PERMISSION_BINDING_SCHEMA_VERSION = 3
-SHELL_ISOLATION_POLICY_ID = "kernel-docker-shared-v1"
+SHELL_ISOLATION_POLICY_ID = "spawn-kernel-shared-v1"
 SHELL_PROFILE_SCHEMA = "sandbox-grant-profile-v1"
+
+
+class PermissionRuleDecision(StrEnum):
+    """User-configurable outcome for a matching effect pattern."""
+
+    ALLOW = "allow"
+    ASK = "ask"
+    DENY = "deny"
+
+
+class PermissionRuleError(ValueError):
+    """Raised when a persisted permission rule is malformed."""
+
+
+@dataclass(frozen=True)
+class PermissionRule:
+    """Typed allow/ask/deny rule shared by config and project policy."""
+
+    tool: str
+    pattern: str
+    decision: PermissionRuleDecision
+    scope: str = "session"
+    constraints: tuple[tuple[str, Any], ...] = ()
+    source: str = "session"
+    revision: int = 0
+
+    @classmethod
+    def from_mapping(
+        cls,
+        value: Mapping[str, Any],
+        *,
+        source: str = "session",
+    ) -> "PermissionRule":
+        if not isinstance(value, Mapping):
+            raise PermissionRuleError("permission rule must be an object")
+        tool = str(value.get("tool") or "*").strip().lower()
+        pattern = str(value.get("pattern") or "*").strip()
+        raw_decision = str(value.get("decision") or "").strip().lower()
+        scope = str(value.get("scope") or "session").strip().lower()
+        if not tool or not pattern:
+            raise PermissionRuleError("permission rule tool and pattern are required")
+        try:
+            decision = PermissionRuleDecision(raw_decision)
+        except ValueError as exc:
+            raise PermissionRuleError(
+                f"unsupported permission rule decision: {raw_decision!r}"
+            ) from exc
+        if decision is PermissionRuleDecision.ALLOW and _is_unbounded_interpreter_pattern(tool, pattern):
+            raise PermissionRuleError(
+                "allow rules may not persist arbitrary interpreter or shell-wrapper patterns"
+            )
+        if scope not in {"global", "project", "session"}:
+            raise PermissionRuleError(f"unsupported permission rule scope: {scope!r}")
+        constraints = value.get("constraints") or {}
+        if not isinstance(constraints, Mapping):
+            raise PermissionRuleError("permission rule constraints must be an object")
+        normalized_constraints = tuple(
+            sorted((str(key), _normalize_rule_constraint(key, item)) for key, item in constraints.items())
+        )
+        revision = value.get("revision", 0)
+        if isinstance(revision, bool) or not isinstance(revision, int) or revision < 0:
+            raise PermissionRuleError("permission rule revision must be a non-negative integer")
+        return cls(
+            tool=tool,
+            pattern=pattern,
+            decision=decision,
+            scope=scope,
+            constraints=normalized_constraints,
+            source=str(value.get("source") or source),
+            revision=revision,
+        )
+
+    def matches(self, *, tool: str, pattern: str) -> bool:
+        return fnmatchcase(tool.lower(), self.tool) and fnmatchcase(pattern, self.pattern)
+
+    def constraint_map(self) -> dict[str, Any]:
+        return dict(self.constraints)
+
+    def allows_effects(self, effects: Mapping[str, Any]) -> bool:
+        constraints = self.constraint_map()
+        if bool(effects.get("network")) and constraints.get("network", False) is not True:
+            return False
+        if bool(effects.get("credentials")) and constraints.get("credentials", False) is not True:
+            return False
+        if bool(effects.get("destructive")) and constraints.get("destructive", False) is not True:
+            return False
+        if bool(effects.get("package_install")) and constraints.get("package_install", False) is not True:
+            return False
+        write_scope = constraints.get("write_scope")
+        actual_scope = str(effects.get("write_scope") or "none")
+        if actual_scope != "none" and write_scope is None:
+            return False
+        if write_scope == "workspace_or_scratch" and actual_scope not in {"none", "workspace", "scratch"}:
+            return False
+        if write_scope == "none" and actual_scope != "none":
+            return False
+        if write_scope == "external" and actual_scope != "external":
+            return False
+        return True
+
+
+def _normalize_rule_constraint(key: Any, value: Any) -> Any:
+    key = str(key)
+    if key in {"network", "credentials", "destructive", "package_install"}:
+        if not isinstance(value, bool):
+            raise PermissionRuleError(f"permission rule constraint {key!r} must be boolean")
+        return value
+    if key == "write_scope":
+        normalized = str(value).strip().lower()
+        if normalized not in {"none", "workspace_or_scratch", "external"}:
+            raise PermissionRuleError(f"unsupported write_scope constraint: {normalized!r}")
+        return normalized
+    raise PermissionRuleError(f"unsupported permission rule constraint: {key!r}")
+
+
+def _is_unbounded_interpreter_pattern(tool: str, pattern: str) -> bool:
+    if tool not in {"execute", "*"}:
+        return False
+    tokens = pattern.split()
+    if not tokens:
+        return False
+    executable = tokens[0].rsplit("/", 1)[-1].lower()
+    if executable not in {"python", "python3", "node", "ruby", "perl", "php", "sh", "bash", "zsh"}:
+        return False
+    # Until command-pattern identity includes script digest/runtime binding,
+    # no interpreter allow rule is safely reusable. Smart mode can still
+    # auto-approve a deterministically safe invocation, while an explicit
+    # approval remains one-time.
+    return True
+
+
+def compile_permission_rules(
+    raw_rules: Any,
+    *,
+    source: str = "session",
+) -> tuple[PermissionRule, ...]:
+    """Validate and freeze persisted rules; malformed policy fails closed."""
+
+    if raw_rules in (None, []):
+        return ()
+    if not isinstance(raw_rules, (list, tuple)):
+        raise PermissionRuleError("permissions.rules must be an array")
+    return tuple(
+        PermissionRule.from_mapping(rule, source=source)
+        for rule in raw_rules
+    )
+
+
+def evaluate_permission_rules(
+    rules: tuple[PermissionRule, ...],
+    *,
+    tool: str,
+    pattern: str,
+    effects: Mapping[str, Any],
+) -> PermissionRuleDecision | None:
+    """Evaluate rules with hard deny and risk constraints before allow."""
+
+    matching = [rule for rule in rules if rule.matches(tool=tool, pattern=pattern)]
+    if not matching:
+        return None
+    deny = [rule for rule in matching if rule.decision == PermissionRuleDecision.DENY]
+    if deny:
+        return PermissionRuleDecision.DENY
+    ask = [rule for rule in matching if rule.decision == PermissionRuleDecision.ASK]
+    if ask:
+        return PermissionRuleDecision.ASK
+    allow = [
+        rule
+        for rule in matching
+        if rule.decision == PermissionRuleDecision.ALLOW and rule.allows_effects(effects)
+    ]
+    if allow:
+        return PermissionRuleDecision.ALLOW
+    return None
 
 
 @dataclass(frozen=True)
@@ -53,6 +227,7 @@ class PermissionBindingPolicy:
         "backend_mode",
         "policy_epoch",
         "policy_version",
+        "permission_rules_revision",
         "workspace_id",
     )
 
@@ -145,6 +320,7 @@ class PermissionBindingPolicy:
             "approval_mode",
             "policy_epoch",
             "policy_version",
+            "permission_rules_revision",
             "workspace_id",
             "isolation_policy_id",
             "profile_schema",
@@ -206,10 +382,31 @@ def permission_policy_snapshot(
     epoch = payload.get("policy_epoch", 1)
     if not isinstance(epoch, int) or isinstance(epoch, bool) or epoch < 1:
         epoch = 1
+    compiled_rules = compile_permission_rules(payload.get("rules"))
+    declared_rules_revision = payload.get("rules_revision", 0)
+    if isinstance(declared_rules_revision, bool) or not isinstance(declared_rules_revision, int):
+        declared_rules_revision = 0
+    rules_revision = max(
+        declared_rules_revision,
+        max((rule.revision for rule in compiled_rules), default=0),
+    )
     return {
         "approval_mode": normalize_approval_mode(payload.get("approval_mode")).value,
         "policy_epoch": epoch,
         "policy_version": PERMISSION_POLICY_VERSION,
+        "permission_rules_revision": rules_revision,
+        "rules": [
+            {
+                "tool": rule.tool,
+                "pattern": rule.pattern,
+                "decision": rule.decision.value,
+                "scope": rule.scope,
+                "constraints": rule.constraint_map(),
+                "source": rule.source,
+                "revision": rule.revision,
+            }
+            for rule in compiled_rules
+        ],
     }
 
 
@@ -223,6 +420,8 @@ class RunPermissionContext:
     backend_mode: str
     backend_id: str
     workspace_id: str
+    rules: tuple[PermissionRule, ...] = ()
+    permission_rules_revision: int = 0
 
     @classmethod
     def from_config_snapshot(
@@ -241,20 +440,16 @@ class RunPermissionContext:
             # A Run snapshot is historical authority. Preserve the version it
             # actually started with instead of upgrading it during restore.
             policy_version=str(frozen_permissions.get("policy_version") or current_permissions["policy_version"]),
-            backend_mode=str(execution.get("backend_mode") or "restricted_host"),
+            backend_mode=str(execution.get("backend_mode") or "spawn"),
             backend_id=str(execution.get("backend_id") or ""),
             workspace_id=str(execution.get("workspace_id") or ""),
+            rules=compile_permission_rules(frozen_permissions.get("rules")),
+            permission_rules_revision=int(current_permissions.get("permission_rules_revision") or 0),
         )
 
     @property
     def smart(self) -> bool:
         return self.approval_mode == ApprovalMode.SMART
-
-    @property
-    def full_access(self) -> bool:
-        """Whether the caller requested the separately-scoped trusted mode."""
-
-        return self.approval_mode == ApprovalMode.FULL_ACCESS
 
     def grant_bindings(self) -> dict[str, Any]:
         return {
@@ -264,6 +459,7 @@ class RunPermissionContext:
             "backend_mode": self.backend_mode,
             "backend_id": self.backend_id,
             "workspace_id": self.workspace_id,
+            "permission_rules_revision": self.permission_rules_revision,
         }
 
     def shell_grant_bindings(self) -> dict[str, Any]:
@@ -273,6 +469,7 @@ class RunPermissionContext:
             "approval_mode": self.approval_mode.value,
             "policy_epoch": self.policy_epoch,
             "policy_version": self.policy_version,
+            "permission_rules_revision": self.permission_rules_revision,
             "workspace_id": self.workspace_id,
             "isolation_policy_id": SHELL_ISOLATION_POLICY_ID,
             "profile_schema": SHELL_PROFILE_SCHEMA,

@@ -121,6 +121,18 @@ _ARGUMENT_DEPENDENT_PERMISSION_TOOLS = frozenset(
     }
 )
 
+_SPAWN_HOST_READ_TOOLS = frozenset(
+    {
+        "ls",
+        "read_file",
+        "glob",
+        "grep",
+        "inspect_file_version",
+    }
+)
+
+_RUNTIME_EFFECT_PERMISSION_TOOLS = frozenset({"execute", "execute_external_directory"})
+
 
 def _merge_skill_ids(current: list[str], update: list[str]) -> list[str]:
     return sorted({str(item) for item in [*current, *update] if str(item)})
@@ -1416,7 +1428,9 @@ class ToolsetMiddleware(AgentMiddleware):
         permission_section = (
             "\n\n## Current Permission Manifest (authoritative)\n\n"
             "This describes authorization for the current Run only. Historical grants and Evidence "
-            "do not grant permission; the Tool Gate makes the final per-call decision.\n\n"
+            "do not grant permission; the Tool Gate makes the final per-call decision. "
+            "runtime_evaluated tools are not predeclared HITL: low-risk effects execute directly, "
+            "while material effects are decided from the concrete arguments.\n\n"
             f"```json\n{json.dumps(permission_model_payload, ensure_ascii=False, sort_keys=True)}\n```"
         )
         cached_skill_instructions = self._cached_skill_instruction_section(request)
@@ -1500,14 +1514,25 @@ class ToolsetMiddleware(AgentMiddleware):
             if isinstance(config_snapshot, dict) and isinstance(config_snapshot.get("permissions"), dict)
             else {}
         )
-        approval_mode = str(permissions.get("approval_mode") or "strict")
-        if approval_mode not in {"strict", "smart", "full_access"}:
-            approval_mode = "strict"
+        approval_mode = str(permissions.get("approval_mode") or "smart")
+        if approval_mode not in {"strict", "smart"}:
+            approval_mode = "smart"
+        execution = (
+            config_snapshot.get("execution")
+            if isinstance(config_snapshot, dict) and isinstance(config_snapshot.get("execution"), dict)
+            else {}
+        )
+        backend_mode = str(execution.get("backend_mode") or "")
+        spawn_host_reads = backend_mode == "spawn"
+        smart_local_reads = (
+            approval_mode == "smart" and backend_mode in {"spawn", "kernel"}
+        )
         active_tool_names = self._allowed_tool_names(
             request.state,
             policy_epoch=self._context_policy_epoch(session_id),
         )
         allowed: list[dict[str, Any]] = []
+        runtime_evaluated: list[dict[str, Any]] = []
         hitl_required: list[dict[str, Any]] = []
         for tool in visible_tools:
             name = self._tool_name(tool)
@@ -1518,14 +1543,40 @@ class ToolsetMiddleware(AgentMiddleware):
             if name not in active_tool_names:
                 continue
             descriptor = tool_control_descriptor(name)
-            if name in _ARGUMENT_DEPENDENT_PERMISSION_TOOLS:
-                hitl_required.append(
+            if name in _RUNTIME_EFFECT_PERMISSION_TOOLS:
+                runtime_evaluated.append(
                     {
                         "tool": name,
-                        "approval_scope": "argument_dependent",
-                        "reason": "workspace_paths_are_allowed_but_external_paths_require_realtime_gate",
+                        "approval_scope": "effect_dependent",
+                        "reason": "low_risk_effects_auto_allow_and_only_material_effects_require_hitl",
                     }
                 )
+            elif name in _ARGUMENT_DEPENDENT_PERMISSION_TOOLS:
+                if smart_local_reads and name in _SPAWN_HOST_READ_TOOLS:
+                    runtime_evaluated.append(
+                        {
+                            "tool": name,
+                            "approval_scope": "path_dependent",
+                            "reason": (
+                                "ordinary_local_reads_auto_allow_while_sensitive_or_expansive_reads_use_the_gate"
+                            ),
+                        }
+                    )
+                elif spawn_host_reads and name in _SPAWN_HOST_READ_TOOLS:
+                    allowed.append(
+                        {
+                            "tool": name,
+                            "reason": "spawn_host_reads_allowed_without_hitl",
+                        }
+                    )
+                else:
+                    hitl_required.append(
+                        {
+                            "tool": name,
+                            "approval_scope": "argument_dependent",
+                            "reason": "workspace_paths_are_allowed_but_external_paths_require_realtime_gate",
+                        }
+                    )
             elif name in self.mcp_tool_names and descriptor is None:
                 hitl_required.append(
                     {
@@ -1571,6 +1622,15 @@ class ToolsetMiddleware(AgentMiddleware):
                 default=str,
             ),
         )
+        runtime_evaluated = sorted(
+            runtime_evaluated,
+            key=lambda item: json.dumps(
+                item,
+                ensure_ascii=False,
+                sort_keys=True,
+                default=str,
+            ),
+        )
         hitl_required = sorted(
             hitl_required,
             key=lambda item: json.dumps(
@@ -1583,6 +1643,7 @@ class ToolsetMiddleware(AgentMiddleware):
         boundary = {
             "approval_mode": approval_mode,
             "allowed": allowed,
+            "runtime_evaluated": runtime_evaluated,
             "hitl_required": hitl_required,
             "blocked": [],
             "policy_epoch": int(permissions.get("policy_epoch") or 1),

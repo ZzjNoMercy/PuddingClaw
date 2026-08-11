@@ -115,7 +115,8 @@ class AgentContextCompactionService:
     ) -> tuple[str, str, list[Any], list[Any]]:
         cfg = config.get_deepagents_summarization_config()
         configured_model_id = str(cfg.get("model_id") or "").strip()
-        keep_messages = max(1, int(cfg.get("keep_messages", 20)))
+        trigger_tokens = max(1, int(cfg.get("trigger_tokens", 160000)))
+        keep_tokens = max(1, int(cfg.get("keep_tokens", trigger_tokens // 2)))
         model = ModelClientChatModel(
             role="summary",
             streaming=False,
@@ -131,7 +132,7 @@ class AgentContextCompactionService:
             model=model,
             backend=StateBackend(),
             trigger=None,
-            keep=("messages", keep_messages),
+            keep=("tokens", min(keep_tokens, trigger_tokens - 1) if trigger_tokens > 1 else 1),
             trim_tokens_to_summarize=max(1, int(cfg.get("summary_input_tokens", 800000))),
             truncate_args_settings=None,
             summary_prompt=self._summary_prompt(focus),
@@ -141,8 +142,8 @@ class AgentContextCompactionService:
             raise AgentContextCompactionError(
                 "nothing_to_compact",
                 (
-                    "Not enough closed Agent history to compact while keeping "
-                    f"the latest {keep_messages} messages"
+                    "No closed Agent history can be compacted within the configured "
+                    f"{keep_tokens}-token retention budget"
                 ),
                 status_code=400,
             )

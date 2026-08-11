@@ -1115,7 +1115,7 @@ def test_scratch_write_is_temporary_and_cannot_satisfy_artifact_delivery(tmp_pat
         "session-scratch",
         run.run_id,
         {
-            "backend_mode": "restricted_host",
+            "backend_mode": "spawn",
             "backend_id": "host:test",
             "workspace_id": "workspace:test",
             "scratch_host_path": str(scratch),

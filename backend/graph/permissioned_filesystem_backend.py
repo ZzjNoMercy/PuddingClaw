@@ -1029,7 +1029,10 @@ class PermissionedCompositeBackend(CompositeBackend):
     ) -> dict[str, Any]:
         """Run one command against a read-only root or isolated writable draft."""
 
-        if self.host_file_broker is None:
+        execution_backend = getattr(self, "execution_backend", None)
+        effective_backend_mode = str(getattr(execution_backend, "mode", "") or "")
+        spawn_read_only = mode == "read_only" and effective_backend_mode == "spawn"
+        if self.host_file_broker is None and not spawn_read_only:
             return {
                 "status": "permission_required",
                 "error": "permission_required: no active HostFileBroker Run",
@@ -1059,9 +1062,12 @@ class PermissionedCompositeBackend(CompositeBackend):
                 ),
                 "next_action": "use_copy_replace_or_enable_feature_flag",
             }
-        if not directory.is_dir() or not self.host_file_broker.authorize(
-            directory,
-            access=access,
+        if not directory.is_dir() or (
+            not spawn_read_only
+            and (
+                self.host_file_broker is None
+                or not self.host_file_broker.authorize(directory, access=access)
+            )
         ):
             return {
                 "status": "permission_required",
@@ -1070,12 +1076,11 @@ class PermissionedCompositeBackend(CompositeBackend):
                     "file permission never grants a shell mount"
                 ),
             }
-        execution_backend = getattr(self, "execution_backend", None)
         execute = getattr(execution_backend, "execute_external_directory", None)
         if not callable(execute):
             return {
                 "status": "io_error",
-                "error": "io_error: external directory commands require the Docker backend",
+                "error": "io_error: external directory commands require a kernel or Docker execution backend",
             }
         execution_directory = directory
         lease: dict[str, Any] | None = None
@@ -1420,15 +1425,29 @@ class PermissionedCompositeBackend(CompositeBackend):
                 in_workspace = True
             except ValueError:
                 pass
-        if in_workspace and relative is not None:
-            execution_backend = getattr(self, "execution_backend", None)
+        execution_backend = getattr(self, "execution_backend", None)
+        run_typed_validator = getattr(execution_backend, "run_html_report_e2e", None)
+        if callable(run_typed_validator) and in_workspace:
+            response = run_typed_validator(canonical, timeout=timeout)
+            exit_code = getattr(response, "exit_code", None)
+            response_payload = {
+                "status": "completed" if exit_code == 0 else "io_error",
+                "workspace_path": str(workspace) if in_workspace else None,
+                "directory_path": None if in_workspace else str(canonical.parent),
+                "read_only": True,
+                "ephemeral": not in_workspace,
+                "exit_code": exit_code,
+                "output": str(getattr(response, "output", "") or ""),
+                "truncated": bool(getattr(response, "truncated", False)),
+            }
+        elif in_workspace and relative is not None:
             execute = getattr(execution_backend, "execute", None)
             if not callable(execute):
                 response_payload = {
                     "status": "infrastructure_error",
                     "error_code": "html_validator_backend_unavailable",
                     "failure_class": "infrastructure_failure",
-                    "error": "HTML browser validation requires the Docker backend",
+                    "error": "HTML browser validation requires a sandbox execution backend",
                 }
             else:
                 response = execute(
@@ -1602,6 +1621,48 @@ class PermissionedCompositeBackend(CompositeBackend):
             return None
         return FilesystemBackend(root_dir=resolved.parent, virtual_mode=True), f"/{resolved.name}"
 
+    def _spawn_external_read_target(
+        self,
+        file_path: str | None,
+    ) -> tuple[FilesystemBackend, str, Path] | None:
+        """Resolve an ordinary host read in Spawn mode without inventing a grant.
+
+        Spawn deliberately has the desktop user's host filesystem authority.
+        This helper only opens existing canonical paths and is never used for
+        writes, deletes, Kernel execution, or an unknown execution mode.
+        """
+
+        if str(getattr(self, "execution_mode", "")) != "spawn" or not file_path:
+            return None
+        classified = self._classify_path(file_path)
+        if classified.authority is not PathAuthority.EXTERNAL:
+            return None
+        requested = Path(file_path).expanduser()
+        if not requested.is_absolute():
+            return None
+        try:
+            resolved = requested.resolve(strict=True)
+        except (OSError, ValueError):
+            return None
+        authority_root = resolved if resolved.is_dir() else resolved.parent
+        backend_path = "/" if resolved.is_dir() else f"/{resolved.name}"
+        return (
+            FilesystemBackend(root_dir=authority_root, virtual_mode=True),
+            backend_path,
+            authority_root,
+        )
+
+    @staticmethod
+    def _restore_spawn_host_paths(result: Any, root: Path) -> Any:
+        items = getattr(result, "entries", None)
+        if items is None:
+            items = getattr(result, "matches", None)
+        if isinstance(items, list):
+            for item in items:
+                if isinstance(item, dict) and item.get("path"):
+                    item["path"] = str(root / str(item["path"]).lstrip("/"))
+        return result
+
     @staticmethod
     def _restore_external_path(result: Any, resolved: str):
         if result.path is not None:
@@ -1631,6 +1692,10 @@ class PermissionedCompositeBackend(CompositeBackend):
     def read(self, file_path: str, offset: int = 0, limit: int = 2000):
         if self._mounted_backend_path(file_path):
             return super().read(file_path, offset=offset, limit=limit)
+        spawn_target = self._spawn_external_read_target(file_path)
+        if spawn_target is not None:
+            backend, backend_path, _root = spawn_target
+            return backend.read(backend_path, offset=offset, limit=limit)
         if self.host_file_broker is not None:
             broker_result = self.host_file_broker.read(
                 file_path,
@@ -1652,6 +1717,10 @@ class PermissionedCompositeBackend(CompositeBackend):
     async def aread(self, file_path: str, offset: int = 0, limit: int = 2000):
         if self._mounted_backend_path(file_path):
             return await super().aread(file_path, offset=offset, limit=limit)
+        spawn_target = self._spawn_external_read_target(file_path)
+        if spawn_target is not None:
+            backend, backend_path, _root = spawn_target
+            return await backend.aread(backend_path, offset=offset, limit=limit)
         if self.host_file_broker is not None:
             broker_result = await asyncio.to_thread(
                 self.host_file_broker.read,
@@ -1761,6 +1830,10 @@ class PermissionedCompositeBackend(CompositeBackend):
     def ls(self, path: str):
         if self._mounted_backend_path(path):
             return super().ls(path)
+        spawn_target = self._spawn_external_read_target(path)
+        if spawn_target is not None:
+            backend, backend_path, root = spawn_target
+            return self._restore_spawn_host_paths(backend.ls(backend_path), root)
         if self.host_file_broker is not None:
             result = self.host_file_broker.ls(path)
             if result is not None:
@@ -1772,6 +1845,11 @@ class PermissionedCompositeBackend(CompositeBackend):
     async def als(self, path: str):
         if self._mounted_backend_path(path):
             return await super().als(path)
+        spawn_target = self._spawn_external_read_target(path)
+        if spawn_target is not None:
+            backend, backend_path, root = spawn_target
+            result = await backend.als(backend_path)
+            return self._restore_spawn_host_paths(result, root)
         if self.host_file_broker is not None:
             result = await asyncio.to_thread(self.host_file_broker.ls, path)
             if result is not None:
@@ -1783,6 +1861,11 @@ class PermissionedCompositeBackend(CompositeBackend):
     def glob(self, pattern: str, path: str | None = None):
         if self._mounted_backend_path(path):
             return super().glob(pattern, path=path)
+        spawn_target = self._spawn_external_read_target(path)
+        if spawn_target is not None:
+            backend, backend_path, root = spawn_target
+            result = backend.glob(pattern, path=backend_path)
+            return self._restore_spawn_host_paths(result, root)
         if self.host_file_broker is not None:
             result = self.host_file_broker.glob(pattern, path=path)
             if result is not None:
@@ -1794,6 +1877,11 @@ class PermissionedCompositeBackend(CompositeBackend):
     async def aglob(self, pattern: str, path: str | None = None):
         if self._mounted_backend_path(path):
             return await super().aglob(pattern, path=path)
+        spawn_target = self._spawn_external_read_target(path)
+        if spawn_target is not None:
+            backend, backend_path, root = spawn_target
+            result = await backend.aglob(pattern, path=backend_path)
+            return self._restore_spawn_host_paths(result, root)
         if self.host_file_broker is not None:
             result = await asyncio.to_thread(
                 self.host_file_broker.glob,
@@ -1809,6 +1897,11 @@ class PermissionedCompositeBackend(CompositeBackend):
     def grep(self, pattern: str, path: str | None = None, glob: str | None = None):
         if self._mounted_backend_path(path):
             return super().grep(pattern, path=path, glob=glob)
+        spawn_target = self._spawn_external_read_target(path)
+        if spawn_target is not None:
+            backend, backend_path, root = spawn_target
+            result = backend.grep(pattern, path=backend_path, glob=glob)
+            return self._restore_spawn_host_paths(result, root)
         if self.host_file_broker is not None:
             result = self.host_file_broker.grep(pattern, path=path, glob=glob)
             if result is not None:
@@ -1820,6 +1913,11 @@ class PermissionedCompositeBackend(CompositeBackend):
     async def agrep(self, pattern: str, path: str | None = None, glob: str | None = None):
         if self._mounted_backend_path(path):
             return await super().agrep(pattern, path=path, glob=glob)
+        spawn_target = self._spawn_external_read_target(path)
+        if spawn_target is not None:
+            backend, backend_path, root = spawn_target
+            result = await backend.agrep(pattern, path=backend_path, glob=glob)
+            return self._restore_spawn_host_paths(result, root)
         if self.host_file_broker is not None:
             result = await asyncio.to_thread(
                 self.host_file_broker.grep,

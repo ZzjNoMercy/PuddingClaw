@@ -5,6 +5,7 @@ from __future__ import annotations
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
@@ -24,10 +25,15 @@ class RegisterProjectRequest(BaseModel):
 class UpdateProjectRequest(BaseModel):
     name: str | None = None
     pinned: bool | None = None
+    execution_mode: str | None = None
 
 
 class UpdateProjectContextRequest(BaseModel):
     content: str
+
+
+class UpdateProjectPermissionRulesRequest(BaseModel):
+    rules: list[dict[str, Any]]
 
 
 class OpenLocalFileRequest(BaseModel):
@@ -57,13 +63,34 @@ async def register_project(request: RegisterProjectRequest):
 @router.patch("/projects/{project_id}")
 async def update_project(project_id: str, request: UpdateProjectRequest):
     try:
-        project = project_registry.update(project_id, name=request.name, pinned=request.pinned)
+        project = project_registry.update(
+            project_id,
+            name=request.name,
+            pinned=request.pinned,
+            execution_mode=request.execution_mode,
+        )
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return project.to_dict()
+
+
+@router.put("/projects/{project_id}/permissions/rules")
+async def update_project_permission_rules(
+    project_id: str,
+    request: UpdateProjectPermissionRulesRequest,
+):
+    """Replace the Project Registry rule set and invalidate old Run grants."""
+
+    try:
+        project = project_registry.set_permission_rules(project_id, request.rules)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     return project.to_dict()
 
 

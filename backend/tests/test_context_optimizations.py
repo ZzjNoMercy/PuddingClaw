@@ -71,7 +71,7 @@ class TestContextEngineeringConfig:
         assert agent_summary["model_id"] == ""
         assert agent_summary["trigger_tokens"] == 160000
         assert "summary_input_tokens" not in agent_summary
-        assert agent_summary["keep_messages"] == 20
+        assert agent_summary["keep_tokens"] == 64000
         # Legacy Chat keeps its existing two-stage policy.
         assert chat_middleware["summarization"]["trigger_tokens"] == 200000
         assert chat_middleware["compaction"]["trigger_tokens"] == 500000

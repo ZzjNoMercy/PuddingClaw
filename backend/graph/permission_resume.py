@@ -411,7 +411,7 @@ class PermissionResumeRegistry:
             "capabilities": list(required_capabilities or ["execute"]),
             "status": "pending",
             "created_at": time.time(),
-            "options": ["once", "session"] if session_target_kind and session_target else ["once"],
+            "options": ["once", "session", "project"] if session_target_kind and session_target else ["once"],
             "policy_source": policy_source,
         }
         if semantic_key:

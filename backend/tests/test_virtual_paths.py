@@ -39,12 +39,19 @@ def test_path_authority_separates_internal_managed_and_external(tmp_path):
         classify_path_authority("/scratch/report.html", workspace_root=workspace).authority
         is PathAuthority.SCRATCH
     )
+    temporary = classify_path_authority("/tmp/report.txt", workspace_root=workspace)
+    assert temporary.authority is PathAuthority.SCRATCH
+    assert temporary.virtual_path == "/scratch/tmp/report.txt"
     assert (
         classify_path_authority("/knowledge/report.md", workspace_root=workspace).authority
         is PathAuthority.MANAGED
     )
     assert (
         classify_path_authority(str(tmp_path / "outside.txt"), workspace_root=workspace).authority
+        is PathAuthority.EXTERNAL
+    )
+    assert (
+        classify_path_authority("/private/tmp/outside.txt", workspace_root=workspace).authority
         is PathAuthority.EXTERNAL
     )
     assert (

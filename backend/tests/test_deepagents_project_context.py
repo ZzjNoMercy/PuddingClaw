@@ -135,10 +135,12 @@ def test_default_tool_guides_use_virtual_filesystem_for_semantic_assets() -> Non
     assert "never pass it to `read_resource`" in prompt
     assert "Do not use `read_resource` for `/skills/`, `/semantic-assets/`" in prompt
     assert "convert it to the equivalent `/workspace/<relative-path>`" in prompt
-    assert "transparently routed through the HostFileBroker" in prompt
+    assert "Submit the original operation exactly once" in prompt
+    assert "Smart may execute ordinary non-sensitive reads directly" in prompt
+    assert "`/tmp/...` is a convenience alias for `/scratch/tmp/...`" in prompt
     assert "do not call deprecated Stage/lease tools for a new Run" in prompt
     assert "`patch_file` with unique replacement anchors" in prompt
-    assert "The default runner is the kernel sandbox" in prompt
+    assert "Kernel and Spawn have the same product permission semantics" in prompt
     assert "stage_external_artifact" not in prompt
     assert "stage_external_directory" not in prompt
 

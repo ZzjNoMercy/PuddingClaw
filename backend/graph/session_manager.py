@@ -16,6 +16,7 @@ from functools import wraps
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from graph.effective_grants import EffectiveGrantSet
 from graph.permission_policy import (
     DEFAULT_APPROVAL_MODE,
     PERMISSION_BINDING_SCHEMA_VERSION,
@@ -254,6 +255,29 @@ class SessionManager:
         path = self._session_path(session_id)  # 获取文件路径
         self._atomic_write_json(path, data, indent=2)
 
+    @staticmethod
+    def _effective_permission_snapshot(data: dict[str, Any] | None) -> dict[str, Any]:
+        """Merge immutable session policy with the selected Project Registry rules."""
+
+        source = data if isinstance(data, dict) else {}
+        permissions = deepcopy(source.get("permissions"))
+        if not isinstance(permissions, dict):
+            permissions = {}
+        project_id = str(source.get("project_id") or "").strip()
+        if project_id:
+            from projects.registry import project_registry
+
+            project_policy = project_registry.get_permission_rules(project_id)
+            session_rules = permissions.get("rules")
+            session_rules = list(session_rules) if isinstance(session_rules, list) else []
+            project_rules = list(project_policy.get("rules") or [])
+            permissions["rules"] = [*session_rules, *project_rules]
+            permissions["rules_revision"] = max(
+                int(permissions.get("rules_revision") or 0),
+                int(project_policy.get("revision") or 0),
+            )
+        return permission_policy_snapshot(permissions)
+
     @_session_write_locked
     def create_session(
         self,
@@ -311,7 +335,7 @@ class SessionManager:
         ):
             if key in data:
                 meta[key] = data.get(key)
-        policy = permission_policy_snapshot(data.get("permissions"))
+        policy = self._effective_permission_snapshot(data)
         meta["approval_mode"] = policy["approval_mode"]
         meta["policy_epoch"] = policy["policy_epoch"]
         meta["policy_version"] = policy["policy_version"]
@@ -323,7 +347,7 @@ class SessionManager:
         data = self._read_file(session_id)
         if not data:
             raise FileNotFoundError(f"Session {session_id} not found")
-        return permission_policy_snapshot(data.get("permissions"))
+        return self._effective_permission_snapshot(data)
 
     @_session_write_locked
     def set_approval_mode_if_idle(
@@ -339,7 +363,7 @@ class SessionManager:
         data = self._read_file(session_id)
         if not data:
             raise FileNotFoundError(f"Session {session_id} not found")
-        current = permission_policy_snapshot(data.get("permissions"))
+        current = self._effective_permission_snapshot(data)
         if expected_epoch is not None and expected_epoch != current["policy_epoch"]:
             raise ValueError("Permission policy changed concurrently; reload before retrying.")
 
@@ -396,7 +420,7 @@ class SessionManager:
             if revoked_any:
                 permissions["grants_revision"] = int(permissions.get("grants_revision") or 0) + 1
         self._write_file(session_id, data)
-        return permission_policy_snapshot(permissions)
+        return self._effective_permission_snapshot(data)
 
     @_session_write_locked
     def update_metadata(self, session_id: str, metadata: dict[str, Any]) -> dict[str, Any]:
@@ -3750,7 +3774,7 @@ class SessionManager:
             config_snapshot = {}
         # The Session lock makes this the linearization point between a mode
         # change and a new Run. Caller-supplied values can never override it.
-        config_snapshot["permissions"] = permission_policy_snapshot(data.get("permissions"))
+        config_snapshot["permissions"] = self._effective_permission_snapshot(data)
         saved_run["config_snapshot"] = config_snapshot
         runs[run_id] = saved_run
         run_order = harness.setdefault("run_order", [])
@@ -3873,6 +3897,73 @@ class SessionManager:
                 raise ValueError("Run execution snapshot is already bound")
             return deepcopy(raw_run)
         config_snapshot["execution"] = snapshot
+        raw_run["updated_at"] = time.time()
+        self._write_file(session_id, data)
+        return deepcopy(raw_run)
+
+    @_session_write_locked
+    def record_run_execution_fallback(
+        self,
+        session_id: str,
+        run_id: str,
+        *,
+        scope: str,
+        request: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Persist the explicit Kernel -> Spawn fallback decision on a Run."""
+
+        if scope not in {"run", "project"}:
+            raise ValueError("Kernel fallback scope must be run or project")
+        data = self._read_file(session_id)
+        harness = data.get("harness") if data else None
+        runs = harness.get("runs") if isinstance(harness, dict) else None
+        raw_run = runs.get(run_id) if isinstance(runs, dict) else None
+        if not isinstance(raw_run, dict):
+            raise ValueError(f"Run {run_id} does not exist in session {session_id}")
+        config_snapshot = raw_run.setdefault("config_snapshot", {})
+        execution = config_snapshot.setdefault("execution", {})
+        if not isinstance(execution, dict):
+            raise ValueError("Run execution snapshot is invalid")
+        configured_mode = str(
+            execution.get("configured_mode")
+            or execution.get("backend_mode")
+            or request.get("configured_mode")
+            or ""
+        )
+        if configured_mode != "kernel":
+            raise ValueError("Kernel fallback may only be recorded for configured kernel Runs")
+        request_id = str(request.get("request_id") or request.get("id") or "")
+        if not request_id:
+            raise ValueError("Kernel fallback request id is required")
+        existing = execution.get("kernel_fallback")
+        next_record = {
+            "request_id": request_id,
+            "scope": scope,
+            "configured_mode": "kernel",
+            "effective_runner": "spawn",
+            "reason_code": str(request.get("reason_code") or ""),
+            "probe_fingerprint": str(request.get("probe_fingerprint") or ""),
+            "availability_class": str(request.get("availability_class") or ""),
+            "recorded_at": time.time(),
+        }
+        if isinstance(existing, dict):
+            comparable_existing = {
+                key: existing.get(key)
+                for key in next_record
+                if key != "recorded_at"
+            }
+            comparable_next = {
+                key: next_record.get(key)
+                for key in next_record
+                if key != "recorded_at"
+            }
+            if comparable_existing != comparable_next:
+                raise ValueError("Run execution fallback is already recorded differently")
+            return deepcopy(raw_run)
+        execution["kernel_fallback"] = next_record
+        execution["effective_runner"] = "spawn"
+        execution["fallback_scope"] = scope
+        execution["fallback_request_id"] = request_id
         raw_run["updated_at"] = time.time()
         self._write_file(session_id, data)
         return deepcopy(raw_run)
@@ -4959,6 +5050,59 @@ class SessionManager:
         # the normal tokenizer approximation at the actual model boundary.
         return max(1, (len(output) + 3) // 4) if output else 0
 
+    @classmethod
+    def materialize_large_tool_result(
+        cls,
+        *,
+        workspace_path: str | Path,
+        session_id: str,
+        query_id: str,
+        tool_call_id: str,
+        output: str,
+    ) -> dict[str, Any]:
+        """Persist one oversized textual Tool Result in the existing Query namespace."""
+
+        workspace = Path(workspace_path).expanduser().resolve()
+        safe_session = cls._safe_evidence_component(session_id)
+        safe_query = cls._safe_evidence_component(query_id)
+        artifact_name = str(tool_call_id or "").replace(".", "_").replace("/", "_").replace("\\", "_")
+        if not artifact_name or artifact_name in {".", ".."}:
+            raise ValueError("Tool call id cannot identify a large-result artifact")
+        root = (
+            workspace
+            / ".puddingclaw"
+            / "large_tool_results"
+            / safe_session
+            / safe_query
+        ).resolve()
+        root.mkdir(parents=True, exist_ok=True)
+        artifact_path = (root / artifact_name).resolve()
+        try:
+            artifact_path.relative_to(root)
+        except ValueError as exc:
+            raise ValueError("Large-result artifact escaped its Query namespace") from exc
+
+        temp_path = root / f".{artifact_name}.{uuid.uuid4().hex}.tmp"
+        try:
+            temp_path.write_text(output, encoding="utf-8")
+            temp_path.replace(artifact_path)
+        finally:
+            temp_path.unlink(missing_ok=True)
+
+        return {
+            "kind": "deepagents_large_tool_result",
+            "session_id": safe_session,
+            "source_query_id": safe_query,
+            "tool_call_id": tool_call_id,
+            "artifact_name": artifact_name,
+            "workspace_path": str(workspace),
+            "virtual_path": f"/large_tool_results/{artifact_name}",
+            "source_hash": cls._tool_context_source_hash(output),
+            "source_hash_scope": "raw_result",
+            "original_chars": len(output),
+            "estimated_tokens": cls._tool_context_tokens(output),
+        }
+
     @staticmethod
     def _tool_context_result_id(output: str) -> str | None:
         patterns = (
@@ -5309,7 +5453,7 @@ class SessionManager:
         session_id: str,
         *,
         min_result_tokens: int,
-        keep_recent: int,
+        retain_tokens: int,
         policy_version: str,
         context_profile: str = "detailed",
     ) -> list[dict[str, Any]]:
@@ -5356,11 +5500,14 @@ class SessionManager:
                     )
                 )
 
-            protected_ids = (
-                {item[1] for item in sorted(completed, key=lambda item: item[4])[-max(0, int(keep_recent)) :]}
-                if keep_recent > 0
-                else set()
-            )
+            protected_ids: set[str] = set()
+            retained_tokens = 0
+            for item in sorted(completed, key=lambda candidate: candidate[4], reverse=True):
+                candidate_tokens = max(0, int(item[3]))
+                if retained_tokens + candidate_tokens > max(0, int(retain_tokens)):
+                    break
+                protected_ids.add(item[1])
+                retained_tokens += candidate_tokens
             candidates: list[dict[str, Any]] = []
             cache_hit_count = 0
             for (
@@ -7959,7 +8106,7 @@ class SessionManager:
 
         normalized_bindings: dict[str, Any] | None = None
         if bindings:
-            effective = permission_policy_snapshot(permissions)
+            effective = self._effective_permission_snapshot(data)
             if (
                 bindings.get("policy_epoch") != effective["policy_epoch"]
                 or bindings.get("policy_version") != effective["policy_version"]
@@ -8376,6 +8523,33 @@ class SessionManager:
                 return True
         return False
 
+    def has_external_path_read_permission(
+        self,
+        session_id: str,
+        path: Path,
+        *,
+        run_id: str = "",
+    ) -> bool:
+        """Consume either an exact-file Grant or an effective parent Grant."""
+
+        if self.has_external_file_read_permission(session_id, path):
+            return True
+        if not run_id:
+            return False
+        run = self.get_run_state(session_id, run_id)
+        if not isinstance(run, dict):
+            return False
+        context = RunPermissionContext.from_config_snapshot(run.get("config_snapshot"))
+        grants, revision = self.permission_grants_snapshot(session_id)
+        effective = EffectiveGrantSet.resolve(
+            grants,
+            run_id=run_id,
+            current_bindings=context.grant_bindings(),
+            current_shell_bindings=context.shell_grant_bindings(),
+            permission_revision=revision,
+        )
+        return effective.allows_directory(path.expanduser().resolve(), access="read")
+
     def has_external_file_write_permission(self, session_id: str, path: Path) -> bool:
         """Return whether the session may write the given exact external file."""
         resolved = str(path.expanduser().resolve())
@@ -8515,6 +8689,7 @@ class SessionManager:
             if (
                 not isinstance(grant, dict)
                 or grant.get("revoked_at")
+                or grant.get("superseded_at")
                 or grant.get("type") != "tool_action"
                 or "execute" not in (grant.get("capabilities") or [])
             ):

@@ -78,3 +78,19 @@ def test_execution_permit_rejects_command_or_runner_replay(tmp_path: Path) -> No
         profile_digest=profile.digest,
         selected_runner="docker",
     )
+
+
+def test_execution_permit_is_consumed_once_per_spawn_snapshot(tmp_path: Path) -> None:
+    command, requirements, profile = _inputs(tmp_path)
+    permit = ExecutionPermit.issue(
+        tool_call_id="call-single-use",
+        command=command,
+        requirements=requirements,
+        permission_revision=1,
+        profile_digest=profile.digest,
+        selected_runner="kernel_macos_seatbelt",
+        runner_binding_digest="sha256:runner",
+    )
+
+    assert permit.consume_at_spawn() is True
+    assert permit.consume_at_spawn() is False

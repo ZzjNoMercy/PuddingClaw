@@ -15,6 +15,7 @@ from langchain.agents.middleware.types import ToolCallRequest
 from langchain_core.messages import ToolMessage
 from langgraph.types import Command
 
+from graph.host_read_policy import is_sensitive_host_read_path
 from graph.middlewares.external_directory import (
     LEASE_TTL_SECONDS,
     MAX_DIRECTORY_BYTES,
@@ -60,8 +61,10 @@ class WorkspacePathRouterMiddleware(AgentMiddleware):
         backend: Any | None = None,
         *,
         managed_host_path_aliases: dict[str, str | Path] | None = None,
+        approval_mode: str = "strict",
     ) -> None:
         self.backend = backend
+        self.approval_mode = str(approval_mode or "strict")
         aliases = managed_host_path_aliases
         if aliases is None and backend is not None:
             aliases = getattr(backend, "managed_host_path_aliases", None)
@@ -70,6 +73,20 @@ class WorkspacePathRouterMiddleware(AgentMiddleware):
             for virtual_root, host_root in dict(aliases or {}).items()
             if str(virtual_root).rstrip("/") in MANAGED_VIRTUAL_NAMESPACE_ROOTS
         }
+
+    @property
+    def _spawn_host_reads_enabled(self) -> bool:
+        return (
+            str(getattr(self.backend, "execution_mode", "")) == "spawn"
+            and self.approval_mode != "smart"
+        )
+
+    @property
+    def _smart_host_reads_enabled(self) -> bool:
+        return (
+            self.approval_mode == "smart"
+            and str(getattr(self.backend, "execution_mode", "")) in {"spawn", "kernel"}
+        )
 
     @classmethod
     def _default_search_scope(
@@ -538,9 +555,13 @@ class WorkspacePathRouterMiddleware(AgentMiddleware):
             )
 
         if kind == "virtual" and routed_path.startswith("/scratch/"):
-            recovery = session_manager.resolve_terminal_scratch_reference(
-                str(context.get("session_id") or ""),
-                routed_path,
+            recovery = (
+                session_manager.resolve_terminal_scratch_reference(
+                    str(context.get("session_id") or ""),
+                    routed_path,
+                )
+                if raw_path == "/scratch" or raw_path.startswith("/scratch/")
+                else None
             )
             if isinstance(recovery, dict):
                 if recovery.get("status") == "durable":
@@ -617,7 +638,26 @@ class WorkspacePathRouterMiddleware(AgentMiddleware):
                 )
             return "backend_read", (request, routed_path, args)  # type: ignore[return-value]
 
-        # Exact host-side resources remain the responsibility of
+        # Spawn exposes ordinary host reads directly. Bind a local resource
+        # reader with the selected mode so images and text retain their typed
+        # result formats without manufacturing an external-file Grant.
+        if (
+            tool_name == "read_resource"
+            and kind == "external"
+            and (self._spawn_host_reads_enabled or self._smart_host_reads_enabled)
+        ):
+            resource_tool = ReadResourceTool(
+                session_id=str(context.get("session_id") or ""),
+                run_id=str(context.get("run_id") or ""),
+                workspace_path=workspace_path,
+                backend_mode=str(getattr(self.backend, "execution_mode", "") or "kernel"),
+                approval_mode=self.approval_mode,
+            )
+            return "resource", (request, resource_tool, {"resource": routed_path, **{
+                key: args[key] for key in ("offset", "limit") if key in args
+            }})  # type: ignore[return-value]
+
+        # Exact host-side resources in Kernel remain the responsibility of
         # ReadResourceTool and ExternalFilePermissionMiddleware. Only scratch
         # needs adaptation above; treating every external read_resource call as
         # a directory search would incorrectly force directory staging.
@@ -637,7 +677,32 @@ class WorkspacePathRouterMiddleware(AgentMiddleware):
             return "execute", request.override(tool_call=tool_call)
 
         if kind != "external":
+            # Canonical aliases such as `/tmp/...` must reach the same Backend
+            # key used by `/scratch/tmp/...`; never let the original spelling
+            # fall through to a host absolute path.
+            if routed_path != raw_path:
+                args[path_arg] = routed_path
+                request = request.override(
+                    tool_call={**request.tool_call, "args": args}
+                )
             return "execute", request
+
+        if self._spawn_host_reads_enabled or (
+            self._smart_host_reads_enabled
+            and str(getattr(self.backend, "execution_mode", "")) == "spawn"
+            and not is_sensitive_host_read_path(routed_path)
+        ):
+            emit_harness_metric(
+                logger,
+                "external_search_route",
+                session_id=str(context.get("session_id") or ""),
+                route="spawn_host_read",
+                tool=tool_name,
+            )
+            args[path_arg] = routed_path
+            return "execute", request.override(
+                tool_call={**request.tool_call, "args": args}
+            )
 
         # Session Workspace Roots are direct host-file capabilities. Once the
         # exact file or containing exact-directory grant is active, keep the
@@ -675,7 +740,10 @@ class WorkspacePathRouterMiddleware(AgentMiddleware):
             resource_args["limit"] = args["limit"]
         resource_tool = ReadResourceTool(
             session_id=str(context.get("session_id") or ""),
+            run_id=str(context.get("run_id") or ""),
             workspace_path=workspace_path,
+            backend_mode=str(getattr(self.backend, "execution_mode", "") or "kernel"),
+            approval_mode=self.approval_mode,
         )
         return "resource", (request, resource_tool, resource_args)  # type: ignore[return-value]
 

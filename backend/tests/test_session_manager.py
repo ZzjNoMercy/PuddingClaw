@@ -31,7 +31,7 @@ def test_metadata_cannot_create_or_overwrite_control_plane_state(tmp_path):
             "protected",
             {"permissions": {"approval_mode": "smart"}},
         )
-    assert session_manager.get_permission_policy("protected")["approval_mode"] == "strict"
+    assert session_manager.get_permission_policy("protected")["approval_mode"] == "smart"
 
 
 def test_deleted_session_cannot_be_recreated_by_message_writes(tmp_path):

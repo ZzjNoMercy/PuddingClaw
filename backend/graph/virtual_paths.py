@@ -22,9 +22,10 @@ VIRTUAL_NAMESPACE_ROOTS = (
     "/skills",
     "/large_tool_results",
     "/scratch",
+    "/tmp",
 )
 
-WRITABLE_VIRTUAL_NAMESPACE_ROOTS = ("/workspace", "/scratch")
+WRITABLE_VIRTUAL_NAMESPACE_ROOTS = ("/workspace", "/scratch", "/tmp")
 MANAGED_VIRTUAL_NAMESPACE_ROOTS = tuple(
     root for root in VIRTUAL_NAMESPACE_ROOTS if root not in WRITABLE_VIRTUAL_NAMESPACE_ROOTS
 )
@@ -111,9 +112,12 @@ def classify_path_authority(
     normalized = normalize_virtual_path(original)
     root = Path(workspace_root).expanduser().resolve() if workspace_root else None
 
-    for virtual_root, authority in (
-        ("/workspace", PathAuthority.WORKSPACE),
-        ("/scratch", PathAuthority.SCRATCH),
+    for virtual_root, authority, canonical_virtual_root in (
+        ("/workspace", PathAuthority.WORKSPACE, "/workspace"),
+        ("/scratch", PathAuthority.SCRATCH, "/scratch"),
+        # `/tmp` is a model-visible convenience alias, never the host's global
+        # temporary directory. Every Run maps it to its own `/scratch/tmp`.
+        ("/tmp", PathAuthority.SCRATCH, "/scratch/tmp"),
     ):
         if normalized == virtual_root or normalized.startswith(f"{virtual_root}/"):
             relative = _virtual_relative_path(normalized, virtual_root)
@@ -123,7 +127,7 @@ def classify_path_authority(
                     original,
                     normalized,
                 )
-            virtual_path = virtual_root + (
+            virtual_path = canonical_virtual_root + (
                 f"/{relative.as_posix()}" if relative.as_posix() != "." else ""
             )
             canonical: Path | None = None

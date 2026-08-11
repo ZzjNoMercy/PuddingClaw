@@ -278,6 +278,7 @@ class SkillCandidate(BaseModel):
     confidence: float = Field(ge=0.0, le=1.0)
     evidence: str = ""
     explicit: bool = False
+    required: bool = False
 
 
 class SkillActivation(BaseModel):
@@ -341,8 +342,9 @@ class PermissionManifest(BaseModel):
 
     manifest_id: str
     run_id: str
-    approval_mode: Literal["strict", "smart", "full_access"]
+    approval_mode: Literal["strict", "smart"]
     allowed: list[dict[str, Any]] = Field(default_factory=list)
+    runtime_evaluated: list[dict[str, Any]] = Field(default_factory=list)
     hitl_required: list[dict[str, Any]] = Field(default_factory=list)
     blocked: list[dict[str, Any]] = Field(default_factory=list)
     policy_epoch: int = 1

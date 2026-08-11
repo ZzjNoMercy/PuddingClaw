@@ -4,7 +4,7 @@ import { Children, isValidElement, useEffect, useRef, useState, type ReactNode }
 import ReactMarkdown from "react-markdown";
 import type { Components } from "react-markdown";
 import { AlertTriangle, CheckCircle2, ChevronDown, ChevronRight, Database, Download, FileSpreadsheet, FileText, FolderOpen, Globe2, HelpCircle, ImageIcon, Key, KeyRound, Layers3, Loader2, Maximize2, PauseCircle, Plus, Sparkles, SquareTerminal, Trash2, XCircle } from "lucide-react";
-import { denyPermissionRequest, grantExternalFilePermission, grantShellDirectoryPermission, grantToolActionPermission, resolveDatabaseSqlRevisionRequest, resolveDimensionBuildRuleRequest, resolveLogicalDatasetRuleRequest, resolveSkillSecretRequest, resolveUserInputRequest, type AgentAttachment, type DatabaseSqlRevisionRequest, type DimensionBuildRuleRequest, type LogicalDatasetRuleRequest, type PermissionRequest, type SkillSecretRequest, type UserInputAnswer, type UserInputRequest } from "@/lib/api";
+import { denyPermissionRequest, grantExternalFilePermission, grantShellDirectoryPermission, grantToolActionPermission, resolveDatabaseSqlRevisionRequest, resolveDimensionBuildRuleRequest, resolveKernelFallbackRequest, resolveLogicalDatasetRuleRequest, resolveSkillSecretRequest, resolveUserInputRequest, type AgentAttachment, type DatabaseSqlRevisionRequest, type DimensionBuildRuleRequest, type KernelFallbackRequest, type LogicalDatasetRuleRequest, type PermissionRequest, type SkillSecretRequest, type UserInputAnswer, type UserInputRequest } from "@/lib/api";
 import { markdownRemarkPlugins, markdownUrlTransform } from "@/lib/markdown";
 import { useApp, type ChatMessage as ChatMessageType, type SourceRecord, type TimelineItem, type ToolCall } from "@/lib/store";
 import { isPreviewableImageAttachment, isQrImageAttachment } from "@/lib/imageAttachments";
@@ -196,6 +196,9 @@ export default function ChatMessage({ message, sessionSources = [], isStreaming 
   const visibleSkillSecretRequests = (message.skillSecretRequests || []).filter(
     (request) => (request.status || "pending") === "pending"
   );
+  const pendingKernelFallbackRequests = (message.kernelFallbackRequests || []).filter(
+    (request) => (request.status || "pending") === "pending"
+  );
   const outputAttachmentPlacement = message.segments?.length
     ? placeOutputAttachments(message.outputAttachments, message.segments, message.toolCalls)
     : { bySegment: [], unplaced: message.outputAttachments || [] };
@@ -291,7 +294,10 @@ export default function ChatMessage({ message, sessionSources = [], isStreaming 
                   {visibleSkillSecretRequests.map((request) => (
                     <SkillSecretRequestCard key={request.id} request={request} sessionId={sessionId} />
                   ))}
-                  {(message.segments.length > 0 || pendingPermissionRequests.length > 0 || pendingDimensionBuildRuleRequests.length > 0 || pendingLogicalDatasetRuleRequests.length > 0 || pendingDatabaseSqlRevisionRequests.length > 0 || visibleUserInputRequests.length > 0 || visibleSkillSecretRequests.length > 0) && (
+                  {pendingKernelFallbackRequests.map((request) => (
+                    <KernelFallbackRequestCard key={request.id} request={request} sessionId={sessionId} />
+                  ))}
+                  {(message.segments.length > 0 || pendingPermissionRequests.length > 0 || pendingDimensionBuildRuleRequests.length > 0 || pendingLogicalDatasetRuleRequests.length > 0 || pendingDatabaseSqlRevisionRequests.length > 0 || visibleUserInputRequests.length > 0 || visibleSkillSecretRequests.length > 0 || pendingKernelFallbackRequests.length > 0) && (
                     <div className="text-[10px] text-gray-400 mt-1 pl-1">
                       {formatTime(message.timestamp)}
                     </div>
@@ -379,7 +385,10 @@ export default function ChatMessage({ message, sessionSources = [], isStreaming 
                         {visibleSkillSecretRequests.map((request) => (
                           <SkillSecretRequestCard key={request.id} request={request} sessionId={sessionId} />
                         ))}
-                        {((message.content || thoughtChain) || pendingPermissionRequests.length > 0 || pendingDimensionBuildRuleRequests.length > 0 || pendingLogicalDatasetRuleRequests.length > 0 || pendingDatabaseSqlRevisionRequests.length > 0 || visibleUserInputRequests.length > 0 || visibleSkillSecretRequests.length > 0) && (
+                        {pendingKernelFallbackRequests.map((request) => (
+                          <KernelFallbackRequestCard key={request.id} request={request} sessionId={sessionId} />
+                        ))}
+                        {((message.content || thoughtChain) || pendingPermissionRequests.length > 0 || pendingDimensionBuildRuleRequests.length > 0 || pendingLogicalDatasetRuleRequests.length > 0 || pendingDatabaseSqlRevisionRequests.length > 0 || visibleUserInputRequests.length > 0 || visibleSkillSecretRequests.length > 0 || pendingKernelFallbackRequests.length > 0) && (
                           <div className="text-[10px] text-gray-400 mt-1 pl-1">
                             {formatTime(message.timestamp)}
                           </div>
@@ -607,6 +616,52 @@ function ErrorNotice({ text }: { text: string }) {
     <div className="mt-3 flex w-full max-w-[820px] items-start gap-2 rounded-xl border border-rose-200 bg-rose-50/85 px-3 py-2.5 text-[12px] font-medium leading-relaxed text-rose-800 shadow-sm shadow-rose-900/[0.03]">
       <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-rose-600" />
       <span className="min-w-0 break-words">{text}</span>
+    </div>
+  );
+}
+
+function KernelFallbackRequestCard({
+  request,
+  sessionId,
+}: {
+  request: KernelFallbackRequest;
+  sessionId: string;
+}) {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const resolve = async (action: "switch_project_to_spawn" | "fallback_once" | "reject") => {
+    setBusy(true);
+    setError(null);
+    try {
+      await resolveKernelFallbackRequest(sessionId, request.id, request.version, action);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "处理回退请求失败");
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <div className="my-3 rounded-xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-950">
+      <div className="flex items-center gap-2 font-medium">
+        <AlertTriangle className="h-4 w-4" /> Kernel 沙箱当前不可用
+      </div>
+      <p className="mt-2 text-xs leading-relaxed text-amber-900">
+        {request.reason}。宿主执行（spawn）没有 OS 沙箱边界，请明确选择回退范围。
+      </p>
+      <div className="mt-3 flex flex-wrap gap-2">
+        {request.project_id ? (
+          <button disabled={busy} onClick={() => void resolve("switch_project_to_spawn")} className="rounded-lg bg-amber-700 px-3 py-2 text-xs font-medium text-white disabled:opacity-50">
+            本项目以后使用宿主执行
+          </button>
+        ) : null}
+        <button disabled={busy} onClick={() => void resolve("fallback_once")} className="rounded-lg border border-amber-300 bg-white px-3 py-2 text-xs font-medium disabled:opacity-50">
+          仅本次 Run 回退
+        </button>
+        <button disabled={busy} onClick={() => void resolve("reject")} className="rounded-lg border border-amber-300 px-3 py-2 text-xs disabled:opacity-50">
+          拒绝
+        </button>
+      </div>
+      {error ? <p className="mt-2 text-xs text-red-700">{error}</p> : null}
     </div>
   );
 }
@@ -900,6 +955,9 @@ function ToolActionPermissionCard({
   const writesSkills = (request.capabilities || []).includes("managed_skill_write");
   const opensSessionScope = (request.options || []).includes("session")
     && Boolean(request.session_target_kind && request.session_target);
+  const opensProjectScope = (request.options || []).includes("project")
+    && request.session_target_kind === "command_pattern"
+    && Boolean(request.session_target);
   const reason = request.reason || "需要人工确认";
   const managesSkills = writesSkills || [
     "prepare_skill_install",
@@ -948,7 +1006,7 @@ function ToolActionPermissionCard({
           ? "允许命令联网执行"
         : "允许执行受控命令";
 
-  const grant = async (scope: "once" | "session") => {
+  const grant = async (scope: "once" | "session" | "project") => {
     setStatus("loading");
     setError("");
     try {
@@ -1076,6 +1134,15 @@ function ToolActionPermissionCard({
           )}
           {status === "idle" || status === "error" ? (
             <div className="mt-3 flex flex-wrap gap-2">
+              {opensProjectScope ? (
+                <button
+                  type="button"
+                  onClick={() => void grant("project")}
+                  className="rounded-full bg-violet-700 px-3.5 py-2 text-[12px] font-semibold text-white hover:bg-violet-800"
+                >
+                  记住到本项目
+                </button>
+              ) : null}
               {opensSessionScope ? (
                 <button
                   type="button"

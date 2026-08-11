@@ -67,6 +67,9 @@ iterm2_workspace.iterm2arrangement
 !/docs/session-and-context-architecture.md
 !/docs/legacy-chat.md
 !/docs/spawn-kernel-execution-architecture.md
+!/docs/plans/
+/docs/plans/*
+!/docs/plans/2026-08-11-user-home-sessions-and-skills-migration.md
 
 # Logs
 *.log

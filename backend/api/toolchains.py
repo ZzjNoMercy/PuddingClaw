@@ -24,7 +24,7 @@ class RollbackCommitRequest(BaseModel):
 
 
 def _service() -> ManagedCliService:
-    return ManagedCliService(_sandbox_manager(require_enabled=True))
+    return ManagedCliService(_sandbox_manager())
 
 
 @router.get("/{adapter_id}/revisions")

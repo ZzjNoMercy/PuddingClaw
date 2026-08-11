@@ -81,7 +81,7 @@ _POSIX_ROOT_PREFIXES = (
     "/mnt/",
     "/opt/",
 )
-_VIRTUAL_RESOURCE_PREFIXES = ("/workspace", "/scratch", "/skills", "/memories")
+_VIRTUAL_RESOURCE_PREFIXES = ("/workspace", "/scratch", "/tmp", "/skills", "/memories")
 _SCRIPT_SRC_RE = re.compile(
     r"<script\b[^>]*\bsrc\s*=\s*[\"'](?P<src>[^\"']+\.js(?:\?[^\"']*)?)[\"']",
     re.IGNORECASE,
@@ -136,6 +136,9 @@ def extract_declared_artifact_targets(message: str) -> list[str]:
 
     targets: list[str] = []
     for path, start, end in _path_spans(message):
+        if path == "/tmp" or path.startswith("/tmp/") or path == "/scratch" or path.startswith("/scratch/"):
+            # Ephemeral Run storage is never a formal delivery target.
+            continue
         before = message[max(0, start - 20) : start].strip(" `\t\r\n，,：:")
         after = message[end : min(len(message), end + 30)].strip(" `\t\r\n，,：:")
         direct_before = any(action in before for action in _DIRECT_ACTIONS)

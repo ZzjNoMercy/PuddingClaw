@@ -7,6 +7,7 @@ from pathlib import Path
 from langchain_core.tools import BaseTool
 from pydantic import BaseModel, Field
 
+from graph.host_read_policy import is_sensitive_host_read_path
 from graph.managed_paths import is_managed_resource_path
 from graph.session_manager import session_manager
 from graph.trace_collector import get_current_trace_collector
@@ -21,15 +22,19 @@ class ReadExternalFileInput(BaseModel):
 class ReadExternalFileTool(BaseTool):
     name: str = "read_external_file"
     description: str = (
-        "Read a local file outside the current workspace after the user has granted "
-        "external-file read permission for this session. Use this only for absolute "
-        "paths pasted by the user, such as files under Downloads or Documents. "
-        "For workspace files, use the normal read_file tool."
+        "Read a local text file outside the current workspace under the current Run Profile. "
+        "Use this only for exact absolute paths supplied by the user, such as files under "
+        "Downloads or Documents. Submit the read once; Harness decides whether it runs or "
+        "interrupts. For workspace, /scratch, or /tmp files, use read_file. This tool does "
+        "not parse PDF or other binary document formats."
     )
     args_schema: type[BaseModel] = ReadExternalFileInput
     risk_level: str = "moderate"
     session_id: str = ""
+    run_id: str = ""
     workspace_path: str = ""
+    backend_mode: str = "kernel"
+    approval_mode: str = "strict"
 
     @staticmethod
     def _is_relative_to(path: Path, parent: Path) -> bool:
@@ -141,24 +146,42 @@ class ReadExternalFileTool(BaseTool):
                 )
                 return "❌ Use read_file for workspace files; read_external_file is only for paths outside the workspace."
 
-            grants = session_manager.list_permission_grants(self.session_id)
-            matching_grant = next(
-                (
-                    grant
-                    for grant in grants
-                    if grant.get("type") == "external_file_read"
-                    and "read" in (grant.get("capabilities") or [])
-                    and (
-                        grant.get("target_kind") == "all_external_files"
-                        or (
-                            grant.get("target_kind") == "exact_file"
-                            and grant.get("target") == str(requested)
-                        )
-                    )
-                ),
-                None,
+            smart_ordinary_read = (
+                self.approval_mode == "smart"
+                and self.backend_mode in {"spawn", "kernel"}
+                and not is_sensitive_host_read_path(requested)
             )
-            if not matching_grant:
+            unrestricted_spawn_read = (
+                self.backend_mode == "spawn" and self.approval_mode != "smart"
+            )
+            matching_grant = None
+            directory_granted = False
+            if not unrestricted_spawn_read and not smart_ordinary_read:
+                grants = session_manager.list_permission_grants(self.session_id)
+                matching_grant = next(
+                    (
+                        grant
+                        for grant in grants
+                        if grant.get("type") == "external_file_read"
+                        and "read" in (grant.get("capabilities") or [])
+                        and (
+                            grant.get("target_kind") == "all_external_files"
+                            or (
+                                grant.get("target_kind") == "exact_file"
+                                and grant.get("target") == str(requested)
+                            )
+                        )
+                    ),
+                    None,
+                )
+                directory_granted = session_manager.has_external_path_read_permission(
+                    self.session_id,
+                    requested,
+                    run_id=self.run_id,
+                )
+            if not unrestricted_spawn_read and not smart_ordinary_read and not (
+                matching_grant or directory_granted
+            ):
                 self._record_permission_span(
                     action="request",
                     path=str(requested),
@@ -181,7 +204,16 @@ class ReadExternalFileTool(BaseTool):
                 action="enforce",
                 path=str(requested),
                 outcome="allowed",
-                grant_kind=str(matching_grant.get("target_kind") or "exact_file"),
+                grant_kind=(
+                    "smart_host_read"
+                    if smart_ordinary_read
+                    else "spawn_host_read"
+                    if unrestricted_spawn_read
+                    else str(
+                        (matching_grant or {}).get("target_kind")
+                        or ("exact_directory" if directory_granted else "exact_file")
+                    )
+                ),
             )
             return content
         except Exception as exc:

@@ -1647,7 +1647,7 @@ def test_approval_mode_is_idempotent_and_blocked_by_active_run(tmp_path):
     original = sessions.get_permission_policy("session-1")
     unchanged = sessions.set_approval_mode_if_idle(
         "session-1",
-        "strict",
+        "smart",
         expected_epoch=original["policy_epoch"],
     )
     assert unchanged == original
@@ -1673,7 +1673,7 @@ def test_execution_snapshot_is_single_assignment_and_config_is_immutable(tmp_pat
         goal_mode=False,
     )
     execution = {
-        "backend_mode": "restricted_host",
+        "backend_mode": "spawn",
         "backend_id": "host:one",
         "workspace_id": "sha256:one",
     }
@@ -2164,8 +2164,8 @@ def test_terminal_run_contract_is_immutable_and_new_run_must_prepare(tmp_path):
     coordinator.bind_execution_snapshot(
         run,
         {
-            "backend_mode": "restricted_host",
-            "backend_id": "restricted-host:test",
+            "backend_mode": "spawn",
+            "backend_id": "spawn:test",
             "workspace_id": "workspace:test",
         },
     )
@@ -2197,8 +2197,8 @@ def test_run_waiting_hitl_transition_round_trip(tmp_path):
     coordinator.bind_execution_snapshot(
         run,
         {
-            "backend_mode": "restricted_host",
-            "backend_id": "restricted-host:test",
+            "backend_mode": "spawn",
+            "backend_id": "spawn:test",
             "workspace_id": "workspace:test",
         },
     )

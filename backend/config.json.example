@@ -82,14 +82,14 @@
         "enabled": true,
         "model_id": "",
         "trigger_tokens": 160000,
-        "keep_messages": 20
+        "keep_tokens": 64000
       },
       "tool_context": {
         "enabled": true,
         "immediate_compaction_enabled": false,
         "single_tool_trigger_tokens": 8000,
         "background_min_result_tokens": 1000,
-        "keep_recent_tool_results": 12,
+        "retain_tool_context_tokens": 32000,
         "batch_size": 6,
         "max_concurrency": 4,
         "job_timeout_seconds": 120,
@@ -180,8 +180,7 @@
       "max_rounds": 8
     },
     "terminal": {
-      "docker_enabled": false,
-      "on_unavailable": "fallback",
+      "execution_mode": "spawn",
       "default_timeout_seconds": 120,
       "docker": {
         "connection": "",

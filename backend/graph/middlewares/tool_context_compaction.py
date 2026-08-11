@@ -9,6 +9,7 @@ import time
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from langchain.agents.middleware import AgentMiddleware
@@ -48,11 +49,8 @@ HARNESS_CONTROL_TOOLS = frozenset(
         "patch_file",
     }
 )
-# Keep this boundary aligned with DeepAgents FilesystemMiddleware defaults:
-# 20,000 tokens at its fixed approximation of four characters per token.
-# Results above this character boundary must pass through unchanged so the
-# outer FilesystemMiddleware can persist them under /large_tool_results.
-DEEPAGENTS_FILESYSTEM_EVICT_CHARS = 20_000 * 4
+LARGE_TOOL_RESULT_OFFLOAD_TOKENS = 20_000
+LARGE_TOOL_RESULT_ARTIFACT_KEY = "puddingclaw_large_tool_result"
 
 
 @dataclass(frozen=True)
@@ -61,7 +59,7 @@ class ToolContextConfig:
     immediate_compaction_enabled: bool = False
     single_tool_trigger_tokens: int = 8000
     background_min_result_tokens: int = 1000
-    keep_recent_tool_results: int = 12
+    retain_tool_context_tokens: int = 32000
     batch_size: int = 6
     max_concurrency: int = 4
     job_timeout_seconds: int = 120
@@ -85,7 +83,7 @@ class ToolContextConfig:
             ),
             single_tool_trigger_tokens=positive("single_tool_trigger_tokens", 8000),
             background_min_result_tokens=positive("background_min_result_tokens", 1000),
-            keep_recent_tool_results=positive("keep_recent_tool_results", 12),
+            retain_tool_context_tokens=positive("retain_tool_context_tokens", 32000),
             batch_size=min(8, positive("batch_size", 6)),
             max_concurrency=min(4, positive("max_concurrency", 4)),
             job_timeout_seconds=positive("job_timeout_seconds", 120),
@@ -274,7 +272,7 @@ class ToolContextCompactionService:
             self.manager.select_tool_context_candidates,
             session_id,
             min_result_tokens=cfg.background_min_result_tokens,
-            keep_recent=cfg.keep_recent_tool_results,
+            retain_tokens=cfg.retain_tool_context_tokens,
             policy_version=POLICY_VERSION,
             context_profile=DEFAULT_CONTEXT_PROFILE,
         )
@@ -567,6 +565,101 @@ class ToolContextCompactionService:
 tool_context_compaction_service = ToolContextCompactionService()
 
 
+class LargeToolResultOffloadMiddleware(AgentMiddleware[Any, Any, Any]):
+    """Persist every oversized textual Tool Result before it reaches model context."""
+
+    def __init__(
+        self,
+        *,
+        manager: SessionManager = session_manager,
+        workspace_path: str | Path | None = None,
+        session_id: str = "",
+        query_id: str = "",
+    ) -> None:
+        super().__init__()
+        self.manager = manager
+        self.workspace_path = str(workspace_path or "")
+        self.session_id = session_id
+        self.query_id = query_id
+
+    @staticmethod
+    def _pointer(raw: str, ref: dict[str, Any]) -> str:
+        preview = _head_tail(raw, max_chars=4000, label="超大 Tool Result 预览")
+        return (
+            "[PuddingClaw：超大 Tool Result 已无损落盘]\n"
+            f"完整结果： {ref['virtual_path']}\n"
+            f"原始大小：约 {ref['estimated_tokens']:,} tokens（{ref['original_chars']:,} 字符）。\n"
+            "需要精确内容时请分段调用 read_file，或使用 grep 搜索该路径。\n\n"
+            f"{preview}"
+        )
+
+    async def awrap_tool_call(
+        self,
+        request: ToolCallRequest,
+        handler: Callable[[ToolCallRequest], Awaitable[ToolMessage | Command[Any]]],
+    ) -> ToolMessage | Command[Any]:
+        result = await handler(request)
+        if not isinstance(result, ToolMessage) or not isinstance(result.content, str):
+            return result
+        raw = result.content
+        if estimate_text_tokens(raw) <= LARGE_TOOL_RESULT_OFFLOAD_TOKENS:
+            return result
+
+        runtime_context = getattr(getattr(request, "runtime", None), "context", None)
+        context = runtime_context if isinstance(runtime_context, dict) else {}
+        workspace_path = str(context.get("workspace_path") or self.workspace_path)
+        session_id = str(context.get("session_id") or self.session_id)
+        query_id = str(context.get("query_id") or self.query_id)
+        tool_call_id = str(request.tool_call.get("id") or result.tool_call_id or "")
+        if not workspace_path or not session_id or not query_id or not tool_call_id:
+            logger.warning(
+                "Large Tool Result could not be offloaded because its owner binding is incomplete: "
+                "tool=%s session=%s query=%s",
+                request.tool_call.get("name"),
+                session_id,
+                query_id,
+            )
+            return result
+
+        try:
+            ref = await asyncio.to_thread(
+                self.manager.materialize_large_tool_result,
+                workspace_path=workspace_path,
+                session_id=session_id,
+                query_id=query_id,
+                tool_call_id=tool_call_id,
+                output=raw,
+            )
+        except (OSError, ValueError):
+            logger.warning(
+                "Failed to offload oversized Tool Result: tool=%s session=%s query=%s",
+                request.tool_call.get("name"),
+                session_id,
+                query_id,
+                exc_info=True,
+            )
+            # Preserve the raw ToolMessage so the outer DeepAgents middleware
+            # can still attempt its own eviction for non-excluded tools.
+            return result
+
+        extra = dict(result.additional_kwargs or {})
+        extra.update(
+            {
+                "puddingclaw_query_id": query_id,
+                "puddingclaw_tool_source_hash": str(ref["source_hash"]),
+            }
+        )
+        artifact = dict(result.artifact) if isinstance(result.artifact, dict) else {}
+        artifact[LARGE_TOOL_RESULT_ARTIFACT_KEY] = ref
+        return result.model_copy(
+            update={
+                "content": self._pointer(raw, ref),
+                "additional_kwargs": extra,
+                "artifact": artifact,
+            }
+        )
+
+
 class ToolContextCompactionMiddleware(AgentMiddleware[Any, Any, Any]):
     """Registered only while DeepAgents Tool Context is enabled."""
 
@@ -601,7 +694,7 @@ class ToolContextCompactionMiddleware(AgentMiddleware[Any, Any, Any]):
         result = result.model_copy(update={"additional_kwargs": tagged_kwargs})
         if not self.cfg.immediate_compaction_enabled:
             return result
-        if len(raw) > DEEPAGENTS_FILESYSTEM_EVICT_CHARS:
+        if estimate_text_tokens(raw) > LARGE_TOOL_RESULT_OFFLOAD_TOKENS:
             return result
         if estimate_text_tokens(raw) <= self.cfg.single_tool_trigger_tokens:
             return result

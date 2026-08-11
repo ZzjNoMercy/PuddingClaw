@@ -36,21 +36,16 @@ class RevokeConnectorRequest(BaseModel):
     confirmed: bool = False
 
 
-def _sandbox_manager(*, require_enabled: bool) -> ProjectSandboxManager:
+def _sandbox_manager() -> ProjectSandboxManager:
     terminal = load_config().get("harness", {}).get("terminal", {})
-    sandbox_mode = str(terminal.get("sandbox_mode") or "")
-    docker_allowed = (
-        sandbox_mode in {"auto", "docker"}
-        if sandbox_mode
-        else bool(terminal.get("docker_enabled", False))
-    )
-    if require_enabled and not docker_allowed:
-        raise HTTPException(status_code=503, detail="托管连接器需要启用 Docker runtime。")
+    # Connector managed-runtime Docker is an internal compatibility path,
+    # not a user-selectable Agent execution mode. Availability is checked by
+    # the manager when the connector operation actually needs it.
     return ProjectSandboxManager(dict(terminal.get("docker", {}) or {}))
 
 
 def _connector_registry() -> ConnectorRegistry:
-    manager = _sandbox_manager(require_enabled=False)
+    manager = _sandbox_manager()
     return ConnectorRegistry(
         PuddingClawPaths.from_environment(),
         manager.runtime_contract,
@@ -62,7 +57,7 @@ def _connector_registry() -> ConnectorRegistry:
 
 def _managed_service() -> ManagedCliService:
     return ManagedCliService(
-        _sandbox_manager(require_enabled=True),
+        _sandbox_manager(),
         registry=_MANAGED_REGISTRY,
         authorization_drivers=_AUTHORIZATION_DRIVERS,
     )

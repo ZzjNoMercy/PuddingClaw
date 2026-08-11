@@ -45,6 +45,8 @@ class SandboxGrantProfile:
     read_roots: tuple[Path, ...]
     write_roots: tuple[Path, ...]
     delete_roots: tuple[Path, ...] = ()
+    deny_roots: tuple[Path, ...] = ()
+    workspace_writable: bool = True
     network_allowed: bool = False
     timeout_seconds: int = 120
     max_output_bytes: int = 100_000
@@ -60,6 +62,8 @@ class SandboxGrantProfile:
         external_read_roots: Iterable[str | Path] = (),
         external_write_roots: Iterable[str | Path] = (),
         external_delete_roots: Iterable[str | Path] = (),
+        external_deny_roots: Iterable[str | Path] = (),
+        workspace_writable: bool = True,
         network_allowed: bool = False,
         timeout_seconds: int = 120,
         max_output_bytes: int = 100_000,
@@ -79,13 +83,14 @@ class SandboxGrantProfile:
         writes = tuple(
             dict.fromkeys(
                 (
-                    workspace,
+                    *((workspace,) if workspace_writable else ()),
                     scratch,
                     *(_canonical_directory(path) for path in external_write_roots),
                 )
             )
         )
         deletes = tuple(dict.fromkeys(_canonical_directory(path) for path in external_delete_roots))
+        denies = tuple(dict.fromkeys(_canonical_directory(path) for path in external_deny_roots))
         if any(not _covered(root, reads) for root in writes):
             raise ValueError("Every shell write root must be covered by explicit read authority")
         if any(not _covered(root, writes) for root in deletes):
@@ -98,6 +103,8 @@ class SandboxGrantProfile:
             read_roots=reads,
             write_roots=writes,
             delete_roots=deletes,
+            deny_roots=denies,
+            workspace_writable=workspace_writable,
             network_allowed=network_allowed,
             timeout_seconds=timeout_seconds,
             max_output_bytes=max_output_bytes,
@@ -113,6 +120,8 @@ class SandboxGrantProfile:
             "read_roots": [str(path) for path in self.read_roots],
             "write_roots": [str(path) for path in self.write_roots],
             "delete_roots": [str(path) for path in self.delete_roots],
+            "deny_roots": [str(path) for path in self.deny_roots],
+            "workspace_writable": self.workspace_writable,
             "network_allowed": self.network_allowed,
             "timeout_seconds": self.timeout_seconds,
             "max_output_bytes": self.max_output_bytes,
@@ -124,7 +133,7 @@ class SandboxGrantProfile:
     def valid_at_spawn(self) -> bool:
         """Reject roots replaced or redirected after profile compilation."""
 
-        for root in (*self.read_roots, *self.write_roots, *self.delete_roots):
+        for root in (*self.read_roots, *self.write_roots, *self.delete_roots, *self.deny_roots):
             if root.is_symlink() or not root.is_dir() or root.resolve() != root:
                 return False
         return all(_covered(root, self.read_roots) for root in self.write_roots) and all(

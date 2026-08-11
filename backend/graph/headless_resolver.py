@@ -18,6 +18,7 @@ from graph.database_sql_revision_resume import database_sql_revision_resume_regi
 from graph.dimension_build_resume import dimension_build_resume_registry
 from graph.logical_dataset_resume import logical_dataset_resume_registry
 from graph.permission_resume import permission_resume_registry
+from graph.kernel_fallback_resume import kernel_fallback_resume_registry
 from graph.skill_plan_resume import skill_plan_resume_registry
 from graph.skill_secret_resume import skill_secret_resume_registry
 from graph.user_input_resume import user_input_resume_registry
@@ -34,6 +35,7 @@ class HeadlessInterruptResolver:
         "user_input_request": user_input_resume_registry,
         "skill_plan_confirmation_request": skill_plan_resume_registry,
         "skill_secret_request": skill_secret_resume_registry,
+        "kernel_fallback_request": kernel_fallback_resume_registry,
     }
 
     def __init__(self, *, context: dict[str, Any]) -> None:
@@ -96,20 +98,18 @@ class HeadlessInterruptResolver:
 
     def _decision(self, interrupt_type: str, request: dict[str, Any]) -> dict[str, Any]:
         if interrupt_type == "permission_request":
-            # A live browser action is always human-in-the-loop. Full-access
-            # is an unattended filesystem/network authority profile and must
-            # never silently authorize click/fill/close/navigate on a user's
-            # real logged-in browser.
+            # A live browser action is always human-in-the-loop. A headless
+            # Worker never turns an unresolved permission request into a
+            # standing filesystem/network authority.
             if str(request.get("tool_name") or "") == "browser":
                 return {"type": "reject", "reason": "browser_action_requires_interactive_user"}
-            mode = str(self.context.get("permission_policy", {}).get("approval_mode") or "smart")
-            if mode == "full_access" and self._within_authority_scope(request):
-                return {"type": "approve", "source": "headless_full_access"}
             return {"type": "reject", "reason": "headless_permission_boundary"}
         if interrupt_type == "user_input_request":
             if bool(request.get("allow_agent_decide", True)):
                 return {"action": "agent_decide"}
             return {"action": "cancel", "reason": "headless_user_input_required"}
+        if interrupt_type == "kernel_fallback_request":
+            return {"action": "reject", "reason": "headless_kernel_fallback_requires_explicit_user_choice"}
         if interrupt_type == "skill_secret_request":
             return {"action": "cancel", "reason": "interactive_secret_entry_required"}
         if interrupt_type == "database_sql_revision_request":
@@ -129,6 +129,13 @@ class HeadlessInterruptResolver:
         decision: dict[str, Any],
         request: dict[str, Any],
     ) -> dict[str, Any] | None:
+        if registry is kernel_fallback_resume_registry:
+            normalized, _resumed = registry.resolve(
+                request_id,
+                str(decision.get("action") or "reject"),
+                request_version=int(request.get("version") or 1),
+            )
+            return normalized
         if registry is skill_plan_resume_registry:
             # Skill plans expose a status-based registry API because committing
             # a plan has side effects. The registry's cancel path resolves the
@@ -176,8 +183,8 @@ class HeadlessInterruptResolver:
             return normalized.rstrip("/") in allowed
         if target_kind == "capability":
             return target == "docker_package_install" and "package" in profile
-        # A raw fingerprint is deliberately not enough to prove the command's
-        # authority. This closes the most dangerous FULL_ACCESS bypass.
+        # A raw fingerprint is deliberately not enough to prove command
+        # authority. A fingerprint is an identity check, not a capability.
         return False
 
 

@@ -461,7 +461,7 @@ async def test_headless_smart_permission_is_resolved_through_registry():
 
 
 @pytest.mark.asyncio
-async def test_full_access_only_approves_workspace_scoped_permission():
+async def test_headless_rejects_unresolved_permission_even_inside_authority_scope():
     request = permission_resume_registry.create_tool_action_request(
         session_id="full-scope-s",
         query_id="q",
@@ -473,12 +473,12 @@ async def test_full_access_only_approves_workspace_scoped_permission():
     )
     request["path"] = "/workspace/report.csv"
     context = {
-        "permission_policy": {"approval_mode": "full_access"},
+        "permission_policy": {"approval_mode": "smart"},
         "authority_profile": "workspace",
         "workspace_path": "/workspace",
     }
     decision = HeadlessInterruptResolver(context=context).resolve("permission_request", request)
-    assert decision["type"] == "approve"
+    assert decision["type"] == "reject"
 
     outside = permission_resume_registry.create_tool_action_request(
         session_id="full-scope-s",
@@ -506,7 +506,7 @@ async def test_headless_never_auto_approves_browser_actions():
         risk="browser_interaction",
     )
     context = {
-        "permission_policy": {"approval_mode": "full_access"},
+        "permission_policy": {"approval_mode": "smart"},
         "authority_profile": "workspace",
         "workspace_path": "/workspace",
     }

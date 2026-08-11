@@ -12,6 +12,13 @@ logger = logging.getLogger(__name__)
 
 CONFIG_FILE = Path(__file__).resolve().parent / "config.json"
 DEEPAGENTS_SUMMARY_INPUT_CONTEXT_RATIO = 0.8
+_LEGACY_TERMINAL_EXECUTION_KEYS = frozenset(
+    {"sandbox_mode", "docker_enabled", "on_unavailable"}
+)
+
+
+class UnsupportedTerminalExecutionConfig(ValueError):
+    """Raised when a config still uses the removed execution-mode contract."""
 
 # Ch5 迁移提示标记：legacy summarization 阈值检测只提示一次（防日志噪声）
 _LEGACY_WARN_SHOWN: bool = False
@@ -260,14 +267,14 @@ _DEFAULT_CONFIG: dict[str, Any] = {
                 # preserves the legacy behavior of following the Agent model.
                 "model_id": "",
                 "trigger_tokens": 160000,
-                "keep_messages": 20,
+                "keep_tokens": 64000,
             },
             "tool_context": {
                 "enabled": True,
                 "immediate_compaction_enabled": False,
                 "single_tool_trigger_tokens": 8000,
                 "background_min_result_tokens": 1000,
-                "keep_recent_tool_results": 12,
+                "retain_tool_context_tokens": 32000,
                 "batch_size": 6,
                 "max_concurrency": 4,
                 "job_timeout_seconds": 120,
@@ -352,10 +359,8 @@ _DEFAULT_CONFIG: dict[str, Any] = {
             "max_rounds": 8,
         },
         "terminal": {
-            "sandbox_mode": "auto",
-            "docker_enabled": False,
+            "execution_mode": "spawn",
             "external_directory_writable_enabled": False,
-            "on_unavailable": "fallback",
             "default_timeout_seconds": 120,
             "docker": {
                 "connection": "",
@@ -522,6 +527,15 @@ def load_config() -> dict[str, Any]:
         return json.loads(json.dumps(_DEFAULT_CONFIG))
     try:
         data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+        terminal = data.get("harness", {}).get("terminal") if isinstance(data, dict) else None
+        if isinstance(terminal, dict):
+            legacy_keys = sorted(_LEGACY_TERMINAL_EXECUTION_KEYS.intersection(terminal))
+            if legacy_keys:
+                raise UnsupportedTerminalExecutionConfig(
+                    "harness.terminal uses removed execution fields: "
+                    + ", ".join(legacy_keys)
+                    + "; choose execution_mode=spawn or kernel"
+                )
         data, migrated = _migrate_legacy_config(data)
         merged = _deep_merge(_DEFAULT_CONFIG, data)
         # One-time provider migration imports all effective credentials into
@@ -536,6 +550,8 @@ def load_config() -> dict[str, Any]:
         if migrated or credentials_migrated:
             save_config(merged)
         return merged
+    except UnsupportedTerminalExecutionConfig:
+        raise
     except Exception:
         return json.loads(json.dumps(_DEFAULT_CONFIG))
 
@@ -1857,6 +1873,19 @@ def update_settings(updates: dict[str, Any]) -> None:
                     if not 10000 <= trigger <= 1000000:
                         raise ValueError("全局摘要阈值必须在 10,000 到 1,000,000 tokens 之间")
                     summary_update["trigger_tokens"] = trigger
+                if "keep_tokens" in summary_update:
+                    keep_tokens = int(summary_update["keep_tokens"])
+                    effective_trigger = int(
+                        summary_update.get(
+                            "trigger_tokens",
+                            config["compression"].get("deepagents", {})
+                            .get("summarization", {})
+                            .get("trigger_tokens", 160000),
+                        )
+                    )
+                    if not 1000 <= keep_tokens < effective_trigger:
+                        raise ValueError("摘要保留预算必须在 1,000 tokens 到摘要阈值之间")
+                    summary_update["keep_tokens"] = keep_tokens
                 deepagents_update = dict(deepagents_update)
                 deepagents_update["summarization"] = summary_update
             tool_context_update = deepagents_update.get("tool_context")
@@ -1870,13 +1899,13 @@ def update_settings(updates: dict[str, Any]) -> None:
                 )
                 single = int(merged_tool_context.get("single_tool_trigger_tokens", 8000))
                 background = int(merged_tool_context.get("background_min_result_tokens", 1000))
-                keep_recent = int(merged_tool_context.get("keep_recent_tool_results", 12))
+                retain_tokens = int(merged_tool_context.get("retain_tool_context_tokens", 32000))
                 if not 1000 <= single <= 20000:
                     raise ValueError("执行中单条工具阈值必须在 1,000 到 20,000 tokens 之间")
                 if not 100 <= background <= 100000:
                     raise ValueError("静默压缩单条下限必须在 100 到 100,000 tokens 之间")
-                if not 1 <= keep_recent <= 100:
-                    raise ValueError("保留最近工具结果必须在 1 到 100 条之间")
+                if not 1000 <= retain_tokens <= 500000:
+                    raise ValueError("工具上下文保留预算必须在 1,000 到 500,000 tokens 之间")
                 tool_context_update = dict(tool_context_update)
                 tool_context_update["immediate_compaction_enabled"] = immediate_enabled
                 deepagents_update = dict(deepagents_update)
@@ -2024,13 +2053,16 @@ def _normalize_harness_update(value: Any) -> dict[str, Any]:
     if terminal is not None:
         if not isinstance(terminal, dict):
             raise ValueError("harness.terminal must be an object")
-        if terminal.get("sandbox_mode", "auto") not in {"auto", "kernel", "docker"}:
-            raise ValueError(
-                "harness.terminal.sandbox_mode must be auto, kernel, or docker"
+        legacy_keys = sorted(_LEGACY_TERMINAL_EXECUTION_KEYS.intersection(terminal))
+        if legacy_keys:
+            raise UnsupportedTerminalExecutionConfig(
+                "harness.terminal uses removed execution fields: "
+                + ", ".join(legacy_keys)
+                + "; choose execution_mode=spawn or kernel"
             )
-        if terminal.get("on_unavailable", "fallback") not in {"fallback", "deny"}:
+        if terminal.get("execution_mode", "spawn") not in {"spawn", "kernel"}:
             raise ValueError(
-                "harness.terminal.on_unavailable must be fallback or deny"
+                "harness.terminal.execution_mode must be spawn or kernel"
             )
         timeout = terminal.get("default_timeout_seconds", 120)
         if (
@@ -2108,7 +2140,7 @@ def get_deepagents_summarization_config() -> dict[str, Any]:
                 "enabled": True,
                 "model_id": "",
                 "trigger_tokens": 160000,
-                "keep_messages": 20,
+                "keep_tokens": 64000,
             },
         )
     )
@@ -2130,7 +2162,7 @@ def get_deepagents_tool_context_config() -> dict[str, Any]:
                 "immediate_compaction_enabled": False,
                 "single_tool_trigger_tokens": 8000,
                 "background_min_result_tokens": 1000,
-                "keep_recent_tool_results": 12,
+                "retain_tool_context_tokens": 32000,
                 "batch_size": 6,
                 "max_concurrency": 4,
                 "job_timeout_seconds": 120,

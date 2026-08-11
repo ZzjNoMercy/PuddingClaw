@@ -41,7 +41,6 @@ import {
   testConnection,
   testDatabaseConnection,
   getCapabilities,
-  probeHarnessDocker,
   getProviders,
   revealProviderCredential,
   updateProvider,
@@ -98,7 +97,7 @@ const HARNESS_SECTIONS: HarnessSection[] = [
   { id: "context", label: "上下文工程", description: "摘要与工具上下文压缩", icon: Brain },
   { id: "prompt-cache", label: "Prompt 缓存", description: "稳定系统、消息与工具前缀", icon: Braces },
   { id: "completion", label: "Goal 与验收", description: "Goal Run Rubric 与执行预算", icon: Target },
-  { id: "sandbox", label: "终端与沙箱", description: "内核优先与按需 Docker", icon: Box },
+  { id: "sandbox", label: "终端执行", description: "宿主执行与内核沙箱", icon: Box },
   { id: "runtime", label: "运行保护", description: "运行保护与权限策略", icon: ShieldCheck },
 ];
 
@@ -117,19 +116,6 @@ const EMBEDDING_PROVIDERS = [
 ];
 
 const SETTINGS_CATEGORY_KEY = "settings:activeCategory";
-const MANAGED_DOCKER_IMAGE = "puddingclaw/sandbox:python3.12-node22-v2";
-const LEGACY_MANAGED_DOCKER_IMAGES = new Set([
-  MANAGED_DOCKER_IMAGE,
-  "puddingclaw/sandbox:python3.12-node22-v1",
-  "python:3.12-slim",
-]);
-const DOCKER_CPU_OPTIONS = ["2", "4", "8", "16"];
-const DOCKER_MEMORY_OPTIONS = [
-  { value: "2048", label: "2 GB" },
-  { value: "4096", label: "4 GB" },
-  { value: "8192", label: "8 GB" },
-  { value: "16384", label: "16 GB" },
-];
 const DEFAULT_IMAGE_ANALYZER_PROMPT =
   "You are an image analysis specialist. When given an image, describe its contents in detail and answer any questions about it. Return your findings as concise, structured text.";
 
@@ -572,11 +558,12 @@ export default function SettingsPage() {
   // Harness context engineering (DeepAgents only)
   const [contextSummaryModelId, setContextSummaryModelId] = useState("");
   const [contextSummaryTriggerTokens, setContextSummaryTriggerTokens] = useState("200000");
+  const [contextSummaryKeepTokens, setContextSummaryKeepTokens] = useState("64000");
   const [toolContextEnabled, setToolContextEnabled] = useState(true);
   const [immediateToolCompactionEnabled, setImmediateToolCompactionEnabled] = useState(false);
   const [singleToolTriggerTokens, setSingleToolTriggerTokens] = useState("8000");
   const [backgroundMinResultTokens, setBackgroundMinResultTokens] = useState("1000");
-  const [keepRecentToolResults, setKeepRecentToolResults] = useState("12");
+  const [retainToolContextTokens, setRetainToolContextTokens] = useState("32000");
 
   // Harness prompt-cache stability
   const [tracePartDiagnostics, setTracePartDiagnostics] = useState(true);
@@ -603,18 +590,7 @@ export default function SettingsPage() {
   }>>([]);
   const [goalsEnabled, setGoalsEnabled] = useState(true);
   const [goalMaxRounds, setGoalMaxRounds] = useState("8");
-  const [sandboxMode, setSandboxMode] = useState<"auto" | "kernel" | "docker">("auto");
-  const [dockerConnection, setDockerConnection] = useState("");
-  const [dockerContext, setDockerContext] = useState("");
-  const [dockerUseCustomImage, setDockerUseCustomImage] = useState(false);
-  const [dockerImage, setDockerImage] = useState("");
-  const [dockerCpuLimit, setDockerCpuLimit] = useState("2");
-  const [dockerMemoryLimitMb, setDockerMemoryLimitMb] = useState("2048");
-  const [dockerPidsLimit, setDockerPidsLimit] = useState("256");
-  const [dockerNetworkEnabled, setDockerNetworkEnabled] = useState(false);
-  const [dockerDependencySetupEnabled, setDockerDependencySetupEnabled] = useState(false);
-  const [dockerProbeStatus, setDockerProbeStatus] = useState<"idle" | "loading" | "ok" | "error">("idle");
-  const [dockerProbeDetail, setDockerProbeDetail] = useState("");
+  const [executionMode, setExecutionMode] = useState<"spawn" | "kernel">("spawn");
 
   // Harness left-right anchor layout
   const [harnessFilter, setHarnessFilter] = useState("");
@@ -762,6 +738,9 @@ export default function SettingsPage() {
         setContextSummaryTriggerTokens(
           String(s.compression.deepagents?.summarization?.trigger_tokens ?? 160000)
         );
+        setContextSummaryKeepTokens(
+          String(s.compression.deepagents?.summarization?.keep_tokens ?? 64000)
+        );
         setToolContextEnabled(s.compression.deepagents?.tool_context?.enabled ?? true);
         setImmediateToolCompactionEnabled(
           s.compression.deepagents?.tool_context?.immediate_compaction_enabled ?? false
@@ -772,8 +751,8 @@ export default function SettingsPage() {
         setBackgroundMinResultTokens(
           String(s.compression.deepagents?.tool_context?.background_min_result_tokens ?? 1000)
         );
-        setKeepRecentToolResults(
-          String(s.compression.deepagents?.tool_context?.keep_recent_tool_results ?? 12)
+        setRetainToolContextTokens(
+          String(s.compression.deepagents?.tool_context?.retain_tool_context_tokens ?? 32000)
         );
         const promptCache = s.harness?.prompt_cache;
         setTracePartDiagnostics(promptCache?.trace_part_diagnostics ?? true);
@@ -803,31 +782,7 @@ export default function SettingsPage() {
         setGoalsEnabled(s.harness?.goals?.enabled ?? true);
         setGoalMaxRounds(String(s.harness?.goals?.max_rounds ?? 8));
         const terminal = s.harness?.terminal;
-        setSandboxMode(
-          terminal?.sandbox_mode === "auto" || terminal?.sandbox_mode === "kernel" || terminal?.sandbox_mode === "docker"
-            ? terminal.sandbox_mode
-            : terminal?.docker_enabled ? "docker" : "kernel"
-        );
-        setDockerConnection(terminal?.docker?.connection || "");
-        setDockerContext(terminal?.docker?.context || "");
-        const configuredDockerImage = terminal?.docker?.image || MANAGED_DOCKER_IMAGE;
-        const usesCustomDockerImage = !LEGACY_MANAGED_DOCKER_IMAGES.has(configuredDockerImage);
-        setDockerUseCustomImage(usesCustomDockerImage);
-        setDockerImage(usesCustomDockerImage ? configuredDockerImage : "");
-        const configuredCpuLimit = terminal?.docker?.cpu_limit || "2";
-        const configuredMemoryLimit = String(terminal?.docker?.memory_limit_mb ?? 2048);
-        setDockerCpuLimit(DOCKER_CPU_OPTIONS.includes(configuredCpuLimit) ? configuredCpuLimit : "2");
-        setDockerMemoryLimitMb(
-          DOCKER_MEMORY_OPTIONS.some((option) => option.value === configuredMemoryLimit)
-            ? configuredMemoryLimit
-            : "2048"
-        );
-        setDockerPidsLimit(String(terminal?.docker?.pids_limit ?? 256));
-        setDockerNetworkEnabled(terminal?.docker?.network_enabled ?? false);
-        setDockerDependencySetupEnabled(
-          terminal?.docker?.dependency_setup_enabled === true
-          && terminal?.docker?.dependency_setup_opt_in_version === 1
-        );
+        setExecutionMode(terminal?.execution_mode === "kernel" ? "kernel" : "spawn");
         // SubAgent
         const items = s.subagents?.items || s.subagent?.items;
         if (Array.isArray(items) && items.length > 0) {
@@ -1163,11 +1118,15 @@ export default function SettingsPage() {
     setSaving(true);
     try {
       const summaryTrigger = positiveIntOrNull(contextSummaryTriggerTokens) ?? 200000;
+      const summaryKeep = positiveIntOrNull(contextSummaryKeepTokens) ?? 64000;
       const singleToolTrigger = positiveIntOrNull(singleToolTriggerTokens) ?? 8000;
       const backgroundMinimum = positiveIntOrNull(backgroundMinResultTokens) ?? 1000;
-      const keepRecentResults = positiveIntOrNull(keepRecentToolResults) ?? 12;
+      const retainedToolTokens = positiveIntOrNull(retainToolContextTokens) ?? 32000;
       if (summaryTrigger < 10000 || summaryTrigger > 1000000) {
         throw new Error("全局摘要阈值必须在 10,000 到 1,000,000 tokens 之间");
+      }
+      if (summaryKeep < 1000 || summaryKeep >= summaryTrigger) {
+        throw new Error("摘要保留预算必须在 1,000 tokens 到全局摘要阈值之间");
       }
       if (singleToolTrigger < 1000 || singleToolTrigger > 20000) {
         throw new Error("执行中单条工具阈值必须在 1,000 到 20,000 tokens 之间");
@@ -1175,11 +1134,8 @@ export default function SettingsPage() {
       if (backgroundMinimum < 100 || backgroundMinimum > 100000) {
         throw new Error("静默压缩单条下限必须在 100 到 100,000 tokens 之间");
       }
-      if (keepRecentResults < 1 || keepRecentResults > 100) {
-        throw new Error("保留最近工具结果必须在 1 到 100 条之间");
-      }
-      if (dockerUseCustomImage && !dockerImage.trim()) {
-        throw new Error("启用自定义 Docker 镜像后必须填写镜像引用");
+      if (retainedToolTokens < 1000 || retainedToolTokens > 500000) {
+        throw new Error("工具上下文保留预算必须在 1,000 到 500,000 tokens 之间");
       }
       await updateSettings({
         ai_gateway: {
@@ -1295,13 +1251,14 @@ export default function SettingsPage() {
             summarization: {
               model_id: contextSummaryModelId,
               trigger_tokens: summaryTrigger,
+              keep_tokens: summaryKeep,
             },
             tool_context: {
               enabled: toolContextEnabled,
               immediate_compaction_enabled: immediateToolCompactionEnabled,
               single_tool_trigger_tokens: singleToolTrigger,
               background_min_result_tokens: backgroundMinimum,
-              keep_recent_tool_results: keepRecentResults,
+              retain_tool_context_tokens: retainedToolTokens,
             },
           },
         },
@@ -1336,25 +1293,8 @@ export default function SettingsPage() {
             max_rounds: positiveIntOrNull(goalMaxRounds) ?? 8,
           },
           terminal: {
-            sandbox_mode: sandboxMode,
-            docker_enabled: sandboxMode === "docker",
-            on_unavailable: "deny",
+            execution_mode: executionMode,
             default_timeout_seconds: 120,
-            docker: {
-              connection: dockerConnection,
-              context: dockerContext,
-              image: dockerUseCustomImage
-                ? dockerImage.trim()
-                : MANAGED_DOCKER_IMAGE,
-              cpu_limit: dockerCpuLimit,
-              memory_limit_mb: positiveIntOrNull(dockerMemoryLimitMb) ?? 2048,
-              pids_limit: positiveIntOrNull(dockerPidsLimit) ?? 256,
-              network_enabled: dockerNetworkEnabled,
-              dependency_setup_enabled: dockerDependencySetupEnabled,
-              dependency_setup_opt_in_version: 1,
-              lifecycle: "project",
-              idle_stop_minutes: 30,
-            },
           },
         },
         subagents: subagentItemsToConfig(subagentItems),
@@ -1378,7 +1318,7 @@ export default function SettingsPage() {
     } finally {
       setSaving(false);
     }
-  }, [gatewayBaseUrl, gatewayHealthPath, gatewayFallback, gatewayModel, thinkingMode, llmProvider, llmModel, llmBaseUrl, llmApiKey, temperature, maxTokens, embProvider, embModel, embDimension, embBatchSize, embBaseUrl, embApiKey, ragTopK, ragThreshold, ragTextVectorWeight, ragImageVectorWeight, ragBm25Weight, ragHybridCandidateTopK, ragRerankEnabled, ragRerankCandidateTopK, dbQaFullRowsTokenBudget, dbQaPreviewRowsTokenBudget, dbQaProfileTokenBudget, dbQaFullRowsHardRowCap, dbQaFullRowsHardColumnCap, dbQaMaxCellCharsForLlm, dbQaResultMaterializationRowCap, dbQaQueryTimeoutSeconds, dbQaSqlGenerationTimeoutSeconds, dbQaResultStoreEnabled, dbQaResultStoreTtlHours, dbQaDefaultPageSize, dbQaMaxPageSize, dbQaExportEnabled, dbQaProfileEnabled, dbQaAgentSqlPathEnabled, dbQaAgentSqlRolloutPercentage, dbQaAgentSqlFallbackEnabled, dbQaAgentSqlShadowCompareEnabled, databaseMode, databaseHost, databasePort, databaseName, databaseUsername, databasePassword, mmBatchSize, knowledgeRootDir, wikiCompilerModelId, wikiHybridEnabled, wikiGbrainEmbeddingModelId, wikiGbrainThinkModelId, kbIndexEnabled, kbVectorStore, kbMilvusUri, kbTextCollection, kbImageCollection, compRatio, contextSummaryTriggerTokens, toolContextEnabled, immediateToolCompactionEnabled, singleToolTriggerTokens, backgroundMinResultTokens, keepRecentToolResults, modelCallLimitEnabled, modelCallRunLimit, modelCallThreadLimit, modelCallExitBehavior, rubricEnabled, rubricMaxIterations, rubricMaxStagnantRepairs, customRubricRulesEnabled, customRubricRules, goalsEnabled, goalMaxRounds, sandboxMode, dockerConnection, dockerContext, dockerUseCustomImage, dockerImage, dockerCpuLimit, dockerMemoryLimitMb, dockerPidsLimit, dockerNetworkEnabled, dockerDependencySetupEnabled, subagentItems, showToast]);
+  }, [gatewayBaseUrl, gatewayHealthPath, gatewayFallback, gatewayModel, thinkingMode, llmProvider, llmModel, llmBaseUrl, llmApiKey, temperature, maxTokens, embProvider, embModel, embDimension, embBatchSize, embBaseUrl, embApiKey, ragTopK, ragThreshold, ragTextVectorWeight, ragImageVectorWeight, ragBm25Weight, ragHybridCandidateTopK, ragRerankEnabled, ragRerankCandidateTopK, dbQaFullRowsTokenBudget, dbQaPreviewRowsTokenBudget, dbQaProfileTokenBudget, dbQaFullRowsHardRowCap, dbQaFullRowsHardColumnCap, dbQaMaxCellCharsForLlm, dbQaResultMaterializationRowCap, dbQaQueryTimeoutSeconds, dbQaSqlGenerationTimeoutSeconds, dbQaResultStoreEnabled, dbQaResultStoreTtlHours, dbQaDefaultPageSize, dbQaMaxPageSize, dbQaExportEnabled, dbQaProfileEnabled, dbQaAgentSqlPathEnabled, dbQaAgentSqlRolloutPercentage, dbQaAgentSqlFallbackEnabled, dbQaAgentSqlShadowCompareEnabled, databaseMode, databaseHost, databasePort, databaseName, databaseUsername, databasePassword, mmBatchSize, knowledgeRootDir, wikiCompilerModelId, wikiHybridEnabled, wikiGbrainEmbeddingModelId, wikiGbrainThinkModelId, kbIndexEnabled, kbVectorStore, kbMilvusUri, kbTextCollection, kbImageCollection, compRatio, contextSummaryTriggerTokens, contextSummaryKeepTokens, toolContextEnabled, immediateToolCompactionEnabled, singleToolTriggerTokens, backgroundMinResultTokens, retainToolContextTokens, modelCallLimitEnabled, modelCallRunLimit, modelCallThreadLimit, modelCallExitBehavior, rubricEnabled, rubricMaxIterations, rubricMaxStagnantRepairs, customRubricRulesEnabled, customRubricRules, goalsEnabled, goalMaxRounds, executionMode, subagentItems, showToast]);
 
   const handleWikiHybridChange = useCallback(async (enabled: boolean) => {
     if (wikiHybridSaving) return;
@@ -1557,22 +1497,6 @@ export default function SettingsPage() {
       setGbrainInitializing(false);
     }
   }, [ensureGbrainDatabase, gbrainDatabaseConnectionPayload, showToast]);
-
-  const handleProbeDocker = useCallback(async () => {
-    setDockerProbeStatus("loading");
-    setDockerProbeDetail("");
-    try {
-      const result = await probeHarnessDocker({
-        connection: dockerConnection,
-        context: dockerContext,
-      });
-      setDockerProbeStatus(result.available ? "ok" : "error");
-      setDockerProbeDetail(result.detail || (result.available ? "Docker 可用" : "Docker 不可用"));
-    } catch (err) {
-      setDockerProbeStatus("error");
-      setDockerProbeDetail(err instanceof Error ? err.message : "Docker 探测失败");
-    }
-  }, [dockerConnection, dockerContext]);
 
   const handleResetVectorCollections = useCallback(async () => {
     const confirmed = window.confirm(
@@ -3590,6 +3514,20 @@ export default function SettingsPage() {
                               className="form-input"
                             />
                           </FormField>
+                          <FormField label="摘要后原始上下文保留预算（tokens）">
+                            <input
+                              type="number"
+                              min={1000}
+                              max={999999}
+                              step={1000}
+                              value={contextSummaryKeepTokens}
+                              onChange={(e) => setContextSummaryKeepTokens(e.target.value)}
+                              className="form-input"
+                            />
+                            <p className="mt-1 text-[10px] leading-relaxed text-gray-400">
+                              默认 64,000 tokens；必须低于触发阈值。旧消息会进入摘要，最近的原始上下文保留在此预算内。
+                            </p>
+                          </FormField>
                         </div>
 
                         <div className="rounded-xl border border-black/[0.06] bg-white/55 px-3.5 py-3">
@@ -3613,9 +3551,9 @@ export default function SettingsPage() {
                           )}
 
                           <div className="mt-3 rounded-lg border border-blue-100 bg-blue-50/70 px-3 py-2 text-[10px] leading-relaxed text-blue-700">
-                            PuddingClaw 基于 DeepAgents 提供单条结果超过 20,000 tokens 的无损落盘机制：
+                            PuddingClaw 统一接管单条文本 Tool Result 超过 20,000 tokens 的无损落盘：
                             完整内容写入 <code>/large_tool_results/</code>，Agent 只接收预览和精确读取路径。
-                            该机制始终生效，不依赖下面的可选即时压缩。
+                            该机制不受工具类型影响，并且始终生效，不依赖下面的可选即时压缩。
                           </div>
 
                           <div className="mt-3 rounded-lg border border-black/[0.05] bg-white/70 px-3 py-3">
@@ -3665,17 +3603,20 @@ export default function SettingsPage() {
                               />
                               <p className="mt-1 text-[10px] text-gray-400">默认 1,000 tokens；更短结果保持原样。</p>
                             </FormField>
-                            <FormField label="保留最近完整结果">
+                            <FormField label="完整 Tool Context 预算">
                               <input
                                 type="number"
-                                min={1}
-                                max={100}
-                                value={keepRecentToolResults}
-                                onChange={(e) => setKeepRecentToolResults(e.target.value)}
+                                min={1000}
+                                max={500000}
+                                step={1000}
+                                value={retainToolContextTokens}
+                                onChange={(e) => setRetainToolContextTokens(e.target.value)}
                                 className="form-input"
                                 disabled={!toolContextEnabled}
                               />
-                              <p className="mt-1 text-[10px] text-gray-400">默认 12 条已完成 Tool Result 不参与事后压缩。</p>
+                              <p className="mt-1 text-[10px] text-gray-400">
+                                默认保留最近 32,000 tokens；单个结果超过 20,000 tokens 时会无损落盘。
+                              </p>
                             </FormField>
                           </div>
                         </div>
@@ -3687,13 +3628,14 @@ export default function SettingsPage() {
                                 summarization: {
                                   model_id: contextSummaryModelId,
                                   trigger_tokens: positiveIntOrNull(contextSummaryTriggerTokens) ?? 160000,
+                                  keep_tokens: positiveIntOrNull(contextSummaryKeepTokens) ?? 64000,
                                 },
                                 tool_context: {
                                   enabled: toolContextEnabled,
                                   immediate_compaction_enabled: immediateToolCompactionEnabled,
                                   single_tool_trigger_tokens: positiveIntOrNull(singleToolTriggerTokens) ?? 8000,
                                   background_min_result_tokens: positiveIntOrNull(backgroundMinResultTokens) ?? 1000,
-                                  keep_recent_tool_results: positiveIntOrNull(keepRecentToolResults) ?? 12,
+                                  retain_tool_context_tokens: positiveIntOrNull(retainToolContextTokens) ?? 32000,
                                 },
                               },
                             },
@@ -3974,29 +3916,28 @@ export default function SettingsPage() {
                   </section>
 
                   <section id="harness-section-sandbox" className="scroll-mt-6">
-                    <SettingsCard title="终端与沙箱" icon={Box} color="#002fa7">
+                    <SettingsCard title="终端执行" icon={Box} color="#002fa7">
                       <div className="space-y-4">
                         <div className="rounded-xl border border-black/[0.06] bg-white/55 px-3.5 py-3">
                           <div>
-                            <p className="text-[13px] font-semibold text-gray-900">Shell 沙箱模式</p>
+                            <p className="text-[13px] font-semibold text-gray-900">执行模式</p>
                             <p className="mt-1 text-[11px] leading-relaxed text-gray-500">
                               Grant Profile 与权限卡保持一致；这里只决定由哪个隔离执行层承载命令。
                             </p>
-                            <div className="mt-3 grid gap-2 lg:grid-cols-3">
+                            <div className="mt-3 grid gap-2 lg:grid-cols-2">
                               {([
-                                ["auto", "自动选择（推荐）", "普通命令使用轻量内核沙箱，需要 Docker 能力时按需升级。"],
+                                ["spawn", "宿主执行", "兼容性优先。命令在当前用户的宿主环境中运行，仍受 Tool Gate 和权限审批约束。"],
                                 [
                                   "kernel",
-                                  "仅内核沙箱",
-                                  "完全不启动 Docker；shell 联网、包安装及浏览器命令会被拒绝，fetch_url 等受控网络工具不受影响。",
+                                  "智能内核沙箱",
+                                  "安全性优先。按命令和授权生成最小 OS 级文件、网络与运行时边界。",
                                 ],
-                                ["docker", "强制 Docker", "所有 shell 命令使用项目容器，隔离更重但运行环境最稳定。"],
                               ] as const).map(([value, label, description]) => (
                                 <button
                                   key={value}
                                   type="button"
-                                  onClick={() => setSandboxMode(value)}
-                                  className={`rounded-xl border px-3 py-3 text-left transition ${sandboxMode === value ? "border-[#002fa7] bg-blue-50/70 ring-1 ring-[#002fa7]/20" : "border-black/[0.07] bg-white hover:bg-slate-50"}`}
+                                  onClick={() => setExecutionMode(value)}
+                                  className={`rounded-xl border px-3 py-3 text-left transition ${executionMode === value ? "border-[#002fa7] bg-blue-50/70 ring-1 ring-[#002fa7]/20" : "border-black/[0.07] bg-white hover:bg-slate-50"}`}
                                 >
                                   <span className="block text-[12px] font-semibold text-slate-900">{label}</span>
                                   <span className="mt-1 block text-[10px] leading-4 text-slate-500">{description}</span>
@@ -4005,119 +3946,12 @@ export default function SettingsPage() {
                             </div>
                           </div>
 
-                          <fieldset disabled={sandboxMode === "kernel"} className={sandboxMode === "kernel" ? "hidden" : ""}>
-                          <div className="mt-4 grid gap-3 sm:grid-cols-2">
-                            <FormField label="Docker connection / DOCKER_HOST">
-                              <input value={dockerConnection} onChange={(event) => setDockerConnection(event.target.value)} className="form-input" placeholder="留空使用本机默认" />
-                            </FormField>
-                            <FormField label="Docker context">
-                              <input value={dockerContext} onChange={(event) => setDockerContext(event.target.value)} className="form-input" placeholder="留空使用当前 context" />
-                            </FormField>
-                            <FormField label="运行时镜像">
-                              <div className="rounded-xl border border-black/[0.06] bg-slate-50 px-3 py-2.5">
-                                <p className="text-[12px] font-semibold text-slate-800">PuddingClaw 托管镜像</p>
-                                <p className="mt-0.5 text-[10px] text-slate-500">Python 3.12 + Node.js 22</p>
-                              </div>
-                            </FormField>
-                            <FormField label="CPU 核数">
-                              <select value={dockerCpuLimit} onChange={(event) => setDockerCpuLimit(event.target.value)} className="form-select">
-                                {DOCKER_CPU_OPTIONS.map((value) => (
-                                  <option key={value} value={value}>{value} 核</option>
-                                ))}
-                              </select>
-                            </FormField>
-                            <FormField label="内存限额">
-                              <select value={dockerMemoryLimitMb} onChange={(event) => setDockerMemoryLimitMb(event.target.value)} className="form-select">
-                                {DOCKER_MEMORY_OPTIONS.map((option) => (
-                                  <option key={option.value} value={option.value}>{option.label}</option>
-                                ))}
-                              </select>
-                            </FormField>
-                            <FormField label="进程数上限">
-                              <input type="number" min={16} value={dockerPidsLimit} onChange={(event) => setDockerPidsLimit(event.target.value)} className="form-input" />
-                            </FormField>
-                            <label className="flex items-center gap-2 pt-6 text-[12px] text-gray-600">
-                              <input type="checkbox" checked={dockerNetworkEnabled} onChange={(event) => setDockerNetworkEnabled(event.target.checked)} />
-                              允许容器常驻网络
-                            </label>
-                          </div>
-
-                          <div className="mt-3 rounded-xl border border-black/[0.07] bg-slate-50/80 px-3.5 py-3">
-                            <label className="flex items-start gap-2 text-[12px] text-slate-800">
-                              <input
-                                type="checkbox"
-                                checked={dockerUseCustomImage}
-                                onChange={(event) => setDockerUseCustomImage(event.target.checked)}
-                                className="mt-0.5"
-                              />
-                              <span>
-                                <span className="font-semibold">使用自定义镜像（高级）</span>
-                                <span className="mt-0.5 block text-[10px] leading-4 text-slate-500">
-                                  默认使用 PuddingClaw 托管镜像。自定义镜像必须同时提供 Python 与 Node.js 基础运行时。
-                                </span>
-                              </span>
-                            </label>
-                            {dockerUseCustomImage && (
-                              <div className="mt-3 pl-7">
-                                <FormField label="自定义镜像引用">
-                                  <input
-                                    value={dockerImage}
-                                    onChange={(event) => setDockerImage(event.target.value)}
-                                    className="form-input"
-                                    placeholder="例如 my-company/puddingclaw-sandbox:latest"
-                                  />
-                                </FormField>
-                              </div>
-                            )}
-                            <p className="mt-3 rounded-lg bg-blue-50 px-3 py-2 text-[10px] leading-relaxed text-blue-700">
-                              默认托管镜像只提供 Python 3.12 + pip 与 Node.js 22 + npm/corepack。
-                              默认不安装项目依赖；第三方 Skill 执行中缺包时才请求 package/network 权限并动态安装。
-                              自定义镜像填写的是本机 Docker tag 或 registry image reference，不需要上传镜像文件。
-                              未开启常驻网络时，经权限管线批准的联网命令和依赖安装会在临时联网容器中执行，结束后自动断开。
-                            </p>
-                          </div>
-
-                          <div className="mt-3 rounded-xl border border-amber-200/70 bg-amber-50/70 px-3.5 py-3">
-                            <label className="flex items-start gap-2 text-[12px] text-amber-950">
-                              <input
-                                type="checkbox"
-                                checked={dockerDependencySetupEnabled}
-                                onChange={(event) => setDockerDependencySetupEnabled(event.target.checked)}
-                                className="mt-0.5"
-                              />
-                              <span>
-                                <span className="font-semibold">按项目 lockfile 准备依赖（高级）</span>
-                                <span className="mt-0.5 block text-[10px] leading-4 text-amber-800">
-                                  默认关闭以保持纯净沙箱。仅当确实需要运行项目脚本或测试时主动开启。
-                                </span>
-                              </span>
-                            </label>
-                          </div>
-
-                          <div className="mt-4 flex flex-wrap items-center gap-3">
-                            <button
-                              type="button"
-                              onClick={() => void handleProbeDocker()}
-                              disabled={dockerProbeStatus === "loading"}
-                              className="rounded-xl border border-black/[0.08] bg-white px-3 py-2 text-[12px] font-medium text-gray-700 hover:bg-gray-50 disabled:opacity-60"
-                            >
-                              {dockerProbeStatus === "loading" ? "正在探测…" : "探测 Docker"}
-                            </button>
-                            {dockerProbeStatus !== "idle" && (
-                              <span className={`text-[11px] ${dockerProbeStatus === "ok" ? "text-emerald-700" : "text-rose-600"}`}>
-                                {dockerProbeDetail}
-                              </span>
-                            )}
-                          </div>
-                          </fieldset>
-                          {sandboxMode === "kernel" ? (
-                            <p className="mt-3 rounded-xl bg-sky-50 px-3 py-2 text-[11px] leading-5 text-sky-800">
-                              当前模式不会探测、创建或启动 Docker。命令由内核沙箱直接约束 workspace、scratch 和已授权目录。
-                            </p>
-                          ) : null}
+                          <p className="mt-3 rounded-xl bg-slate-50 px-3 py-2 text-[11px] leading-5 text-slate-600">
+                            宿主执行提供最高兼容性；内核沙箱提供 OS 级最小权限边界。两种模式都继续经过 Tool Gate、Grant 和审计流程。
+                          </p>
                         </div>
                         <p className="rounded-xl bg-amber-50 px-3 py-2 text-[11px] leading-5 text-amber-800">
-                          自动模式优先使用内核沙箱，普通 Run 不触发 Docker CLI。内核与 Docker 都不可用时会 fail-closed，不再降级到无内核边界的 Host Terminal。
+                          当前模式会从下一次 Agent 运行开始生效；内核沙箱不可用时不会静默降级为宿主执行。
                         </p>
                       </div>
                     </SettingsCard>

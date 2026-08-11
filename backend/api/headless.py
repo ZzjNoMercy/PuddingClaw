@@ -1013,10 +1013,10 @@ async def create_headless_run(
     model_route: AnalyticsModelRoute | None = None
     authority = headless_authority_from_environment()
     configured_mode = os.getenv("PUDDINGCLAW_HEADLESS_APPROVAL_MODE", "smart").strip().lower()
-    if configured_mode not in {"smart", "full_access"}:
+    if configured_mode not in {"strict", "smart"}:
         configured_mode = "smart"
     authority_profile = str(principal.get("authority_profile") or "smart").strip().lower()
-    approval_mode = "full_access" if configured_mode == "full_access" and authority_profile != "smart" else "smart"
+    approval_mode = configured_mode
     if not _claim_headless_session(session_id):
         _abandon_idempotency(key, request_hash)
         raise HTTPException(status_code=409, detail="Headless Session already has an active request")
@@ -1141,7 +1141,7 @@ async def create_headless_run(
                 session_id=session_id,
                 project_id=project_id,
                 approval_mode=approval_mode,
-                authority={**authority, "profile": authority_profile if approval_mode == "full_access" else "smart"},
+                authority={**authority, "profile": authority_profile},
                 request_received_at=request_received_at,
                 analytics_model_id=selected,
                 analytics_model_match=model_route.to_dict(),
