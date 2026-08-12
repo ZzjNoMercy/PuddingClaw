@@ -30,6 +30,9 @@ NC='\033[0m'
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$SCRIPT_DIR"
 
+export PUDDINGCLAW_HOME="${PUDDINGCLAW_HOME:-${HOME}/.puddingclaw}"
+export PUDDINGCLAW_HOST_HOME="${PUDDINGCLAW_HOST_HOME:-${PUDDINGCLAW_HOME}}"
+
 BACKEND_HOST="${BACKEND_HOST:-0.0.0.0}"
 BACKEND_PORT="${BACKEND_PORT:-8888}"
 FRONTEND_PORT="${FRONTEND_PORT:-3000}"
@@ -68,7 +71,7 @@ if ! command -v node >/dev/null 2>&1; then
     exit 1
 fi
 
-echo -e "${BLUE}[信息] Python 版本:${NC} $(python3 --version)"
+echo -e "${BLUE}[信息] 系统 Python 版本:${NC} $(python3 --version)"
 echo -e "${BLUE}[信息] uv 版本:${NC} $(uv --version)"
 echo -e "${BLUE}[信息] Node.js 版本:${NC} $(node --version)"
 echo ""
@@ -84,6 +87,7 @@ UV_CACHE_DIR="${UV_CACHE_DIR:-/private/tmp/puddingclaw-uv-cache}" uv sync \
     --all-extras \
     --group dev \
     --group deepagents-test
+echo -e "${BLUE}[信息] Backend 实际 Python 版本:${NC} $(.venv/bin/python --version)"
 cd ..
 echo -e "${GREEN}[成功] 后端依赖安装完成${NC}"
 

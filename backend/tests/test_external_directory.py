@@ -897,10 +897,11 @@ def test_session_directory_grant_survives_container_rebuild_but_stays_workspace_
 
     assert grant["scope"] == "session"
     assert grant["stable_bindings"] == {
-        "approval_mode": "strict",
+        "approval_mode": "smart",
         "backend_mode": "docker",
         "policy_epoch": 1,
-            "policy_version": "tool-execution-v4",
+        "permission_rules_revision": 0,
+        "policy_version": "tool-execution-v4",
         "workspace_id": "workspace:stable",
     }
     assert "backend_id" not in grant["stable_bindings"]
@@ -979,7 +980,7 @@ def test_session_directory_grant_is_invalid_after_permission_policy_epoch_change
 
     policy = session_manager.set_approval_mode_if_idle(
         "directory-session",
-        "smart",
+        "strict",
         expected_epoch=1,
     )
     assert policy["policy_epoch"] == 2

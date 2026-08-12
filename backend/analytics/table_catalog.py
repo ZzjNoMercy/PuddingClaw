@@ -242,7 +242,9 @@ class TableAssetCatalog:
             raise TableCatalogError("同名逻辑数据集已存在；请使用刷新操作或更换名称。")
 
         refs = [self._ref_from_model(source) for source in sources]
-        output_dir = self.base_dir / "data" / "analytics-concat-datasets" / dataset_id
+        from runtime_identity.paths import PuddingClawPaths
+
+        output_dir = PuddingClawPaths.from_environment().data() / "analytics-concat-datasets" / dataset_id
         output_path = output_dir / "dataset.json"
         output_columns = (
             schema_preview["baseline_columns"]

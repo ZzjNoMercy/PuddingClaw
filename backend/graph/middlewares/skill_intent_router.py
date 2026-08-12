@@ -10,10 +10,10 @@ from langchain.agents.middleware import AgentMiddleware
 from langchain.agents.middleware.types import ModelRequest, ModelResponse, ToolCallRequest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
-import config
 from graph.prompt_cache import append_control_message
 from graph.session_manager import session_manager
 from harness.models import RunTaskProfile
+
 
 _MARKER = "[系统 Skill 提示]"
 
@@ -295,20 +295,17 @@ class SkillIntentRouterMiddleware(AgentMiddleware):
             for item in (invocation_notice, missing_required_notice, missing_notice, load_notice)
             if item
         )
-        if bool(
-            config.load_config().get("harness", {}).get("prompt_cache", {}).get("tail_routing_message", True)
-        ):
-            # Keep the user's HumanMessage byte-for-byte intact.  The control
-            # tail is request-scoped and is removed before Session persistence.
-            return request.override(
-                messages=append_control_message(
-                    messages,
-                    section="skill_routing",
-                    content=f"{routing_prompt}\n\n规范化任务文本（仅供路由参考）：{content}",
-                )
+        # Keep the user's HumanMessage byte-for-byte intact. The control tail
+        # is request-scoped and is removed before Session persistence. A
+        # routing hint must never rewrite user-authored content, regardless of
+        # prompt-cache configuration.
+        return request.override(
+            messages=append_control_message(
+                messages,
+                section="skill_routing",
+                content=f"{routing_prompt}\n\n规范化任务文本（仅供路由参考）：{content}",
             )
-        messages[index] = original.model_copy(update={"content": f"{content}\n\n{_MARKER} {routing_prompt}"})
-        return request.override(messages=messages)
+        )
 
     def wrap_model_call(self, request: ModelRequest, handler: Any) -> ModelResponse:
         prepared = self._request_with_routing_prompt(request)

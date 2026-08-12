@@ -5,6 +5,14 @@ from graph.session_manager import SessionManager, session_manager
 
 
 def test_search_sessions_matches_title_and_visible_content(tmp_path):
+    from projects.registry import project_registry
+
+    project_home = tmp_path / "project-registry"
+    project_registry.initialize(project_home)
+    project_path = tmp_path / "project-1"
+    project_path.mkdir()
+    project = project_registry.register(str(project_path), trusted=True)
+
     manager = SessionManager()
     manager.initialize(tmp_path)
     manager.create_session("session-title", metadata={"runtime_mode": "chat"})
@@ -13,7 +21,7 @@ def test_search_sessions_matches_title_and_visible_content(tmp_path):
 
     manager.create_session(
         "session-content",
-        metadata={"runtime_mode": "agent", "project_id": "project-1"},
+        metadata={"runtime_mode": "agent", "project_id": project.project_id},
     )
     manager.rename_session("session-content", "普通对话")
     manager.save_message("session-content", "user", "请帮我检查 SearchWidget 的交互细节")
@@ -26,7 +34,7 @@ def test_search_sessions_matches_title_and_visible_content(tmp_path):
     assert [item["id"] for item in content_results] == ["session-content"]
     assert content_results[0]["matched_in"] == "content"
     assert "SearchWidget" in content_results[0]["snippet"]
-    assert content_results[0]["project_id"] == "project-1"
+    assert content_results[0]["project_id"] == project.project_id
 
 
 def test_search_sessions_ignores_tool_payloads_and_includes_archived_messages(tmp_path):

@@ -13,9 +13,9 @@ from typing import Any
 import httpx
 
 from config import get_knowledge_mineru_config
+from runtime_identity.paths import PuddingClawPaths
 
 DEFAULT_MINERU_URL = "http://localhost:8002"
-REPO_ROOT = Path(__file__).resolve().parents[2]
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff"}
 
 
@@ -221,10 +221,11 @@ def _mime_from_suffix(suffix: str) -> str:
 
 def _mineru_runtime_config() -> tuple[Path, bool]:
     config = get_knowledge_mineru_config()
-    configured = str(config.get("runtime_output_dir") or "data/mineru-runtime/output").strip()
-    output_dir = Path(configured).expanduser()
-    if not output_dir.is_absolute():
-        output_dir = REPO_ROOT / output_dir
+    paths = PuddingClawPaths.from_environment()
+    configured = str(config.get("runtime_output_dir") or "").strip()
+    output_dir = Path(configured).expanduser() if configured else paths.temporary() / "mineru-runtime" / "output"
+    if configured and not output_dir.is_absolute():
+        output_dir = paths.root / output_dir
     return output_dir, bool(config.get("keep_runtime_output", False))
 
 

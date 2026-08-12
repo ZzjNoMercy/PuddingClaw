@@ -11,22 +11,12 @@ frontend/out/
 
 # Environment & secrets
 backend/.env
-backend/config.json
 frontend/.env
 skills/**/.env
 !backend/.env.example
 !backend/config.json.example
 !frontend/.env.example
 !skills/**/.env.example
-
-# Runtime data
-backend/sessions/
-backend/memory/
-backend/logs/
-backend/archive/
-backend/storage/
-backend/workspace/
-backend/output/
 
 # Legacy task/reminder files (should not be in backend root)
 backend/tasks.json
@@ -39,10 +29,9 @@ backend/prompts/*
 !backend/prompts/AGENTS.md
 !backend/prompts/SOUL.md
 !backend/prompts/IDENTITY.md
-!backend/prompts/USER.md
 !backend/prompts/system.md
-!backend/prompts/deepagents/
-!backend/prompts/deepagents/*.md
+!backend/prompts/tool_guides/
+!backend/prompts/tool_guides/*
 __pycache__/
 *.py[cod]
 *$py.class
@@ -67,6 +56,8 @@ iterm2_workspace.iterm2arrangement
 !/docs/session-and-context-architecture.md
 !/docs/legacy-chat.md
 !/docs/spawn-kernel-execution-architecture.md
+!/docs/puddingclaw-harness-engineering.md
+!/docs/puddingclaw-harness-prompt-guide.md
 !/docs/plans/
 /docs/plans/*
 !/docs/plans/2026-08-11-user-home-sessions-and-skills-migration.md
@@ -79,7 +70,10 @@ dist/
 build/
 dist-electron/
 *.egg-info/
-frontend/tsconfig.tsbuildinfo
+*.tsbuildinfo
+
+# Local configuration audit generated during Home migration
+/CONFIG_DEFAULTS_REVIEW.md
 
 # The Worker CLI is installed directly from this repository, so its checked-in
 # dependency-free runtime is part of the package rather than a disposable build.
@@ -88,7 +82,6 @@ frontend/tsconfig.tsbuildinfo
 
 # Docker volumes (if any)
 volumes/
-data/
 
 # Generated design artifacts
 designs/

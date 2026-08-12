@@ -7,7 +7,6 @@ from typing import Any
 from fastapi import APIRouter, HTTPException
 from langchain_core.messages import HumanMessage
 
-from config import get_compress_ratio
 from graph.session_manager import session_manager
 
 router = APIRouter()
@@ -55,8 +54,7 @@ async def auto_compress_session(session_id: str) -> dict[str, Any] | None:
         if len(messages) < 4:
             return None
 
-        ratio = get_compress_ratio()
-        num_to_remove = max(4, int(len(messages) * ratio))
+        num_to_remove = max(4, len(messages) // 2)
         messages_to_compress = messages[:num_to_remove]
 
         summary = await _generate_summary(messages_to_compress)

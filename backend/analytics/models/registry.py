@@ -16,6 +16,7 @@ from typing import Any, BinaryIO
 import yaml
 
 from knowledge.paths import get_knowledge_root
+from runtime_identity.paths import PuddingClawPaths
 
 
 class AnalyticsModelError(ValueError):
@@ -135,11 +136,6 @@ class AnalyticsModel:
         data = self.to_summary()
         data.update({"body": self.body, "frontmatter": self.frontmatter or {}})
         return data
-
-
-def _base_dir_from_here() -> Path:
-    return Path(__file__).resolve().parents[2]
-
 
 def canonical_model_resource_path(raw_path: object, *, root: str) -> str:
     """Return one model-relative resource path with a single declared root.
@@ -269,7 +265,9 @@ def _model_relative_path(original_path: str) -> Path | None:
 
 class AnalyticsModelRegistry:
     def __init__(self, base_dir: Path | None = None):
-        self.base_dir = base_dir or _base_dir_from_here()
+        self.base_dir = (
+            base_dir or PuddingClawPaths.from_environment().user_definitions()
+        ).expanduser().resolve()
         self.root_dir = self.base_dir / "analytics-models"
         self._lock = RLock()
         self._models: dict[str, AnalyticsModel] = {}
@@ -408,7 +406,9 @@ class AnalyticsModelRegistry:
             if not asset_id or "/" in asset_id or "\\" in asset_id:
                 missing_data_assets.append(table_ref)
                 continue
-            definition_path = self.base_dir / "data" / "analytics-concat-datasets" / asset_id / "dataset.json"
+            from runtime_identity.paths import PuddingClawPaths
+
+            definition_path = PuddingClawPaths.from_environment().data() / "analytics-concat-datasets" / asset_id / "dataset.json"
             try:
                 definition = json.loads(definition_path.read_text(encoding="utf-8"))
             except Exception:
@@ -929,7 +929,7 @@ _REGISTRIES_LOCK = RLock()
 
 
 def get_analytics_model_registry(base_dir: Path | None = None) -> AnalyticsModelRegistry:
-    resolved = (base_dir or _base_dir_from_here()).resolve()
+    resolved = (base_dir or PuddingClawPaths.from_environment().user_definitions()).resolve()
     with _REGISTRIES_LOCK:
         registry = _REGISTRIES.get(resolved)
         if registry is None:

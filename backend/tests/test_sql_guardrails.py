@@ -7,9 +7,9 @@ from types import SimpleNamespace
 from analytics.nl2sql import guardrails as guardrail_module
 from analytics.nl2sql.guardrails import (
     GuardrailRule,
+    GuardrailRuleSet,
     detect_guardrail_conflicts,
     list_guardrail_rules,
-    reset_guardrail_rules,
     scope_matches,
     upsert_guardrail_rule,
 )
@@ -322,24 +322,26 @@ def test_global_guardrail_allows_counting_preserved_left_side_tuple() -> None:
 
 
 def test_guardrail_rules_are_loaded_from_markdown_assets(tmp_path, monkeypatch) -> None:
-    monkeypatch.setattr(guardrail_module, "BASE_DIR", tmp_path)
-    monkeypatch.setattr(guardrail_module, "GUARDRAILS_ROOT", tmp_path / "sql-guardrails")
-    monkeypatch.setattr(guardrail_module, "GUARDRAILS_RULES_DIR", tmp_path / "sql-guardrails" / "rules")
-    monkeypatch.setattr(guardrail_module, "GUARDRAILS_DRAFTS_DIR", tmp_path / "sql-guardrails" / "drafts")
+    definitions = tmp_path / "definitions"
+    monkeypatch.setattr(guardrail_module, "GUARDRAILS_ROOT", definitions / "sql-guardrails")
+    monkeypatch.setattr(guardrail_module, "GUARDRAILS_RULES_DIR", definitions / "sql-guardrails" / "rules")
+    monkeypatch.setattr(guardrail_module, "GUARDRAILS_DRAFTS_DIR", definitions / "sql-guardrails" / "drafts")
 
-    payload = reset_guardrail_rules()
+    temporary_rule = GuardrailRule(
+        id="temporary_sql_rule",
+        name="Temporary SQL Rule",
+        type="require_sql_contains",
+        params={"contains": "select"},
+    )
+    guardrail_module.save_guardrail_rules(GuardrailRuleSet(guardrails=[temporary_rule]))
+    payload = list_guardrail_rules()
 
-    assert len(payload["guardrails"]) == 9
-    assert {
-        "voltage_platform_400v_physical_value",
-        "voltage_platform_800v_physical_value",
-        "rear_screen_physical_type_name",
-    }.issubset({item["id"] for item in payload["guardrails"]})
-    doc_path = tmp_path / "sql-guardrails" / "rules" / "config_rate_model_key_group" / "guardrail.md"
+    assert [item["id"] for item in payload["guardrails"]] == ["temporary_sql_rule"]
+    doc_path = definitions / "sql-guardrails" / "rules" / "temporary_sql_rule" / "guardrail.md"
     assert doc_path.exists()
     text = doc_path.read_text(encoding="utf-8")
     assert "formatter: sql-guardrail" in text
-    assert "type: require_group_by" in text
+    assert "type: require_sql_contains" in text
 
     loaded = guardrail_module.load_guardrail_rules()
     assert sorted(rule.id for rule in loaded.guardrails) == sorted(item["id"] for item in payload["guardrails"])
@@ -353,10 +355,10 @@ def test_guardrail_rules_are_loaded_from_markdown_assets(tmp_path, monkeypatch) 
 
 
 def test_guardrail_raw_markdown_upsert(tmp_path, monkeypatch) -> None:
-    monkeypatch.setattr(guardrail_module, "BASE_DIR", tmp_path)
-    monkeypatch.setattr(guardrail_module, "GUARDRAILS_ROOT", tmp_path / "sql-guardrails")
-    monkeypatch.setattr(guardrail_module, "GUARDRAILS_RULES_DIR", tmp_path / "sql-guardrails" / "rules")
-    monkeypatch.setattr(guardrail_module, "GUARDRAILS_DRAFTS_DIR", tmp_path / "sql-guardrails" / "drafts")
+    definitions = tmp_path / "definitions"
+    monkeypatch.setattr(guardrail_module, "GUARDRAILS_ROOT", definitions / "sql-guardrails")
+    monkeypatch.setattr(guardrail_module, "GUARDRAILS_RULES_DIR", definitions / "sql-guardrails" / "rules")
+    monkeypatch.setattr(guardrail_module, "GUARDRAILS_DRAFTS_DIR", definitions / "sql-guardrails" / "drafts")
     content = """---
 formatter: sql-guardrail
 id: raw_rule
@@ -384,4 +386,4 @@ action:
 
     assert saved["id"] == "raw_rule"
     assert saved["document_body"].startswith("# Raw Rule")
-    assert (tmp_path / "sql-guardrails" / "rules" / "raw_rule" / "guardrail.md").exists()
+    assert (definitions / "sql-guardrails" / "rules" / "raw_rule" / "guardrail.md").exists()

@@ -7,6 +7,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from api.mcp import router
+from api.mcp import _validate_mcp_config
 from config import _DEFAULT_CONFIG
 from mcp_clients.servers import (
     allowed_mcp_tool_names,
@@ -18,22 +19,43 @@ from mcp_clients.servers import (
 from tools.toolsets import tools_for_toolsets
 
 
-def test_default_config_auto_enables_only_ready_gbrain_runtime() -> None:
+def test_default_config_keeps_gbrain_out_of_user_configuration() -> None:
     assert _DEFAULT_CONFIG["mcp"]["enabled"] == []
-    assert _DEFAULT_CONFIG["mcp"]["auto_enable_gbrain"] is True
-    assert set(_DEFAULT_CONFIG["mcp"]["servers"]) == {"zhihuiya_patents", "gbrain"}
+    assert "auto_enable_gbrain" not in _DEFAULT_CONFIG["mcp"]
+    assert set(_DEFAULT_CONFIG["mcp"]["servers"]) == {"zhihuiya_patents"}
+
+
+def test_gbrain_user_configuration_is_silently_ignored() -> None:
+    normalized = _validate_mcp_config(
+        {
+            "enabled": ["gbrain", "custom"],
+            "auto_enable_gbrain": False,
+            "servers": {
+                "gbrain": {"transport": "stdio", "command": "other-gbrain"},
+                "custom": {"transport": "stdio", "command": "custom-mcp"},
+            },
+        },
+        {"enabled": [], "servers": {}},
+    )
+
+    assert normalized == {
+        "enabled": ["custom"],
+        "servers": {
+            "custom": {"transport": "stdio", "command": "custom-mcp"},
+        },
+    }
 
 
 def test_gbrain_server_requires_ready_dedicated_home(monkeypatch, tmp_path) -> None:
-    monkeypatch.delenv("PUDDINGCLAW_GBRAIN_HOME", raising=False)
-    monkeypatch.setenv("PUDDINGCLAW_KNOWLEDGE_DIR", str(tmp_path / "knowledge"))
+    knowledge_root = tmp_path / "knowledge"
+    runtime_home = knowledge_root / "llm-wiki" / ".puddingclaw" / "gbrain-home"
+    monkeypatch.setenv("PUDDINGCLAW_KNOWLEDGE_DIR", str(knowledge_root))
     assert build_mcp_servers_config(["gbrain"]) == {}
-    monkeypatch.setenv("PUDDINGCLAW_GBRAIN_HOME", str(tmp_path))
     monkeypatch.setenv("PUDDINGCLAW_GBRAIN_BIN", sys.executable)
     assert build_mcp_servers_config(["gbrain"]) == {}
-    (tmp_path / ".gbrain" / "schema-packs" / "puddingclaw-wiki").mkdir(parents=True)
-    (tmp_path / ".gbrain" / "config.json").write_text("{}", encoding="utf-8")
-    (tmp_path / ".gbrain" / "schema-packs" / "puddingclaw-wiki" / "pack.yaml").write_text("api_version: gbrain-schema-pack-v1\n", encoding="utf-8")
+    (runtime_home / ".gbrain" / "schema-packs" / "puddingclaw-wiki").mkdir(parents=True)
+    (runtime_home / ".gbrain" / "config.json").write_text("{}", encoding="utf-8")
+    (runtime_home / ".gbrain" / "schema-packs" / "puddingclaw-wiki" / "pack.yaml").write_text("api_version: gbrain-schema-pack-v1\n", encoding="utf-8")
     runtime = {
         "embedding": {"name": "embed", "provider": "dashscope", "dimension": 1024},
         "think": {"name": "think", "provider": "deepseek"},
@@ -44,22 +66,31 @@ def test_gbrain_server_requires_ready_dedicated_home(monkeypatch, tmp_path) -> N
         lambda base: ({**base, "DASHSCOPE_API_KEY": "test"}, runtime),
     )
     config = build_mcp_servers_config(["gbrain"])["gbrain"]
-    assert config["cwd"] == str(tmp_path.resolve())
+    assert config["cwd"] == str(runtime_home.resolve())
     assert config["transport"] == "stdio"
-    assert config["env"]["GBRAIN_HOME"] == str(tmp_path)
+    assert config["env"]["GBRAIN_HOME"] == str(runtime_home)
     assert config["env"]["GBRAIN_SCHEMA_PACK"] == "puddingclaw-wiki"
     assert gbrain_runtime_status()["ready"] is True
-    assert effective_mcp_server_names([], auto_enable_gbrain=True) == ["gbrain"]
+    assert effective_mcp_server_names([]) == ["gbrain"]
 
 
 def test_unready_gbrain_is_removed_even_when_explicitly_enabled(monkeypatch, tmp_path) -> None:
-    monkeypatch.setenv("PUDDINGCLAW_GBRAIN_HOME", str(tmp_path))
+    monkeypatch.setenv("PUDDINGCLAW_KNOWLEDGE_DIR", str(tmp_path / "knowledge"))
     monkeypatch.setenv("PUDDINGCLAW_GBRAIN_BIN", sys.executable)
-    assert effective_mcp_server_names(["gbrain", "zhihuiya_patents"], auto_enable_gbrain=True) == ["zhihuiya_patents"]
+    assert effective_mcp_server_names(["gbrain", "zhihuiya_patents"]) == ["zhihuiya_patents"]
     status = gbrain_runtime_status()
-    assert status["configured"] is True
+    assert status["configured"] is False
     assert status["ready"] is False
-    assert "not initialized" in status["reason"]
+    assert "尚未初始化" in status["reason"]
+
+
+def test_gbrain_home_is_always_derived_from_the_active_knowledge_base(monkeypatch, tmp_path) -> None:
+    knowledge_root = tmp_path / "knowledge"
+    expected_home = knowledge_root / "llm-wiki" / ".puddingclaw" / "gbrain-home"
+    monkeypatch.setenv("PUDDINGCLAW_KNOWLEDGE_DIR", str(knowledge_root))
+    monkeypatch.setenv("PUDDINGCLAW_GBRAIN_HOME", str(tmp_path / "obsolete-global-home"))
+
+    assert gbrain_runtime_status()["home"] == str(expected_home)
 
 
 def test_gbrain_mcp_filter_is_read_only_and_fail_closed() -> None:
@@ -95,7 +126,7 @@ def test_other_mcp_servers_are_unchanged() -> None:
 def test_mcp_catalog_reports_filtered_tools_after_live_probe(monkeypatch) -> None:
     monkeypatch.setattr(
         "api.mcp.load_config",
-        lambda: {"mcp": {"enabled": [], "auto_enable_gbrain": True}},
+        lambda: {"mcp": {"enabled": []}},
     )
     monkeypatch.setattr(
         "mcp_clients.servers.gbrain_runtime_status",
@@ -111,7 +142,7 @@ def test_mcp_catalog_reports_filtered_tools_after_live_probe(monkeypatch) -> Non
     )
     monkeypatch.setattr(
         "mcp_clients.servers.effective_mcp_server_names",
-        lambda _enabled, *, auto_enable_gbrain: ["gbrain"],
+        lambda _enabled: ["gbrain"],
     )
 
     async def fake_load(_enabled):

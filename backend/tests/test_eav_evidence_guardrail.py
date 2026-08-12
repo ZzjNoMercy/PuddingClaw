@@ -358,8 +358,13 @@ async def test_top_k_miss_is_enriched_from_live_catalog_before_execution(
             return "SELECT * FROM vehicle_params WHERE type_name = '电池电量[kWh]'"
 
     async def fake_inspect(**kwargs: Any) -> list[dict[str, Any]]:
-        assert "电池电量[kWh]" in kwargs["requested_names"]
-        return [{"type_name": "电池电量[kWh]", "count": 9748}]
+        requested_names = kwargs["requested_names"]
+        if "电池电量[kWh]" in requested_names:
+            return [{"type_name": "电池电量[kWh]", "count": 9748}]
+        # The post-candidate pass may re-check the model's alias.  The live
+        # catalog is exact-match evidence, so an alias absent from the DB
+        # returns no row; the already observed canonical name remains valid.
+        return []
 
     monkeypatch.setattr(nl2sql_service, "_inspect_live_eav_type_names", fake_inspect)
     monkeypatch.setattr(

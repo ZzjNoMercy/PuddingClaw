@@ -31,12 +31,24 @@ class WebSearchInput(BaseModel):
     include_domains: list[str] = Field(default_factory=list, description="只包含这些网页域名，最多 5 个")
     exclude_domains: list[str] = Field(default_factory=list, description="排除这些网页域名，最多 5 个")
     time_range: Literal["day", "week", "month", "year"] | None = Field(
-        default=None, description="网页搜索的相对时间范围"
+        default=None, description="X Search 的相对时间范围"
     )
     allowed_x_handles: list[str] = Field(default_factory=list, description="只检索这些 X 账号，最多 20 个")
     excluded_x_handles: list[str] = Field(default_factory=list, description="排除这些 X 账号，最多 20 个")
     from_date: str | None = Field(default=None, description="X Search 起始日期，YYYY-MM-DD")
     to_date: str | None = Field(default=None, description="X Search 结束日期，YYYY-MM-DD")
+    enable_image_understanding: bool = Field(
+        default=False,
+        description="需要 Grok 分析网页或 X 帖子内图片时开启",
+    )
+    enable_image_search: bool = Field(
+        default=False,
+        description="需要 Grok 搜索并返回可嵌入图片时开启；仅适用于 Web Search",
+    )
+    enable_video_understanding: bool = Field(
+        default=False,
+        description="需要 Grok 分析 X 帖子内视频时开启；仅适用于 X Search",
+    )
 
 
 class ManagedWebSearchTool(BaseTool):

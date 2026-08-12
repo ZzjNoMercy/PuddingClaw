@@ -3,17 +3,29 @@
 import copy
 import json
 import logging
+import math
 import os
 import tempfile
 from pathlib import Path
 from typing import Any
 
+from runtime_identity.paths import PuddingClawPaths
+
 logger = logging.getLogger(__name__)
 
-CONFIG_FILE = Path(__file__).resolve().parent / "config.json"
+# Production always reads the user-owned sparse override below
+# PUDDINGCLAW_HOME. Tests may replace this with an explicit temporary path.
+CONFIG_FILE: Path | None = None
 DEEPAGENTS_SUMMARY_INPUT_CONTEXT_RATIO = 0.8
 _LEGACY_TERMINAL_EXECUTION_KEYS = frozenset(
     {"sandbox_mode", "docker_enabled", "on_unavailable"}
+)
+_REPLACE_DICT_PATHS = frozenset(
+    {
+        ("vanna", "query", "entity_top_k_by_type"),
+        ("subagents",),
+        ("mcp", "servers"),
+    }
 )
 
 
@@ -24,81 +36,23 @@ class UnsupportedTerminalExecutionConfig(ValueError):
 _LEGACY_WARN_SHOWN: bool = False
 
 _DEFAULT_CONFIG: dict[str, Any] = {
-    "rag_mode": False,
-    "memory_backend": "markdown",  # "markdown" = MEMORY.md 原生方案, "mem0" = mem0 框架
-    "thinking_mode": False,  # 开启后 gateway_llm / fallback_llm 使用 thinking 模型与参数
-    "ai_gateway": {
-        # 覆盖地址：为空时由 backend 自动探测 Docker full profile 中的 Higress
-        "base_url": "",
-        "health_path": "/health",
-        "fallback_to_direct": True,
-    },
-    "gateway_llm": {
-        # Higress 可用时实际使用的模型；与 fallback_llm 分离，避免和 fallback 直连配置混淆
-        "model": "deepseek-v4-pro",
-        # 思考模式开关开启时使用的模型与参数（DeepSeek 通过 extra_body 启用 thinking）
-        "thinking": {
-            "model": "deepseek-v4-pro",
-            "reasoning_effort": "high",
-            "extra_body": {"thinking": {"type": "enabled"}},
-        },
-    },
-    "fallback_llm": {
-        "provider": "deepseek",
-        "model": "deepseek-v4-pro",
-        "base_url": "https://api.deepseek.com",
-        "api_key": "",
-        "temperature": 0.7,
-        "max_tokens": 4096,
-        "context_window": 1000000,
-        # 直连 fallback 的思考模式配置
-        "thinking": {
-            "model": "deepseek-v4-pro",
-            "reasoning_effort": "high",
-            "extra_body": {"thinking": {"type": "enabled"}},
-        },
-    },
-    "fallback_embedding": {
-        "provider": "qwen",
-        "model": "text-embedding-v4",
-        "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-        "api_key": "",
-        "dimension": 1024,
-        "batch_size": 10,
-    },
-    "multimodal_embedding": {
-        "provider": "dashscope",
-        "model": "qwen3-vl-embedding",
-        "dimension": 1024,
-        # qwen3-vl-embedding accepts up to 20 independent content elements.
-        "batch_size": 10,
-        # qwen-vl embedding uses DashScope native API, not OpenAI-compatible /v1/embeddings.
-        # Leave base_url empty for direct DashScope SDK mode. If a Higress native passthrough
-        # route is configured, set base_url to the gateway root and keep route_path below.
-        "base_url": "",
-        "route_path": "/api/v1/services/embeddings/multimodal-embedding/multimodal-embedding",
-        "api_key": "",
-        "prefer_gateway": False,
-    },
     "rag": {
-        "top_k": 3,
-        "similarity_threshold": 0.7,
+        "top_k": 10,
+        "similarity_threshold": 0.5,
         "hybrid": {
             "enabled": True,
             "mode": "reciprocal_rerank",
-            "text_vector_weight": 0.45,
-            "image_vector_weight": 0.35,
-            "bm25_weight": 0.2,
-            "candidate_top_k": 10,
+            "text_vector_weight": 0.7,
+            "image_vector_weight": 0.4,
+            "bm25_weight": 0.3,
+            "candidate_top_k": 30,
         },
         "rerank": {
             "enabled": True,
             "provider": "dashscope",
             "model": "qwen3-vl-rerank",
-            "top_n": 3,
+            "top_n": 10,
             "candidate_top_k": 50,
-            "base_url": "",
-            "api_key": "",
         },
     },
     "database": {
@@ -113,38 +67,30 @@ _DEFAULT_CONFIG: dict[str, Any] = {
         "port": 5432,
         "database": "puddingclaw",
         "username": "puddingclaw",
-        "password": "puddingclaw",
+        # Secrets are never code defaults or config.json values. Bundled mode
+        # receives its credential through the deployment environment.
+        "password": "",
         # Advanced escape hatch for deployments that need a full SQLAlchemy URL.
         # The frontend intentionally does not ask normal desktop users to write this.
         "url": "",
     },
     "knowledge": {
         # User-owned physical directory for local knowledge artifacts. Empty
-        # means backend/knowledge for development; PUDDINGCLAW_KNOWLEDGE_DIR can
-        # still override this temporarily.
+        # resolves to the canonical knowledge directory under PuddingClaw Home.
         "root_dir": "",
         "llm_wiki": {
-            # Dedicated background compiler Agent. An empty model_id follows
-            # the main Agent binding from Model Services.
-            "compiler_agent": {"model_id": ""},
-            # Keep the deterministic Markdown query as the compatibility
-            # default. Hybrid mode adds a rebuildable LlamaIndex/Milvus
-            # projection without changing the Wiki source of truth.
-            "retrieval": {"hybrid_enabled": False},
-            # gbrain uses a text embedding model while importing/searching and
-            # a chat model for `think`. Empty ids follow the global bindings.
-            "gbrain": {
-                "embedding_model_id": "",
-                "think_model_id": "",
-            },
+            # Hybrid retrieval is enabled by default. Dedicated compiler or
+            # GBrain model ids are persisted only when the user overrides the
+            # corresponding Provider Registry binding.
+            "retrieval": {"hybrid_enabled": True},
         },
         "mineru": {
             "base_url": "http://localhost:8002",
-            # MinerU service writes its own runtime scratch files under
-            # data/mineru-runtime/output when started by setup-mineru.py.
+            # Empty means PUDDINGCLAW_HOME/tmp/mineru-runtime/output. An explicit
+            # relative path is resolved from PUDDINGCLAW_HOME, never the package.
             # PuddingClaw copies final assets into the user knowledge directory,
             # so successful imports clean runtime output by default.
-            "runtime_output_dir": "data/mineru-runtime/output",
+            "runtime_output_dir": "",
             "keep_runtime_output": False,
             # Large PDFs can take minutes in MinerU pipeline mode. Keep connect
             # timeout short, but allow a long read timeout for parsing.
@@ -158,6 +104,9 @@ _DEFAULT_CONFIG: dict[str, Any] = {
             "text_collection": "puddingclaw_knowledge_text",
             "image_collection": "puddingclaw_knowledge_image",
             "bm25_enabled": True,
+            # Model identity and credentials live in Provider Registry; batch
+            # size is part of the knowledge indexing runtime.
+            "embedding_batch_size": 10,
         },
         "search": {
             "enabled": True,
@@ -180,9 +129,8 @@ _DEFAULT_CONFIG: dict[str, Any] = {
         "default_database_source_id": "project_postgres",
         "default_dialect": "PostgreSQL",
         "llm": {
-            # Reuse app-level gateway/fallback config by default. Override only
-            # when NL2SQL needs a dedicated model or endpoint.
-            "reuse": "gateway_llm",
+            # Resolve the dedicated Provider Registry binding by default.
+            "reuse": "vanna_llm",
             "model": "",
             "base_url": "",
             "api_key": "",
@@ -190,11 +138,9 @@ _DEFAULT_CONFIG: dict[str, Any] = {
             "max_tokens": 14000,
         },
         "embedding": {
-            # Reuse fallback_embedding by default. For Qwen/OpenAI compatible
-            # text embeddings, base_url is the /v1 root, not the /embeddings path.
-            # Vanna training data is text-only, so it intentionally does not
-            # reuse multimodal_embedding.
-            "reuse": "fallback_embedding",
+            # Vanna training data is text-only, so it resolves the dedicated
+            # text-embedding binding instead of the multimodal binding.
+            "reuse": "vanna_embedding",
             "provider": "qwen",
             "model": "text-embedding-v4",
             "base_url": "",
@@ -224,7 +170,13 @@ _DEFAULT_CONFIG: dict[str, Any] = {
             # SQL generation. Keep this default conservative; individual
             # business entity types can override it below.
             "entity_top_k_default": 10,
-            "entity_top_k_by_type": {},
+            "entity_top_k_by_type": {
+                "品牌": 5,
+                "款型": 5,
+                "车系": 5,
+                "配置分类": 10,
+                "配置名称": 20,
+            },
         },
     },
     "analytics": {
@@ -235,28 +187,21 @@ _DEFAULT_CONFIG: dict[str, Any] = {
             "full_rows_hard_row_cap": 200,
             "full_rows_hard_column_cap": 20,
             "max_cell_chars_for_llm": 500,
-            "result_materialization_row_cap": 5000,
+            "result_materialization_row_cap": 99999,
             "query_timeout_ms": 30000,
             "sql_generation_timeout_ms": 210000,
             "result_store_enabled": True,
             "result_store_ttl_hours": 168,
             "default_page_size": 100,
             "max_page_size": 500,
-            "export_enabled": False,
+            "export_enabled": True,
             "profile_enabled": True,
-            # Retained for migration telemetry and non-Agent compatibility.
-            # Agent tool exposure no longer depends on these rollout values:
-            # legacy SQL generation/validation is always hidden from Agents.
-            "database_agent_sql_path_enabled": False,
-            "database_agent_sql_path_rollout_percentage": 1,
-            "database_agent_sql_fallback_enabled": True,
-            "database_agent_sql_shadow_compare_enabled": False,
         },
     },
     "compression": {
-        "ratio": 0.5,
         # Must be less than MAX_HISTORY_MESSAGES (50) so compression fires before truncation
-        "trigger_count": 15,
+        "trigger_count": 20,
+        "max_history_messages": 100,
         # Agent/DeepAgents uses its own built-in history offload + summarization
         # lifecycle. Keep this separate from the legacy Chat middleware stack.
         "deepagents": {
@@ -265,8 +210,10 @@ _DEFAULT_CONFIG: dict[str, Any] = {
                 # Optional registered Provider model id used by both automatic
                 # DeepAgents summarization and manual /compact. An empty value
                 # preserves the legacy behavior of following the Agent model.
+                # Empty follows the current Agent Provider binding. Model
+                # identity has one source of truth in Provider Registry.
                 "model_id": "",
-                "trigger_tokens": 160000,
+                "trigger_tokens": 272000,
                 "keep_tokens": 64000,
             },
             "tool_context": {
@@ -309,7 +256,9 @@ _DEFAULT_CONFIG: dict[str, Any] = {
     },
     "subagents": {
         "image_analyzer": {
-            "enabled": False,
+            "enabled": True,
+            # The image analyzer resolves the dedicated Provider binding; this
+            # field remains only as the generic subagent display fallback.
             "model": "qwen:qwen3.7",
             "description": "Analyze image inputs and answer questions about them.",
             "route_trigger": "image_input",
@@ -344,8 +293,8 @@ _DEFAULT_CONFIG: dict[str, Any] = {
                 "enabled": False,
                 # Task classification, permission review and completion grading
                 # share this non-thinking model unless a deployment overrides it.
-                "model": "deepseek-v4-pro",
-                "max_iterations": 2,
+                "model": "deepseek-v4-flash",
+                "max_iterations": 3,
                 "max_stagnant_repairs": 2,
                 "custom_rules_enabled": False,
                 "custom_rules": [],
@@ -368,7 +317,7 @@ _DEFAULT_CONFIG: dict[str, Any] = {
                 "probe_timeout_seconds": 5,
                 "image": "puddingclaw/sandbox:python3.12-node22-chromium-v5",
                 "cpu_limit": "2",
-                "memory_limit_mb": 2048,
+                "memory_limit_mb": 4096,
                 "pids_limit": 256,
                 "network_enabled": False,
                 "dependency_setup_enabled": False,
@@ -377,28 +326,6 @@ _DEFAULT_CONFIG: dict[str, Any] = {
                 "idle_stop_minutes": 30,
             },
         },
-    },
-    "mem0": {
-        "user_id": "default_user",
-        "llm": {
-            "provider": "openai",
-            "config": {
-                "model": "deepseek-chat",
-                "openai_base_url": "https://api.deepseek.com/v1",
-            },
-        },
-        "embedder": {
-            "provider": "openai",
-            "config": {
-                "model": "text-embedding-3-small",
-            },
-        },
-        "version": "v1.1",
-    },
-    "smart_extractor": {
-        "throttle_every": 3,
-        "score_threshold": 0.1,
-        "stale_days": 30,
     },
     "tool_intent_router": {
         "enabled": True,
@@ -412,12 +339,12 @@ _DEFAULT_CONFIG: dict[str, Any] = {
             "triggers": ["帮我", "待办", "记得", "提醒", "任务", "需要做"],
         },
     },
-    # A dedicated, initialized PUDDINGCLAW_GBRAIN_HOME is the capability
-    # boundary. When it is ready, Agent runtimes automatically attach only the
-    # hard-allowlisted gbrain query tools; an incomplete runtime fails closed.
+    # The initialized gbrain home belonging to the active knowledge base is the
+    # capability boundary. When it is ready, Agent runtimes automatically
+    # attach only the hard-allowlisted gbrain query tools; an incomplete
+    # runtime fails closed.
     "mcp": {
         "enabled": [],
-        "auto_enable_gbrain": True,
         # Every MCP server is described in this one config section. Secret
         # values use environment references and are resolved at runtime.
         "servers": {
@@ -428,26 +355,29 @@ _DEFAULT_CONFIG: dict[str, Any] = {
                 "headers": {"Authorization": "${ZHIHUIYA_MCP_API_KEY}"},
                 "timeout": 60,
             },
-            "gbrain": {
-                "name": "gbrain",
-                "transport": "stdio",
-                "command": "gbrain",
-                "args": ["serve"],
-            },
         },
     },
 }
 
 
-def _deep_merge(base: dict, override: dict) -> dict:
+def _deep_merge(
+    base: dict,
+    override: dict,
+    *,
+    _path: tuple[str, ...] = (),
+) -> dict:
     """Deep merge override into base, preserving nested defaults."""
     # Callers mutate the returned settings object. A shallow copy would retain
     # references into _DEFAULT_CONFIG whenever an override omits a nested key,
     # making one settings save silently change process-wide defaults.
     result = copy.deepcopy(base)
     for key, value in override.items():
+        path = (*_path, str(key))
+        if path in _REPLACE_DICT_PATHS and isinstance(value, dict):
+            result[key] = copy.deepcopy(value)
+            continue
         if key in result and isinstance(result[key], dict) and isinstance(value, dict):
-            result[key] = _deep_merge(result[key], value)
+            result[key] = _deep_merge(result[key], value, _path=path)
         else:
             result[key] = value
     return result
@@ -456,7 +386,10 @@ def _deep_merge(base: dict, override: dict) -> dict:
 def _deepagents_summary_input_tokens(config: dict[str, Any]) -> int:
     """Derive the summary-call input ceiling from the configured model window."""
 
-    raw_context_window = config.get("fallback_llm", {}).get("context_window", 1000000)
+    from provider_registry import get_provider_registry
+
+    resolved = get_provider_registry().resolve_binding("agent")
+    raw_context_window = resolved.get("context_window", 1000000)
     try:
         context_window = max(1, int(raw_context_window))
     except (TypeError, ValueError):
@@ -464,69 +397,127 @@ def _deepagents_summary_input_tokens(config: dict[str, Any]) -> int:
     return max(1, int(context_window * DEEPAGENTS_SUMMARY_INPUT_CONTEXT_RATIO))
 
 
-def _migrate_legacy_config(data: dict[str, Any]) -> tuple[dict[str, Any], bool]:
-    """将旧版 llm / embedding 顶层键迁移为 fallback_llm / fallback_embedding。
+def _validate_config_document(value: Any) -> dict[str, Any]:
+    """Validate the current sparse override schema without compatibility rewrites."""
 
-    仅迁移一次：若存在旧键且新键不存在，则复制后删除旧键。
-    """
-    migrated = False
-    if "llm" in data:
-        if "fallback_llm" not in data:
-            data["fallback_llm"] = data["llm"]
-        del data["llm"]
-        migrated = True
-    if "embedding" in data:
-        if "fallback_embedding" not in data:
-            data["fallback_embedding"] = data["embedding"]
-        del data["embedding"]
-        migrated = True
-    if isinstance(data.get("subagent"), dict) and "subagents" not in data:
-        data["subagents"] = data["subagent"]
-        del data["subagent"]
-        migrated = True
-    if isinstance(data.get("subagents"), dict):
-        canonical = _subagent_config_from_items(_subagent_items_for_display(data["subagents"]))
-        if canonical != data["subagents"]:
-            data["subagents"] = canonical
-            migrated = True
-    summarization = data.get("compression", {}).get("deepagents", {}).get("summarization", {})
-    if isinstance(summarization, dict) and "summary_input_tokens" in summarization:
-        summarization.pop("summary_input_tokens", None)
-        migrated = True
-    docker = data.get("harness", {}).get("terminal", {}).get("docker", {})
-    if isinstance(docker, dict) and docker.get("image") in {
+    if not isinstance(value, dict):
+        raise ValueError("PuddingClaw settings must be a JSON object")
+    data = copy.deepcopy(value)
+    schema_version = data.pop("schema_version", 1)
+    if schema_version != 1:
+        raise ValueError(f"Unsupported config schema_version: {schema_version!r}")
+
+    retired = {
+        "llm",
+        "embedding",
+        "subagent",
+        "ai_gateway",
+        "gateway_llm",
+        "fallback_llm",
+        "fallback_embedding",
+        "multimodal_embedding",
+        "rag_mode",
+        "memory_backend",
+        "thinking_mode",
+        "mem0",
+        "smart_extractor",
+    }.intersection(data)
+    if retired:
+        raise ValueError("Retired settings are not supported: " + ", ".join(sorted(retired)))
+    unknown = set(data).difference(_DEFAULT_CONFIG)
+    if unknown:
+        raise ValueError("Unknown settings: " + ", ".join(sorted(unknown)))
+
+    compression = data.get("compression")
+    if isinstance(compression, dict) and "ratio" in compression:
+        raise ValueError("Retired setting is not supported: compression.ratio")
+    knowledge = data.get("knowledge")
+    multimodal_index = knowledge.get("multimodal_index") if isinstance(knowledge, dict) else None
+    if isinstance(multimodal_index, dict) and "overwrite" in multimodal_index:
+        raise ValueError("Retired setting is not supported: knowledge.multimodal_index.overwrite")
+    database = data.get("database")
+    if isinstance(database, dict) and database.get("password"):
+        raise ValueError("database.password must be stored through Credential Vault")
+    analytics = data.get("analytics")
+    database_qa = analytics.get("database_qa") if isinstance(analytics, dict) else None
+    if isinstance(database_qa, dict):
+        removed_analytics = {
+            "database_agent_sql_path_enabled",
+            "database_agent_sql_path_rollout_percentage",
+            "database_agent_sql_shadow_compare_enabled",
+        }.intersection(database_qa)
+        if removed_analytics:
+            raise ValueError(
+                "Retired analytics settings are not supported: "
+                + ", ".join(sorted(removed_analytics))
+            )
+    harness = data.get("harness")
+    terminal = harness.get("terminal") if isinstance(harness, dict) else None
+    docker = terminal.get("docker") if isinstance(terminal, dict) else None
+    removed_images = {
         "python:3.12-slim",
         "puddingclaw/sandbox:python3.12-node22-v1",
         "puddingclaw/sandbox:python3.12-node22-v2",
         "puddingclaw/sandbox:python3.12-node22-curl-v3",
-    }:
-        docker["image"] = "puddingclaw/sandbox:python3.12-node22-chromium-v5"
-        docker.setdefault("dependency_setup_enabled", False)
-        migrated = True
-    if isinstance(docker, dict):
-        if (
-            docker.get("dependency_setup_enabled") is True
-            and docker.get("dependency_setup_opt_in_version") != 1
-        ):
-            # Early development builds briefly defaulted project dependency
-            # preparation to true. Reset that legacy implicit opt-in once so
-            # existing users return to the clean Python+Node sandbox default.
-            docker["dependency_setup_enabled"] = False
-            migrated = True
-        if docker.get("dependency_setup_opt_in_version") != 1:
-            docker["dependency_setup_opt_in_version"] = 1
-            migrated = True
-    if migrated:
-        logger.info("[config] 已完成 legacy 配置迁移")
-    return data, migrated
+    }
+    if isinstance(docker, dict) and docker.get("image") in removed_images:
+        raise ValueError(f"Unsupported sandbox image: {docker['image']}")
+    mcp = data.get("mcp")
+    if isinstance(mcp, dict):
+        # gbrain is mandatory and readiness-driven. Ignore all user attempts
+        # to toggle or redefine it, including direct edits to Home JSON.
+        mcp.pop("auto_enable_gbrain", None)
+        enabled = mcp.get("enabled")
+        if isinstance(enabled, list):
+            mcp["enabled"] = [name for name in enabled if name != "gbrain"]
+        servers = mcp.get("servers")
+        if isinstance(servers, dict):
+            only_builtin_gbrain = bool(servers) and all(name == "gbrain" for name in servers)
+            servers.pop("gbrain", None)
+            if only_builtin_gbrain:
+                mcp.pop("servers", None)
+    _strip_empty_inherited_overrides(data)
+    return data
+
+
+def _strip_empty_inherited_overrides(config: dict[str, Any]) -> bool:
+    """Remove blank overrides whose product default is a meaningful value."""
+
+    harness = config.get("harness")
+    completion = harness.get("completion") if isinstance(harness, dict) else None
+    rubric = completion.get("rubric") if isinstance(completion, dict) else None
+    if not isinstance(rubric, dict):
+        return False
+    model = rubric.get("model")
+    if not isinstance(model, str) or model.strip():
+        return False
+    rubric.pop("model", None)
+    if not rubric:
+        completion.pop("rubric", None)
+    if not completion:
+        harness.pop("completion", None)
+    if not harness:
+        config.pop("harness", None)
+    return True
+
+
+def _config_path() -> Path:
+    """Return the user override file, while honoring explicit test overrides."""
+
+    if CONFIG_FILE is not None:
+        return Path(CONFIG_FILE)
+    return PuddingClawPaths.from_environment().root / "config.json"
 
 
 def load_config() -> dict[str, Any]:
-    """Load configuration from disk, returning defaults if missing."""
-    if not CONFIG_FILE.exists():
+    """Load bundled defaults plus user overrides from PUDDINGCLAW_HOME."""
+    config_path = _config_path()
+    if not config_path.exists():
         return json.loads(json.dumps(_DEFAULT_CONFIG))
     try:
-        data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+        data = _validate_config_document(
+            json.loads(config_path.read_text(encoding="utf-8"))
+        )
         terminal = data.get("harness", {}).get("terminal") if isinstance(data, dict) else None
         if isinstance(terminal, dict):
             legacy_keys = sorted(_LEGACY_TERMINAL_EXECUTION_KEYS.intersection(terminal))
@@ -536,52 +527,100 @@ def load_config() -> dict[str, Any]:
                     + ", ".join(legacy_keys)
                     + "; choose execution_mode=spawn or kernel"
                 )
-        data, migrated = _migrate_legacy_config(data)
         merged = _deep_merge(_DEFAULT_CONFIG, data)
-        # One-time provider migration imports all effective credentials into
-        # the user-local CredentialStore before stripping repository-local
-        # plaintext copies. It never deletes Higress data; that remains a
-        # read-only migration source for rollback/audit.
-        from provider_registry import get_provider_registry
-
-        get_provider_registry().ensure_migrated(merged)
-        credentials_migrated = _strip_provider_credentials(merged)
-        # 若发生迁移，立即回写，避免下次仍读取旧键/明文凭证
-        if migrated or credentials_migrated:
-            save_config(merged)
         return merged
     except UnsupportedTerminalExecutionConfig:
         raise
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        logger.error("[config] invalid settings file %s: %s", config_path, exc)
+        raise ValueError(f"Invalid PuddingClaw settings file: {config_path}") from exc
     except Exception:
-        return json.loads(json.dumps(_DEFAULT_CONFIG))
+        # A Vault, permission, or validation failure must not be disguised as
+        # a clean default configuration; doing so can overwrite user intent
+        # and make credentials appear to have vanished.
+        logger.exception("[config] failed to load settings from %s", config_path)
+        raise
 
 
 def save_config(config: dict[str, Any]) -> None:
-    """Persist non-secret configuration atomically with owner-only permissions."""
-    CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
-    fd, raw_path = tempfile.mkstemp(prefix=".config.", dir=CONFIG_FILE.parent)
+    """Persist user overrides atomically below PUDDINGCLAW_HOME."""
+    target = _config_path()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    persisted = copy.deepcopy(config)
+    _strip_empty_inherited_overrides(persisted)
+    mcp = persisted.get("mcp")
+    if isinstance(mcp, dict):
+        mcp.pop("auto_enable_gbrain", None)
+        if isinstance(mcp.get("enabled"), list):
+            mcp["enabled"] = [name for name in mcp["enabled"] if name != "gbrain"]
+        if isinstance(mcp.get("servers"), dict):
+            only_builtin_gbrain = bool(mcp["servers"]) and all(
+                name == "gbrain" for name in mcp["servers"]
+            )
+            mcp["servers"].pop("gbrain", None)
+            if only_builtin_gbrain:
+                mcp.pop("servers", None)
+    _strip_provider_credentials(persisted)
+    _strip_database_credentials(persisted)
+    database = persisted.get("database")
+    if isinstance(database, dict) and database.get("password_ref") and database.get("password") == "":
+        database.pop("password", None)
+    payload = {"schema_version": 1, **_config_overrides(persisted, _DEFAULT_CONFIG)}
+    fd, raw_path = tempfile.mkstemp(prefix=".config.", dir=target.parent)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             if os.name != "nt":
                 os.fchmod(handle.fileno(), 0o600)
-            handle.write(json.dumps(config, ensure_ascii=False, indent=2))
+            handle.write(json.dumps(payload, ensure_ascii=False, indent=2))
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(raw_path, CONFIG_FILE)
+        os.replace(raw_path, target)
         if os.name != "nt":
-            os.chmod(CONFIG_FILE, 0o600)
+            os.chmod(target, 0o600)
     finally:
         if os.path.exists(raw_path):
             os.unlink(raw_path)
 
 
+def _config_overrides(
+    value: Any,
+    defaults: Any,
+    *,
+    _path: tuple[str, ...] = (),
+) -> dict[str, Any]:
+    """Return only user-owned differences from package defaults."""
+
+    if not isinstance(value, dict) or not isinstance(defaults, dict):
+        return value
+    result: dict[str, Any] = {}
+    for key, current in value.items():
+        if key == "schema_version":
+            continue
+        if key not in defaults:
+            result[key] = current
+            continue
+        default = defaults[key]
+        path = (*_path, str(key))
+        if path in _REPLACE_DICT_PATHS:
+            if current != default:
+                result[key] = copy.deepcopy(current)
+            continue
+        if isinstance(current, dict) and isinstance(default, dict):
+            nested = _config_overrides(current, default, _path=path)
+            if nested:
+                result[key] = nested
+        elif isinstance(current, float) and isinstance(default, (int, float)):
+            if not math.isclose(current, float(default), rel_tol=1e-12, abs_tol=1e-12):
+                result[key] = current
+        elif current != default:
+            result[key] = current
+    return result
+
+
 def _strip_provider_credentials(config: dict[str, Any]) -> bool:
-    """Remove only migrated provider credentials from the legacy config file."""
+    """Keep provider secrets out of the general settings document."""
     changed = False
     paths = [
-        ("fallback_llm",),
-        ("fallback_embedding",),
-        ("multimodal_embedding",),
         ("rag", "rerank"),
         ("vanna", "llm"),
         ("vanna", "embedding"),
@@ -597,6 +636,18 @@ def _strip_provider_credentials(config: dict[str, Any]) -> bool:
             current["api_key"] = ""
             changed = True
     return changed
+
+
+def _strip_database_credentials(config: dict[str, Any]) -> bool:
+    database = config.get("database")
+    if not isinstance(database, dict) or not database.get("password"):
+        return False
+    from provider_registry import LocalCredentialStore
+
+    reference = LocalCredentialStore().put("database-config", str(database.get("password")))
+    database["password_ref"] = reference
+    database["password"] = ""
+    return True
 
 
 def get_middleware_config() -> dict:
@@ -650,33 +701,11 @@ def get_cache_config() -> dict:
 def get_compress_trigger_count() -> int:
     """Get the message count threshold for auto-compression."""
     config = load_config()
-    return int(config.get("compression", {}).get("trigger_count", 15))
-
-
-def get_compress_ratio() -> float:
-    """Get compression ratio (proportion of messages to compress)."""
-    config = load_config()
-    return float(config.get("compression", {}).get("ratio", 0.5))
-
-
-def get_rag_mode() -> bool:
-    """Get current RAG mode setting."""
-    return bool(load_config().get("rag_mode", False))
-
-
-def set_rag_mode(enabled: bool) -> None:
-    """Set RAG mode on/off."""
-    config = load_config()
-    config["rag_mode"] = enabled
-    from provider_registry import get_provider_registry
-
-    get_provider_registry().ensure_migrated(config)
-    _strip_provider_credentials(config)
-    save_config(config)
+    return int(config.get("compression", {}).get("trigger_count", 20))
 
 
 def get_rag_config() -> dict[str, Any]:
-    """Read general RAG retrieval settings from config.json."""
+    """Read document-knowledge retrieval settings used by Agent tools."""
 
     config = load_config()
     rag = config.get("rag", {})
@@ -694,9 +723,8 @@ def get_rag_config() -> dict[str, Any]:
             return fallback
 
     return {
-        "enabled": bool(config.get("rag_mode", False)),
-        "top_k": _positive_int(rag.get("top_k"), 3),
-        "similarity_threshold": _float(rag.get("similarity_threshold"), 0.7),
+        "top_k": _positive_int(rag.get("top_k"), 10),
+        "similarity_threshold": _float(rag.get("similarity_threshold"), 0.5),
     }
 
 
@@ -723,77 +751,11 @@ def get_rag_hybrid_config() -> dict[str, Any]:
     return {
         "enabled": bool(hybrid.get("enabled", True)),
         "mode": hybrid.get("mode", "reciprocal_rerank"),
-        "text_vector_weight": _weight(hybrid.get("text_vector_weight", hybrid.get("vector_weight")), 0.45),
-        "image_vector_weight": _weight(hybrid.get("image_vector_weight"), 0.35),
-        "bm25_weight": _weight(hybrid.get("bm25_weight"), 0.2),
-        "candidate_top_k": _positive_int(hybrid.get("candidate_top_k"), 10),
+        "text_vector_weight": _weight(hybrid.get("text_vector_weight"), 0.7),
+        "image_vector_weight": _weight(hybrid.get("image_vector_weight"), 0.4),
+        "bm25_weight": _weight(hybrid.get("bm25_weight"), 0.3),
+        "candidate_top_k": _positive_int(hybrid.get("candidate_top_k"), 30),
     }
-
-
-def get_memory_backend() -> str:
-    """获取长期记忆后端类型：'markdown' 或 'mem0'。"""
-    backend = load_config().get("memory_backend", "markdown")
-    if backend not in ("markdown", "mem0"):
-        return "markdown"
-    return backend
-
-
-def get_mem0_config() -> dict[str, Any]:
-    """构建 mem0 Memory.from_config() 所需的配置字典。
-
-    复用 fallback_llm 和 fallback_embedding 的 api_key，避免用户配置两套凭证。
-    """
-    import copy
-    import os
-    config = load_config()
-    mem0_cfg = copy.deepcopy(config.get("mem0", {}))
-    llm_cfg = config.get("fallback_llm", {})
-    emb_cfg = config.get("fallback_embedding", {})
-
-    # 复用已有的 api_key（llm → mem0.llm, embedding → mem0.embedder）
-    mem0_llm = mem0_cfg.get("llm", {})
-    mem0_llm_config = mem0_llm.get("config", {})
-    mem0_llm_config["api_key"] = llm_cfg.get("api_key") or os.getenv("DEEPSEEK_API_KEY", "")
-
-    mem0_emb = mem0_cfg.get("embedder", {})
-    mem0_emb_config = mem0_emb.get("config", {})
-    # 优先用 config.json 显式配置的 api_key；为空时才从环境变量读取
-    if not mem0_emb_config.get("api_key"):
-        openai_key = emb_cfg.get("api_key") or os.getenv("OPENAI_API_KEY", "") or os.getenv("DASHSCOPE_API_KEY", "")
-        if openai_key:
-            mem0_emb_config["api_key"] = openai_key
-    # base_url 也支持环境覆盖
-    if not mem0_emb_config.get("openai_base_url"):
-        openai_base = os.getenv("OPENAI_BASE_URL") or os.getenv("OPENAI_API_BASE") or emb_cfg.get("base_url")
-        if openai_base:
-            mem0_emb_config["openai_base_url"] = openai_base
-
-    result = {
-        "llm": {
-            "provider": mem0_llm.get("provider", "openai"),
-            "config": mem0_llm_config,
-        },
-        "embedder": {
-            "provider": mem0_emb.get("provider", "openai"),
-            "config": mem0_emb_config,
-        },
-        "version": mem0_cfg.get("version", "v1.1"),
-    }
-
-    # vector_store 配置透传（支持 Milvus / Qdrant 等）
-    if "vector_store" in mem0_cfg:
-        vs = mem0_cfg["vector_store"]
-        result["vector_store"] = {
-            "provider": vs.get("provider", "qdrant"),
-            "config": dict(vs.get("config", {})),
-        }
-
-    return result
-
-
-def get_mem0_user_id() -> str:
-    """获取 mem0 的默认 user_id。"""
-    return load_config().get("mem0", {}).get("user_id", "default_user")
 
 
 def get_tool_intent_router_config() -> dict:
@@ -818,34 +780,6 @@ def get_write_middleware_config() -> dict:
     })
 
 
-def get_smart_extractor_config() -> dict[str, int | float]:
-    """获取 SmartExtractor 配置：throttle_every / score_threshold / stale_days。"""
-    config = load_config()
-    se = config.get("smart_extractor", {})
-    return {
-        "throttle_every": int(se.get("throttle_every", 3)),
-        "score_threshold": float(se.get("score_threshold", 0.1)),
-        "stale_days": int(se.get("stale_days", 30)),
-    }
-
-
-def get_gateway_config() -> dict[str, Any]:
-    """读取 AI Gateway 配置，环境变量优先于持久化设置。
-
-    当 base_url 为空且未配置环境变量时，backend 会自动探测默认地址。
-    """
-    import os
-
-    gateway = load_config().get("ai_gateway", {})
-    env_url = os.getenv("AI_GATEWAY_URL", "").strip()
-    configured_url = gateway.get("base_url", "").strip()
-    return {
-        "base_url": env_url or configured_url or "",
-        "health_path": gateway.get("health_path", "/health"),
-        "fallback_to_direct": bool(gateway.get("fallback_to_direct", True)),
-    }
-
-
 def get_fallback_llm_config(
     *,
     thinking_enabled_override: bool | None = None,
@@ -867,47 +801,35 @@ def get_fallback_llm_config(
     resolved = (
         registry.resolve_model(
             model_id_override,
-            legacy_config=config,
             credential_name=credential_name,
         )
         if model_id_override
         else registry.resolve_binding(
             binding,
-            legacy_config=config,
             credential_name=credential_name,
         )
     )
-    if model_id_override or thinking_level is not None:
-        from llm.thinking_mapping import map_thinking_request
+    from llm.thinking_mapping import map_thinking_request
 
-        mapped_thinking = map_thinking_request(
+    # Conversation models follow their Provider Profile by default. Internal
+    # callers such as summaries, titles and rubric checks can still explicitly
+    # force reasoning off without reintroducing a global thinking_mode switch.
+    mapped_thinking = (
+        {
+            "thinking_enabled": False,
+            "thinking_level": None,
+            "reasoning_effort": None,
+            "extra_body": None,
+        }
+        if thinking_enabled_override is False
+        else map_thinking_request(
             resolved.get("thinking_profile", {}),
             thinking_level,
         )
-        return {
-            "provider": resolved.get("provider_id", "deepseek"),
-            "model": resolved.get("name") or "deepseek-chat",
-            "api_key": resolved.get("api_key", ""),
-            "base_url": resolved.get("base_url", "https://api.deepseek.com"),
-            "protocol": resolved.get("protocol", "deepseek"),
-            "model_id": resolved.get("id", ""),
-            "credential_name": resolved.get("credential_name", "default"),
-            "temperature": float(resolved.get("temperature", 0.7)),
-            "max_tokens": int(resolved.get("max_tokens", 4096)),
-            "context_window": int(resolved.get("context_window", 1000000)),
-            **mapped_thinking,
-        }
-    thinking = resolved.get("thinking", {})
-    thinking_enabled = (
-        bool(config.get("thinking_mode", False))
-        if thinking_enabled_override is None
-        else thinking_enabled_override
     )
-    base_model = resolved.get("name") or "deepseek-chat"
-    effective_model = thinking["model"] if thinking_enabled and thinking.get("model") else base_model
     return {
         "provider": resolved.get("provider_id", "deepseek"),
-        "model": effective_model,
+        "model": resolved.get("name") or "deepseek-chat",
         "api_key": resolved.get("api_key", ""),
         "base_url": resolved.get("base_url", "https://api.deepseek.com"),
         "protocol": resolved.get("protocol", "deepseek"),
@@ -916,10 +838,7 @@ def get_fallback_llm_config(
         "temperature": float(resolved.get("temperature", 0.7)),
         "max_tokens": int(resolved.get("max_tokens", 4096)),
         "context_window": int(resolved.get("context_window", 1000000)),
-        "reasoning_effort": thinking.get("reasoning_effort") if thinking_enabled else None,
-        "extra_body": thinking.get("extra_body") if thinking_enabled else None,
-        "thinking_enabled": thinking_enabled,
-        "thinking_level": thinking.get("reasoning_effort") if thinking_enabled else None,
+        **mapped_thinking,
     }
 
 
@@ -950,9 +869,9 @@ def get_llm_wiki_compiler_agent_config(
 
     registry = get_provider_registry()
     resolved = (
-        registry.resolve_model(configured_model_id, legacy_config=config)
+        registry.resolve_model(configured_model_id)
         if configured_model_id
-        else registry.resolve_binding("agent", legacy_config=config)
+        else registry.resolve_binding("agent")
     )
     return {
         "model_id": str(resolved.get("id") or ""),
@@ -975,7 +894,7 @@ def get_llm_wiki_retrieval_config() -> dict[str, Any]:
     if not isinstance(settings, dict):
         settings = {}
     return {
-        "hybrid_enabled": bool(settings.get("hybrid_enabled", False)),
+        "hybrid_enabled": bool(settings.get("hybrid_enabled", True)),
         "lexical_weight": 0.45,
         "semantic_weight": 0.55,
         "candidate_multiplier": 6,
@@ -1007,16 +926,15 @@ def get_llm_wiki_gbrain_config() -> dict[str, Any]:
     embedding = (
         registry.resolve_model(
             embedding_model_id,
-            legacy_config=config,
             expected_capability="text_embedding",
         )
         if embedding_model_id
-        else registry.resolve_binding("text_embedding", legacy_config=config)
+        else registry.resolve_binding("text_embedding")
     )
     think = (
-        registry.resolve_model(think_model_id, legacy_config=config)
+        registry.resolve_model(think_model_id)
         if think_model_id
-        else registry.resolve_binding("agent", legacy_config=config)
+        else registry.resolve_binding("agent")
     )
     dimension = int(embedding.get("dimension") or 0)
     if dimension <= 0:
@@ -1036,47 +954,13 @@ def get_llm_wiki_gbrain_config() -> dict[str, Any]:
     }
 
 
-def get_gateway_llm_config(
-    *,
-    thinking_enabled_override: bool | None = None,
-) -> dict[str, Any]:
-    """读取 Gateway 模式下的 LLM 模型配置。
-
-    与 fallback_llm 配置分离，避免 fallback 直连参数和网关路由模型混淆。
-    若 gateway_llm.model 未设置，向后兼容 fallback 到 fallback_llm.model。
-    当 thinking_mode 开启时，使用 thinking 下的模型与参数。
-    """
-    config = load_config()
-    gateway_llm = config.get("gateway_llm", {})
-    thinking = gateway_llm.get("thinking", {})
-    thinking_enabled = (
-        bool(config.get("thinking_mode", False))
-        if thinking_enabled_override is None
-        else thinking_enabled_override
-    )
-    fallback_model = get_fallback_llm_config(
-        thinking_enabled_override=thinking_enabled_override,
-    ).get("model", "deepseek-chat")
-    base_model = gateway_llm.get("model") or fallback_model
-    effective_model = thinking["model"] if thinking_enabled and thinking.get("model") else base_model
-    return {
-        "model": effective_model,
-        "reasoning_effort": thinking.get("reasoning_effort") if thinking_enabled else None,
-        "extra_body": thinking.get("extra_body") if thinking_enabled else None,
-    }
-
-
 def get_fallback_embedding_config() -> dict[str, Any]:
-    """从 config.json 读取 fallback Embedding 直连配置，fallback 到环境变量。
-
-    返回 model/api_key/api_base 三个字段。
-    注意：api_base 是 OpenAIEmbedding 的参数名，与 config.json 中的 base_url 做了映射。
-    """
+    """Resolve the text-embedding workload from Provider Registry."""
     config = load_config()
     from llm.embedding_limits import clamp_embedding_batch_size
     from provider_registry import get_provider_registry
 
-    resolved = get_provider_registry().resolve_binding("text_embedding", legacy_config=config)
+    resolved = get_provider_registry().resolve_binding("text_embedding")
     model = str(resolved.get("name") or "text-embedding-v4")
     return {
         "provider": resolved.get("provider_id", "dashscope"),
@@ -1096,26 +980,25 @@ def get_multimodal_embedding_config() -> dict[str, Any]:
     config = load_config()
     from provider_registry import get_provider_registry
 
-    resolved = get_provider_registry().resolve_binding("multimodal_embedding", legacy_config=config)
+    resolved = get_provider_registry().resolve_binding("multimodal_embedding")
     # Model identity, endpoint, dimension and credential belong to Model
     # Services. Request concurrency is an indexing runtime concern and remains
     # configurable from Knowledge settings for compatibility with existing
     # installations.
-    runtime = config.get("multimodal_embedding", {})
+    runtime = config.get("knowledge", {}).get("multimodal_index", {})
     return {
         "provider": resolved.get("provider_id", "dashscope"),
         "model": resolved.get("name", "qwen3-vl-embedding"),
         "dimension": int(resolved.get("dimension", 1024)),
         "batch_size": max(
             1,
-            int(runtime.get("batch_size", resolved.get("batch_size", resolved.get("concurrency", 10)))),
+            int(runtime.get("embedding_batch_size", resolved.get("batch_size", resolved.get("concurrency", 10)))),
         ),
         "api_key": resolved.get("api_key", ""),
         "base_url": resolved.get("base_url", "https://dashscope.aliyuncs.com"),
         "route_path": resolved.get("route_path", "/api/v1/services/embeddings/multimodal-embedding/multimodal-embedding"),
         "protocol": resolved.get("protocol", "dashscope_multimodal_embedding"),
         "model_id": resolved.get("id", ""),
-        "prefer_gateway": False,
     }
 
 
@@ -1176,8 +1059,6 @@ def get_rag_rerank_config() -> dict[str, Any]:
         "model": rerank.get("model", "qwen3-vl-rerank"),
         "top_n": _positive_int(rerank.get("top_n"), 5),
         "candidate_top_k": _positive_int(rerank.get("candidate_top_k"), 50),
-        "base_url": rerank.get("base_url", ""),
-        "api_key": rerank.get("api_key", ""),
     }
 
 
@@ -1202,7 +1083,7 @@ def get_knowledge_mineru_config() -> dict[str, Any]:
 
     config = load_config()
     mineru = config.get("knowledge", {}).get("mineru", {})
-    output_dir = str(mineru.get("runtime_output_dir") or "data/mineru-runtime/output").strip()
+    output_dir = str(mineru.get("runtime_output_dir") or "").strip()
     return {
         "base_url": str(mineru.get("base_url") or "http://localhost:8002").strip(),
         "runtime_output_dir": output_dir,
@@ -1223,8 +1104,8 @@ def get_vanna_config() -> dict[str, Any]:
     training = vanna.get("training", {})
     query = vanna.get("query", {})
     knowledge_index = config.get("knowledge", {}).get("multimodal_index", {})
-    fallback_llm = get_fallback_llm_config()
-    fallback_embedding = get_fallback_embedding_config()
+    agent_llm = get_fallback_llm_config()
+    text_embedding = get_fallback_embedding_config()
 
     def _positive_int(value: Any, default: int) -> int:
         try:
@@ -1246,17 +1127,17 @@ def get_vanna_config() -> dict[str, Any]:
                 continue
         return normalized
 
-    # ``gateway_llm`` is a legacy storage label. Both legacy reuse modes now
-    # resolve through the same explicit direct Provider binding.
+    # Legacy reuse labels are imported once, while runtime resolution always
+    # follows the dedicated Provider Registry binding.
     llm_reuse = str(llm.get("reuse") or "vanna_llm")
-    default_llm_model = fallback_llm.get("model", "")
-    default_llm_base = fallback_llm.get("base_url", "")
-    default_llm_key = fallback_llm.get("api_key", "")
+    default_llm_model = agent_llm.get("model", "")
+    default_llm_base = agent_llm.get("base_url", "")
+    default_llm_key = agent_llm.get("api_key", "")
 
-    embedding_reuse = str(embedding.get("reuse") or "fallback_embedding")
-    default_embedding_model = fallback_embedding.get("model", "")
-    default_embedding_base = fallback_embedding.get("base_url", "")
-    default_embedding_key = fallback_embedding.get("api_key", "")
+    embedding_reuse = str(embedding.get("reuse") or "vanna_embedding")
+    default_embedding_model = text_embedding.get("model", "")
+    default_embedding_base = text_embedding.get("api_base", "")
+    default_embedding_key = text_embedding.get("api_key", "")
 
     return {
         "enabled": bool(vanna.get("enabled", True)),
@@ -1272,11 +1153,11 @@ def get_vanna_config() -> dict[str, Any]:
         },
         "embedding": {
             "reuse": embedding_reuse,
-            "provider": str(embedding.get("provider") or fallback_embedding.get("provider") or "qwen"),
+            "provider": str(embedding.get("provider") or text_embedding.get("provider") or "qwen"),
             "model": str(embedding.get("model") or default_embedding_model),
             "base_url": str(embedding.get("base_url") or default_embedding_base),
             "api_key": str(embedding.get("api_key") or default_embedding_key),
-            "batch_size": max(1, int(embedding.get("batch_size") or fallback_embedding.get("batch_size") or 10)),
+            "batch_size": max(1, int(embedding.get("batch_size") or text_embedding.get("batch_size") or 10)),
         },
         "milvus": {
             "uri": str(milvus.get("uri") or knowledge_index.get("milvus_uri") or "http://localhost:19530"),
@@ -1315,14 +1196,6 @@ def get_database_qa_config() -> dict[str, Any]:
             return min(maximum, parsed)
         return parsed
 
-    try:
-        agent_sql_rollout_percentage = int(
-            database_qa.get("database_agent_sql_path_rollout_percentage", 1) or 0
-        )
-    except (TypeError, ValueError):
-        agent_sql_rollout_percentage = 100
-    agent_sql_rollout_percentage = max(0, min(100, agent_sql_rollout_percentage))
-
     return {
         "full_rows_token_budget": _positive_int(database_qa.get("full_rows_token_budget"), 10000, maximum=100000),
         "preview_rows_token_budget": _positive_int(database_qa.get("preview_rows_token_budget"), 3000, maximum=50000),
@@ -1332,7 +1205,7 @@ def get_database_qa_config() -> dict[str, Any]:
         "max_cell_chars_for_llm": _positive_int(database_qa.get("max_cell_chars_for_llm"), 500, maximum=10000),
         "result_materialization_row_cap": _positive_int(
             database_qa.get("result_materialization_row_cap"),
-            5000,
+            99999,
             maximum=100000,
         ),
         "query_timeout_ms": _positive_int(database_qa.get("query_timeout_ms"), 30000, minimum=1000, maximum=300000),
@@ -1346,12 +1219,8 @@ def get_database_qa_config() -> dict[str, Any]:
         "result_store_ttl_hours": _positive_int(database_qa.get("result_store_ttl_hours"), 168, maximum=24 * 365),
         "default_page_size": _positive_int(database_qa.get("default_page_size"), 100, maximum=5000),
         "max_page_size": _positive_int(database_qa.get("max_page_size"), 500, maximum=10000),
-        "export_enabled": bool(database_qa.get("export_enabled", False)),
+        "export_enabled": bool(database_qa.get("export_enabled", True)),
         "profile_enabled": bool(database_qa.get("profile_enabled", True)),
-        "database_agent_sql_path_enabled": bool(database_qa.get("database_agent_sql_path_enabled", False)),
-        "database_agent_sql_path_rollout_percentage": agent_sql_rollout_percentage,
-        "database_agent_sql_fallback_enabled": bool(database_qa.get("database_agent_sql_fallback_enabled", True)),
-        "database_agent_sql_shadow_compare_enabled": bool(database_qa.get("database_agent_sql_shadow_compare_enabled", False)),
     }
 
 
@@ -1375,8 +1244,15 @@ def get_database_config() -> dict[str, Any]:
     port = int(database.get("port") or 5432)
     db_name = str(database.get("database", "puddingclaw") or "puddingclaw").strip()
     username = str(database.get("username", "puddingclaw") or "puddingclaw").strip()
-    raw_password = database.get("password")
-    password = "puddingclaw" if raw_password is None else str(raw_password)
+    from provider_registry import LocalCredentialStore
+
+    raw_password = str(database.get("password") or "")
+    password_ref = str(database.get("password_ref") or "")
+    if raw_password and not password_ref:
+        password_ref = LocalCredentialStore().put("database-config", raw_password)
+    password = LocalCredentialStore().get(password_ref) if password_ref else ""
+    if not password:
+        password = os.getenv("PUDDINGCLAW_DATABASE_PASSWORD", "")
     assembled_url = ""
     if mode in {"bundled", "external"}:
         assembled_url = (
@@ -1391,6 +1267,7 @@ def get_database_config() -> dict[str, Any]:
         "database": db_name,
         "username": username,
         "password": password,
+        "password_ref": password_ref,
         "url": env_url or effective_config_url,
         "configured_url": configured_url,
         "configured_by": (
@@ -1404,24 +1281,16 @@ def get_database_config() -> dict[str, Any]:
     }
 
 
-def mask_api_key(key: str) -> str:
-    """Mask API key for display: sk-***...last4"""
-    if not key or len(key) < 8:
-        return "***"
-    return f"{key[:3]}***...{key[-4:]}"
-
-
 _SUBAGENT_RESERVED_KEYS = {"enabled", "items"}
 
 
 def _subagent_items_for_display(raw: dict[str, Any]) -> list[dict[str, Any]]:
-    """Return display-friendly subagent items from canonical or legacy config."""
+    """Return display-friendly items from the canonical keyed config."""
     if not raw:
         return []
 
-    # Legacy UI format: {"items": [{"name": "...", ...}]}
     if "items" in raw:
-        return [item for item in raw.get("items", []) if isinstance(item, dict)]
+        raise ValueError("subagents.items is not supported; use a keyed subagents object")
 
     items: list[dict[str, Any]] = []
     for key, value in raw.items():
@@ -1460,15 +1329,9 @@ def _normalize_subagent_config(raw: dict[str, Any]) -> dict[str, Any]:
 
 def get_settings_for_display() -> dict[str, Any]:
     """Get settings with masked API keys for frontend display."""
-    import os
-
     from provider_registry import get_provider_registry
 
     config = load_config()
-    effective_gateway = get_gateway_config()
-    effective_llm = get_fallback_llm_config()
-    effective_embedding = get_fallback_embedding_config()
-    effective_multimodal_embedding = get_multimodal_embedding_config()
     effective_knowledge_index = get_knowledge_multimodal_index_config()
     effective_knowledge_root = get_knowledge_root_config()
     effective_knowledge_mineru = get_knowledge_mineru_config()
@@ -1476,44 +1339,13 @@ def get_settings_for_display() -> dict[str, Any]:
     effective_vanna = get_vanna_config()
     effective_database_qa = get_database_qa_config()
     raw_vanna = config.get("vanna", {})
-    provider_registry = get_provider_registry().display(legacy_config=config)
+    provider_registry = get_provider_registry().display()
+    display_database = dict(effective_database)
+    display_database["password"] = ""
+    display_database["url"] = _redact_database_url(str(display_database.get("url") or ""))
     result = {
-        "memory_backend": config.get("memory_backend", "markdown"),
-        "thinking_mode": bool(config.get("thinking_mode", False)),
-        "ai_gateway": {
-            **effective_gateway,
-            "environment_override": bool(os.getenv("AI_GATEWAY_URL")),
-            # 是否启用由 backend 自动探测决定，前端不再展示开关
-            "enabled": bool(effective_gateway.get("base_url")),
-            # Compatibility-only field; runtime and the new settings UI use
-            # provider_registry instead of scanning Higress files.
-            "routed_models": [],
-        },
         "provider_registry": provider_registry,
-        "gateway_llm": {
-            **config.get("gateway_llm", {}),
-            "model": get_gateway_llm_config().get("model", effective_llm.get("model", "deepseek-chat")),
-        },
-        "fallback_llm": {
-            **config.get("fallback_llm", {}),
-            "api_key_masked": mask_api_key(effective_llm.get("api_key", "")),
-        },
-        "fallback_embedding": {
-            **config.get("fallback_embedding", {}),
-            "api_key_masked": mask_api_key(effective_embedding.get("api_key", "")),
-        },
-        "multimodal_embedding": {
-            **config.get("multimodal_embedding", {}),
-            "api_key_masked": mask_api_key(effective_multimodal_embedding.get("api_key", "")),
-            "effective_model": effective_multimodal_embedding.get("model"),
-            "effective_dimension": effective_multimodal_embedding.get("dimension"),
-            "gateway_route_required": True,
-            "openai_compatible": False,
-        },
-        "rag": {
-            "enabled": config.get("rag_mode", False),
-            **config.get("rag", {}),
-        },
+        "rag": config.get("rag", {}),
         "vanna": {
             "enabled": bool(raw_vanna.get("enabled", True)),
             "default_database_source_id": str(raw_vanna.get("default_database_source_id") or "project_postgres"),
@@ -1539,80 +1371,47 @@ def get_settings_for_display() -> dict[str, Any]:
         },
         "database": {
             **config.get("database", {}),
-            **effective_database,
+            **display_database,
         },
         "compression": config.get("compression", {}),
         "harness": config.get("harness", {}),
         "subagents": _normalize_subagent_config(config.get("subagents", {})),
     }
-    # Remove raw API keys from response
-    result["fallback_llm"].pop("api_key", None)
-    result["fallback_embedding"].pop("api_key", None)
-    result["multimodal_embedding"].pop("api_key", None)
+    result["database"].pop("password", None)
     return result
+
+
+def _redact_database_url(value: str) -> str:
+    if "@" not in value or "://" not in value:
+        return value
+    scheme, rest = value.split("://", 1)
+    authority, suffix = rest.split("@", 1)
+    if ":" in authority:
+        user = authority.split(":", 1)[0]
+        return f"{scheme}://{user}:***@{suffix}"
+    return value
 
 
 def update_settings(updates: dict[str, Any]) -> None:
     """Update settings from frontend, handling partial updates and API key logic."""
+    retired = {
+        "ai_gateway",
+        "gateway_llm",
+        "fallback_llm",
+        "fallback_embedding",
+        "multimodal_embedding",
+        "rag_mode",
+        "memory_backend",
+        "thinking_mode",
+        "mem0",
+        "smart_extractor",
+        "subagent",
+    }.intersection(updates)
+    if retired:
+        raise ValueError(
+            "Retired settings are not accepted: " + ", ".join(sorted(retired))
+        )
     config = load_config()
-
-    if "ai_gateway" in updates:
-        gateway_update = updates["ai_gateway"]
-        if "ai_gateway" not in config:
-            config["ai_gateway"] = {}
-        for key in ("base_url", "health_path", "fallback_to_direct"):
-            if key in gateway_update:
-                config["ai_gateway"][key] = gateway_update[key]
-
-    if "thinking_mode" in updates:
-        config["thinking_mode"] = bool(updates["thinking_mode"])
-
-    if "gateway_llm" in updates:
-        gateway_llm_update = updates["gateway_llm"]
-        if "gateway_llm" not in config:
-            config["gateway_llm"] = {}
-        if "model" in gateway_llm_update:
-            config["gateway_llm"]["model"] = gateway_llm_update["model"]
-        if "thinking" in gateway_llm_update:
-            config["gateway_llm"]["thinking"] = gateway_llm_update["thinking"]
-
-    if "fallback_llm" in updates:
-        llm_update = updates["fallback_llm"]
-        if "fallback_llm" not in config:
-            config["fallback_llm"] = {}
-        for key in ("provider", "model", "base_url", "temperature", "max_tokens", "context_window"):
-            if key in llm_update:
-                config["fallback_llm"][key] = llm_update[key]
-        if "context_window" in llm_update:
-            context_window = int(llm_update["context_window"])
-            if not 10000 <= context_window <= 10000000:
-                raise ValueError("模型上下文窗口必须在 10,000 到 10,000,000 tokens 之间")
-            config["fallback_llm"]["context_window"] = context_window
-        if "thinking" in llm_update:
-            config["fallback_llm"]["thinking"] = llm_update["thinking"]
-        # Only update API key if a non-empty value is provided
-        if llm_update.get("api_key"):
-            config["fallback_llm"]["api_key"] = llm_update["api_key"]
-
-    if "fallback_embedding" in updates:
-        emb_update = updates["fallback_embedding"]
-        if "fallback_embedding" not in config:
-            config["fallback_embedding"] = {}
-        for key in ("provider", "model", "base_url", "dimension", "batch_size"):
-            if key in emb_update:
-                config["fallback_embedding"][key] = emb_update[key]
-        if emb_update.get("api_key"):
-            config["fallback_embedding"]["api_key"] = emb_update["api_key"]
-
-    if "multimodal_embedding" in updates:
-        mm_update = updates["multimodal_embedding"]
-        if "multimodal_embedding" not in config:
-            config["multimodal_embedding"] = {}
-        for key in ("provider", "model", "base_url", "route_path", "dimension", "batch_size", "prefer_gateway"):
-            if key in mm_update:
-                config["multimodal_embedding"][key] = mm_update[key]
-        if mm_update.get("api_key"):
-            config["multimodal_embedding"]["api_key"] = mm_update["api_key"]
 
     if "analytics" in updates:
         analytics_update = updates["analytics"]
@@ -1634,24 +1433,13 @@ def update_settings(updates: dict[str, Any]) -> None:
                     "result_store_ttl_hours",
                     "default_page_size",
                     "max_page_size",
-                    "database_agent_sql_path_rollout_percentage",
                 ):
                     if key in database_qa_update:
-                        if key == "database_agent_sql_path_rollout_percentage":
-                            try:
-                                parsed_rollout = int(database_qa_update[key])
-                            except (TypeError, ValueError):
-                                continue
-                            config["analytics"]["database_qa"][key] = max(0, min(100, parsed_rollout))
-                        else:
-                            config["analytics"]["database_qa"][key] = database_qa_update[key]
+                        config["analytics"]["database_qa"][key] = database_qa_update[key]
                 for key in (
                     "result_store_enabled",
                     "export_enabled",
                     "profile_enabled",
-                    "database_agent_sql_path_enabled",
-                    "database_agent_sql_fallback_enabled",
-                    "database_agent_sql_shadow_compare_enabled",
                 ):
                     if key in database_qa_update:
                         config["analytics"]["database_qa"][key] = bool(database_qa_update[key])
@@ -1672,7 +1460,6 @@ def update_settings(updates: dict[str, Any]) -> None:
                 "mode",
                 "text_vector_weight",
                 "image_vector_weight",
-                "vector_weight",
                 "bm25_weight",
                 "candidate_top_k",
             ):
@@ -1683,15 +1470,10 @@ def update_settings(updates: dict[str, Any]) -> None:
             existing_rerank = config["rag"].get("rerank", {})
             if not isinstance(existing_rerank, dict):
                 existing_rerank = {}
-            for key in ("enabled", "provider", "model", "top_n", "candidate_top_k", "base_url"):
+            for key in ("enabled", "provider", "model", "top_n", "candidate_top_k"):
                 if key in rag_update["rerank"]:
                     existing_rerank[key] = rag_update["rerank"][key]
-            if rag_update["rerank"].get("api_key"):
-                existing_rerank["api_key"] = rag_update["rerank"]["api_key"]
             config["rag"]["rerank"] = existing_rerank
-        if "enabled" in rag_update:
-            config["rag_mode"] = rag_update["enabled"]
-
     if "vanna" in updates:
         vanna_update = updates["vanna"]
         if "vanna" not in config:
@@ -1734,7 +1516,20 @@ def update_settings(updates: dict[str, Any]) -> None:
                 config["database"]["mode"] = "external" if mode == "external" else "bundled"
             for key in ("host", "database", "username", "password", "url"):
                 if key in database_update:
-                    config["database"][key] = str(database_update.get(key) or "").strip()
+                    value = str(database_update.get(key) or "").strip()
+                    if key == "password":
+                        # The settings API never returns a stored password.
+                        # Therefore an empty write means "unchanged", not
+                        # "erase the credential". A future explicit clear
+                        # action must use a separate, intentional contract.
+                        if not value:
+                            continue
+                        from provider_registry import LocalCredentialStore
+
+                        config["database"]["password_ref"] = LocalCredentialStore().put("database-config", value)
+                        config["database"]["password"] = ""
+                    else:
+                        config["database"][key] = value
             if "port" in database_update:
                 try:
                     config["database"]["port"] = int(database_update.get("port") or 5432)
@@ -1745,7 +1540,11 @@ def update_settings(updates: dict[str, Any]) -> None:
         knowledge_update = updates["knowledge"]
         if "knowledge" not in config:
             config["knowledge"] = {}
-        if isinstance(knowledge_update, dict) and "root_dir" in knowledge_update:
+        if (
+            isinstance(knowledge_update, dict)
+            and "root_dir" in knowledge_update
+            and not os.getenv("PUDDINGCLAW_KNOWLEDGE_DIR", "").strip()
+        ):
             config["knowledge"]["root_dir"] = str(knowledge_update.get("root_dir") or "").strip()
 
         if isinstance(knowledge_update, dict) and "search" in knowledge_update:
@@ -1774,11 +1573,17 @@ def update_settings(updates: dict[str, Any]) -> None:
                     if model_id:
                         from provider_registry import get_provider_registry
 
-                        resolved = get_provider_registry().resolve_model(model_id, legacy_config=config)
+                        resolved = get_provider_registry().resolve_model(model_id)
                         if str(resolved.get("capability") or "") != "llm":
                             raise ValueError("LLM Wiki 编译 Agent 只能选择 LLM 模型")
-                    existing_compiler["model_id"] = model_id
-                existing_llm_wiki["compiler_agent"] = existing_compiler
+                    if model_id:
+                        existing_compiler["model_id"] = model_id
+                    else:
+                        existing_compiler.pop("model_id", None)
+                if existing_compiler:
+                    existing_llm_wiki["compiler_agent"] = existing_compiler
+                else:
+                    existing_llm_wiki.pop("compiler_agent", None)
             if isinstance(llm_wiki_update, dict) and "retrieval" in llm_wiki_update:
                 retrieval_update = llm_wiki_update.get("retrieval")
                 existing_retrieval = existing_llm_wiki.get("retrieval", {})
@@ -1806,11 +1611,16 @@ def update_settings(updates: dict[str, Any]) -> None:
 
                             get_provider_registry().resolve_model(
                                 model_id,
-                                legacy_config=config,
                                 expected_capability=capability,
                             )
-                        existing_gbrain[key] = model_id
-                existing_llm_wiki["gbrain"] = existing_gbrain
+                        if model_id:
+                            existing_gbrain[key] = model_id
+                        else:
+                            existing_gbrain.pop(key, None)
+                if existing_gbrain:
+                    existing_llm_wiki["gbrain"] = existing_gbrain
+                else:
+                    existing_llm_wiki.pop("gbrain", None)
             config["knowledge"]["llm_wiki"] = existing_llm_wiki
         if isinstance(knowledge_update, dict) and "mineru" in knowledge_update:
             mineru_update = knowledge_update["mineru"]
@@ -1841,18 +1651,26 @@ def update_settings(updates: dict[str, Any]) -> None:
                 "text_collection",
                 "image_collection",
                 "bm25_enabled",
+                "embedding_batch_size",
             ):
                 if key in mm_index_update:
+                    env_by_key = {
+                        "enabled": "PUDDINGCLAW_ENABLE_MULTIMODAL_INDEX",
+                        "vector_store": "PUDDINGCLAW_MULTIMODAL_VECTOR_STORE",
+                        "milvus_uri": "PUDDINGCLAW_MILVUS_URI",
+                        "text_collection": "PUDDINGCLAW_MILVUS_TEXT_COLLECTION",
+                        "image_collection": "PUDDINGCLAW_MILVUS_IMAGE_COLLECTION",
+                    }
+                    env_name = env_by_key.get(key)
+                    if env_name and os.getenv(env_name, "").strip():
+                        continue
                     existing[key] = mm_index_update[key]
-            existing["overwrite"] = False
             config["knowledge"]["multimodal_index"] = existing
 
     if "compression" in updates:
         comp_update = updates["compression"]
         if "compression" not in config:
             config["compression"] = {}
-        if "ratio" in comp_update:
-            config["compression"]["ratio"] = comp_update["ratio"]
         if "trigger_count" in comp_update:
             config["compression"]["trigger_count"] = comp_update["trigger_count"]
         if "deepagents" in comp_update:
@@ -1880,7 +1698,7 @@ def update_settings(updates: dict[str, Any]) -> None:
                             "trigger_tokens",
                             config["compression"].get("deepagents", {})
                             .get("summarization", {})
-                            .get("trigger_tokens", 160000),
+                            .get("trigger_tokens", 272000),
                         )
                     )
                     if not 1000 <= keep_tokens < effective_trigger:
@@ -1919,11 +1737,6 @@ def update_settings(updates: dict[str, Any]) -> None:
             existing_mw = config["compression"].get("middleware", {})
             config["compression"]["middleware"] = _deep_merge(existing_mw, comp_update["middleware"])
 
-    if "memory_backend" in updates:
-        backend = updates["memory_backend"]
-        if backend in ("markdown", "mem0"):
-            config["memory_backend"] = backend
-
     if "write_middleware" in updates:
         existing = config.get("write_middleware", {})
         config["write_middleware"] = _deep_merge(existing, updates["write_middleware"])
@@ -1935,15 +1748,11 @@ def update_settings(updates: dict[str, Any]) -> None:
             _normalize_harness_update(updates["harness"]),
         )
 
-    sub_update = updates.get("subagents", updates.get("subagent"))
+    sub_update = updates.get("subagents")
     if sub_update is not None:
         if isinstance(sub_update, dict):
             config["subagents"] = _subagent_config_from_items(_subagent_items_for_display(sub_update))
-            config.pop("subagent", None)
 
-    from provider_registry import get_provider_registry
-
-    get_provider_registry().ensure_migrated(config)
     _strip_provider_credentials(config)
     save_config(config)
 
@@ -2139,7 +1948,7 @@ def get_deepagents_summarization_config() -> dict[str, Any]:
             {
                 "enabled": True,
                 "model_id": "",
-                "trigger_tokens": 160000,
+                "trigger_tokens": 272000,
                 "keep_tokens": 64000,
             },
         )

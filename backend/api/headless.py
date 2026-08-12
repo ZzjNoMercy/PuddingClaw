@@ -454,7 +454,9 @@ def _safe_model(item: dict[str, Any]) -> dict[str, Any]:
 
 
 def _model_options(principal: dict[str, Any]) -> list[dict[str, Any]]:
-    snapshot = get_analytics_model_registry(BASE_DIR).list_models()
+    from runtime_identity.paths import PuddingClawPaths
+
+    snapshot = get_analytics_model_registry(PuddingClawPaths.from_environment().user_definitions()).list_models()
     allowed = {str(item) for item in principal.get("allowed_analytics_models") or [] if str(item).strip()}
     models = [_safe_model(item) for item in snapshot.get("models") or [] if isinstance(item, dict)]
     if allowed:
@@ -465,7 +467,9 @@ def _model_options(principal: dict[str, Any]) -> list[dict[str, Any]]:
 def _model_routing_candidates(principal: dict[str, Any]) -> list[dict[str, Any]]:
     """Return only allowed models, enriched with bounded routing guidance."""
 
-    registry = get_analytics_model_registry(BASE_DIR)
+    from runtime_identity.paths import PuddingClawPaths
+
+    registry = get_analytics_model_registry(PuddingClawPaths.from_environment().user_definitions())
     candidates: list[dict[str, Any]] = []
     for option in _model_options(principal):
         candidate = dict(option)
@@ -544,7 +548,9 @@ def _model_routing_needs_input(
 
 
 def _model_binding(model_id: str) -> dict[str, Any]:
-    model = get_analytics_model_registry(BASE_DIR).get_model(model_id)
+    from runtime_identity.paths import PuddingClawPaths
+
+    model = get_analytics_model_registry(PuddingClawPaths.from_environment().user_definitions()).get_model(model_id)
     body = str(model.get("body") or "").encode("utf-8")
     return {
         "id": model_id,
@@ -565,7 +571,11 @@ def _ensure_worker_project() -> tuple[str, Path]:
     except OSError as exc:
         raise HTTPException(status_code=503, detail="Worker projects root is unavailable") from exc
     try:
-        record = project_registry.register(str(path), name=_WORKER_PROJECT_NAME)
+        record = project_registry.register(
+            str(path),
+            name=_WORKER_PROJECT_NAME,
+            trusted=True,
+        )
     except (FileNotFoundError, NotADirectoryError, KeyError) as exc:
         raise HTTPException(status_code=503, detail="Worker project is unavailable") from exc
     return record.project_id, path
@@ -591,7 +601,11 @@ def _resolve_worker_project(workspace_path: str | None) -> tuple[str, Path]:
     if not path.is_dir():
         raise HTTPException(status_code=400, detail="workspace_path must be a directory")
     try:
-        record = project_registry.register(str(path), name=path.name or _WORKER_PROJECT_NAME)
+        record = project_registry.register(
+            str(path),
+            name=path.name or _WORKER_PROJECT_NAME,
+            trusted=True,
+        )
     except (FileNotFoundError, NotADirectoryError) as exc:
         raise HTTPException(status_code=400, detail="workspace_path is unavailable") from exc
     except Exception as exc:
@@ -639,7 +653,9 @@ def _admin(request: Request) -> None:
 
 
 def _idempotency_path() -> Path:
-    data_dir = BASE_DIR / "data"
+    from runtime_identity.paths import PuddingClawPaths
+
+    data_dir = PuddingClawPaths.from_environment().state()
     data_dir.mkdir(parents=True, exist_ok=True)
     return data_dir / "headless-idempotency.json"
 

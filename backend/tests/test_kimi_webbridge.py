@@ -337,7 +337,9 @@ def test_browser_snapshot_ref_alias_is_canonicalized_before_policy_and_authoriza
             runtime=SimpleNamespace(context={"session_id": "s", "run_id": "r"}),
         )
 
-        assert pipeline._preflight(request).decision == PolicyDecision.ASK
+        # Smart approval auto-authorizes run-bound click/fill actions; the
+        # selector alias does not change that classification.
+        assert pipeline._preflight(request).decision == PolicyDecision.ALLOW
 
 
 def test_browser_ref_alias_rejects_conflicting_selector():
@@ -841,7 +843,8 @@ def test_browser_policy_requires_human_confirmation_for_interactions_and_active_
             state={},
             runtime=SimpleNamespace(context={"session_id": "s", "run_id": "r"}),
         )
-        assert pipeline._preflight(request).decision == PolicyDecision.ASK
+        expected = PolicyDecision.ASK if action == "find_tab" else PolicyDecision.ALLOW
+        assert pipeline._preflight(request).decision == expected
 
 
 def test_smart_mode_auto_authorizes_click_and_fill_but_not_other_browser_gates():

@@ -1,6 +1,7 @@
 from pathlib import Path
 from types import SimpleNamespace
 
+from deepagents.middleware._utils import append_to_system_message
 from langchain.agents.middleware.types import ModelRequest
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
@@ -37,7 +38,7 @@ def test_manifest_references_valid_unique_guide_files() -> None:
 
 
 def test_core_guide_forbids_narrating_cli_install_without_a_tool_call() -> None:
-    core = (BASE_DIR / "prompts" / "deepagents" / "tool_guides" / "core.md").read_text(
+    core = (BASE_DIR / "prompts" / "tool_guides" / "core.md").read_text(
         encoding="utf-8"
     )
 
@@ -52,6 +53,27 @@ def test_no_request_scoped_guide_is_injected_before_activation() -> None:
     updated = middleware._request_with_guides(_request())
 
     assert updated.system_message.content == "base"
+
+
+def test_cache_reorder_reads_text_blocks_without_python_repr() -> None:
+    middleware = ToolGuideMiddleware(base_dir=BASE_DIR)
+    system_message = append_to_system_message(
+        SystemMessage(content="## Current Run Delta\n\nruntime"),
+        "## Stable Core\n\ncore",
+    )
+    request = ModelRequest(
+        model=None,
+        messages=[HumanMessage(content="test")],
+        system_message=system_message,
+        tools=[],
+        state={"messages": [], "active_skill_ids": []},
+    )
+
+    updated = middleware._request_with_guides(request)
+    prompt = updated.system_message.text
+
+    assert prompt.index("## Stable Core") < prompt.index("## Current Run Delta")
+    assert "{'type': 'text'" not in prompt
 
 
 def test_active_database_skill_injects_only_database_guide() -> None:
@@ -86,6 +108,11 @@ def test_web_search_tool_activates_managed_search_guide() -> None:
     prompt = str(updated.system_message.content)
     assert "## Managed Web Search" in prompt
     assert "source=x" in prompt
+    assert "allowed_x_handles" in prompt
+    assert "time_range=day|week|month|year" in prompt
+    assert "enable_image_understanding=true" in prompt
+    assert "enable_video_understanding=true" in prompt
+    assert "`enable_image_search` is a Web Search capability" in prompt
 
 
 def test_browser_guide_routes_screenshot_pixels_conditionally() -> None:
@@ -105,10 +132,23 @@ def test_browser_guide_routes_screenshot_pixels_conditionally() -> None:
     assert "Reconcile evidence after every navigation" in prompt
 
 
-def test_successful_skill_read_activates_guide_on_next_model_turn() -> None:
+def test_successful_skill_read_activates_guide_on_next_model_turn(tmp_path: Path) -> None:
+    skills_dir = tmp_path / "skills"
+    skill_dir = skills_dir / "database-analysis"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\n"
+        "name: database-analysis\n"
+        "description: Database analysis test Skill.\n"
+        "toolsets:\n"
+        "  - database_analysis\n"
+        "---\n"
+        "# Database Analysis\n",
+        encoding="utf-8",
+    )
     toolset = ToolsetMiddleware(
-        skills_dir=BASE_DIR / "skills",
-        toolsets_by_skill=discover_skill_toolsets(BASE_DIR / "skills"),
+        skills_dir=skills_dir,
+        toolsets_by_skill=discover_skill_toolsets(skills_dir),
     )
     messages = [
         AIMessage(
@@ -135,14 +175,14 @@ def test_successful_skill_read_activates_guide_on_next_model_turn() -> None:
         model=None,
         messages=messages,
         system_message=SystemMessage(content="base"),
-        tools=[{"name": "read_file"}, {"name": "database_sql_generate"}],
+        tools=[{"name": "read_file"}, {"name": "database_evidence_search"}],
         state=state,
     )
 
     filtered = toolset._request_with_capability_manifest(request)
     updated = ToolGuideMiddleware(base_dir=BASE_DIR)._request_with_guides(filtered)
 
-    assert [tool["name"] for tool in filtered.tools] == ["read_file", "database_sql_generate"]
+    assert [tool["name"] for tool in filtered.tools] == ["read_file", "database_evidence_search"]
     assert "## Database Analysis" in str(updated.system_message.content)
 
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from web_search.adapters.base import (
@@ -17,6 +18,14 @@ from web_search.models import AdapterResponse, SearchRequest, WebSearchError
 
 class GrokSearchAdapter(WebSearchAdapter):
     id = "grok"
+
+    @staticmethod
+    def _relative_date_range(time_range: str | None) -> tuple[str | None, str | None]:
+        days = {"day": 1, "week": 7, "month": 30, "year": 365}.get(str(time_range or ""))
+        if days is None:
+            return None, None
+        today = datetime.now(UTC).date()
+        return (today - timedelta(days=days)).isoformat(), today.isoformat()
 
     def probe(self, credential: str, options: dict[str, Any]) -> AdapterResponse:
         source = "both" if options.get("web_search_enabled", True) and options.get("x_search_enabled", True) else (
@@ -34,9 +43,8 @@ class GrokSearchAdapter(WebSearchAdapter):
             options,
         )
 
-    def search(self, request: SearchRequest, credential: str, options: dict[str, Any]) -> AdapterResponse:
-        from openai import APIConnectionError, APIStatusError, OpenAI
-
+    @classmethod
+    def _build_tools(cls, request: SearchRequest, options: dict[str, Any]) -> list[dict[str, Any]]:
         source = request.source if request.source != "auto" else "web"
         web_enabled = bool(options.get("web_search_enabled", True))
         x_enabled = bool(options.get("x_search_enabled", True))
@@ -48,10 +56,16 @@ class GrokSearchAdapter(WebSearchAdapter):
         tools: list[dict[str, Any]] = []
         if source in {"web", "both"}:
             web_tool: dict[str, Any] = {"type": "web_search"}
+            # xAI's OpenAI Responses-compatible API nests domain constraints
+            # under filters; the native xAI SDK exposes the same names directly.
             if request.include_domains:
                 web_tool["filters"] = {"allowed_domains": request.include_domains}
             elif request.exclude_domains:
                 web_tool["filters"] = {"excluded_domains": request.exclude_domains}
+            if request.enable_image_understanding:
+                web_tool["enable_image_understanding"] = True
+            if request.enable_image_search:
+                web_tool["enable_image_search"] = True
             tools.append(web_tool)
         if source in {"x", "both"}:
             x_tool: dict[str, Any] = {"type": "x_search"}
@@ -59,17 +73,30 @@ class GrokSearchAdapter(WebSearchAdapter):
                 x_tool["allowed_x_handles"] = request.allowed_x_handles
             elif request.excluded_x_handles:
                 x_tool["excluded_x_handles"] = request.excluded_x_handles
-            if request.from_date:
-                x_tool["from_date"] = request.from_date
-            if request.to_date:
-                x_tool["to_date"] = request.to_date
+            relative_from, relative_to = cls._relative_date_range(request.time_range)
+            if request.from_date or relative_from:
+                x_tool["from_date"] = request.from_date or relative_from
+            if request.to_date or relative_to:
+                x_tool["to_date"] = request.to_date or relative_to
+            if request.enable_image_understanding:
+                x_tool["enable_image_understanding"] = True
+            if request.enable_video_understanding:
+                x_tool["enable_video_understanding"] = True
             tools.append(x_tool)
+        return tools
+
+    def search(self, request: SearchRequest, credential: str, options: dict[str, Any]) -> AdapterResponse:
+        from openai import APIConnectionError, APIStatusError, OpenAI
+
+        tools = self._build_tools(request, options)
 
         started = time.monotonic()
         client = OpenAI(
             api_key=credential,
             base_url="https://api.x.ai/v1",
-            timeout=30.0,
+            # grok-4.5 may spend more than 30 seconds reasoning and searching X;
+            # the previous limit produced false connection failures in normal use.
+            timeout=60.0,
             max_retries=0,
         )
         prompt = (

@@ -14,7 +14,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from projects.project_context import ensure_project_context
 
 
 @dataclass(frozen=True)
@@ -28,6 +27,8 @@ class ProjectRecord:
     execution_mode: str | None = None
     permission_rules: tuple[dict[str, Any], ...] = ()
     permission_rules_revision: int = 0
+    trust_state: str = "pending"
+    identity_digest: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -40,6 +41,8 @@ class ProjectRecord:
             "execution_mode": self.execution_mode,
             "permission_rules": [dict(rule) for rule in self.permission_rules],
             "permission_rules_revision": self.permission_rules_revision,
+            "trust_state": self.trust_state,
+            "identity_digest": self.identity_digest,
         }
 
 
@@ -52,11 +55,15 @@ class ProjectRegistry:
         self._workspaces_dir: Path | None = None
 
     def initialize(self, base_dir: Path) -> None:
+        if base_dir.expanduser().resolve().name == "backend":
+            from runtime_identity.paths import PuddingClawPaths
+
+            base_dir = PuddingClawPaths.from_environment().root
         self._base_dir = base_dir
-        data_dir = base_dir / "data"
-        data_dir.mkdir(exist_ok=True)
-        self._projects_file = data_dir / "projects.json"
-        self._workspaces_dir = data_dir / "agent-workspaces"
+        data_dir = base_dir / "projects"
+        data_dir.mkdir(parents=True, exist_ok=True)
+        self._projects_file = data_dir / "registry.json"
+        self._workspaces_dir = base_dir / "data" / "agent-workspaces"
         self._workspaces_dir.mkdir(parents=True, exist_ok=True)
         if not self._projects_file.exists():
             self._write_all({})
@@ -96,8 +103,31 @@ class ProjectRegistry:
         digest = hashlib.sha256(str(path).encode("utf-8")).hexdigest()[:16]
         return f"proj_{digest}"
 
-    def register(self, path: str, name: str | None = None) -> ProjectRecord:
-        """Register a local directory and return its stable project record."""
+    @staticmethod
+    def _identity_digest(path: Path) -> str:
+        """Bind trust to stable project identity, not generated runtime files."""
+
+        try:
+            stat = path.stat()
+            parts = [f"directory:{stat.st_dev}:{stat.st_ino}"]
+        except FileNotFoundError:
+            parts = ["directory:missing"]
+        git_head = path / ".git" / "HEAD"
+        if git_head.is_file():
+            try:
+                parts.append(f"git-head:{git_head.read_text(encoding='utf-8').strip()}")
+            except OSError:
+                pass
+        return hashlib.sha256((str(path) + "\0" + "\0".join(parts)).encode()).hexdigest()
+
+    def register(
+        self,
+        path: str,
+        name: str | None = None,
+        *,
+        trusted: bool = False,
+    ) -> ProjectRecord:
+        """Register a directory, optionally recording an explicit local authorization."""
 
         self._assert_ready()
         resolved = Path(path).expanduser().resolve()
@@ -111,6 +141,12 @@ class ProjectRegistry:
         records = self._read_all()
         existing = records.get(project_id, {})
         created_at = float(existing.get("created_at") or now)
+        existing_trust_state = existing.get("trust_state")
+        trust_state = "trusted" if trusted else (
+            str(existing_trust_state)
+            if existing_trust_state in {"pending", "trusted", "denied"}
+            else "pending"
+        )
         record = ProjectRecord(
             project_id=project_id,
             name=(name or resolved.name or project_id).strip(),
@@ -121,9 +157,13 @@ class ProjectRegistry:
             execution_mode=(str(existing.get("execution_mode")) if existing.get("execution_mode") in {"spawn", "kernel"} else None),
             permission_rules=self._normalize_permission_rules(existing.get("permission_rules")),
             permission_rules_revision=int(existing.get("permission_rules_revision") or 0),
+            trust_state=trust_state,
+            identity_digest=(
+                self._identity_digest(resolved)
+                if trusted
+                else str(existing.get("identity_digest") or self._identity_digest(resolved))
+            ),
         )
-        assert self._base_dir is not None
-        ensure_project_context(resolved, self._base_dir)
         records[project_id] = record.to_dict()
         self._write_all(records)
         return record
@@ -134,8 +174,6 @@ class ProjectRegistry:
         for project_id, raw in records.items():
             try:
                 project_path = Path(str(raw["path"])).expanduser().resolve()
-                if project_path.exists() and project_path.is_dir():
-                    ensure_project_context(project_path, self.base_dir)
                 projects.append(
                     ProjectRecord(
                         project_id=project_id,
@@ -147,6 +185,8 @@ class ProjectRegistry:
                         execution_mode=(str(raw.get("execution_mode")) if raw.get("execution_mode") in {"spawn", "kernel"} else None),
                         permission_rules=self._normalize_permission_rules(raw.get("permission_rules")),
                         permission_rules_revision=int(raw.get("permission_rules_revision") or 0),
+                        trust_state=str(raw.get("trust_state") or "pending") if raw.get("trust_state") in {"pending", "trusted", "denied"} else "pending",
+                        identity_digest=str(raw.get("identity_digest") or ""),
                     )
                 )
             except Exception:
@@ -184,6 +224,8 @@ class ProjectRegistry:
             execution_mode=(str(next_raw.get("execution_mode")) if next_raw.get("execution_mode") in {"spawn", "kernel"} else None),
             permission_rules=self._normalize_permission_rules(next_raw.get("permission_rules")),
             permission_rules_revision=int(next_raw.get("permission_rules_revision") or 0),
+            trust_state=str(next_raw.get("trust_state") or "pending"),
+            identity_digest=str(next_raw.get("identity_digest") or ""),
         )
 
     @staticmethod
@@ -252,6 +294,8 @@ class ProjectRegistry:
             execution_mode=(str(raw.get("execution_mode")) if raw.get("execution_mode") in {"spawn", "kernel"} else None),
             permission_rules=self._normalize_permission_rules(raw.get("permission_rules")),
             permission_rules_revision=int(raw.get("permission_rules_revision") or 0),
+            trust_state=str(raw.get("trust_state") or "pending") if raw.get("trust_state") in {"pending", "trusted", "denied"} else "pending",
+            identity_digest=str(raw.get("identity_digest") or ""),
         )
 
     def get_execution_mode(self, project_id: str | None) -> str | None:
@@ -263,6 +307,34 @@ class ProjectRegistry:
 
     def set_execution_mode(self, project_id: str, execution_mode: str) -> ProjectRecord:
         return self.update(project_id, execution_mode=execution_mode)
+
+    def set_trust(self, project_id: str, trust_state: str) -> ProjectRecord:
+        if trust_state not in {"pending", "trusted", "denied"}:
+            raise ValueError("trust_state must be pending, trusted, or denied")
+        records = self._read_all()
+        raw = records.get(project_id)
+        if not isinstance(raw, dict):
+            raise KeyError(f"Unknown project_id: {project_id}")
+        current_path = Path(str(raw.get("path") or "")).expanduser().resolve()
+        raw = dict(raw)
+        # This is an explicit decision about the path as it exists now. Record
+        # that current identity with the requested state. Future identity
+        # changes are still rejected by is_trusted().
+        raw["trust_state"] = trust_state
+        raw["identity_digest"] = self._identity_digest(current_path)
+        raw["updated_at"] = time.time()
+        records[project_id] = raw
+        self._write_all(records)
+        return self._record_from_raw(project_id, raw)
+
+    def is_trusted(self, project_id: str | None) -> bool:
+        if not project_id:
+            return False
+        raw = self._read_all().get(project_id)
+        if not isinstance(raw, dict) or raw.get("trust_state") != "trusted":
+            return False
+        path = Path(str(raw.get("path") or "")).expanduser().resolve()
+        return str(raw.get("identity_digest") or "") == self._identity_digest(path)
 
     def remove(self, project_id: str) -> None:
         records = self._read_all()

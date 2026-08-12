@@ -402,8 +402,7 @@ class LlmWikiService:
 
     @property
     def gbrain_runtime_home(self) -> Path:
-        configured = os.getenv("PUDDINGCLAW_GBRAIN_HOME", "").strip()
-        return Path(configured).expanduser().resolve() if configured else self.root / ".puddingclaw" / "gbrain-home"
+        return self.root / ".puddingclaw" / "gbrain-home"
 
     def _embedding_service(self):
         from knowledge.llm_wiki_embeddings import get_llm_wiki_embedding_service

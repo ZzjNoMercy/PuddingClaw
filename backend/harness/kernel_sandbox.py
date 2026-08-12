@@ -22,6 +22,7 @@ import threading
 import time
 from collections.abc import Callable, Mapping
 from pathlib import Path
+from typing import Any
 
 from deepagents.backends.protocol import ExecuteResponse
 
@@ -500,6 +501,37 @@ class MacOSSeatbeltRunner:
             profile=self.profile,
         )
 
+    def _execution_environment(
+        self,
+        environment: Mapping[str, str] | None,
+    ) -> dict[str, str]:
+        env: dict[str, str] = {
+            "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+            "HOME": str(self.home),
+            "TMPDIR": str(self.tmp),
+            "LANG": "C.UTF-8",
+        }
+        for key, value in (environment or {}).items():
+            normalized_key = str(key)
+            normalized_value = str(value)
+            if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", normalized_key):
+                raise ValueError("Seatbelt environment contains an invalid variable name")
+            if "\x00" in normalized_value:
+                raise ValueError("Seatbelt environment contains a NUL byte")
+            env[normalized_key] = normalized_value
+        return env
+
+    @staticmethod
+    def _direct_argv(argv: list[str] | tuple[str, ...]) -> list[str]:
+        values = [str(value) for value in argv]
+        if (
+            not values
+            or not Path(values[0]).is_absolute()
+            or any(not value or "\x00" in value for value in values)
+        ):
+            raise ValueError("Seatbelt direct argv is invalid")
+        return values
+
     def execute(
         self,
         command: str,
@@ -508,6 +540,7 @@ class MacOSSeatbeltRunner:
         spawn_guard: Callable[[], bool] | None = None,
         environment: Mapping[str, str] | None = None,
         cwd: Path | None = None,
+        input_text: str | None = None,
     ) -> ExecuteResponse:
         if not isinstance(command, str) or not command.strip():
             return ExecuteResponse(output="Error: Command must be non-empty.", exit_code=1)
@@ -531,24 +564,67 @@ class MacOSSeatbeltRunner:
             "-c",
             self._map_virtual_paths(command),
         ]
-        env: dict[str, str] = {
-            "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
-            "HOME": str(self.home),
-            "TMPDIR": str(self.tmp),
-            "LANG": "C.UTF-8",
-        }
-        for key, value in (environment or {}).items():
-            normalized_key = str(key)
-            normalized_value = str(value)
-            if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", normalized_key):
-                raise ValueError("Seatbelt environment contains an invalid variable name")
-            if "\x00" in normalized_value:
-                raise ValueError("Seatbelt environment contains a NUL byte")
-            env[normalized_key] = normalized_value
+        env = self._execution_environment(environment)
         process = subprocess.Popen(  # noqa: S603
             argv,
             cwd=working_directory,
             env=env,
+            stdin=subprocess.PIPE if input_text is not None else subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+            close_fds=True,
+        )
+        try:
+            stdout, stderr = process.communicate(input=input_text, timeout=effective_timeout)
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGKILL)
+            stdout, stderr = process.communicate()
+            output, truncated = _bounded_output(
+                stdout,
+                stderr,
+                limit=self.profile.max_output_bytes,
+            )
+            return ExecuteResponse(
+                output=f"{output}\n\nError: Command timed out after {effective_timeout} seconds.",
+                exit_code=124,
+                truncated=truncated,
+            )
+        output, truncated = _bounded_output(
+            stdout,
+            stderr,
+            limit=self.profile.max_output_bytes,
+        )
+        if process.returncode:
+            output = f"{output.rstrip()}\n\nExit code: {process.returncode}"
+        return ExecuteResponse(
+            output=output,
+            exit_code=int(process.returncode or 0),
+            truncated=truncated,
+        )
+
+    def execute_argv(
+        self,
+        argv: list[str] | tuple[str, ...],
+        *,
+        timeout: int | None = None,
+        environment: Mapping[str, str] | None = None,
+        cwd: Path | None = None,
+    ) -> ExecuteResponse:
+        """Execute already-normalized argv without another shell parse."""
+
+        if not self.profile.valid_at_spawn():
+            return ExecuteResponse(
+                output="Error: Sandbox profile roots changed before process spawn.",
+                exit_code=126,
+            )
+        working_directory = _validated_working_directory(self.profile, cwd)
+        effective_timeout = timeout or self.profile.timeout_seconds
+        process = subprocess.Popen(  # noqa: S603
+            [str(self.executable), "-p", self.render_profile(), *self._direct_argv(argv)],
+            cwd=working_directory,
+            env=self._execution_environment(environment),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -582,6 +658,64 @@ class MacOSSeatbeltRunner:
             output=output,
             exit_code=int(process.returncode or 0),
             truncated=truncated,
+        )
+
+    def start_background(
+        self,
+        command: str,
+        *,
+        environment: Mapping[str, str] | None,
+        cwd: Path,
+        output: Any,
+    ) -> subprocess.Popen[str]:
+        """Start one long-lived command under the same immutable Seatbelt profile."""
+
+        if not isinstance(command, str) or not command.strip() or not self.profile.valid_at_spawn():
+            raise ValueError("Seatbelt background command or profile is invalid")
+        working_directory = _validated_working_directory(self.profile, cwd)
+        argv = [
+            str(self.executable),
+            "-p",
+            self.render_profile(),
+            "/bin/sh",
+            "-c",
+            self._map_virtual_paths(command),
+        ]
+        env = self._execution_environment(environment)
+        return subprocess.Popen(  # noqa: S603
+            argv,
+            cwd=working_directory,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=output,
+            stderr=subprocess.STDOUT,
+            text=True,
+            start_new_session=True,
+            close_fds=True,
+        )
+
+    def start_background_argv(
+        self,
+        argv: list[str] | tuple[str, ...],
+        *,
+        environment: Mapping[str, str] | None,
+        cwd: Path,
+        output: Any,
+    ) -> subprocess.Popen[str]:
+        """Start normalized argv in Seatbelt without a shell intermediary."""
+
+        if not self.profile.valid_at_spawn():
+            raise ValueError("Seatbelt background profile is invalid")
+        return subprocess.Popen(  # noqa: S603
+            [str(self.executable), "-p", self.render_profile(), *self._direct_argv(argv)],
+            cwd=_validated_working_directory(self.profile, cwd),
+            env=self._execution_environment(environment),
+            stdin=subprocess.DEVNULL,
+            stdout=output,
+            stderr=subprocess.STDOUT,
+            text=True,
+            start_new_session=True,
+            close_fds=True,
         )
 
 

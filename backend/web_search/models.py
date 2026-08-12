@@ -25,6 +25,9 @@ class SearchRequest(BaseModel):
     excluded_x_handles: list[str] = Field(default_factory=list, max_length=20)
     from_date: str | None = Field(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$")
     to_date: str | None = Field(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$")
+    enable_image_understanding: bool = False
+    enable_image_search: bool = False
+    enable_video_understanding: bool = False
 
     @model_validator(mode="after")
     def validate_filters(self) -> SearchRequest:
@@ -36,6 +39,16 @@ class SearchRequest(BaseModel):
             raise ValueError("X 账号过滤仅适用于 source=x 或 source=both")
         if self.source == "x" and (self.include_domains or self.exclude_domains):
             raise ValueError("网页域名过滤不适用于 source=x")
+        if self.source == "x" and self.enable_image_search:
+            raise ValueError("图片搜索仅适用于 source=web 或 source=both")
+        if self.source == "web" and self.enable_video_understanding:
+            raise ValueError("视频理解仅适用于 source=x 或 source=both")
+        if (
+            self.enable_image_understanding
+            or self.enable_image_search
+            or self.enable_video_understanding
+        ) and self.provider not in {"auto", "grok"}:
+            raise ValueError("图片搜索、图片理解与视频理解仅由 Grok 支持")
         return self
 
 

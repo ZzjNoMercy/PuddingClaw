@@ -99,6 +99,7 @@ _STABLE_TOOL_ORDER = (
     "task",
     "update_todos",
     "update_goal",
+    "update_memory",
     "request_user_input",
     "read_evidence",
 )

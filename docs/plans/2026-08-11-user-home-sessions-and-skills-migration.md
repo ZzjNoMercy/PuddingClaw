@@ -49,17 +49,14 @@ PuddingClaw source/package
     └── ...
 
 PUDDINGCLAW_HOME/
+├── config.json                # 非敏感用户 overrides，不是 defaults 完整快照
 ├── config/
-│   ├── settings.json          # 非敏感用户 overrides，不是 defaults 完整快照
 │   ├── providers.json         # Provider 元数据与 credential_ref，不含明文密钥
 │   ├── mcp.json               # MCP server 元数据与 Secret 引用
 │   ├── web-search.json        # Provider 开关、路由与选项
 │   └── evaluation.json        # Evaluation/LangSmith 非敏感设置
 ├── profile/
-│   ├── SOUL.md                # 用户覆盖；缺失时回退 bundled prompt
-│   ├── IDENTITY.md
-│   ├── USER.md
-│   └── AGENTS.md
+│   └── AGENTS.md              # 可选用户追加指令；不替换 bundled prompt
 ├── memory/
 │   ├── global/
 │   └── projects/
@@ -161,13 +158,13 @@ Backend 目前以源码目录 `BASE_DIR = backend/` 同时承担应用资产和�
 
 | 当前对象 | 第一性归属 | 目标 | 决策 |
 |---|---|---|---|
-| `backend/config.json` 普通设置 | 用户覆盖 | `$PUDDINGCLAW_HOME/config/settings.json` | 迁移；只保存相对 bundled defaults 的差异并带 `schema_version` |
+| `backend/config.json` 普通设置 | 用户覆盖 | `$PUDDINGCLAW_HOME/config.json` | bundled 默认保留在 backend；Home 根配置只保存用户差异 |
 | `backend/.env` | Desktop bootstrap 或 Operator 注入 | 已知用户值导入 Settings/Vault；部署值仍留环境层 | 不整文件搬迁，也不把进程环境反写到 Home |
 | Provider、Endpoint、Model、Binding | 用户配置 | `$PUDDINGCLAW_HOME/config/providers.json` | 迁移；只含元数据和 `credential_ref` |
 | `config.mcp` Server、启用状态、参数 | 用户配置 | `$PUDDINGCLAW_HOME/config/mcp.json` | 迁移；Secret 仅允许引用，命令和路径按平台校验 |
 | Web Search 路由、Provider 选项 | 用户配置 | `$PUDDINGCLAW_HOME/config/web-search.json` | 从旧 `PuddingData/web_search.json` 迁移 |
 | Evaluation/LangSmith 非敏感设置 | 用户配置 | `$PUDDINGCLAW_HOME/config/evaluation.json` | 从 `backend/data/evaluation-settings.json` 迁移，API Key 入 Vault |
-| `SOUL.md`、`IDENTITY.md`、`USER.md`、用户 `AGENTS.md` | 用户画像/行为覆盖 | `$PUDDINGCLAW_HOME/profile/` | 新增覆盖层；`backend/prompts` 只保留只读默认模板 |
+| 用户 `AGENTS.md` | 用户行为追加 | `$PUDDINGCLAW_HOME/profile/AGENTS.md` | 只追加在最终 Prompt 末尾；`SOUL.md`、`IDENTITY.md`、`USER.md` 不建立用户副本，用户事实和偏好进入 Memory |
 | `projects.json`、Pinned、执行模式、可信权限规则 | 用户对本机项目的登记和信任 | `$PUDDINGCLAW_HOME/projects/registry.json` | 迁移；增加 `pending/trusted/denied` 信任门，绝对路径标记 `machine_local`，不随通用配置盲目导入 |
 | 全局/项目长期记忆 | 用户事实状态 | `$PUDDINGCLAW_HOME/memory/{global,projects}/` | 迁移；项目 `PROJECT_CONTEXT.md` 仍留在项目自身 `.puddingclaw/` |
 | Knowledge Root 和搜索范围 | 用户配置+内容事实源 | 默认 `$PUDDINGCLAW_HOME/knowledge/`，也可引用外部根 | 配置迁移；外部内容不复制，Registry 保存经用户批准的机器本地绑定 |
@@ -497,12 +494,12 @@ Browser
 
 ```text
 bundled prompt defaults
-  + $PUDDINGCLAW_HOME/profile/ 中存在的用户覆盖
   + 已通过信任门的项目 .puddingclaw/PROJECT_CONTEXT.md
   + Session/Run 动态上下文
+  + $PUDDINGCLAW_HOME/profile/AGENTS.md（可选，始终最后追加）
 ```
 
-设置页的 Memory Editor 不再通过通用 `/api/files` 写 `backend/workspace` 或 `backend/memory`，而应调用 typed Profile/Memory API。用户 Profile 是配置，长期 Memory 是用户事实状态；两者不能继续借用 Workspace 目录。全局和项目记忆也要明确 owner/project ID，避免多个用户或项目共享一个隐式 `MEMORY.md`。
+设置页的 Memory Editor 不再写 `backend/workspace` 或 `backend/memory`；受限文件 API 只把 `profile/AGENTS.md` 和 Memory 路由到 Home。用户 AGENTS 是追加指令，长期 Memory 是用户事实状态；两者不能继续借用 Workspace 目录。
 
 `backend/prompts/AGENTS.md` 中的系统安全规则不可被用户 Profile 整体替换。实现应把可个性化内容与不可覆盖的系统约束拆成不同 Prompt 层，并对最终 Prompt 标记来源。
 

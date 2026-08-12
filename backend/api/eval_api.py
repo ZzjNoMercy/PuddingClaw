@@ -8,6 +8,8 @@ from typing import Any, Literal
 
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
+from runtime_identity.paths import PuddingClawPaths
+from tools.skills_scanner import scan_skill_registry
 
 router = APIRouter()
 
@@ -15,6 +17,21 @@ router = APIRouter()
 _SAFE_NAME = re.compile(r"^[a-zA-Z0-9._-]+$")
 
 BASE_DIR = Path(__file__).resolve().parent.parent
+
+
+def _user_eval_dir(name: str) -> Path:
+    return PuddingClawPaths.from_environment().skill_evals() / name
+
+
+def _read_eval_dir(name: str) -> Path:
+    user_dir = _user_eval_dir(name)
+    if user_dir.exists():
+        return user_dir
+    records = scan_skill_registry(BASE_DIR, user_root=PuddingClawPaths.from_environment().user_skills())
+    record = next((item for item in records if item.get("skill_id") == name and item.get("effective")), None)
+    if record:
+        return Path(str(record["physical_root"])) / "evals"
+    return user_dir
 
 
 def _validate_segment(value: str, label: str) -> str:
@@ -30,7 +47,7 @@ async def list_eval_iterations(name: str):
     """Scan skills/{name}/evals/ and return iteration summaries."""
     _validate_segment(name, "skill name")
 
-    evals_dir = BASE_DIR / "skills" / name / "evals"
+    evals_dir = _read_eval_dir(name)
     if not evals_dir.is_dir():
         return {"iterations": []}
 
@@ -89,7 +106,7 @@ async def get_benchmark(name: str, iteration: str):
     _validate_segment(name, "skill name")
     _validate_segment(iteration, "iteration id")
 
-    benchmark_path = BASE_DIR / "skills" / name / "evals" / iteration / "benchmark.json"
+    benchmark_path = _read_eval_dir(name) / iteration / "benchmark.json"
     if not benchmark_path.is_file():
         raise HTTPException(status_code=404, detail="Benchmark not found")
 
@@ -109,9 +126,7 @@ async def get_grading(name: str, iteration: str, eval_id: str):
     _validate_segment(iteration, "iteration id")
     _validate_segment(eval_id, "eval id")
 
-    grading_path = (
-        BASE_DIR / "skills" / name / "evals" / iteration / eval_id / "grading.json"
-    )
+    grading_path = _read_eval_dir(name) / iteration / eval_id / "grading.json"
     if not grading_path.is_file():
         raise HTTPException(status_code=404, detail="Grading not found")
 
@@ -136,7 +151,7 @@ async def save_feedback(name: str, iteration: str, body: FeedbackRequest):
     _validate_segment(name, "skill name")
     _validate_segment(iteration, "iteration id")
 
-    iter_dir = BASE_DIR / "skills" / name / "evals" / iteration
+    iter_dir = _user_eval_dir(name) / iteration
     if not iter_dir.is_dir():
         # Create directory if it doesn't exist yet
         iter_dir.mkdir(parents=True, exist_ok=True)
@@ -192,11 +207,11 @@ async def save_eval_result(name: str, body: EvalResultRequest, version: str = Qu
         # Validate version label format (allow dots for version labels like v1.0)
         if not re.match(r"^[a-zA-Z0-9._-]+$", version):
             raise HTTPException(status_code=400, detail=f"Invalid version: {version!r}")
-        result_path = BASE_DIR / "skills" / name / "versions" / version / "five-dim-result.json"
+        result_path = _user_eval_dir(name) / "versions" / version / "five-dim-result.json"
         if not result_path.parent.is_dir():
             raise HTTPException(status_code=404, detail=f"Version '{version}' not found")
     else:
-        evals_dir = BASE_DIR / "skills" / name / "evals"
+        evals_dir = _user_eval_dir(name)
         evals_dir.mkdir(parents=True, exist_ok=True)
         result_path = evals_dir / "five-dim-result.json"
 
@@ -218,9 +233,9 @@ async def get_eval_result(name: str, version: str = Query(default="")):
     if version and version != "current":
         if not re.match(r"^[a-zA-Z0-9._-]+$", version):
             raise HTTPException(status_code=400, detail=f"Invalid version: {version!r}")
-        result_path = BASE_DIR / "skills" / name / "versions" / version / "five-dim-result.json"
+        result_path = _read_eval_dir(name) / "versions" / version / "five-dim-result.json"
     else:
-        result_path = BASE_DIR / "skills" / name / "evals" / "five-dim-result.json"
+        result_path = _read_eval_dir(name) / "five-dim-result.json"
 
     if not result_path.is_file():
         raise HTTPException(status_code=404, detail="Eval result not found")
@@ -242,7 +257,7 @@ async def list_eval_results(name: str):
     results = []
 
     # Check current (evals/five-dim-result.json)
-    current_path = BASE_DIR / "skills" / name / "evals" / "five-dim-result.json"
+    current_path = _read_eval_dir(name) / "five-dim-result.json"
     if current_path.is_file():
         try:
             data = json.loads(current_path.read_text(encoding="utf-8"))
@@ -256,7 +271,7 @@ async def list_eval_results(name: str):
             pass
 
     # Check each version directory
-    versions_dir = BASE_DIR / "skills" / name / "versions"
+    versions_dir = _read_eval_dir(name) / "versions"
     if versions_dir.is_dir():
         for ver_dir in sorted(versions_dir.iterdir()):
             if not ver_dir.is_dir():

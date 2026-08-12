@@ -16,6 +16,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.background import BackgroundTask
+from runtime_identity.paths import PuddingClawPaths
 
 from analytics.models import AnalyticsModelError, get_analytics_model_registry
 from analytics.nl2sql.entity_candidates import recommend_entity_candidates
@@ -296,7 +297,7 @@ class SemanticDimensionSourceRegistryRequest(BaseModel):
 @router.get("/semantic-assets")
 async def list_semantic_assets():
     try:
-        return get_semantic_asset_registry(BASE_DIR).list_assets()
+        return get_semantic_asset_registry(PuddingClawPaths.from_environment().user_definitions()).list_assets()
     except Exception as exc:
         raise HTTPException(status_code=503, detail=f"Failed to list semantic assets: {exc}") from exc
 
@@ -378,7 +379,11 @@ async def publish_semantic_dimension_job(
     session: AsyncSession = Depends(get_db_session),
 ):
     try:
-        result = await publish_semantic_dimension_build(session, base_dir=BASE_DIR, job_id=job_id)
+        result = await publish_semantic_dimension_build(
+            session,
+            base_dir=PuddingClawPaths.from_environment().user_definitions(),
+            job_id=job_id,
+        )
         return {
             "job": semantic_dimension_job_to_dict(result["job"]),
             "already_published": result["already_published"],
@@ -401,7 +406,7 @@ async def get_semantic_dimension_matching(
 ):
     try:
         return get_matching_view(
-            BASE_DIR,
+            PuddingClawPaths.from_environment().user_definitions(),
             dimension_id,
             status=status,
             source_ref=source_ref,
@@ -423,7 +428,13 @@ async def get_semantic_dimension_matching_overview(
     limit: int = Query(default=100, ge=1, le=500),
 ):
     try:
-        return get_matching_overview(BASE_DIR, dimension_id, query=query, offset=offset, limit=limit)
+        return get_matching_overview(
+            PuddingClawPaths.from_environment().user_definitions(),
+            dimension_id,
+            query=query,
+            offset=offset,
+            limit=limit,
+        )
     except SemanticDimensionCrosswalkError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
@@ -472,11 +483,26 @@ async def resolve_semantic_dimension_baseline_change_request(
                 raise ValueError("Staging Crosswalk artifact is missing")
             staged = json.loads(staged_path.read_text(encoding="utf-8"))
             if request.action == "inactive":
-                retained = retain_staged_entities_as_inactive(BASE_DIR, job.dimension_id, staged, entity_keys)
+                retained = retain_staged_entities_as_inactive(
+                    PuddingClawPaths.from_environment().user_definitions(),
+                    job.dimension_id,
+                    staged,
+                    entity_keys,
+                )
                 staged = retained["staged"]
-                staged_path.write_text(json.dumps(staged, ensure_ascii=False, indent=2), encoding="utf-8")
+                temporary = staged_path.with_name(
+                    f".{staged_path.name}.{uuid.uuid4().hex}.tmp"
+                )
+                try:
+                    temporary.write_text(
+                        json.dumps(staged, ensure_ascii=False, indent=2),
+                        encoding="utf-8",
+                    )
+                    temporary.replace(staged_path)
+                finally:
+                    temporary.unlink(missing_ok=True)
             for item in removed:
-                save_semantic_dimension_entity_override(BASE_DIR, job.dimension_id, {
+                save_semantic_dimension_entity_override(PuddingClawPaths.from_environment().user_definitions(), job.dimension_id, {
                     "entity_key": str(item.get("entity_key") or ""),
                     "action": request.action,
                     "reason": "用户处理构建发现的规范基准变化。",
@@ -497,7 +523,11 @@ async def save_semantic_dimension_matching_override(
     request: SemanticDimensionOverrideRequest,
 ):
     try:
-        result = save_semantic_dimension_override(BASE_DIR, dimension_id, request.model_dump(mode="json"))
+        result = save_semantic_dimension_override(
+            PuddingClawPaths.from_environment().user_definitions(),
+            dimension_id,
+            request.model_dump(mode="json"),
+        )
         return {"override": result["override"], "status": "saved"}
     except SemanticDimensionCrosswalkError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -508,7 +538,9 @@ async def save_semantic_dimension_matching_override(
 @router.delete("/semantic-dimensions/{dimension_id}/matching/overrides/{override_id}")
 async def delete_semantic_dimension_matching_override(dimension_id: str, override_id: str):
     try:
-        return delete_semantic_dimension_override(BASE_DIR, dimension_id, override_id)
+        return delete_semantic_dimension_override(
+            PuddingClawPaths.from_environment().user_definitions(), dimension_id, override_id
+        )
     except SemanticDimensionCrosswalkError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except Exception as exc:
@@ -523,7 +555,11 @@ async def save_semantic_dimension_entity_lifecycle(
     """Save a draft canonical lifecycle decision; publication remains explicit."""
 
     try:
-        result = save_semantic_dimension_entity_override(BASE_DIR, dimension_id, request.model_dump(mode="json"))
+        result = save_semantic_dimension_entity_override(
+            PuddingClawPaths.from_environment().user_definitions(),
+            dimension_id,
+            request.model_dump(mode="json"),
+        )
         return {"override": result["override"], "status": "saved", "has_unpublished_changes": result["has_unpublished_changes"]}
     except SemanticDimensionCrosswalkError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -536,7 +572,9 @@ async def publish_semantic_dimension_matching_overrides(dimension_id: str):
     """Publish reviewed matching overrides as a new active Crosswalk version."""
 
     try:
-        return publish_semantic_dimension_draft_overrides(BASE_DIR, dimension_id)
+        return publish_semantic_dimension_draft_overrides(
+            PuddingClawPaths.from_environment().user_definitions(), dimension_id
+        )
     except SemanticDimensionCrosswalkError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
@@ -552,7 +590,11 @@ async def save_semantic_dimension_source_registry(
     if source_id != request.id:
         raise HTTPException(status_code=400, detail="source_id path must match request id")
     try:
-        return save_source_registry_entry(BASE_DIR, dimension_id, request.model_dump(mode="json"))
+        return save_source_registry_entry(
+            PuddingClawPaths.from_environment().user_definitions(),
+            dimension_id,
+            request.model_dump(mode="json"),
+        )
     except SemanticDimensionCrosswalkError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
@@ -616,7 +658,7 @@ async def read_task_notification(
 @router.post("/semantic-assets/refresh")
 async def refresh_semantic_assets():
     try:
-        return get_semantic_asset_registry(BASE_DIR).refresh()
+        return get_semantic_asset_registry(PuddingClawPaths.from_environment().user_definitions()).refresh()
     except Exception as exc:
         raise HTTPException(status_code=503, detail=f"Failed to refresh semantic assets: {exc}") from exc
 
@@ -674,7 +716,7 @@ async def reset_sql_guardrails():
 @router.post("/semantic-assets")
 async def create_semantic_asset(request: SemanticAssetCreateRequest):
     try:
-        asset = get_semantic_asset_registry(BASE_DIR).create_asset(
+        asset = get_semantic_asset_registry(PuddingClawPaths.from_environment().user_definitions()).create_asset(
             name=request.name,
             asset_type=request.type,
             description=request.description,
@@ -698,7 +740,7 @@ async def create_semantic_asset(request: SemanticAssetCreateRequest):
 async def import_semantic_assets(files: list[UploadFile] = File(...)):
     if not files:
         raise HTTPException(status_code=400, detail="No files uploaded")
-    registry = get_semantic_asset_registry(BASE_DIR)
+    registry = get_semantic_asset_registry(PuddingClawPaths.from_environment().user_definitions())
     try:
         first_filename = files[0].filename or ""
         if len(files) == 1 and first_filename.lower().endswith(".zip"):
@@ -716,7 +758,7 @@ async def import_semantic_assets(files: list[UploadFile] = File(...)):
 @router.patch("/semantic-assets/{asset_id:path}/dimension-definition")
 async def update_semantic_dimension_definition(asset_id: str, request: SemanticDimensionDefinitionUpdateRequest):
     try:
-        asset = get_semantic_asset_registry(BASE_DIR).update_dimension_definition(
+        asset = get_semantic_asset_registry(PuddingClawPaths.from_environment().user_definitions()).update_dimension_definition(
             asset_id,
             dict(request.dimension_definition),
             name=request.name,
@@ -737,7 +779,7 @@ async def update_semantic_dimension_definition(asset_id: str, request: SemanticD
 @router.patch("/semantic-assets/{asset_id:path}/relation-definition")
 async def update_semantic_relation_definition(asset_id: str, request: SemanticRelationDefinitionUpdateRequest):
     try:
-        asset = get_semantic_asset_registry(BASE_DIR).update_relation_definition(
+        asset = get_semantic_asset_registry(PuddingClawPaths.from_environment().user_definitions()).update_relation_definition(
             asset_id,
             dict(request.relation_definition),
             name=request.name,
@@ -758,7 +800,7 @@ async def update_semantic_relation_definition(asset_id: str, request: SemanticRe
 @router.get("/models")
 async def list_analytics_models():
     try:
-        return get_analytics_model_registry(BASE_DIR).list_models()
+        return get_analytics_model_registry(PuddingClawPaths.from_environment().user_definitions()).list_models()
     except Exception as exc:
         raise HTTPException(status_code=503, detail=f"Failed to list analytics models: {exc}") from exc
 
@@ -766,7 +808,7 @@ async def list_analytics_models():
 @router.post("/models/refresh")
 async def refresh_analytics_models():
     try:
-        return get_analytics_model_registry(BASE_DIR).refresh()
+        return get_analytics_model_registry(PuddingClawPaths.from_environment().user_definitions()).refresh()
     except Exception as exc:
         raise HTTPException(status_code=503, detail=f"Failed to refresh analytics models: {exc}") from exc
 
@@ -774,7 +816,7 @@ async def refresh_analytics_models():
 @router.post("/models")
 async def create_analytics_model(request: AnalyticsModelCreateRequest):
     try:
-        model = get_analytics_model_registry(BASE_DIR).create_model(
+        model = get_analytics_model_registry(PuddingClawPaths.from_environment().user_definitions()).create_model(
             name=request.name,
             description=request.description,
             version=request.version,
@@ -800,7 +842,7 @@ async def create_analytics_model(request: AnalyticsModelCreateRequest):
 async def import_analytics_models(files: list[UploadFile] = File(...)):
     if not files:
         raise HTTPException(status_code=400, detail="No files uploaded")
-    registry = get_analytics_model_registry(BASE_DIR)
+    registry = get_analytics_model_registry(PuddingClawPaths.from_environment().user_definitions())
     try:
         first_filename = files[0].filename or ""
         if len(files) == 1 and first_filename.lower().endswith(".zip"):
@@ -821,7 +863,7 @@ async def plan_analytics_project_export(
     session: AsyncSession = Depends(get_db_session),
 ):
     try:
-        plan = await AnalysisProjectExporter(BASE_DIR).build_plan(
+        plan = await AnalysisProjectExporter(PuddingClawPaths.from_environment().user_definitions()).build_plan(
             session,
             model_id=request.model_id,
             data_file_mode=request.data_file_mode,
@@ -839,7 +881,7 @@ async def export_analytics_project(
     session: AsyncSession = Depends(get_db_session),
 ):
     try:
-        artifact = await AnalysisProjectExporter(BASE_DIR).export(
+        artifact = await AnalysisProjectExporter(PuddingClawPaths.from_environment().user_definitions()).export(
             session,
             model_id=request.model_id,
             data_file_mode=request.data_file_mode,
@@ -866,7 +908,7 @@ async def download_analytics_project(
 ):
     """Stream a potentially large project archive without buffering it in browser JavaScript."""
     try:
-        artifact = await AnalysisProjectExporter(BASE_DIR).export(
+        artifact = await AnalysisProjectExporter(PuddingClawPaths.from_environment().user_definitions()).export(
             session,
             model_id=model_id,
             data_file_mode=data_file_mode,
@@ -887,7 +929,7 @@ async def download_analytics_project(
 @router.get("/models/{model_id:path}")
 async def get_analytics_model(model_id: str):
     try:
-        return {"model": get_analytics_model_registry(BASE_DIR).get_model(model_id)}
+        return {"model": get_analytics_model_registry(PuddingClawPaths.from_environment().user_definitions()).get_model(model_id)}
     except AnalyticsModelError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except Exception as exc:
@@ -897,7 +939,7 @@ async def get_analytics_model(model_id: str):
 @router.get("/semantic-assets/{asset_id:path}")
 async def get_semantic_asset(asset_id: str):
     try:
-        return {"asset": get_semantic_asset_registry(BASE_DIR).get_asset(asset_id)}
+        return {"asset": get_semantic_asset_registry(PuddingClawPaths.from_environment().user_definitions()).get_asset(asset_id)}
     except SemanticAssetError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except Exception as exc:

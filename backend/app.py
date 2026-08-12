@@ -44,10 +44,7 @@ async def _warm_mcp_discovery(
         from mcp_clients.servers import effective_mcp_server_names
 
         mcp_config = config.load_config().get("mcp", {})
-        enabled_mcp = effective_mcp_server_names(
-            mcp_config.get("enabled", []),
-            auto_enable_gbrain=bool(mcp_config.get("auto_enable_gbrain", False)),
-        )
+        enabled_mcp = effective_mcp_server_names(mcp_config.get("enabled", []))
         if not enabled_mcp:
             return
         attempts = max(1, max_attempts)
@@ -123,28 +120,80 @@ async def lifespan(app: FastAPI):
     from graph.agent import agent_manager
     from graph.attachment_store import attachment_store
     from graph.deepagents_manager import deepagents_agent_manager
-    from graph.memory_indexer import get_memory_indexer
     from graph.session_manager import session_manager
     from knowledge.import_worker import knowledge_import_worker_manager
     from knowledge.portal_search import knowledge_catalog_watcher
     from knowledge.semantic_dimension_worker import semantic_dimension_build_worker_manager
     from projects.registry import project_registry
+    from runtime_identity.migration import (
+        migrate_definitions_and_data,
+        migrate_home_layout,
+        migrate_project_trust_registry,
+        migrate_projects_and_memory,
+        migrate_runtime_artifacts,
+        migrate_runtime_home,
+        migrate_workspace_artifacts,
+    )
     from runtime_identity.paths import PuddingClawPaths
     from tools.skills_scanner import scan_skills
     from worker_access import worker_access_store
 
-    scan_skills(BASE_DIR)
-    semantic_assets = get_semantic_asset_registry(BASE_DIR).refresh()
-    print(f"🧭 Semantic assets loaded: {semantic_assets.get('count', 0)}")
-    project_registry.initialize(BASE_DIR)
-    attachment_store.initialize(
+    user_paths = PuddingClawPaths.from_environment()
+    user_paths.ensure_layout()
+    migration = migrate_runtime_home(BASE_DIR, user_paths)
+    definitions_data_migration = migrate_definitions_and_data(BASE_DIR, user_paths)
+    projects_memory_migration = migrate_projects_and_memory(BASE_DIR, user_paths)
+    project_trust_migration = migrate_project_trust_registry(user_paths)
+    runtime_artifacts_migration = migrate_runtime_artifacts(BASE_DIR, user_paths)
+    workspace_artifacts_migration = migrate_workspace_artifacts(BASE_DIR, user_paths)
+    home_layout_migration = migrate_home_layout(user_paths)
+    if migration.get("conflicts"):
+        print(f"⚠️ Runtime migration retained {len(migration['conflicts'])} conflicts for review")
+    if definitions_data_migration.get("conflicts"):
+        print(
+            "⚠️ Definitions/data migration retained "
+            f"{len(definitions_data_migration['conflicts'])} conflicts for review"
+        )
+    if projects_memory_migration.get("conflicts"):
+        print(
+            "⚠️ Projects/memory migration retained "
+            f"{len(projects_memory_migration['conflicts'])} conflicts for review"
+        )
+    if project_trust_migration.get("upgraded"):
+        print(
+            "🔐 Preserved trust for "
+            f"{project_trust_migration['upgraded']} migrated projects"
+        )
+    if runtime_artifacts_migration.get("conflicts"):
+        print(
+            "⚠️ Runtime artifact migration retained "
+            f"{len(runtime_artifacts_migration['conflicts'])} conflicts for review"
+        )
+    if workspace_artifacts_migration.get("conflicts"):
+        print(
+            "⚠️ Workspace artifact migration retained "
+            f"{len(workspace_artifacts_migration['conflicts'])} conflicts for review"
+        )
+    if home_layout_migration.get("conflicts"):
+        print(
+            "⚠️ Home layout migration retained "
+            f"{len(home_layout_migration['conflicts'])} conflicts for review"
+        )
+    scan_skills(
         BASE_DIR,
-        legacy_base_dirs=(PuddingClawPaths.from_environment().root,),
+        user_root=user_paths.user_skills(),
+        snapshot_path=user_paths.skill_management() / "SKILLS_SNAPSHOT.md",
     )
-    knowledge_catalog_watcher.start(BASE_DIR)
+    semantic_assets = get_semantic_asset_registry(user_paths.user_definitions()).refresh()
+    print(f"🧭 Semantic assets loaded: {semantic_assets.get('count', 0)}")
+    project_registry.initialize(user_paths.root)
+    attachment_store.initialize(
+        user_paths.root,
+    )
+    knowledge_catalog_watcher.start(user_paths.root)
     # SQL Evidence catalog backfill needs the durable Session owner index.
-    session_manager.initialize(BASE_DIR)
-    worker_access_store.initialize(BASE_DIR)
+    session_manager.initialize(sessions_dir=user_paths.sessions())
+    worker_access_store.initialize(user_paths.root)
     cli_status = detect_cli_runtime(BASE_DIR)
     if not cli_status.get("installed"):
         print(
@@ -174,13 +223,13 @@ async def lifespan(app: FastAPI):
     # LEGACY compatibility bootstrap. /api/chat and one deep-research helper
     # still depend on it while they await migration; new flows must not do so.
     try:
-        agent_manager.initialize(BASE_DIR)
+        agent_manager.initialize(BASE_DIR, sessions_dir=user_paths.sessions())
     except Exception as e:
         print(f"⚠️ Legacy Chat compatibility runtime initialization failed: {e}")
         traceback.print_exc()
         print("ℹ️ Server will continue running; the maintained Agent runtime initializes separately.")
     try:
-        deepagents_agent_manager.initialize(BASE_DIR)
+        deepagents_agent_manager.initialize(BASE_DIR, user_root=user_paths.root)
     except Exception as e:
         print(f"⚠️ DeepAgents initialization failed: {e}")
         traceback.print_exc()
@@ -189,20 +238,8 @@ async def lifespan(app: FastAPI):
         # LLM Wiki jobs use the Agent harness without creating a user-visible
         # conversation, so workers may only claim jobs after the harness owner
         # has been initialized.
-        knowledge_import_worker_manager.start(BASE_DIR)
-        semantic_dimension_build_worker_manager.start(BASE_DIR)
-
-    # Initialize memory indexer only when RAG mode is enabled (requires Embedding API)
-    from config import get_rag_mode
-
-    if get_rag_mode():
-        try:
-            indexer = get_memory_indexer(BASE_DIR)
-            indexer.initialize_index()
-        except Exception as e:
-            print(f"⚠️ Memory index build failed: {e}")
-    else:
-        print("ℹ️ RAG mode disabled, skipping memory index build")
+        knowledge_import_worker_manager.start(user_paths.root)
+        semantic_dimension_build_worker_manager.start(user_paths.root)
 
     print("✅ PuddingClaw backend ready")
     await evaluation_worker_manager.start_pending()

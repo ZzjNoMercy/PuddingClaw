@@ -19,6 +19,7 @@ from knowledge.semantic_dimension_jobs import (
 )
 from knowledge.semantic_dimension_publisher import publish_semantic_dimension_build
 from analytics.semantic_assets import SemanticAssetError, get_semantic_asset_registry
+from runtime_identity.paths import PuddingClawPaths
 
 
 class EnqueueSemanticDimensionBuildInput(BaseModel):
@@ -90,7 +91,7 @@ class EnqueueSemanticDimensionBuildTool(BaseTool):
         kwargs["query_id"] = str(kwargs.get("query_id") or self.query_id or tool_call_id or "")
         if not kwargs["session_id"]:
             return "❌ 无法创建语义维度构建任务：缺少当前会话标识。"
-        base_dir = Path(__file__).resolve().parents[1]
+        base_dir = PuddingClawPaths.from_environment().user_definitions()
         _ensure_dimension_package(
             base_dir=base_dir,
             dimension_id=str(kwargs.get("dimension_id") or ""),
@@ -153,7 +154,7 @@ class PublishSemanticDimensionBuildTool(BaseTool):
 
     async def _arun(self, job_id: str) -> str:
         sessionmaker = get_sessionmaker()
-        base_dir = Path(__file__).resolve().parents[1]
+        base_dir = PuddingClawPaths.from_environment().user_definitions()
         async with sessionmaker() as session:
             result = await publish_semantic_dimension_build(session, base_dir=base_dir, job_id=job_id)
         payload = semantic_dimension_job_to_dict(result["job"])

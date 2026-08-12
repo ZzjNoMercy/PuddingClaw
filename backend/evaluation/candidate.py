@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+from runtime_identity.paths import PuddingClawPaths
 
 from .contracts import ExperimentCandidate
 
@@ -110,6 +111,42 @@ def _tree_hash(base_dir: Path, roots: list[str]) -> str:
     return digest.hexdigest()
 
 
+def _skill_tree_hash(root: Path) -> str:
+    """Hash authored Skill contents, including scripts and binary resources."""
+
+    digest = hashlib.sha256()
+    ignored_parts = {".git", ".venv", "node_modules", "__pycache__"}
+    ignored_names = {".DS_Store"}
+    if not root.is_dir():
+        return digest.hexdigest()
+    for path in sorted(item for item in root.rglob("*") if item.is_file()):
+        relative = path.relative_to(root)
+        if ignored_parts.intersection(relative.parts) or path.name in ignored_names:
+            continue
+        try:
+            digest.update(relative.as_posix().encode("utf-8"))
+            digest.update(path.read_bytes())
+        except OSError:
+            continue
+    return digest.hexdigest()
+
+
+def _skill_hashes(base_dir: Path) -> dict[str, str]:
+    """Fingerprint both immutable bundled Skills and user-owned Home Skills."""
+
+    bundled = _skill_tree_hash(base_dir / "skills")
+    user_root = PuddingClawPaths.from_environment().user_skills()
+    user = _skill_tree_hash(user_root)
+    effective = hashlib.sha256(
+        f"bundled:{bundled}\nuser:{user}".encode("utf-8")
+    ).hexdigest()
+    return {
+        "bundled_skill_hash": bundled,
+        "user_skill_hash": user,
+        "skill_hash": effective,
+    }
+
+
 def resolve_candidate(base_dir: Path, request: CandidateRequest) -> ExperimentCandidate:
     import config
 
@@ -123,6 +160,7 @@ def resolve_candidate(base_dir: Path, request: CandidateRequest) -> ExperimentCa
         resolution_kwargs["credential_name"] = request.credential_name
     effective_llm = config.get_fallback_llm_config(**resolution_kwargs)
     effective_llm = _without_secrets(effective_llm)
+    skill_hashes = _skill_hashes(base_dir)
     snapshots: dict[str, Any] = {
         "llm_model_id": request.llm_model_id,
         "thinking_level": request.thinking_level,
@@ -134,7 +172,7 @@ def resolve_candidate(base_dir: Path, request: CandidateRequest) -> ExperimentCa
         "git_dirty": bool(dirty) if dirty is not None else None,
         "prompt_hash": _tree_hash(base_dir, ["prompts"]),
         "tool_hash": _tree_hash(base_dir, ["tools"]),
-        "skill_hash": _tree_hash(base_dir, ["skills"]),
+        **skill_hashes,
         "runtime_hash": _tree_hash(base_dir, ["graph", "pyproject.toml"]),
         "source_manifest_hash": _tree_hash(base_dir, _CANDIDATE_SOURCE_ROOTS),
         "tool_allowlist": sorted(set(request.tool_allowlist)),
@@ -170,6 +208,7 @@ def verify_candidate_snapshot(base_dir: Path, candidate: ExperimentCandidate) ->
         resolution_kwargs["credential_name"] = candidate.credential_name
     effective_llm = config.get_fallback_llm_config(**resolution_kwargs)
     effective_llm = _without_secrets(effective_llm)
+    skill_hashes = _skill_hashes(base_dir)
     current = {
         "llm_model_id": candidate.llm_model_id,
         "thinking_level": candidate.thinking_level,
@@ -181,7 +220,7 @@ def verify_candidate_snapshot(base_dir: Path, candidate: ExperimentCandidate) ->
         "git_dirty": bool(_git(base_dir, "status", "--porcelain")),
         "prompt_hash": _tree_hash(base_dir, ["prompts"]),
         "tool_hash": _tree_hash(base_dir, ["tools"]),
-        "skill_hash": _tree_hash(base_dir, ["skills"]),
+        **skill_hashes,
         "runtime_hash": _tree_hash(base_dir, ["graph", "pyproject.toml"]),
         "source_manifest_hash": _tree_hash(base_dir, _CANDIDATE_SOURCE_ROOTS),
     }

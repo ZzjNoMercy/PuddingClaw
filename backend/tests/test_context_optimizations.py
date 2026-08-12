@@ -1,13 +1,13 @@
 """测试上下文工程（Context Engineering）优化项。
 
 覆盖范围：
-  - 配置阈值：DeepSeek V4 1M 上下文窗口 + 分级兜底阈值
+  - 配置阈值：DeepSeek V4 1M 上下文窗口 + DeepAgents 分级阈值
   - TailTrimMiddleware：cache-friendly 中段裁剪、HumanMessage 边界保护
   - ToolResultClearMiddleware：轮次边界、min_summary_length、摘要前缀、summary_source、emit 事件
   - _summarize_tool_result：单条超长 tool output 摘要（20K tokens）
   - CompactionMiddleware：全局 reset、动态截断、保留 System + 最近 8 条、emit 事件
   - SessionManager：archive 合并、update_tool_call_output、context_usage_peak
-  - Tokens API：优先返回 context_usage_peak
+  - Tokens API：返回当前 DeepAgents 有效上下文状态
 """
 
 import asyncio
@@ -30,9 +30,40 @@ if str(BACKEND_DIR) not in sys.path:
 class TestContextEngineeringConfig:
     """Context Engineering 推荐阈值与配置。"""
 
-    def test_default_context_window_is_1m(self):
+    def test_knowledge_rag_defaults_are_preserved(self):
         from config import _DEFAULT_CONFIG
-        assert _DEFAULT_CONFIG["fallback_llm"]["context_window"] == 1000000
+
+        assert _DEFAULT_CONFIG["rag"] == {
+            "top_k": 10,
+            "similarity_threshold": 0.5,
+            "hybrid": {
+                "enabled": True,
+                "mode": "reciprocal_rerank",
+                "text_vector_weight": 0.7,
+                "image_vector_weight": 0.4,
+                "bm25_weight": 0.3,
+                "candidate_top_k": 30,
+            },
+            "rerank": {
+                "enabled": True,
+                "provider": "dashscope",
+                "model": "qwen3-vl-rerank",
+                "top_n": 10,
+                "candidate_top_k": 50,
+            },
+        }
+
+    def test_llm_wiki_defaults_enable_hybrid_without_empty_model_overrides(self):
+        from config import _DEFAULT_CONFIG
+
+        assert _DEFAULT_CONFIG["knowledge"]["llm_wiki"] == {
+            "retrieval": {"hybrid_enabled": True},
+        }
+
+    def test_default_context_window_is_1m(self):
+        from provider_registry import DEFAULT_AGENT_MODEL
+
+        assert DEFAULT_AGENT_MODEL["context_window"] == 1000000
 
     def test_tail_trim_threshold_is_200k(self):
         from config import _DEFAULT_CONFIG
@@ -62,19 +93,15 @@ class TestContextEngineeringConfig:
         assert cm["keep_recent"] == 8
         assert cm["compact_budget_tokens"] == 120000
 
-    def test_deepagents_summarization_is_independent_at_160k(self):
+    def test_deepagents_summarization_uses_current_trigger(self):
         from config import _DEFAULT_CONFIG
 
         agent_summary = _DEFAULT_CONFIG["compression"]["deepagents"]["summarization"]
-        chat_middleware = _DEFAULT_CONFIG["compression"]["middleware"]
 
         assert agent_summary["model_id"] == ""
-        assert agent_summary["trigger_tokens"] == 160000
+        assert agent_summary["trigger_tokens"] == 272000
         assert "summary_input_tokens" not in agent_summary
         assert agent_summary["keep_tokens"] == 64000
-        # Legacy Chat keeps its existing two-stage policy.
-        assert chat_middleware["summarization"]["trigger_tokens"] == 200000
-        assert chat_middleware["compaction"]["trigger_tokens"] == 500000
 
     def test_deepagents_summary_input_budget_uses_model_context_window(self, tmp_path, monkeypatch):
         import config
@@ -83,13 +110,11 @@ class TestContextEngineeringConfig:
         config_path.write_text(
             json.dumps(
                 {
-                    "fallback_llm": {"context_window": 500000},
                     "compression": {
                         "deepagents": {
                             "summarization": {
                                 "model_id": "provider:endpoint:flash:llm",
                                 "trigger_tokens": 120000,
-                                "summary_input_tokens": 1,
                             }
                         }
                     },
@@ -98,6 +123,10 @@ class TestContextEngineeringConfig:
             encoding="utf-8",
         )
         monkeypatch.setattr(config, "CONFIG_FILE", config_path)
+        registry = MagicMock()
+        registry.resolve_binding.return_value = {"context_window": 500000}
+        registry.display.return_value = {"providers": [], "bindings": {}}
+        monkeypatch.setattr("provider_registry.get_provider_registry", lambda: registry)
 
         runtime = config.get_deepagents_summarization_config()
         displayed = config.get_settings_for_display()
@@ -124,51 +153,6 @@ class TestContextEngineeringConfig:
         )
         assert saved["compression"]["deepagents"]["summarization"]["trigger_tokens"] == 130000
         assert "summary_input_tokens" not in saved["compression"]["deepagents"]["summarization"]
-
-    def test_chat_preannounces_pending_tool_result_clear(self):
-        from api.chat import _should_preannounce_tool_result_clear
-
-        history = [
-            {
-                "role": "assistant",
-                "content": "",
-                "tool_calls": [
-                    {"tool": "t", "output": "x" * 600}
-                    for _ in range(11)
-                ],
-            }
-        ]
-
-        with patch("api.chat.get_middleware_config", return_value={
-            "enabled": True,
-            "tool_clear": {"keep_recent": 10, "min_summary_length": 500},
-        }):
-            assert _should_preannounce_tool_result_clear(history) is True
-
-    def test_chat_does_not_preannounce_already_summarized_tool_results(self):
-        from api.chat import _should_preannounce_tool_result_clear
-
-        history = [
-            {
-                "role": "assistant",
-                "content": "",
-                "tool_calls": [
-                    {
-                        "tool": "t",
-                        "output": "[摘要] 已整理",
-                        "summary_source": "tool_result_clear",
-                    }
-                    for _ in range(11)
-                ],
-            }
-        ]
-
-        with patch("api.chat.get_middleware_config", return_value={
-            "enabled": True,
-            "tool_clear": {"keep_recent": 10, "min_summary_length": 500},
-        }):
-            assert _should_preannounce_tool_result_clear(history) is False
-
 
 # ══════════════════════════════════════════════════════════════════════
 # Agent streaming
@@ -294,134 +278,6 @@ class TestAgentStreaming:
         assert ai_messages[0].tool_calls[0]["id"] == "tc_missing"
         assert tool_messages[0].tool_call_id == "tc_missing"
         assert MISSING_TOOL_OUTPUT_PLACEHOLDER in tool_messages[0].content
-
-    def test_chat_save_sanitizer_backfills_missing_tool_output(self):
-        from api.chat import MISSING_TOOL_OUTPUT_PLACEHOLDER, _ensure_tool_call_outputs
-
-        segment = {
-            "content": "我来查一下。",
-            "tool_calls": [
-                {"tool": "search_patents", "id": "tc_missing", "input": "{}"}
-            ],
-        }
-
-        normalized = _ensure_tool_call_outputs(segment)
-
-        tc = normalized["tool_calls"][0]
-        assert tc["output"] == MISSING_TOOL_OUTPUT_PLACEHOLDER
-        assert tc["is_error"] is True
-        assert tc["summary_source"] == "missing_tool_output"
-
-    def test_chat_missing_tool_end_events_for_frontend(self):
-        from api.chat import MISSING_TOOL_OUTPUT_PLACEHOLDER, _missing_tool_end_events
-
-        segment = {
-            "content": "我来查一下。",
-            "tool_calls": [
-                {"tool": "bibliography", "id": "tc_missing", "input": "{}"},
-                {"tool": "bibliography", "id": "tc_done", "input": "{}", "output": "ok"},
-            ],
-        }
-
-        events = _missing_tool_end_events(segment)
-
-        assert len(events) == 1
-        assert events[0]["tool"] == "bibliography"
-        assert events[0]["id"] == "tc_missing"
-        assert events[0]["output"] == MISSING_TOOL_OUTPUT_PLACEHOLDER
-        assert events[0]["is_error"] is True
-        assert events[0]["summary_source"] == "missing_tool_output"
-
-    def test_live_skill_plan_output_is_compact_and_parseable(self):
-        from api.chat import _live_tool_output
-
-        full_plan = {
-            "ok": True,
-            "plan_id": "skill-plan-1",
-            "plan_sha256": "a" * 64,
-            "skill_name": "lark-doc",
-            "action": "install",
-            "status": "prepared",
-            "phase": "awaiting_confirmation",
-            "requires_confirmation": True,
-            "ui_commit_supported": True,
-            "source": "https://open.feishu.cn/.well-known/skills/lark-doc",
-            "large_diff": "x" * 20_000,
-        }
-        raw = json.dumps(
-            {
-                "ok": True,
-                "managed_by": "skill_management",
-                "intercepted": True,
-                "source": "https://open.feishu.cn",
-                "plans": [full_plan],
-                "errors": [],
-            }
-        )
-
-        output = _live_tool_output(
-            {
-                "tool": "execute",
-                "output": raw,
-                "raw_output": raw,
-                "output_preview": raw[:2000],
-            }
-        )
-
-        payload = json.loads(output)
-        assert payload["event_kind"] == "skill_plan_batch_confirmation"
-        assert payload["prepared_count"] == 1
-        assert payload["plans"][0]["plan_id"] == "skill-plan-1"
-        assert "large_diff" not in payload["plans"][0]
-        assert len(output) < 2000
-
-    def test_live_authorization_output_preserves_complete_qr_envelope(self):
-        from api.chat import _live_tool_output
-
-        qr = "\n".join(["▀▄█ " * 48] * 40)
-        raw = json.dumps(
-            {
-                "ok": True,
-                "managed_by": "managed_cli",
-                "status": "awaiting_user_browser",
-                "authorization_request": {
-                    "type": "managed_authorization_request",
-                    "flow_id": "auth-test",
-                    "revision": 2,
-                    "attempt": 1,
-                    "provider": "lark",
-                    "profile_id": "lark_default",
-                    "status": "awaiting_user",
-                    "phase": {
-                        "id": "user_consent",
-                        "step": 2,
-                        "total": 2,
-                        "title": "授权应用访问你的飞书数据",
-                        "description": "用户身份授权",
-                    },
-                    "verification_url": "https://accounts.feishu.cn/oauth/v1/device/verify",
-                    "qr_ascii": qr,
-                    "completion_hint": "完成后告诉我。",
-                    "device_code": "must-not-project",
-                },
-                "output": "第 2/2 步已开始。",
-            }
-        )
-
-        output = _live_tool_output(
-            {
-                "tool": "execute",
-                "output": raw,
-                "raw_output": raw,
-                "output_preview": raw[:2000],
-            }
-        )
-
-        payload = json.loads(output)
-        assert len(raw) > 4000
-        assert payload["event_kind"] == "managed_authorization_request"
-        assert payload["authorization_request"]["qr_ascii"] == qr
-        assert "device_code" not in output
 
     def test_tool_end_keeps_full_output_and_preview_separate(self):
         from graph.agent import AgentManager
@@ -1068,7 +924,7 @@ class TestSessionManagerPersistence:
         assert agent_call["context_compaction"]["method"] == "search_adapter"
 
 
-    def test_load_session_for_agent_still_merges_plain_consecutive_assistant_text(self, tmp_path):
+    def test_load_session_for_agent_keeps_plain_consecutive_assistant_text_separate(self, tmp_path):
         from graph.session_manager import SessionManager
 
         mgr = SessionManager()
@@ -1080,7 +936,10 @@ class TestSessionManagerPersistence:
 
         agent_history = mgr.load_session_for_agent(sid)
 
-        assert agent_history == [{"role": "assistant", "content": "first\nsecond"}]
+        assert agent_history == [
+            {"role": "assistant", "content": "first"},
+            {"role": "assistant", "content": "second"},
+        ]
 
     def test_middle_trim_archives_but_display_history_stays_complete(self, tmp_path):
         from graph.session_manager import SessionManager
@@ -1127,60 +986,17 @@ class TestSessionManagerPersistence:
         assert any(m["content"] == "trim-assistant" for m in agent_history)
         assert not any("trimmed task was completed" in m["content"] for m in agent_history)
 
-    def test_middle_trim_span_aligns_tail_to_user(self):
-        from api.chat import _select_middle_trim_span
-
-        messages = [
-            {"role": "user", "content": "head user"},
-            {"role": "assistant", "content": "head assistant"},
-            {"role": "user", "content": "middle user"},
-            {"role": "assistant", "content": "middle assistant"},
-            {"role": "tool", "content": "middle tool"},
-            {"role": "user", "content": "tail user"},
-            {"role": "assistant", "content": "tail assistant"},
-        ]
-
-        span = _select_middle_trim_span(
-            messages,
-            {"enabled": True, "max_tokens": 1, "head_keep": 2, "keep_recent": 2},
-        )
-
-        assert span == (2, 5)
-
-
 # ══════════════════════════════════════════════════════════════════════
 # Tokens API
 # ══════════════════════════════════════════════════════════════════════
 
 class TestTokensAPI:
-    """/api/tokens/session/{id} 优先返回峰值。"""
-
-    @pytest.mark.asyncio
-    async def test_peak_takes_precedence(self, tmp_path):
-        from api.tokens import get_session_token_count
-        from graph.session_manager import session_manager
-        from config import CONFIG_FILE
-
-        with patch("config.CONFIG_FILE", tmp_path / "nonexistent_config.json"):
-            session_manager.initialize(tmp_path)
-            sid = "tokens-test"
-            session_manager.create_session(sid)
-            session_manager.save_message(sid, "user", "hello")
-            session_manager.update_context_usage_peak(sid, 999999)
-
-            with patch("api.tokens.build_system_prompt", return_value="sys"):
-                with patch("api.tokens._count_tokens", return_value=1):
-                    result = await get_session_token_count(sid)
-
-        assert result["message_tokens"] == 999998
-        assert result["total_tokens"] == 999999
-        assert result["compaction_trigger"] == 500000
+    """/api/tokens/session/{id} reports the current Agent context state."""
 
     @pytest.mark.asyncio
     async def test_agent_uses_current_effective_context_not_full_history_or_peak(self, tmp_path):
         from api.tokens import get_session_token_count
         from graph.session_manager import session_manager
-        from config import CONFIG_FILE
 
         with patch("config.CONFIG_FILE", tmp_path / "nonexistent_config.json"):
             session_manager.initialize(tmp_path)
@@ -1198,8 +1014,8 @@ class TestTokensAPI:
                     result = await get_session_token_count(sid)
 
         assert result["total_tokens"] == 6800
-        assert result["compaction_trigger"] == 160000
-        assert result["percentage"] == 4.2
+        assert result["compaction_trigger"] == 272000
+        assert result["percentage"] == 2.5
         assert result["measured"] is True
 
     @pytest.mark.asyncio
@@ -1235,11 +1051,11 @@ class TestTokensAPI:
         session_manager.create_session(sid, metadata={"runtime_mode": "agent"})
 
         with (
-            patch("api.tokens.build_system_prompt", return_value="legacy chat prompt"),
+            patch("api.tokens.build_system_prompt", return_value="unused system prompt"),
             patch("api.tokens._count_tokens", return_value=11392),
             patch(
                 "api.tokens.get_deepagents_summarization_config",
-                return_value={"trigger_tokens": 160000},
+                return_value={"trigger_tokens": 272000},
             ),
         ):
             result = await get_session_token_count(sid)
@@ -1249,28 +1065,3 @@ class TestTokensAPI:
         assert result["total_tokens"] == 0
         assert result["percentage"] == 0.0
         assert result["measured"] is False
-
-    @pytest.mark.asyncio
-    async def test_persisted_chat_ignores_agent_runtime_hint(self, tmp_path):
-        from api.tokens import get_session_token_count
-        from graph.session_manager import session_manager
-
-        session_manager.initialize(tmp_path)
-        sid = "persisted-chat-token-test"
-        session_manager.create_session(sid, metadata={"runtime_mode": "chat"})
-        with (
-            patch("api.tokens.build_system_prompt", return_value="sys"),
-            patch("api.tokens._count_tokens", return_value=1),
-            patch("api.tokens.get_compaction_trigger_tokens", return_value=500000),
-            patch(
-                "api.tokens.get_deepagents_summarization_config",
-                return_value={"trigger_tokens": 272000},
-            ),
-        ):
-            result = await get_session_token_count(
-                sid,
-                runtime_mode="agent",
-            )
-
-        assert result["compaction_trigger"] == 500000
-        assert result["measured"] is True

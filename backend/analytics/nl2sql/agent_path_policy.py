@@ -11,7 +11,6 @@ import time
 import uuid
 from typing import Any
 
-from config import get_database_qa_config
 from graph.session_manager import session_manager
 
 _INFRASTRUCTURE_FALLBACK_CODES = frozenset(
@@ -77,24 +76,26 @@ def classify_evidence_exception(exc: BaseException) -> str:
 
 
 def fallback_policy(error_code: str, *, config: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Return the server-owned fallback decision for one structured error."""
+    """Reject legacy SQL fallback for every error class.
 
-    effective_config = config if config is not None else get_database_qa_config()
+    The Agent-led database path is the only supported path. Infrastructure
+    failures are reported to the caller and never switch execution engines.
+    ``config`` remains accepted only so older callers fail closed.
+    """
+
+    del config
     normalized_code = str(error_code or "").strip()
     infrastructure = normalized_code in _INFRASTRUCTURE_FALLBACK_CODES
-    enabled = bool(effective_config.get("database_agent_sql_fallback_enabled", True))
     return {
-        "eligible": infrastructure and enabled,
+        "eligible": False,
         "infrastructure_error": infrastructure,
-        "enabled": enabled,
+        "enabled": False,
         "error_code": normalized_code,
-        "target_path": "legacy_generation" if infrastructure and enabled else "",
+        "target_path": "",
         "blocked_reason": (
             "business_or_security_boundary"
             if not infrastructure
-            else "fallback_disabled"
-            if not enabled
-            else ""
+            else "fallback_removed"
         ),
     }
 

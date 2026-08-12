@@ -316,7 +316,9 @@ async def agent(request: AgentRequest):
 
     selection_explicit = bool(selected_model_id or selected_thinking_level or selected_credential_name)
     runtime_model_id = str(effective_llm.get("model_id") or "") if selection_explicit else None
-    runtime_thinking_level = effective_llm.get("thinking_level") if selection_explicit else None
+    # The inherited default route still freezes the model Profile's default
+    # reasoning strength for this Run. It is not persisted as a user override.
+    runtime_thinking_level = effective_llm.get("thinking_level")
     runtime_credential_name = effective_llm.get("credential_name") if selection_explicit else None
     selection_source = (
         "request"

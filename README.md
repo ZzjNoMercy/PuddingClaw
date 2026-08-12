@@ -207,7 +207,7 @@ analysis-project/
 | 高级设置 | 兼容性压缩参数等低频运行选项 |
 | 系统状态 | PostgreSQL、Milvus、MinerU、模型接入等能力探测与降级状态 |
 
-正常桌面使用以设置页和 `backend/config.json` 为事实源；环境变量主要用于部署覆盖。不要把包含真实 API Key、数据库密码或本机路径的配置提交到版本库。
+正常桌面使用以代码 defaults 与 `~/.puddingclaw/config.json` 的稀疏用户覆盖合并结果为事实源；环境变量仅用于部署覆盖。Provider 凭据和数据库密码进入 Credential Vault，不写入配置文件。
 
 知识库现已提供 Schema Studio：可查看 gbrain 内置 Schema、选择父 pack、结构化编辑完整官方 manifest，并预览 custom/parent/resolved YAML。当前还缺少可视化 diff、官方 YAML CST 导入/注释保留、Ingest / Query / Lint 运维页、raw/Wiki drift 看板、Embedding 绑定与托管式重建入口。
 
@@ -244,7 +244,7 @@ chmod +x scripts/start-local-infra.sh scripts/start-macos-linux.sh
 ./scripts/start-local-infra.sh
 ```
 
-脚本会自动写入 `backend/config.json`，并根据 `5432` 端口选择 PostgreSQL：
+脚本会通过统一设置接口写入 `~/.puddingclaw/config.json` 的稀疏覆盖，并根据 `5432` 端口选择 PostgreSQL：
 
 - `detect`（默认）：保留已有本机 PostgreSQL，否则启动 bundled PostgreSQL。
 - `bundled`：强制使用 Docker PostgreSQL。
@@ -297,7 +297,7 @@ curl http://127.0.0.1:8888/api/capabilities
 2. 在“设置 → 知识库”确认 Catalog Database 连接，并选择长期知识目录。
 3. 在“系统状态”确认 PostgreSQL / Milvus 健康；未启用的可选能力应显示为降级，而不是伪装成可用。
 
-Provider 密钥推荐在设置页管理。`backend/.env` 和 `backend/config.json` 均可包含密钥、数据库密码或本机路径，已被 Git 忽略，不应手动提交。
+Provider 密钥推荐在设置页管理，并只保存到 Credential Vault。数据库账号和知识库路径等机器配置由设置页或后续 `puddingclaw init` 写入 Home 覆盖。
 
 #### 6. 可选：启动 MinerU
 
@@ -317,7 +317,6 @@ Docker Core 适合将 Web 前端、API 和 PostgreSQL 统一交给 Compose 管�
 
 ```bash
 cp backend/.env.example backend/.env
-cp backend/config.json.example backend/config.json
 ```
 
 修改 `backend/.env` 里的 `POSTGRES_PASSWORD`，生产或可被其他设备访问的环境不得使用默认密码。默认连接串直接使用该密码，因此建议使用字母、数字、`_` / `-` / `.` 组成的强密码；如果包含 URL 保留字符，请额外设置经百分号编码的 `PUDDINGCLAW_DATABASE_URL`。
@@ -325,9 +324,12 @@ cp backend/config.json.example backend/config.json
 #### 2. 构建并启动
 
 ```bash
+export PUDDINGCLAW_HOST_HOME="${HOME}/.puddingclaw"
 docker compose --env-file backend/.env up --build -d
 docker compose --env-file backend/.env ps
 ```
+
+容器内固定使用 `/app/.puddingclaw`；宿主 Home 通过 bind mount 映射，`db/` 再由独立 named volume 覆盖，避免 SQLite 位于 Docker Desktop 共享文件系统。
 
 Compose 会把 backend 数据库连接强制指向容器内的 `postgres:5432`，避免误用 `config.json` 中的宿主机地址。首次启动可通过以下命令观察健康检查：
 
@@ -341,7 +343,7 @@ curl http://127.0.0.1:8888/api/capabilities
 - 用 Nginx、Caddy 或等价网关终止 TLS，对外只暴露 Web 入口。
 - 将 `CORS_ORIGINS` 设为真实前端域名，不要使用通配来源。
 - 通过主机防火墙限制 PostgreSQL `5432`、Milvus `19530` 和 backend `8888`；这些端口不应直接暴露到公网。
-- 保留 `backend/.env` 和 `backend/config.json` 的宿主机备份，但不要将它们提交到 Git。
+- 保留 `backend/.env` 与 PuddingClaw Home 的宿主机备份，但不要将凭据文件提交到 Git。
 
 #### 4. 停止
 
@@ -386,11 +388,11 @@ docker compose -f docker-compose.infra.yml stop
 docker compose -f docker-compose.infra.yml down
 ```
 
-`docker-compose.infra.yml` 使用 `data/postgres/` 和 `data/milvus/` 持久化数据；Docker Core 的 PostgreSQL 使用 `postgres_data` 命名卷。业务可迁移资产主要位于用户选择的知识目录、`backend/semantic-assets/`、`backend/analytics-models/`、`backend/sql-guardrails/` 和分析项目导出包。升级或迁移前应同时备份：
+`docker-compose.infra.yml` 使用 `$PUDDINGCLAW_HOST_HOME/infrastructure/postgres/` 和 `$PUDDINGCLAW_HOST_HOME/infrastructure/milvus/` 持久化本地基础设施数据（该变量默认等于 `$PUDDINGCLAW_HOME`）；Docker Core 的 PostgreSQL 使用 `postgres_data` 命名卷。用户定义的 Semantic Asset、Analytics Model 和 SQL Guardrail 位于 `$PUDDINGCLAW_HOME/definitions/`。升级或迁移前应同时备份：
 
 - PostgreSQL（使用 `pg_dump`，不要直接复制正在运行的数据目录）；
 - 用户知识目录和分析项目导出包；
-- `backend/config.json`、`backend/.env` 以及需要保留的 `backend/sessions/`。
+- `~/.puddingclaw/`、`backend/.env` 以及需要保留的运行时会话数据。
 
 Milvus 和 gbrain 索引应能从原始知识、Schema 和 Wiki 重建，不应成为唯一事实源。
 

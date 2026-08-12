@@ -24,8 +24,7 @@ from tools.read_resource_tool import ReadResourceTool
 
 @pytest.fixture(autouse=True)
 def _isolated_provider_registry(tmp_path, monkeypatch):
-    """Legacy config fixtures must not share a migrated user profile."""
-    monkeypatch.setenv("PUDDINGDATA_USER_DATA_DIR", str(tmp_path / "user-data"))
+    """Config fixtures must not share a cached Provider Registry."""
     monkeypatch.setattr(provider_registry, "_default_registry_instance", None)
 
 
@@ -83,9 +82,11 @@ def test_harness_settings_freeze_explicit_goal_and_validate_rules(tmp_path, monk
     )
 
     saved = json.loads(config_path.read_text(encoding="utf-8"))["harness"]
-    assert saved["goals"]["activation"] == "explicit_user_only"
-    assert saved["goals"]["default_enabled"] is False
-    assert saved["goals"]["auto_promote_from_run"] is False
+    effective = config.load_config()["harness"]
+    assert "activation" not in saved["goals"]
+    assert effective["goals"]["activation"] == "explicit_user_only"
+    assert effective["goals"]["default_enabled"] is False
+    assert effective["goals"]["auto_promote_from_run"] is False
     assert saved["completion"]["rubric"]["custom_rules"][0]["statement"] == "原因必须给出影响量级"
     assert saved["completion"]["rubric"]["model"] == "grader-model"
     assert saved["completion"]["rubric"]["max_stagnant_repairs"] == 4
@@ -140,67 +141,6 @@ def test_harness_settings_freeze_explicit_goal_and_validate_rules(tmp_path, monk
         )
 
 
-def test_legacy_python_only_sandbox_image_migrates_to_managed_runtime(
-    tmp_path,
-    monkeypatch,
-):
-    config_path = tmp_path / "config.json"
-    config_path.write_text(
-        json.dumps(
-            {
-                "harness": {
-                    "terminal": {
-                        "docker": {
-                            "image": "python:3.12-slim",
-                        }
-                    }
-                }
-            }
-        ),
-        encoding="utf-8",
-    )
-    monkeypatch.setattr(config, "CONFIG_FILE", config_path)
-
-    loaded = config.load_config()
-
-    docker = loaded["harness"]["terminal"]["docker"]
-    assert docker["image"] == "puddingclaw/sandbox:python3.12-node22-chromium-v5"
-    assert docker["dependency_setup_enabled"] is False
-    assert docker["dependency_setup_opt_in_version"] == 1
-    persisted = json.loads(config_path.read_text(encoding="utf-8"))
-    assert persisted["harness"]["terminal"]["docker"]["image"] == "puddingclaw/sandbox:python3.12-node22-chromium-v5"
-
-
-def test_legacy_implicit_project_dependency_setup_is_reset_to_clean_default(
-    tmp_path,
-    monkeypatch,
-):
-    config_path = tmp_path / "config.json"
-    config_path.write_text(
-        json.dumps(
-            {
-                "harness": {
-                    "terminal": {
-                        "docker": {
-                            "image": "puddingclaw/sandbox:python3.12-node22-v1",
-                            "dependency_setup_enabled": True,
-                        }
-                    }
-                }
-            }
-        ),
-        encoding="utf-8",
-    )
-    monkeypatch.setattr(config, "CONFIG_FILE", config_path)
-
-    loaded = config.load_config()
-
-    docker = loaded["harness"]["terminal"]["docker"]
-    assert docker["image"] == "puddingclaw/sandbox:python3.12-node22-chromium-v5"
-    assert docker["dependency_setup_enabled"] is False
-    assert docker["dependency_setup_opt_in_version"] == 1
-
-
 @pytest.mark.parametrize(
     "legacy_image",
     [
@@ -208,7 +148,7 @@ def test_legacy_implicit_project_dependency_setup_is_reset_to_clean_default(
         "puddingclaw/sandbox:python3.12-node22-curl-v3",
     ],
 )
-def test_managed_sandbox_migrates_to_browser_runtime(
+def test_removed_sandbox_images_fail_fast(
     tmp_path,
     monkeypatch,
     legacy_image,
@@ -230,12 +170,8 @@ def test_managed_sandbox_migrates_to_browser_runtime(
     )
     monkeypatch.setattr(config, "CONFIG_FILE", config_path)
 
-    loaded = config.load_config()
-
-    assert (
-        loaded["harness"]["terminal"]["docker"]["image"]
-        == "puddingclaw/sandbox:python3.12-node22-chromium-v5"
-    )
+    with pytest.raises(ValueError, match="Unsupported sandbox image"):
+        config.load_config()
 
 
 def test_docker_probe_endpoint_reports_daemon_status(monkeypatch):
@@ -254,34 +190,6 @@ def test_docker_probe_endpoint_reports_daemon_status(monkeypatch):
     assert response.status_code == 200
     assert response.json()["available"] is True
     assert response.json()["detail"] == "27.0.1"
-
-
-def test_gateway_has_no_key_and_provider_key_is_masked(tmp_path, monkeypatch):
-    config_path = tmp_path / "config.json"
-    config_path.write_text(
-        json.dumps(
-            {
-                "ai_gateway": {
-                    "base_url": "http://gateway:8080/v1",
-                    "health_path": "/ready",
-                    "fallback_to_direct": True,
-                },
-                "fallback_llm": {"api_key": "provider-secret-1234"},
-            }
-        ),
-        encoding="utf-8",
-    )
-    monkeypatch.setattr(config, "CONFIG_FILE", config_path)
-
-    displayed = config.get_settings_for_display()
-    assert "api_key" not in displayed["ai_gateway"]
-    assert "api_key_masked" not in displayed["ai_gateway"]
-    assert displayed["fallback_llm"]["api_key_masked"].endswith("1234")
-
-    config.update_settings({"ai_gateway": {"base_url": "http://new-gateway:8080/v1"}})
-    saved = json.loads(config_path.read_text(encoding="utf-8"))
-    assert saved["ai_gateway"]["base_url"] == "http://new-gateway:8080/v1"
-    assert "enabled" not in saved["ai_gateway"]
 
 
 def test_provider_connection_check_is_separate_from_model_discovery(monkeypatch):
@@ -316,135 +224,6 @@ def test_provider_connection_check_is_separate_from_model_discovery(monkeypatch)
     }
 
 
-def test_provider_credential_reveal_requires_explicit_endpoint(monkeypatch):
-    def fake_reveal(self, provider_id, credential_name, *, legacy_config):
-        assert provider_id == "deepseek"
-        assert credential_name == "evaluation"
-        assert isinstance(legacy_config, dict)
-        return "evaluation-secret"
-
-    monkeypatch.setattr(provider_registry.ProviderRegistry, "reveal_credential", fake_reveal)
-
-    response = TestClient(app).post(
-        "/api/providers/deepseek/credentials/evaluation/reveal"
-    )
-
-    assert response.status_code == 200
-    assert response.json() == {"name": "evaluation", "value": "evaluation-secret"}
-    assert response.headers["cache-control"] == "no-store"
-
-
-def test_multimodal_embedding_settings_are_separate_from_openai_embedding(tmp_path, monkeypatch):
-    config_path = tmp_path / "config.json"
-    config_path.write_text(
-        json.dumps(
-            {
-                "fallback_embedding": {
-                    "model": "text-embedding-v4",
-                    "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-                    "api_key": "text-secret-1234",
-                },
-                "multimodal_embedding": {
-                    "provider": "dashscope",
-                    "model": "qwen2.5-vl-embedding",
-                    "dimension": 1024,
-                    "base_url": "http://localhost:8080",
-                    "route_path": "/api/v1/services/embeddings/multimodal-embedding/multimodal-embedding",
-                    "api_key": "mm-secret-5678",
-                    "prefer_gateway": True,
-                },
-            }
-        ),
-        encoding="utf-8",
-    )
-    monkeypatch.setattr(config, "CONFIG_FILE", config_path)
-
-    mm = config.get_multimodal_embedding_config()
-    assert mm["model"] == "qwen2.5-vl-embedding"
-    assert mm["dimension"] == 1024
-    # Legacy Higress passthrough is retained as an archived config value, but
-    # the active multimodal binding resolves to DashScope's native endpoint.
-    assert mm["base_url"] == "https://dashscope.aliyuncs.com"
-    assert mm["route_path"].endswith("/multimodal-embedding")
-
-    displayed = config.get_settings_for_display()
-    # Bailian endpoints share the OpenAI-compatible credential selected during
-    # the lossless Provider migration.
-    assert displayed["multimodal_embedding"]["api_key_masked"].endswith("1234")
-    assert displayed["multimodal_embedding"]["openai_compatible"] is False
-    assert "api_key" not in displayed["multimodal_embedding"]
-
-    config.update_settings(
-        {
-            "multimodal_embedding": {
-                "base_url": "http://higress:8080",
-                "model": "qwen3-vl-embedding",
-                "dimension": 2560,
-                "batch_size": 6,
-            }
-        }
-    )
-    saved = json.loads(config_path.read_text(encoding="utf-8"))
-    assert saved["multimodal_embedding"]["base_url"] == "http://higress:8080"
-    assert saved["multimodal_embedding"]["model"] == "qwen3-vl-embedding"
-    assert saved["multimodal_embedding"]["dimension"] == 2560
-    # Provider Registry owns the selected model and its dimensions, while the
-    # knowledge-index runtime keeps a separately tunable request concurrency.
-    assert config.get_multimodal_embedding_config()["batch_size"] == 6
-
-
-def test_multimodal_embedding_can_reuse_higress_qwen_token(tmp_path, monkeypatch):
-    config_path = tmp_path / "config.json"
-    config_path.write_text(
-        json.dumps(
-            {
-                "multimodal_embedding": {
-                    "provider": "dashscope",
-                    "model": "qwen2.5-vl-embedding",
-                    "dimension": 1024,
-                    "api_key": "",
-                }
-            }
-        ),
-        encoding="utf-8",
-    )
-    higress_dir = tmp_path / "higress"
-    plugin_dir = higress_dir / "wasmplugins"
-    plugin_dir.mkdir(parents=True)
-    (plugin_dir / "ai-proxy.internal.yaml").write_text(
-        """
-apiVersion: extensions.higress.io/v1alpha1
-kind: WasmPlugin
-metadata:
-  name: ai-proxy.internal
-spec:
-  defaultConfig:
-    providers:
-      - id: base-model
-        type: deepseek
-        apiTokens: deepseek-secret
-      - id: multi-model
-        type: qwen
-        protocol: openai
-        qwenEnableCompatible: true
-        apiTokens:
-          - dashscope-secret-9999
-""",
-        encoding="utf-8",
-    )
-    monkeypatch.setattr(config, "CONFIG_FILE", config_path)
-    monkeypatch.setattr(higress_config_reader, "DEFAULT_HIGRESS_DATA_DIR", higress_dir)
-    monkeypatch.delenv("DASHSCOPE_API_KEY", raising=False)
-    monkeypatch.delenv("EMBEDDING_API_KEY", raising=False)
-
-    mm = config.get_multimodal_embedding_config()
-    assert mm["api_key"] == "dashscope-secret-9999"
-
-    displayed = config.get_settings_for_display()
-    assert displayed["multimodal_embedding"]["api_key_masked"].endswith("9999")
-    assert "api_key" not in displayed["multimodal_embedding"]
-
-
 def test_knowledge_multimodal_index_settings_live_in_config_json(tmp_path, monkeypatch):
     config_path = tmp_path / "config.json"
     config_path.write_text(
@@ -457,9 +236,6 @@ def test_knowledge_multimodal_index_settings_live_in_config_json(tmp_path, monke
                         "milvus_uri": "http://milvus.local:19530",
                         "text_collection": "kb_text",
                         "image_collection": "kb_image",
-                        # Legacy value should be ignored. Collection reset is now an
-                        # explicit user action, not an ingestion-time flag.
-                        "overwrite": True,
                     }
                 }
             }
@@ -495,7 +271,7 @@ def test_knowledge_multimodal_index_settings_live_in_config_json(tmp_path, monke
     assert saved["knowledge"]["multimodal_index"]["text_collection"] == "pudding_text"
     assert saved["knowledge"]["multimodal_index"]["image_collection"] == "pudding_image"
     assert saved["knowledge"]["multimodal_index"]["milvus_uri"] == "http://milvus.local:19530"
-    assert saved["knowledge"]["multimodal_index"]["overwrite"] is False
+    assert "overwrite" not in saved["knowledge"]["multimodal_index"]
 
 
 def test_knowledge_root_dir_settings_live_in_config_json(tmp_path, monkeypatch):
@@ -530,10 +306,7 @@ def test_llm_wiki_compiler_model_setting_uses_provider_registry(tmp_path, monkey
     monkeypatch.setattr(config, "CONFIG_FILE", config_path)
 
     class FakeRegistry:
-        def ensure_migrated(self, legacy_config):
-            return None
-
-        def resolve_model(self, model_id, *, legacy_config, expected_capability="llm"):
+        def resolve_model(self, model_id, *, expected_capability="llm"):
             models = {
                 "provider:endpoint:wiki-model": ("wiki-model", "llm", 0),
                 "provider:endpoint:wiki-embedding": ("wiki-embedding", "text_embedding", 1024),
@@ -553,7 +326,7 @@ def test_llm_wiki_compiler_model_setting_uses_provider_registry(tmp_path, monkey
                 "protocol": "openai_compatible",
             }
 
-        def resolve_binding(self, binding, *, legacy_config):
+        def resolve_binding(self, binding):
             assert binding == "agent"
             return {
                 "id": "provider:endpoint:agent-model",
@@ -581,7 +354,7 @@ def test_llm_wiki_compiler_model_setting_uses_provider_registry(tmp_path, monkey
     )
     saved = json.loads(config_path.read_text(encoding="utf-8"))
     assert saved["knowledge"]["llm_wiki"]["compiler_agent"]["model_id"] == "provider:endpoint:wiki-model"
-    assert saved["knowledge"]["llm_wiki"]["retrieval"] == {"hybrid_enabled": True}
+    assert "retrieval" not in saved["knowledge"]["llm_wiki"]
     assert config.get_llm_wiki_retrieval_config()["hybrid_enabled"] is True
     assert saved["knowledge"]["llm_wiki"]["gbrain"] == {
         "embedding_model_id": "provider:endpoint:wiki-embedding",
@@ -637,53 +410,21 @@ def test_database_settings_live_in_config_json(tmp_path, monkeypatch):
         }
     )
     saved = json.loads(config_path.read_text(encoding="utf-8"))
-    assert saved["database"]["mode"] == "bundled"
+    assert "mode" not in saved["database"]
+    assert config.load_config()["database"]["mode"] == "bundled"
     assert saved["database"]["url"].startswith("postgresql+asyncpg://puddingclaw:")
 
 
-def test_database_settings_can_build_url_from_local_fields(tmp_path, monkeypatch):
+def test_plaintext_database_password_fails_fast(tmp_path, monkeypatch):
     config_path = tmp_path / "config.json"
     config_path.write_text(
-        json.dumps(
-            {
-                "database": {
-                    "mode": "bundled",
-                    "host": "127.0.0.1",
-                    "port": 5433,
-                    "database": "puddingclaw",
-                    "username": "puddingclaw",
-                    "password": "puddingclaw",
-                }
-            }
-        ),
+        json.dumps({"database": {"password": "puddingclaw"}}),
         encoding="utf-8",
     )
     monkeypatch.setattr(config, "CONFIG_FILE", config_path)
-    monkeypatch.delenv("PUDDINGCLAW_DATABASE_URL", raising=False)
-    monkeypatch.delenv("DATABASE_URL", raising=False)
-    monkeypatch.delenv("POSTGRES_URL", raising=False)
 
-    database = config.get_database_config()
-    assert database["mode"] == "bundled"
-    assert database["port"] == 5433
-    assert database["url"] == "postgresql+asyncpg://puddingclaw:puddingclaw@127.0.0.1:5433/puddingclaw"
-
-    config.update_settings(
-        {
-            "database": {
-                "mode": "external",
-                "port": 15432,
-                "database": "mydb",
-                "username": "me",
-                "password": "secret",
-            }
-        }
-    )
-    saved = json.loads(config_path.read_text(encoding="utf-8"))
-    assert saved["database"]["mode"] == "external"
-    assert saved["database"]["port"] == 15432
-    assert saved["database"]["database"] == "mydb"
-    assert saved["database"]["username"] == "me"
+    with pytest.raises(ValueError, match="Credential Vault"):
+        config.load_config()
 
 
 def test_database_generic_env_does_not_override_config_json(tmp_path, monkeypatch):
@@ -732,112 +473,43 @@ def test_database_puddingclaw_env_can_override_config_json(tmp_path, monkeypatch
     assert database["environment_override"] is True
 
 
-def test_thinking_mode_switches_to_thinking_model(tmp_path, monkeypatch):
-    config_path = tmp_path / "config.json"
-    config_path.write_text(
-        json.dumps(
-            {
-                "thinking_mode": False,
-                "gateway_llm": {
-                    "model": "deepseek-v4-flash",
-                    "thinking": {
-                        "model": "deepseek-v4-pro",
-                        "reasoning_effort": "high",
-                        "extra_body": {"thinking": {"type": "enabled"}},
-                    },
-                },
-                "fallback_llm": {
-                    "provider": "deepseek",
-                    "model": "deepseek-v4-flash",
-                    "thinking": {
-                        "model": "deepseek-v4-pro",
-                        "reasoning_effort": "high",
-                        "extra_body": {"thinking": {"type": "enabled"}},
-                    },
-                },
-            }
-        ),
-        encoding="utf-8",
-    )
-    monkeypatch.setattr(config, "CONFIG_FILE", config_path)
-
-    # Off by default
-    gateway = config.get_gateway_llm_config()
-    fallback = config.get_fallback_llm_config()
-    assert gateway["model"] == "deepseek-v4-flash"
-    assert gateway["reasoning_effort"] is None
-    assert fallback["model"] == "deepseek-v4-flash"
-    assert fallback["reasoning_effort"] is None
-
-    # Enable thinking mode
-    config.update_settings({"thinking_mode": True})
-    gateway = config.get_gateway_llm_config()
-    fallback = config.get_fallback_llm_config()
-    assert gateway["model"] == "deepseek-v4-pro"
-    assert gateway["reasoning_effort"] == "high"
-    assert gateway["extra_body"] == {"thinking": {"type": "enabled"}}
-    assert fallback["model"] == "deepseek-v4-pro"
-    assert fallback["reasoning_effort"] == "high"
-    assert fallback["extra_body"] == {"thinking": {"type": "enabled"}}
-
-    # Displayed settings include the flag
-    displayed = config.get_settings_for_display()
-    assert displayed["thinking_mode"] is True
-    saved = json.loads(config_path.read_text(encoding="utf-8"))
-    assert saved["thinking_mode"] is True
-
-    rubric_fallback = config.get_fallback_llm_config(
-        thinking_enabled_override=False,
-    )
-    rubric_gateway = config.get_gateway_llm_config(
-        thinking_enabled_override=False,
-    )
-    assert rubric_fallback["reasoning_effort"] is None
-    assert rubric_fallback["extra_body"] is None
-    assert rubric_gateway["reasoning_effort"] is None
-    assert rubric_gateway["extra_body"] is None
-
-
-def test_default_agent_routing_and_rubric_models_use_pro(tmp_path, monkeypatch):
+def test_default_agent_thinking_and_rubric_use_flash(tmp_path, monkeypatch):
     config_path = tmp_path / "config.json"
     config_path.write_text("{}", encoding="utf-8")
     monkeypatch.setattr(config, "CONFIG_FILE", config_path)
 
     loaded = config.load_config()
 
-    assert loaded["gateway_llm"]["model"] == "deepseek-v4-pro"
-    assert loaded["fallback_llm"]["model"] == "deepseek-v4-pro"
-    assert loaded["harness"]["completion"]["rubric"]["model"] == "deepseek-v4-pro"
+    assert "gateway_llm" not in loaded
+    assert "fallback_llm" not in loaded
+    default_agent = config.get_fallback_llm_config()
+    assert default_agent["model"] == "deepseek-v4-flash"
+    assert default_agent["thinking_enabled"] is True
+    assert default_agent["thinking_level"] == "high"
+    assert loaded["harness"]["completion"]["rubric"]["model"] == "deepseek-v4-flash"
 
 
-def test_settings_api_accepts_thinking_mode(tmp_path, monkeypatch):
-    """PUT /api/settings must persist the thinking_mode toggle from the dialog."""
+def test_empty_llm_wiki_model_overrides_are_not_persisted(tmp_path, monkeypatch):
     config_path = tmp_path / "config.json"
-    config_path.write_text(
-        json.dumps(
-            {
-                "thinking_mode": True,
-                "gateway_llm": {"model": "deepseek-v4-flash"},
-                "fallback_llm": {"model": "deepseek-v4-flash"},
-            }
-        ),
-        encoding="utf-8",
-    )
+    config_path.write_text("{}", encoding="utf-8")
     monkeypatch.setattr(config, "CONFIG_FILE", config_path)
 
-    client = TestClient(app)
-    response = client.put("/api/settings", json={"thinking_mode": False})
-    assert response.status_code == 200, response.text
+    config.update_settings(
+        {
+            "knowledge": {
+                "llm_wiki": {
+                    "compiler_agent": {"model_id": ""},
+                    "retrieval": {"hybrid_enabled": True},
+                    "gbrain": {"embedding_model_id": "", "think_model_id": ""},
+                }
+            }
+        }
+    )
 
+    displayed = config.get_settings_for_display()["knowledge"]["llm_wiki"]
+    assert displayed == {"retrieval": {"hybrid_enabled": True}}
     saved = json.loads(config_path.read_text(encoding="utf-8"))
-    assert saved["thinking_mode"] is False
-
-    gateway = config.get_gateway_llm_config()
-    fallback = config.get_fallback_llm_config()
-    assert gateway["model"] == "deepseek-v4-flash"
-    assert gateway["reasoning_effort"] is None
-    assert fallback["model"] == "deepseek-v4-flash"
-    assert fallback["reasoning_effort"] is None
+    assert "llm_wiki" not in saved.get("knowledge", {})
 
 
 def test_subagent_defaults_are_displayed_when_config_is_empty(tmp_path, monkeypatch):
@@ -848,7 +520,7 @@ def test_subagent_defaults_are_displayed_when_config_is_empty(tmp_path, monkeypa
     displayed = config.get_settings_for_display()
     image_analyzer = displayed["subagents"]["items"][0]
 
-    assert image_analyzer["enabled"] is False
+    assert image_analyzer["enabled"] is True
     assert image_analyzer["name"] == "image_analyzer"
     assert image_analyzer["model"] == "qwen:qwen3.7"
     assert image_analyzer["route_trigger"] == "image_input"
@@ -916,7 +588,11 @@ def test_settings_api_persists_harness_model_call_limit(tmp_path, monkeypatch):
     assert response.status_code == 200, response.text
 
     saved = json.loads(config_path.read_text(encoding="utf-8"))
-    assert saved["harness"]["model_call_limit"] == payload["harness"]["model_call_limit"]
+    assert saved["harness"]["model_call_limit"] == {
+        "run_limit": 12,
+        "thread_limit": 100,
+        "exit_behavior": "error",
+    }
 
     displayed = config.get_settings_for_display()
     assert displayed["harness"]["model_call_limit"]["run_limit"] == 12
@@ -940,7 +616,7 @@ def test_settings_api_persists_harness_prompt_cache_controls(tmp_path, monkeypat
     assert response.status_code == 200, response.text
 
     saved = json.loads(config_path.read_text(encoding="utf-8"))
-    assert saved["harness"]["prompt_cache"] == prompt_cache
+    assert saved == {"schema_version": 1}
     assert config.get_settings_for_display()["harness"]["prompt_cache"] == prompt_cache
 
 
@@ -1049,39 +725,6 @@ def test_settings_api_rejects_summary_keep_budget_at_or_above_trigger(tmp_path, 
 
     assert response.status_code == 400
     assert "摘要保留预算" in response.json()["detail"]
-
-
-def test_settings_api_migrates_legacy_subagent_items_to_keyed_config(tmp_path, monkeypatch):
-    config_path = tmp_path / "config.json"
-    config_path.write_text("{}", encoding="utf-8")
-    monkeypatch.setattr(config, "CONFIG_FILE", config_path)
-
-    payload = {
-        "subagent": {
-            "items": [
-                {
-                    "enabled": True,
-                    "name": "image_analyzer",
-                    "model": "qwen3.7-plus",
-                    "description": "Analyze image inputs and answer questions about them.",
-                    "route_trigger": "image_input",
-                    "tools": {"mode": "inherit"},
-                    "skills": {"mode": "inherit", "paths": []},
-                    "system_prompt": "Analyze images.",
-                }
-            ]
-        }
-    }
-
-    client = TestClient(app)
-    response = client.put("/api/settings", json=payload)
-    assert response.status_code == 200, response.text
-
-    saved = json.loads(config_path.read_text(encoding="utf-8"))
-    assert "subagent" not in saved
-    assert "items" not in saved["subagents"]
-    assert saved["subagents"]["image_analyzer"]["model"] == "qwen3.7-plus"
-    assert "name" not in saved["subagents"]["image_analyzer"]
 
 
 def test_subagent_route_hint_is_exposed_through_native_description():

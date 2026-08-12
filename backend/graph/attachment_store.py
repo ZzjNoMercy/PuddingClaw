@@ -43,40 +43,24 @@ def _attachment_store_locked(method):
 class AttachmentStore:
     def __init__(self) -> None:
         self._base_dir: Path | None = None
-        self._legacy_base_dirs: tuple[Path, ...] = ()
         self._lock = threading.RLock()
 
     def initialize(
         self,
         base_dir: Path,
-        *,
-        legacy_base_dirs: tuple[Path, ...] = (),
     ) -> None:
         canonical = (base_dir / "data" / "attachments").resolve()
         canonical.mkdir(parents=True, exist_ok=True)
-        legacy_roots: list[Path] = []
-        for legacy_base_dir in legacy_base_dirs:
-            legacy_root = (legacy_base_dir / "data" / "attachments").resolve()
-            if legacy_root != canonical and legacy_root not in legacy_roots:
-                legacy_roots.append(legacy_root)
         with self._lock:
             self._base_dir = canonical
-            # These roots are compatibility reads for attachments written by
-            # the former WebBridge integration. New bytes always use the
-            # canonical Backend attachment root above.
-            self._legacy_base_dirs = tuple(legacy_roots)
 
     @property
     def root_dir(self) -> Path | None:
         return self._base_dir
 
-    @property
-    def legacy_root_dirs(self) -> tuple[Path, ...]:
-        return self._legacy_base_dirs
-
     def _read_roots(self) -> tuple[Path, ...]:
         assert self._base_dir is not None
-        return (self._base_dir, *self._legacy_base_dirs)
+        return (self._base_dir,)
 
     @staticmethod
     def _safe_id(value: str) -> str:

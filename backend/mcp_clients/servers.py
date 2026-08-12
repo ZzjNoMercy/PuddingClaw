@@ -42,8 +42,8 @@ _REGISTRY: dict[str, Any] = {
         },
         "timeout": 60,
     },
-    # Enabled only when PUDDINGCLAW_GBRAIN_HOME points at the dedicated,
-    # PostgreSQL-configured brain. Never fall back to the user's personal brain.
+    # Enabled only when the active knowledge base owns an initialized,
+    # PostgreSQL-configured brain. Never fall back to a separate personal brain.
     "gbrain": {
         "transport": "stdio",
         "command": "gbrain",
@@ -100,7 +100,7 @@ def _configured_servers() -> dict[str, Any]:
 
 
 def _server_registry(custom_servers: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Return the single MCP config registry, with legacy fallback entries."""
+    """Combine code-owned built-ins with user-defined MCP servers."""
 
     registry = copy.deepcopy(_REGISTRY)
     for name, value in (custom_servers if custom_servers is not None else _configured_servers()).items():
@@ -123,6 +123,10 @@ def _resolve_environment_values(value: Any) -> Any:
         return {key: _resolve_environment_values(item) for key, item in value.items()}
     if isinstance(value, list):
         return [_resolve_environment_values(item) for item in value]
+    if isinstance(value, str) and value.startswith("vault://"):
+        from provider_registry import LocalCredentialStore
+
+        return LocalCredentialStore().get(value)
     if isinstance(value, str) and value.startswith("${") and value.endswith("}"):
         return _get_env(value[2:-1])
     return value
@@ -156,21 +160,17 @@ def gbrain_runtime_status() -> dict[str, Any]:
     second MCP process before the real client does discovery.
     """
 
-    configured_home = _get_env("PUDDINGCLAW_GBRAIN_HOME").strip()
     binary = resolve_gbrain_binary()
-    if configured_home:
-        home = Path(configured_home).expanduser().resolve()
-    else:
-        from knowledge.paths import get_knowledge_root
+    from knowledge.paths import get_gbrain_runtime_home
 
-        backend_root = Path(__file__).resolve().parent.parent
-        home = get_knowledge_root(backend_root) / "llm-wiki" / ".puddingclaw" / "gbrain-home"
+    backend_root = Path(__file__).resolve().parent.parent
+    home = get_gbrain_runtime_home(backend_root)
     config_exists = (home / ".gbrain" / "config.json").is_file()
-    if not configured_home and not config_exists:
+    if not config_exists:
         return {
             "configured": False,
             "ready": False,
-            "reason": "dedicated gbrain home is not initialized",
+            "reason": "gbrain 专用运行目录尚未初始化",
             "home": str(home),
             "binary": binary or "",
             "config_exists": False,
@@ -183,7 +183,7 @@ def gbrain_runtime_status() -> dict[str, Any]:
     if not binary:
         reasons.append("gbrain CLI is not installed")
     if not config_exists:
-        reasons.append("dedicated gbrain home is not initialized")
+        reasons.append("gbrain 专用运行目录尚未初始化")
     if not pack_exists:
         reasons.append("puddingclaw-wiki schema pack is not compiled")
     try:
@@ -208,17 +208,19 @@ def gbrain_runtime_status() -> dict[str, Any]:
 
 def effective_mcp_server_names(
     enabled_names: list[str] | None,
-    *,
-    auto_enable_gbrain: bool = False,
 ) -> list[str]:
-    """Return the effective server set after runtime-readiness policy."""
+    """Return user-enabled servers plus the mandatory ready gbrain runtime."""
 
-    result = list(dict.fromkeys(str(name) for name in (enabled_names or []) if str(name)))
+    result = list(
+        dict.fromkeys(
+            str(name)
+            for name in (enabled_names or [])
+            if str(name) and str(name) != "gbrain"
+        )
+    )
     status = gbrain_runtime_status()
-    if auto_enable_gbrain and status["ready"] and "gbrain" not in result:
+    if status["ready"]:
         result.append("gbrain")
-    if not status["ready"]:
-        result = [name for name in result if name != "gbrain"]
     return result
 
 

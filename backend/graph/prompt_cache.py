@@ -19,7 +19,7 @@ from langchain_core.messages import HumanMessage
 CONTROL_SOURCE = "puddingclaw_prompt_cache_control"
 _SYSTEM_SECTION_HEADINGS = {
     "stable_core": ("## Stable Core", "## Agent Core"),
-    "project_context": ("## Project Context", "## Project Context (stable)"),
+    "project_agents": ("## Project AGENTS",),
     "versioned": ("## Versioned Analytics / Semantics", "## Analytics Model Semantic Assets"),
     "memory": ("<agent_memory>",),
     "active_runtime": (
@@ -31,11 +31,13 @@ _SYSTEM_SECTION_HEADINGS = {
         "## Current Capability Manifest",
         "## Current Permission Manifest",
         "## Current Run Delta",
+        "## `update_todos`",
     ),
+    "user_additions": ("## User AGENTS Additions",),
 }
 _SYSTEM_SECTION_MARKERS = (
     ("stable_core", re.compile(r"(?m)^## Stable Core(?:\s*)$|^## Agent Core(?:\s*)$")),
-    ("project_context", re.compile(r"(?m)^## Project Context(?: \(stable\))?(?:\s*)$")),
+    ("project_agents", re.compile(r"(?m)^## Project AGENTS(?:\s*)$")),
     (
         "versioned",
         re.compile(r"(?m)^## Versioned Analytics / Semantics(?:\s*)$|^## Analytics Model Semantic Assets(?:\s*)$"),
@@ -51,13 +53,16 @@ _SYSTEM_SECTION_MARKERS = (
         "volatile_tail",
         re.compile(
             r"(?m)^## Current Capability Manifest(?:[^\n]*)$|^## Current Permission Manifest(?:[^\n]*)$|"
-            r"^## Current Run Delta(?:[^\n]*)$|^## 工具调用提醒(?:[^\n]*)$"
+            r"^## Current Run Delta(?:[^\n]*)$|^## `update_todos`(?:[^\n]*)$|"
+            r"^## 工具调用提醒(?:[^\n]*)$"
         ),
     ),
+    ("user_additions", re.compile(r"(?m)^## User AGENTS Additions(?:\s*)$")),
 )
 _SYSTEM_SECTION_ORDER = (
     "stable_core",
-    "project_context",
+    "user_additions",
+    "project_agents",
     "versioned",
     "memory",
     "active_runtime",
@@ -162,7 +167,8 @@ def system_part_fingerprints(system_prompt: str) -> dict[str, str]:
     stable = [prefix, *buckets["stable_core"]]
     return {
         "system_stable_hash": digest("\n\n".join(item for item in stable if item)),
-        "system_project_hash": digest(buckets["project_context"]),
+        "system_user_agents_hash": digest(buckets["user_additions"]),
+        "system_project_hash": digest(buckets["project_agents"]),
         "system_versioned_hash": digest(buckets["versioned"]),
         "system_memory_hash": digest(buckets["memory"]),
         "system_active_runtime_hash": digest(buckets["active_runtime"]),

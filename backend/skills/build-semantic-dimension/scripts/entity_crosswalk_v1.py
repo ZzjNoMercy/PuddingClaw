@@ -104,7 +104,9 @@ async def _load_binding_frame(binding: dict[str, Any], *, session_id: str) -> tu
         # Re-initialize the persistent attachment root instead of relying on
         # the FastAPI lifespan that owns the interactive Agent process.
         if attachment_store.root_dir is None:
-            attachment_store.initialize(BASE_DIR)
+            from runtime_identity.paths import PuddingClawPaths
+
+            attachment_store.initialize(PuddingClawPaths.from_environment().root)
         attachment_id = str(input_spec.get("attachment_id") or "")
         item = attachment_store.get(session_id, attachment_id)
         if not item or str(item.get("type")) != "spreadsheet":
@@ -124,7 +126,9 @@ async def _load_binding_frame(binding: dict[str, Any], *, session_id: str) -> tu
     if kind == "table_asset":
         asset_id = str(input_spec.get("asset_id") or "")
         async with get_sessionmaker()() as session:
-            catalog = TableAssetCatalog(BASE_DIR)
+            from runtime_identity.paths import PuddingClawPaths
+
+            catalog = TableAssetCatalog(PuddingClawPaths.from_environment().root)
             asset, frame = await catalog.load_dataframe_for_asset(session, asset_id)
         missing = [field for field in fields if field not in frame.columns]
         if missing:
@@ -166,7 +170,9 @@ async def _load_binding_frame(binding: dict[str, Any], *, session_id: str) -> tu
         dimension_id = str(input_spec.get("dimension_id") or "").strip()
         if not dimension_id or not IDENTIFIER_RE.fullmatch(dimension_id):
             raise RuntimeError("Active Crosswalk binding requires a valid dimension_id")
-        active_path = BASE_DIR / "semantic-assets" / "dimensions" / dimension_id / "references" / "active_crosswalk.json"
+        from runtime_identity.paths import PuddingClawPaths
+
+        active_path = PuddingClawPaths.from_environment().user_definitions() / "semantic-assets" / "dimensions" / dimension_id / "references" / "active_crosswalk.json"
         if not active_path.is_file():
             raise RuntimeError(f"Active Crosswalk is unavailable for dimension: {dimension_id}")
         try:

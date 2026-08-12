@@ -32,6 +32,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 from analytics.table_catalog import TableAssetCatalog
 from db import get_sessionmaker
 from knowledge.database_sources import database_source_url, get_database_source
+from runtime_identity.paths import PuddingClawPaths
 
 BASE_DIR = Path(__file__).resolve().parents[3]
 PROJECT_DIR = BASE_DIR.parent
@@ -39,7 +40,8 @@ DEFAULT_SALES_FILE_NAME = "2023年1-5月乘用车市场上险量.xlsx"
 DEFAULT_SOURCE_ID = "dbs_77982e981bac4a6fa8"
 CONFIGURATION_TABLE = "vehicle_model_base"
 SEMANTIC_REFERENCE_PATH = (
-    BASE_DIR / "semantic-assets" / "dimensions" / "vehicle_series" / "references" / "byd_chery_demo.json"
+    PuddingClawPaths.from_environment().user_definitions()
+    / "semantic-assets" / "dimensions" / "vehicle_series" / "references" / "byd_chery_demo.json"
 )
 BRAND_SUFFIXES = ("汽车有限公司", "汽车集团", "汽车", "品牌")
 PUNCTUATION_RE = re.compile(r"[^0-9a-z\u4e00-\u9fff]+")

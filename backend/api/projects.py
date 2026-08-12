@@ -11,7 +11,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from graph.session_manager import session_manager
-from projects.project_context import ensure_project_context, read_project_context, write_project_context
+from projects.project_agents import read_project_agents
 from projects.registry import project_registry
 
 router = APIRouter()
@@ -20,6 +20,7 @@ router = APIRouter()
 class RegisterProjectRequest(BaseModel):
     path: str
     name: str | None = None
+    authorize: bool = False
 
 
 class UpdateProjectRequest(BaseModel):
@@ -28,12 +29,12 @@ class UpdateProjectRequest(BaseModel):
     execution_mode: str | None = None
 
 
-class UpdateProjectContextRequest(BaseModel):
-    content: str
-
-
 class UpdateProjectPermissionRulesRequest(BaseModel):
     rules: list[dict[str, Any]]
+
+
+class TrustProjectRequest(BaseModel):
+    state: str
 
 
 class OpenLocalFileRequest(BaseModel):
@@ -43,14 +44,25 @@ class OpenLocalFileRequest(BaseModel):
 
 @router.get("/projects")
 async def list_projects():
-    projects = [project.to_dict() for project in project_registry.list_projects()]
+    projects = []
+    for project in project_registry.list_projects():
+        item = project.to_dict()
+        # Surface effective trust. If the directory identity changed since the
+        # last decision, the UI must ask again before the next Agent run.
+        if project.trust_state == "trusted" and not project_registry.is_trusted(project.project_id):
+            item["trust_state"] = "pending"
+        projects.append(item)
     return {"projects": projects}
 
 
 @router.post("/projects/register")
 async def register_project(request: RegisterProjectRequest):
     try:
-        project = project_registry.register(request.path, request.name)
+        project = project_registry.register(
+            request.path,
+            request.name,
+            trusted=request.authorize,
+        )
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except NotADirectoryError as exc:
@@ -76,6 +88,16 @@ async def update_project(project_id: str, request: UpdateProjectRequest):
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return project.to_dict()
+
+
+@router.post("/projects/{project_id}/trust")
+async def set_project_trust(project_id: str, request: TrustProjectRequest):
+    try:
+        return project_registry.set_trust(project_id, request.state).to_dict()
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.put("/projects/{project_id}/permissions/rules")
@@ -150,16 +172,19 @@ async def open_local_file(request: OpenLocalFileRequest):
     return {"ok": True, "path": str(target)}
 
 
-@router.get("/projects/{project_id}/context")
-async def get_project_context(project_id: str):
+@router.get("/projects/{project_id}/agents")
+async def get_project_agents(project_id: str):
     try:
         project_path = project_registry.resolve(project_id)
-        ensure_project_context(project_path, project_registry.base_dir)
-        content, source_path, is_project_local = read_project_context(project_path, project_registry.base_dir)
+        if not project_registry.is_trusted(project_id):
+            raise HTTPException(status_code=409, detail="Project trust decision required before reading AGENTS.md")
+        content, source_path, is_project_local = read_project_agents(project_path)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -168,26 +193,6 @@ async def get_project_context(project_id: str):
         "content": content,
         "path": str(source_path),
         "is_project_local": is_project_local,
-    }
-
-
-@router.put("/projects/{project_id}/context")
-async def update_project_context(project_id: str, request: UpdateProjectContextRequest):
-    try:
-        project_path = project_registry.resolve(project_id)
-        context_path = write_project_context(project_path, project_registry.base_dir, request.content)
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    except FileNotFoundError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    return {
-        "project_id": project_id,
-        "content": request.content,
-        "path": str(context_path),
-        "is_project_local": True,
     }
 
 

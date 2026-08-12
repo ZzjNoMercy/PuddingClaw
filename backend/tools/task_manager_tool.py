@@ -183,5 +183,7 @@ class TaskManagerTool(BaseTool):
 def create_task_manager_tool(base_dir: Path) -> TaskManagerTool:
     """工厂函数：tools/__init__.py 自动发现要求的 create_* 入口。"""
     tool = TaskManagerTool()
-    tool.todo_path = base_dir / "workspace" / "TODO.md"
+    from runtime_identity.paths import PuddingClawPaths
+
+    tool.todo_path = PuddingClawPaths.from_environment().agent_workspaces() / "unscoped" / "default" / "TODO.md"
     return tool

@@ -808,10 +808,15 @@ def test_puddingclaw_offloads_oversized_read_file_without_deepagents_allowlist(t
         return result
 
     offloaded = asyncio.run(invoke())
+    workspace_digest = __import__("hashlib").sha256(
+        str(workspace.resolve()).encode("utf-8")
+    ).hexdigest()[:20]
     artifact = (
-        workspace
-        / ".puddingclaw"
-        / "large_tool_results"
+        tmp_path
+        / "data"
+        / "large-tool-results"
+        / "projects"
+        / workspace_digest
         / "session-large"
         / "query-large"
         / "call_read_file"

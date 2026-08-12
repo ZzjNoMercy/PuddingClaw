@@ -14,6 +14,8 @@ from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
 from services.skill_management import SkillManagementError, SkillManagementService, get_skill_management_service
+from runtime_identity.paths import PuddingClawPaths
+from tools.skills_scanner import scan_skill_registry
 
 router = APIRouter()
 
@@ -329,6 +331,31 @@ def _upload_service() -> SkillManagementService:
     return get_skill_management_service(BASE_DIR)
 
 
+def _skill_roots() -> tuple[Path, Path]:
+    from app import BASE_DIR
+
+    return BASE_DIR / "skills", PuddingClawPaths.from_environment().user_skills()
+
+
+def _effective_skill_dir(skill_name: str) -> Path | None:
+    bundled, user = _skill_roots()
+    records = scan_skill_registry(bundled.parent, user_root=user)
+    for record in records:
+        if record.get("skill_id") == skill_name and record.get("effective"):
+            return Path(str(record["physical_root"]))
+    return None
+
+
+def _user_skill_dir(skill_name: str) -> Path:
+    user = _skill_roots()[1]
+    if not skill_name or not all(char.isalnum() or char in "_-" for char in skill_name):
+        raise HTTPException(status_code=400, detail="Invalid skill name")
+    target = (user / skill_name).resolve()
+    if not target.is_relative_to(user.resolve()):
+        raise HTTPException(status_code=403, detail="Access denied: path traversal attempt")
+    return target
+
+
 # ── Static routes (must come before dynamic routes) ────────
 
 
@@ -343,17 +370,14 @@ async def get_active_skills():
 @router.post("/skills/load")
 async def load_skill(data: dict):
     """Load a skill into current session."""
-    from app import BASE_DIR
-
     skill_name = data.get("skill_name")
 
     if not skill_name:
         raise HTTPException(status_code=400, detail="skill_name is required")
 
-    skills_dir = BASE_DIR / "skills"
-    skill_dir = skills_dir / skill_name
+    skill_dir = _effective_skill_dir(skill_name)
 
-    if not skill_dir.exists():
+    if skill_dir is None or not skill_dir.exists():
         raise HTTPException(status_code=404, detail=f"Skill '{skill_name}' not found")
 
     # Read SKILL.md for description
@@ -397,12 +421,9 @@ async def watch_skills():
 @router.get("/skills/{skill_name}/tree")
 async def get_skill_tree(skill_name: str):
     """Get recursive file tree for a skill."""
-    from app import BASE_DIR
+    skill_dir = _effective_skill_dir(skill_name)
 
-    skills_dir = BASE_DIR / "skills"
-    skill_dir = skills_dir / skill_name
-
-    if not skill_dir.exists():
+    if skill_dir is None or not skill_dir.exists():
         raise HTTPException(status_code=404, detail="Skill not found")
 
     files = _build_file_tree(skill_dir, skill_dir)
@@ -413,11 +434,13 @@ async def get_skill_tree(skill_name: str):
 @router.get("/skills/{skill_name}/file")
 async def read_skill_file(skill_name: str, path: str):
     """Read any file in a skill directory."""
-    from app import BASE_DIR
+    skill_dir = _effective_skill_dir(skill_name)
+    if skill_dir is None:
+        raise HTTPException(status_code=404, detail="Skill not found")
 
-    skills_dir = BASE_DIR / "skills"
-
-    target = _validate_path(skills_dir, skill_name, path)
+    target = (skill_dir / path).resolve()
+    if not target.is_relative_to(skill_dir.resolve()):
+        raise HTTPException(status_code=403, detail="Access denied: path traversal attempt")
 
     if not target.exists():
         raise HTTPException(status_code=404, detail="File not found")
@@ -452,11 +475,12 @@ async def save_skill_file(skill_name: str, data: FileContent):
     """Save any file in a skill directory with atomic write."""
     import tempfile
 
-    from app import BASE_DIR
-
-    skills_dir = BASE_DIR / "skills"
-
-    target = _validate_path(skills_dir, skill_name, data.path)
+    skill_dir = _user_skill_dir(skill_name)
+    if not skill_dir.is_dir():
+        raise HTTPException(status_code=404, detail="User Skill not found; bundled Skills are read-only")
+    target = (skill_dir / data.path).resolve()
+    if not target.is_relative_to(skill_dir):
+        raise HTTPException(status_code=403, detail="Access denied: path traversal attempt")
 
     # Create parent directories if needed
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -484,12 +508,9 @@ async def save_skill_file(skill_name: str, data: FileContent):
 @router.post("/skills/{skill_name}/rename")
 async def rename_skill(skill_name: str, data: RenameSkill):
     """Rename a skill directory."""
-    from app import BASE_DIR
-
-    skills_dir = BASE_DIR / "skills"
-
-    old_dir = skills_dir / skill_name
-    new_dir = skills_dir / data.new_name
+    skills_dir = _skill_roots()[1]
+    old_dir = _user_skill_dir(skill_name)
+    new_dir = _user_skill_dir(data.new_name)
 
     # Validate old directory exists
     if not old_dir.exists():

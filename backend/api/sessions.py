@@ -8,7 +8,7 @@ from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 
-from config import get_fallback_llm_config, get_rag_mode
+from config import get_fallback_llm_config
 from graph.deepagents_manager import deepagents_agent_manager
 from graph.permission_resume import permission_resume_registry
 from graph.prompt_builder import build_system_prompt
@@ -187,7 +187,12 @@ async def delete_session(session_id: str):
 async def get_raw_messages(session_id: str):
     """Get raw conversation messages without reading execution traces."""
     data = await run_in_threadpool(session_manager.get_raw_messages, session_id)
-    system_prompt = build_system_prompt(BASE_DIR, rag_mode=get_rag_mode())
+    from runtime_identity.paths import PuddingClawPaths
+
+    system_prompt = build_system_prompt(
+        BASE_DIR,
+        runtime_root=PuddingClawPaths.from_environment().root,
+    )
     # Prepend system prompt as the first message
     all_messages = [{"role": "system", "content": system_prompt}] + data.get("messages", [])
     result: dict[str, Any] = {

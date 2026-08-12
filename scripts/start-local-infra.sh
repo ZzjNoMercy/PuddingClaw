@@ -17,6 +17,65 @@ NC='\033[0m'
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$SCRIPT_DIR"
 
+export PUDDINGCLAW_HOME="${PUDDINGCLAW_HOME:-${HOME}/.puddingclaw}"
+export PUDDINGCLAW_HOST_HOME="${PUDDINGCLAW_HOST_HOME:-${PUDDINGCLAW_HOME}}"
+
+migrate_legacy_infrastructure_dir() {
+    local legacy="$1"
+    local target="$2"
+
+    if [ ! -d "$legacy" ]; then
+        mkdir -p "$target"
+        return
+    fi
+
+    if [ -d "$target" ] && [ -n "$(find "$target" -mindepth 1 ! -type d -print -quit 2>/dev/null)" ]; then
+        echo -e "${RED}[错误] 旧目录和 Home 目标目录同时含有数据，拒绝自动合并：${NC}"
+        echo "       旧目录：$legacy"
+        echo "       Home：  $target"
+        exit 1
+    fi
+
+    mkdir -p "$(dirname "$target")"
+    if [ -d "$target" ]; then
+        find "$target" -depth -type d -empty -delete
+    fi
+    if [ -d "$target" ]; then
+        rmdir "$target"
+    fi
+    mv "$legacy" "$target"
+    echo -e "${GREEN}[迁移] $legacy -> $target${NC}"
+}
+
+migrate_legacy_infrastructure() {
+    local legacy_present="false"
+    for legacy in "$SCRIPT_DIR/data/postgres" "$SCRIPT_DIR/data/milvus" "$SCRIPT_DIR/data/higress"; do
+        if [ -d "$legacy" ]; then
+            legacy_present="true"
+            break
+        fi
+    done
+
+    if [ "$legacy_present" = "true" ]; then
+        echo -e "${YELLOW}[迁移] 检测到源码目录中的旧基础设施数据，先停止相关容器。${NC}"
+        docker compose -f docker-compose.infra.yml stop postgres milvus milvus-etcd milvus-minio >/dev/null 2>&1 || true
+    fi
+
+    migrate_legacy_infrastructure_dir \
+        "$SCRIPT_DIR/data/postgres" \
+        "$PUDDINGCLAW_HOST_HOME/infrastructure/postgres"
+    migrate_legacy_infrastructure_dir \
+        "$SCRIPT_DIR/data/milvus" \
+        "$PUDDINGCLAW_HOST_HOME/infrastructure/milvus"
+    migrate_legacy_infrastructure_dir \
+        "$SCRIPT_DIR/data/higress" \
+        "$PUDDINGCLAW_HOST_HOME/infrastructure/higress"
+
+    mkdir -p "$PUDDINGCLAW_HOST_HOME/infrastructure/milvus/etcd"
+    mkdir -p "$PUDDINGCLAW_HOST_HOME/infrastructure/milvus/minio"
+    mkdir -p "$PUDDINGCLAW_HOST_HOME/infrastructure/milvus/data"
+}
+
 echo ""
 echo "============================================"
 echo "  PuddingClaw - 本地基础设施"
@@ -104,21 +163,14 @@ update_database_config() {
     local username="$5"
     local password="$6"
     python3 - "$mode" "$host" "$port" "$database" "$username" "$password" <<'PY'
-import json
 import sys
 from pathlib import Path
 
 mode, host, port, database, username, password = sys.argv[1:7]
-path = Path("backend/config.json")
-if path.exists():
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        data = {}
-else:
-    data = {}
-data.setdefault("database", {})
-data["database"].update({
+sys.path.insert(0, str(Path.cwd() / "backend"))
+from config import update_settings
+
+update_settings({"database": {
     "mode": mode,
     "host": host,
     "port": int(port),
@@ -126,9 +178,7 @@ data["database"].update({
     "username": username,
     "password": password,
     "url": "",
-})
-path.parent.mkdir(parents=True, exist_ok=True)
-path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+}})
 PY
 }
 
@@ -330,6 +380,8 @@ if ! command -v docker >/dev/null 2>&1; then
     exit 1
 fi
 
+migrate_legacy_infrastructure
+
 if [ "$START_BUNDLED_POSTGRES" = "true" ]; then
     echo -e "${YELLOW}[步骤 1/2] 启动 bundled PostgreSQL + Milvus...${NC}"
     COMPOSE_SERVICES=()
@@ -347,7 +399,7 @@ else
 fi
 
 update_database_config "$DB_CONFIG_MODE" "127.0.0.1" "$POSTGRES_PORT" "$DB_CONFIG_DB" "$DB_CONFIG_USER" "$DB_CONFIG_PASSWORD"
-echo -e "${GREEN}[完成] 已根据 PostgreSQL 检测结果更新 backend/config.json：${DB_CONFIG_MODE}${NC}"
+echo -e "${GREEN}[完成] 已根据 PostgreSQL 检测结果更新 Home 稀疏配置：${DB_CONFIG_MODE}${NC}"
 
 if ! docker compose -f docker-compose.infra.yml up -d "${COMPOSE_SERVICES[@]}"; then
     echo ""
@@ -405,15 +457,15 @@ echo ""
 echo -e "${BLUE}[提示] 如需启动本机 MinerU：${NC}"
 echo "  python scripts/setup-mineru.py --foreground"
 echo "  # 或使用已有 conda 环境：MINERU_PORT=8002 scripts/start-mineru-host.sh"
-echo "  # MinerU 地址会写入 backend/config.json 的 knowledge.mineru.base_url"
+echo "  # MinerU 地址会写入 PUDDINGCLAW_HOME/config.json 的稀疏覆盖"
 echo ""
 echo -e "${BLUE}[提示] 本机 backend 推荐环境变量：${NC}"
 if [ "$START_BUNDLED_POSTGRES" = "true" ]; then
-    echo "  已写入 backend/config.json；backend 会使用 Settings 中的数据库配置。"
+    echo "  已写入 Home 稀疏配置；backend 会使用 Settings 中的数据库配置。"
     echo "  如需命令行强制覆盖，可设置："
     echo "  PUDDINGCLAW_DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@127.0.0.1:${POSTGRES_PORT}/${POSTGRES_DB}"
 else
-    echo "  已写入 backend/config.json；如需覆盖，可在 Settings -> 知识库 -> Catalog Database 中调整。"
+    echo "  已写入 Home 稀疏配置；如需覆盖，可在 Settings -> 知识库 -> Catalog Database 中调整。"
 fi
 echo ""
 echo -e "${GREEN}[完成] 基础设施启动命令已执行。${NC}"

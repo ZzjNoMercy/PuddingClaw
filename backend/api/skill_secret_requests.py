@@ -13,13 +13,14 @@ from graph.skill_secret_resume import skill_secret_resume_registry
 from runtime_identity.paths import PuddingClawPaths, trusted_owner_user_id
 from runtime_identity.skill_secrets import SkillSecretStore
 from runtime_identity.software_runtime import skill_content_version
+from tools.skills_scanner import resolve_effective_skill_root
 
 router = APIRouter(
     prefix="/sessions/{session_id}/skill-secret-requests",
     tags=["sessions"],
 )
 
-_SKILLS_ROOT = Path(__file__).resolve().parents[1] / "skills"
+_PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 
 
 class ResolveSkillSecretRequest(BaseModel):
@@ -55,9 +56,9 @@ def _validate_live_request(session_id: str, request: dict[str, Any]) -> None:
 
 
 def _current_skill_version(skill_id: str) -> str:
-    root = (_SKILLS_ROOT / skill_id).resolve(strict=True)
-    root.relative_to(_SKILLS_ROOT.resolve(strict=True))
-    if root.is_symlink() or not (root / "SKILL.md").is_file():
+    paths = PuddingClawPaths.from_environment()
+    root = resolve_effective_skill_root(_PACKAGE_ROOT, paths.user_skills(), skill_id)
+    if root is None or root.is_symlink() or not (root / "SKILL.md").is_file():
         raise ValueError("Skill is not installed")
     return skill_content_version(root)
 

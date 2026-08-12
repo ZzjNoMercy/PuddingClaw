@@ -100,13 +100,34 @@ class SessionManager:
         with type(self)._shared_session_locks_guard:
             return type(self)._shared_session_locks.setdefault(key, threading.RLock())
 
-    def initialize(self, base_dir: Path) -> None:
-        """初始化：设置存储目录为 base_dir/sessions/，不存在则创建"""
-        self._base_dir = base_dir
-        self._sessions_dir = base_dir / "sessions"  # 拼接会话目录路径
-        self._sessions_dir.mkdir(exist_ok=True)  # 目录不存在时自动创建
+    def initialize(
+        self,
+        base_dir: Path | None = None,
+        *,
+        sessions_dir: Path | None = None,
+    ) -> None:
+        """Initialize at an explicit user-owned sessions directory.
+
+        ``base_dir`` remains a test/legacy compatibility shim. Production
+        startup passes ``sessions_dir=PuddingClawPaths.sessions()``.
+        """
+        if sessions_dir is None:
+            if base_dir is None:
+                raise ValueError("SessionManager.initialize requires sessions_dir or base_dir")
+            if base_dir.expanduser().resolve().name == "backend":
+                from runtime_identity.paths import PuddingClawPaths
+
+                base_dir = PuddingClawPaths.from_environment().root
+            self._base_dir = base_dir
+            sessions_dir = base_dir / "sessions"
+        else:
+            sessions_dir = sessions_dir.expanduser().resolve()
+            self._base_dir = sessions_dir.parent.parent
+        self._sessions_dir = sessions_dir
+        self._sessions_dir.mkdir(parents=True, exist_ok=True)
         self._traces_dir = self._sessions_dir / "traces"
-        self._traces_dir.mkdir(exist_ok=True)
+        self._traces_dir.mkdir(parents=True, exist_ok=True)
+        (self._sessions_dir / "archive").mkdir(parents=True, exist_ok=True)
 
     @property
     def is_initialized(self) -> bool:
@@ -4609,20 +4630,10 @@ class SessionManager:
     def delete_session(self, session_id: str) -> None:
         """删除会话文件"""
         data = self._read_file(session_id)
-        source_workspaces: set[str] = set()
         if data:
             logical = deepcopy(data)
             logical["messages"] = deepcopy(self.load_session(session_id))
             self._ensure_evidence_metadata(session_id, logical)
-            for item in (logical.get("evidence_index") or {}).values():
-                raw_ref = item.get("raw_output_ref") if isinstance(item, dict) else None
-                if isinstance(raw_ref, dict) and raw_ref.get("kind") == "deepagents_large_tool_result":
-                    workspace = str(raw_ref.get("workspace_path") or "")
-                    if workspace:
-                        source_workspaces.add(workspace)
-            legacy_workspace = str(data.get("workspace_path") or "")
-            if legacy_workspace:
-                source_workspaces.add(legacy_workspace)
         path = self._session_path(session_id)  # 获取文件路径
         if path.exists():  # 存在则删除
             path.unlink()
@@ -4644,15 +4655,10 @@ class SessionManager:
             if projects_root.exists():
                 for project_root in projects_root.iterdir():
                     shutil.rmtree(project_root / safe_session, ignore_errors=True)
-            for source_workspace in source_workspaces:
-                workspace = Path(source_workspace).expanduser().resolve()
-                large_results_root = (workspace / ".puddingclaw" / "large_tool_results").resolve()
-                target = (large_results_root / safe_session).resolve()
-                try:
-                    target.relative_to(large_results_root)
-                except ValueError:
-                    continue
-                shutil.rmtree(target, ignore_errors=True)
+            large_results_projects = self._base_dir / "data" / "large-tool-results" / "projects"
+            if large_results_projects.exists():
+                for project_root in large_results_projects.iterdir():
+                    shutil.rmtree(project_root / safe_session, ignore_errors=True)
 
     def get_raw_messages(self, session_id: str) -> dict[str, Any]:
         """Return session data without loading heavyweight trace sidecars."""
@@ -4744,6 +4750,12 @@ class SessionManager:
         for f in sorted(
             self._sessions_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True
         ):  # 遍历所有 JSON 文件，按修改时间倒序
+            if (
+                not f.is_file()
+                or f.is_symlink()
+                or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}", f.stem)
+            ):
+                continue
             # Background jobs may reuse the Agent harness for one isolated run,
             # but they are task-center records rather than user conversations.
             if f.stem.startswith("background-job-"):
@@ -4753,9 +4765,11 @@ class SessionManager:
                 # Reuse the canonical reader so legacy embedded traces are
                 # migrated once instead of slowing every sidebar refresh.
                 raw = self._read_file(f.stem)
-                if isinstance(raw, dict):  # v2 格式
+                if isinstance(raw, dict) and isinstance(raw.get("messages"), list):  # v2 格式
                     title = raw.get("title", f.stem)  # 取标题，缺省用文件名
                     updated_at = raw.get("updated_at", f.stat().st_mtime)  # 取更新时间
+                elif isinstance(raw, dict):
+                    continue
                 else:  # v1 格式（纯列表）
                     title = f.stem  # 用文件名作标题
                     updated_at = f.stat().st_mtime  # 用文件修改时间
@@ -5050,9 +5064,8 @@ class SessionManager:
         # the normal tokenizer approximation at the actual model boundary.
         return max(1, (len(output) + 3) // 4) if output else 0
 
-    @classmethod
     def materialize_large_tool_result(
-        cls,
+        self,
         *,
         workspace_path: str | Path,
         session_id: str,
@@ -5063,15 +5076,21 @@ class SessionManager:
         """Persist one oversized textual Tool Result in the existing Query namespace."""
 
         workspace = Path(workspace_path).expanduser().resolve()
-        safe_session = cls._safe_evidence_component(session_id)
-        safe_query = cls._safe_evidence_component(query_id)
+        if self._base_dir is None:
+            raise RuntimeError("SessionManager must be initialized before materializing Tool Results")
+        user_root = self._base_dir
+        workspace_digest = hashlib.sha256(str(workspace).encode("utf-8")).hexdigest()[:20]
+        safe_session = self._safe_evidence_component(session_id)
+        safe_query = self._safe_evidence_component(query_id)
         artifact_name = str(tool_call_id or "").replace(".", "_").replace("/", "_").replace("\\", "_")
         if not artifact_name or artifact_name in {".", ".."}:
             raise ValueError("Tool call id cannot identify a large-result artifact")
         root = (
-            workspace
-            / ".puddingclaw"
-            / "large_tool_results"
+            user_root
+            / "data"
+            / "large-tool-results"
+            / "projects"
+            / workspace_digest
             / safe_session
             / safe_query
         ).resolve()
@@ -5095,12 +5114,12 @@ class SessionManager:
             "source_query_id": safe_query,
             "tool_call_id": tool_call_id,
             "artifact_name": artifact_name,
-            "workspace_path": str(workspace),
+            "workspace_digest": workspace_digest,
             "virtual_path": f"/large_tool_results/{artifact_name}",
-            "source_hash": cls._tool_context_source_hash(output),
+            "source_hash": self._tool_context_source_hash(output),
             "source_hash_scope": "raw_result",
             "original_chars": len(output),
-            "estimated_tokens": cls._tool_context_tokens(output),
+            "estimated_tokens": self._tool_context_tokens(output),
         }
 
     @staticmethod
@@ -5175,13 +5194,20 @@ class SessionManager:
                     sql_ref[key] = str(match.group(1))
             return sql_ref
         if re.search(r"(?:^|\s)/large_tool_results/[^\s`]+", output):
+            workspace_digest = (
+                hashlib.sha256(
+                    str(Path(workspace_path).expanduser().resolve()).encode("utf-8")
+                ).hexdigest()[:20]
+                if workspace_path
+                else ""
+            )
             return {
                 "kind": "deepagents_large_tool_result",
                 "session_id": session_id,
                 "source_query_id": source_query_id,
                 "tool_call_id": tool_call_id,
                 "artifact_name": tool_call_id.replace(".", "_").replace("/", "_").replace("\\", "_"),
-                "workspace_path": workspace_path,
+                "workspace_digest": workspace_digest,
                 "source_hash": source_hash,
                 "source_hash_scope": source_hash_scope,
             }
@@ -5696,10 +5722,12 @@ class SessionManager:
             result["hash_matches"] = None
             return result
         if kind == "deepagents_large_tool_result":
-            origin_workspace = str(raw_ref.get("workspace_path") or workspace_path or "")
-            if not origin_workspace:
+            raw_workspace_digest = str(raw_ref.get("workspace_digest") or "")
+            if not raw_workspace_digest:
+                return {**result, "status": "invalid_locator", "content": ""}
+            workspace_digest = self._safe_evidence_component(raw_workspace_digest)
+            if self._base_dir is None:
                 return {**result, "status": "workspace_unavailable", "content": ""}
-            workspace = Path(origin_workspace).expanduser().resolve()
             safe_session = self._safe_evidence_component(str(raw_ref.get("session_id") or session_id))
             safe_query = self._safe_evidence_component(str(raw_ref.get("source_query_id") or ""))
             artifact_name = str(raw_ref.get("artifact_name") or "")
@@ -5709,7 +5737,15 @@ class SessionManager:
                 )
             if not artifact_name or artifact_name in {".", ".."} or "/" in artifact_name or "\\" in artifact_name:
                 return {**result, "status": "invalid_locator", "content": ""}
-            root = (workspace / ".puddingclaw" / "large_tool_results" / safe_session / safe_query).resolve()
+            root = (
+                self._base_dir
+                / "data"
+                / "large-tool-results"
+                / "projects"
+                / workspace_digest
+                / safe_session
+                / safe_query
+            ).resolve()
             artifact = (root / artifact_name).resolve()
             try:
                 artifact.relative_to(root)
@@ -5739,7 +5775,7 @@ class SessionManager:
             result_id = self._safe_evidence_component(str(raw_ref.get("result_id") or ""))
             if self._base_dir is None:
                 return {**result, "status": "store_unavailable", "content": ""}
-            root = (self._base_dir / "data" / "database-query-results").resolve()
+            root = (self._base_dir / "data" / "query-results").resolve()
             catalog_path = (root / ".catalog" / f"{result_id}.json").resolve()
             catalog: dict[str, Any] = {}
             try:
@@ -5771,7 +5807,7 @@ class SessionManager:
                 unavailable_status = "unauthorized"
             catalog_artifact = str(catalog.get("artifact_path") or "")
             artifact = (
-                (self._base_dir / catalog_artifact).resolve()
+                (root / catalog_artifact).resolve()
                 if catalog_artifact
                 else (root / f"{result_id}.jsonl").resolve()
             )

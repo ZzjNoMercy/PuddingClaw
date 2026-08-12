@@ -16,7 +16,7 @@ def test_langsmith_secret_is_stored_outside_evaluation_settings(tmp_path: Path, 
 
     serialized = settings_path.read_text(encoding="utf-8")
     assert "lsv2_secret_value" not in serialized
-    assert json.loads(serialized)["api_key_ref"] == "local-file://puddingclaw-langsmith"
+    assert json.loads(serialized)["api_key_ref"].startswith("vault://users/")
     assert public["api_key_configured"] is True
     assert store.load().api_key == "lsv2_secret_value"
     assert "lsv2_secret_value" not in str(public)

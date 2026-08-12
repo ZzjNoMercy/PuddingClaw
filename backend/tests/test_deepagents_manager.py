@@ -422,6 +422,23 @@ def test_build_middlewares_includes_model_call_limit(tmp_path, monkeypatch):
     assert rubric.max_stagnant_repairs == 4
 
 
+def test_build_middlewares_injects_explicit_managed_cli_control_plane(tmp_path):
+    from graph.deepagents_manager import DeepAgentsAgentManager
+    from harness.tool_execution import ToolExecutionPipeline
+
+    manager = DeepAgentsAgentManager()
+    manager.initialize(tmp_path, user_root=tmp_path)
+    managed_service = object()
+
+    middlewares = manager._build_middlewares(  # noqa: SLF001
+        project_id=None,
+        managed_cli_service=managed_service,
+    )
+
+    pipeline = next(item for item in middlewares if isinstance(item, ToolExecutionPipeline))
+    assert pipeline.managed_cli_service is managed_service
+
+
 def test_completion_gate_loops_before_rubric_grader(tmp_path):
     from graph.deepagents_manager import PuddingClawRubricMiddleware
     from harness.rubric_compiler import RubricBuildContext, RunRubricCompiler
@@ -2538,6 +2555,7 @@ def test_runtime_inventory_exposes_effective_execution_backend(tmp_path):
 
     assert inventory["execution"] == {
         "mode": "spawn",
+        "effective_mode": "spawn",
         "backend_id": "spawn-test",
         "fallback_reason": "docker unavailable",
         "workspace_path": str(tmp_path),
@@ -2552,7 +2570,8 @@ def test_semantic_asset_middleware_owns_model_frontmatter_index(tmp_path):
     from graph.deepagents_manager import DeepAgentsAgentManager
     from graph.middlewares.semantic_assets import SemanticAssetsMiddleware
 
-    assets = SemanticAssetRegistry(tmp_path)
+    definitions_root = tmp_path / "definitions"
+    assets = SemanticAssetRegistry(definitions_root)
     measure = assets.create_asset(
         name="上市周期",
         asset_type="measure",
@@ -2560,13 +2579,13 @@ def test_semantic_asset_middleware_owns_model_frontmatter_index(tmp_path):
         aliases=["换代周期", "更新周期"],
         tags=["产品更新", "上市"],
     )
-    models = AnalyticsModelRegistry(tmp_path)
+    models = AnalyticsModelRegistry(definitions_root)
     model = models.create_model(
         name="产品配置分析",
         semantic_assets={"measures": [measure["id"]]},
     )
     manager = DeepAgentsAgentManager()
-    manager.initialize(tmp_path)
+    manager.initialize(tmp_path / "backend", user_root=tmp_path)
 
     prompt, payload = manager._analytics_model_context(model["id"])
 
@@ -2582,7 +2601,7 @@ def test_semantic_asset_middleware_owns_model_frontmatter_index(tmp_path):
         }
     ]
 
-    middleware = SemanticAssetsMiddleware(base_dir=tmp_path)
+    middleware = SemanticAssetsMiddleware(base_dir=definitions_root)
     update = middleware.before_agent(
         {
             "analytics_model_id": model["id"],
@@ -2632,15 +2651,97 @@ def test_semantic_asset_middleware_owns_model_frontmatter_index(tmp_path):
     assert inherited_goal["allowed_semantic_asset_ids"] == [measure["id"]]
 
 
-def test_analytics_model_prompt_exposes_agent_selected_template_workflow() -> None:
+def test_update_memory_tool_is_bound_to_current_run_scope(tmp_path):
     from graph.deepagents_manager import DeepAgentsAgentManager
 
-    base_dir = Path(__file__).resolve().parents[1]
     manager = DeepAgentsAgentManager()
-    manager.initialize(base_dir)
+    manager.initialize(tmp_path / "backend", user_root=tmp_path)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    global_tools = manager._build_tools(workspace, project_id=None)
+    project_tools = manager._build_tools(workspace, project_id="project-1")
+    global_memory = next(tool for tool in global_tools if tool.name == "update_memory")
+    project_memory = next(tool for tool in project_tools if tool.name == "update_memory")
+
+    assert Path(global_memory.memory_file) == tmp_path / "memory" / "global" / "MEMORY.md"
+    assert Path(project_memory.memory_file) == (
+        tmp_path / "memory" / "projects" / "project-1" / "MEMORY.md"
+    )
+    assert Path(global_memory.memory_root) == tmp_path / "memory"
+    assert Path(project_memory.memory_root) == tmp_path / "memory"
+    assert Path(global_memory.memory_file).read_text(encoding="utf-8").startswith("# Global Memory")
+    assert Path(project_memory.memory_file).read_text(encoding="utf-8").startswith("# Project Memory")
+
+
+def test_memory_scope_rejects_symlink_escape(tmp_path):
+    from graph.deepagents_manager import DeepAgentsAgentManager
+
+    manager = DeepAgentsAgentManager()
+    manager.initialize(tmp_path / "backend", user_root=tmp_path)
+    projects = tmp_path / "memory" / "projects"
+    external = tmp_path / "external"
+    projects.mkdir(parents=True)
+    external.mkdir()
+    (projects / "project-escape").symlink_to(external, target_is_directory=True)
+
+    with pytest.raises(PermissionError, match="symbolic links"):
+        manager._memory_dir_for("project-escape")
+
+
+def _prepare_prompt_template_model(definitions_root: Path) -> str:
+    from analytics.models.registry import AnalyticsModelRegistry
+
+    model_id = "prompt-template-test"
+    registry = AnalyticsModelRegistry(definitions_root)
+    registry.create_model(
+        name="Prompt Template Test",
+        slug=model_id,
+        templates={
+            "monthly_product_config_report": {
+                "path": "templates/monthly_product_config_report/index.html",
+                "guide": "templates/monthly_product_config_report/TEMPLATE.md",
+                "format": "html",
+                "use_when": ["刷新月报"],
+                "do_not_use_when": ["普通问答"],
+            },
+            "topic_product_config_report": {
+                "path": "templates/topic_product_config_report/index.html",
+                "guide": "templates/topic_product_config_report/TEMPLATE.md",
+                "format": "html",
+                "use_when": ["生成专题 HTML"],
+                "do_not_use_when": ["刷新月报"],
+            },
+        },
+    )
+    template_root = definitions_root / "analytics-models" / model_id / "templates"
+    for template_id in ("monthly_product_config_report", "topic_product_config_report"):
+        current = template_root / template_id
+        current.mkdir(parents=True, exist_ok=True)
+        (current / "index.html").write_text("<html></html>", encoding="utf-8")
+        (current / "TEMPLATE.md").write_text(
+            "---\n"
+            "formatter: analytics-template\n"
+            f"id: {template_id}\n"
+            "version: 1.0.0\n"
+            "---\n"
+            f"# {template_id}\n",
+            encoding="utf-8",
+        )
+    registry.refresh()
+    return model_id
+
+
+def test_analytics_model_prompt_exposes_agent_selected_template_workflow(tmp_path: Path) -> None:
+    from graph.deepagents_manager import DeepAgentsAgentManager
+
+    definitions_root = tmp_path / "definitions"
+    model_id = _prepare_prompt_template_model(definitions_root)
+    manager = DeepAgentsAgentManager()
+    manager.initialize(tmp_path / "backend", user_root=tmp_path)
 
     prompt, payload = manager._analytics_model_context(
-        "产品配置分析",
+        model_id,
         query="刷新2026年6月月报",
     )
 
@@ -2659,8 +2760,8 @@ def test_analytics_model_prompt_exposes_agent_selected_template_workflow() -> No
     assert "compiled_semantic_scope" not in topic_template
     assert "template_route" not in payload
     assert "active_template" not in payload
-    assert "/analytics-models/产品配置分析/templates/monthly_product_config_report/index.html" in prompt
-    assert "/analytics-models/产品配置分析/templates/topic_product_config_report/index.html" in prompt
+    assert f"/analytics-models/{model_id}/templates/monthly_product_config_report/index.html" in prompt
+    assert f"/analytics-models/{model_id}/templates/topic_product_config_report/index.html" in prompt
     assert "自主比较模板的 use_when/do_not_use_when" in prompt
     assert "成功读取会把模板 manifest 渐进写入本轮可信 state" in prompt
 
@@ -2688,23 +2789,24 @@ def test_run_scope_middleware_does_not_preselect_analysis_template() -> None:
     assert child_state["_run_objective"] == "刷新月报"
 
 
-def test_template_guide_read_progressively_activates_private_state() -> None:
+def test_template_guide_read_progressively_activates_private_state(tmp_path: Path) -> None:
     from graph.middlewares.analysis_templates import AnalysisTemplateMiddleware
 
-    base_dir = Path(__file__).resolve().parents[1]
-    middleware = AnalysisTemplateMiddleware(base_dir=base_dir)
+    definitions_root = tmp_path / "definitions"
+    model_id = _prepare_prompt_template_model(definitions_root)
+    middleware = AnalysisTemplateMiddleware(base_dir=definitions_root)
     request = SimpleNamespace(
         tool_call={
             "name": "read_file",
             "id": "read-template-1",
             "args": {
                 "file_path": (
-                    "/analytics-models/产品配置分析/templates/"
+                    f"/analytics-models/{model_id}/templates/"
                     "monthly_product_config_report/TEMPLATE.md"
                 )
             },
         },
-        state={"analytics_model_id": "产品配置分析"},
+        state={"analytics_model_id": model_id},
     )
 
     result = middleware.wrap_tool_call(
@@ -2718,42 +2820,31 @@ def test_template_guide_read_progressively_activates_private_state() -> None:
     )
 
     activation = result.update["_active_analysis_template"]
-    assert activation["model_id"] == "产品配置分析"
+    assert activation["model_id"] == model_id
     assert activation["template_id"] == "monthly_product_config_report"
     assert activation["source"] == "authoritative_guide_read"
     assert activation["guide_content_sha256"].startswith("sha256:")
-    assert activation["semantic_scope"]["enum_filters"]["dimension:energy_type"] == {
-        "members": [
-            "纯电",
-            "插电混合",
-            "增程式纯电动",
-            "汽油",
-            "汽油+48V轻混系统",
-            "油电混合",
-            "汽油电驱",
-            "汽油+24V轻混系统",
-        ],
-        "classifications": ["新能源", "传统能源"],
-    }
+    assert activation["semantic_scope"] == {"enum_filters": {}}
 
 
-def test_non_guide_read_does_not_activate_analysis_template() -> None:
+def test_non_guide_read_does_not_activate_analysis_template(tmp_path: Path) -> None:
     from graph.middlewares.analysis_templates import AnalysisTemplateMiddleware
 
-    base_dir = Path(__file__).resolve().parents[1]
-    middleware = AnalysisTemplateMiddleware(base_dir=base_dir)
+    definitions_root = tmp_path / "definitions"
+    model_id = _prepare_prompt_template_model(definitions_root)
+    middleware = AnalysisTemplateMiddleware(base_dir=definitions_root)
     request = SimpleNamespace(
         tool_call={
             "name": "read_file",
             "id": "read-template-entry",
             "args": {
                 "file_path": (
-                    "/analytics-models/产品配置分析/templates/"
+                    f"/analytics-models/{model_id}/templates/"
                     "monthly_product_config_report/index.html"
                 )
             },
         },
-        state={"analytics_model_id": "产品配置分析"},
+        state={"analytics_model_id": model_id},
     )
     original = ToolMessage(
         content="template entry",
@@ -3572,7 +3663,7 @@ def test_cancelled_agent_stream_persists_reasoning_only_partial(tmp_path, monkey
             raise asyncio.CancelledError
             yield  # pragma: no cover
 
-    monkeypatch.setattr(manager_module.config, "load_config", lambda: {"thinking_mode": True})
+    monkeypatch.setattr(manager_module.config, "load_config", lambda: {})
     monkeypatch.setattr(manager_module, "create_deep_agent", lambda **_kwargs: FakeDeepAgent())
     monkeypatch.setattr(manager_module.permission_resume_registry, "reject_session", lambda *_args, **_kwargs: 0)
 
@@ -3923,10 +4014,24 @@ def test_native_large_result_capture_hashes_origin_bytes_without_compaction(
     from langchain_core.messages import ToolMessage
 
     from graph.deepagents_manager import DeepAgentsAgentManager
+    from graph.session_manager import session_manager
+    from runtime_identity.paths import PuddingClawPaths
 
     workspace = tmp_path / "workspace"
+    home = PuddingClawPaths.from_environment().root
+    session_manager.initialize(home)
+    workspace_digest = hashlib.sha256(
+        str(workspace.resolve()).encode("utf-8")
+    ).hexdigest()[:20]
     artifact = (
-        workspace / ".puddingclaw" / "large_tool_results" / "native-large-session" / "query-native-large" / "call:1"
+        home
+        / "data"
+        / "large-tool-results"
+        / "projects"
+        / workspace_digest
+        / "native-large-session"
+        / "query-native-large"
+        / "call:1"
     )
     artifact.parent.mkdir(parents=True)
     artifact.write_bytes(b"line-one\r\nline-two\r\n")
@@ -3948,7 +4053,7 @@ def test_native_large_result_capture_hashes_origin_bytes_without_compaction(
     assert fields["source_hash"] == expected
     assert fields["raw_output_ref"]["source_hash_scope"] == "raw_bytes"
     assert fields["raw_output_ref"]["artifact_name"] == "call:1"
-    assert fields["raw_output_ref"]["workspace_path"] == str(workspace.resolve())
+    assert fields["raw_output_ref"]["workspace_digest"] == workspace_digest
 
 
 @pytest.mark.parametrize(
@@ -4035,7 +4140,7 @@ def test_agent_stream_persists_user_message_before_first_event(tmp_path, monkeyp
     assert history[1]["content"] == "收到。"
 
 
-def test_build_backend_resolves_workspace_and_skills(tmp_path, monkeypatch):
+def test_build_backend_resolves_workspace_and_skills(tmp_path):
     """/workspace/ and /skills/ routes should resolve to the correct directories."""
 
     from graph import deepagents_manager as manager_module
@@ -4043,7 +4148,7 @@ def test_build_backend_resolves_workspace_and_skills(tmp_path, monkeypatch):
 
     project_registry.initialize(tmp_path)
     manager = manager_module.DeepAgentsAgentManager()
-    manager.initialize(tmp_path)
+    manager.initialize(tmp_path / "backend", user_root=tmp_path)
 
     workspace = tmp_path / "workspaces" / "test"
     workspace.mkdir(parents=True)
@@ -4057,8 +4162,6 @@ def test_build_backend_resolves_workspace_and_skills(tmp_path, monkeypatch):
     knowledge_dir = tmp_path / "knowledge"
     knowledge_dir.mkdir(parents=True)
     (knowledge_dir / "test.md").write_text("kb doc")
-    monkeypatch.setattr(manager_module, "get_knowledge_root", lambda _base_dir: knowledge_dir)
-
     backend = manager._build_backend(workspace)
 
     assert backend.read("/workspace/dashboard.html").file_data["content"] == "dashboard"
@@ -4095,12 +4198,8 @@ def test_large_tool_results_are_isolated_by_session_and_query(tmp_path, monkeypa
     # may write it.
     assert first.write("/large_tool_results/call_reused", "first result").error is not None
     assert second.write("/large_tool_results/call_reused", "second result").error is not None
-    first_path = (
-        workspace / ".puddingclaw" / "large_tool_results" / "session-1" / "query-1" / "call_reused"
-    )
-    second_path = (
-        workspace / ".puddingclaw" / "large_tool_results" / "session-1" / "query-2" / "call_reused"
-    )
+    first_path = Path(first.managed_host_path_aliases["/large_tool_results"]) / "call_reused"
+    second_path = Path(second.managed_host_path_aliases["/large_tool_results"]) / "call_reused"
     first_path.write_text("first result", encoding="utf-8")
     second_path.write_text("second result", encoding="utf-8")
     assert first.read("/large_tool_results/call_reused").file_data["content"] == "first result"
@@ -4839,7 +4938,7 @@ def test_deepagents_manager_separates_reasoning_from_final_answer(tmp_path, monk
     from graph.session_manager import session_manager
     from projects.registry import project_registry
 
-    monkeypatch.setattr(manager_module.config, "load_config", lambda: {"thinking_mode": True})
+    monkeypatch.setattr(manager_module.config, "load_config", lambda: {})
 
     session_manager.initialize(tmp_path)
     project_registry.initialize(tmp_path)
@@ -4901,7 +5000,7 @@ def test_deepagents_manager_ignores_internal_context_summary_chunks(tmp_path, mo
     from llm.model_client import INTERNAL_CALL_MARKER
     from projects.registry import project_registry
 
-    monkeypatch.setattr(manager_module.config, "load_config", lambda: {"thinking_mode": False})
+    monkeypatch.setattr(manager_module.config, "load_config", lambda: {})
     session_manager.initialize(tmp_path)
     project_registry.initialize(tmp_path)
     session_manager.create_session("agent-summary-filter-session")
@@ -5117,7 +5216,7 @@ def test_deepagents_manager_extracts_reasoning_from_thinking_blocks(tmp_path, mo
     from graph.session_manager import session_manager
     from projects.registry import project_registry
 
-    monkeypatch.setattr(manager_module.config, "load_config", lambda: {"thinking_mode": True})
+    monkeypatch.setattr(manager_module.config, "load_config", lambda: {})
 
     session_manager.initialize(tmp_path)
     project_registry.initialize(tmp_path)
@@ -5191,7 +5290,7 @@ def test_deepagents_manager_emits_interleaved_reasoning_and_content(tmp_path, mo
     from graph.session_manager import session_manager
     from projects.registry import project_registry
 
-    monkeypatch.setattr(manager_module.config, "load_config", lambda: {"thinking_mode": True})
+    monkeypatch.setattr(manager_module.config, "load_config", lambda: {})
 
     session_manager.initialize(tmp_path)
     project_registry.initialize(tmp_path)
@@ -5247,7 +5346,7 @@ def test_deepagents_manager_persists_reasoning_for_tool_call_turns(tmp_path, mon
     from graph.session_manager import session_manager
     from projects.registry import project_registry
 
-    monkeypatch.setattr(manager_module.config, "load_config", lambda: {"thinking_mode": True})
+    monkeypatch.setattr(manager_module.config, "load_config", lambda: {})
 
     session_manager.initialize(tmp_path)
     project_registry.initialize(tmp_path)
@@ -5390,18 +5489,18 @@ def test_deepagents_manager_uses_backend_execute_instead_of_custom_terminal(tmp_
 
 
 def test_memory_dir_and_memory_md_creation(tmp_path):
-    """Project memory should live under data/deepagents-memory and auto-create MEMORY.md."""
+    """Project memory should live under user Home and auto-create MEMORY.md."""
 
     from graph.deepagents_manager import DeepAgentsAgentManager
 
     runtime = DeepAgentsAgentManager()
-    runtime.initialize(tmp_path)
+    runtime.initialize(tmp_path / "backend", user_root=tmp_path)
 
     project_memory = runtime._memory_dir_for("proj_abc123")  # noqa: SLF001
-    assert project_memory == tmp_path / "data" / "deepagents-memory" / "projects" / "proj_abc123"
+    assert project_memory == tmp_path / "memory" / "projects" / "proj_abc123"
 
     global_memory = runtime._memory_dir_for(None)  # noqa: SLF001
-    assert global_memory == tmp_path / "data" / "deepagents-memory" / "global"
+    assert global_memory == tmp_path / "memory" / "global"
 
     memory_md = runtime._ensure_memory_md(project_memory)  # noqa: SLF001
     assert memory_md.exists()
@@ -5412,7 +5511,7 @@ def test_memory_file_migrates_legacy_agents_md_without_copy(tmp_path):
     from graph.deepagents_manager import DeepAgentsAgentManager
 
     runtime = DeepAgentsAgentManager()
-    runtime.initialize(tmp_path)
+    runtime.initialize(tmp_path / "backend", user_root=tmp_path)
     memory_dir = runtime._memory_dir_for("proj_abc123")  # noqa: SLF001
     memory_dir.mkdir(parents=True)
     legacy = memory_dir / "AGENTS.md"
@@ -5425,18 +5524,13 @@ def test_memory_file_migrates_legacy_agents_md_without_copy(tmp_path):
     assert not legacy.exists()
 
 
-def test_memory_middleware_includes_project_and_gstack(tmp_path):
-    """When gstack/AGENTS.md exists, one MemoryMiddleware loads both sources."""
+def test_memory_middleware_loads_only_project_memory(tmp_path):
+    """MemoryMiddleware loads the Home-backed MEMORY.md source."""
 
     from graph.deepagents_manager import DeepAgentsAgentManager
     from graph.permission_middleware import ExternalFilePermissionMiddleware
 
-    # Simulate backend layout with bundled gstack index
     backend_dir = tmp_path
-    gstack_dir = backend_dir / "gstack"
-    gstack_dir.mkdir(parents=True)
-    (gstack_dir / "AGENTS.md").write_text("# GStack Skills\n", encoding="utf-8")
-
     runtime = DeepAgentsAgentManager()
     runtime.initialize(backend_dir)
 
@@ -5446,8 +5540,7 @@ def test_memory_middleware_includes_project_and_gstack(tmp_path):
     assert len(memory_middlewares) == 1
     mw = memory_middlewares[0]
     assert isinstance(mw, MemoryMiddleware)
-    assert "/MEMORY.md" in mw.sources
-    assert "/gstack/AGENTS.md" in mw.sources
+    assert mw.sources == ["/MEMORY.md"]
 
 
 def test_deepagents_manager_emits_graph_structure(tmp_path, monkeypatch):

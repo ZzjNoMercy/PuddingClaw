@@ -23,7 +23,6 @@ TOOL_CATEGORIES: dict[str, list[str]] = {
     "research": ["deep_research_tool"],
     "skill": ["execute_skill_tool", "create_skill_version_tool"],
     "code_exec": ["python_repl_tool"],
-    "memory": ["memory_tools"],
 }
 
 

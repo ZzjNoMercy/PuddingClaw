@@ -6,53 +6,22 @@ from typing import Any
 
 import httpx
 from fastapi import APIRouter, HTTPException
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 from starlette.concurrency import run_in_threadpool
 
-from config import (
-    get_fallback_embedding_config,
-    get_fallback_llm_config,
-    get_rag_mode,
-    get_settings_for_display,
-    load_config,
-    set_rag_mode,
-    update_settings,
-)
+from config import get_settings_for_display, update_settings
 from postgres_dependencies import PGVECTOR_STATUS_SQL, normalize_pgvector_status
 from provider_registry import get_provider_registry
 
 router = APIRouter()
 
 
-# ── RAG mode (existing, unchanged) ────────────────────────
-
-
-class RagModeRequest(BaseModel):
-    enabled: bool
-
-
-@router.get("/config/rag-mode")
-async def get_rag_mode_endpoint():
-    return {"rag_mode": get_rag_mode()}
-
-
-@router.put("/config/rag-mode")
-async def set_rag_mode_endpoint(request: RagModeRequest):
-    set_rag_mode(request.enabled)
-    return {"rag_mode": request.enabled}
-
-
 # ── Settings CRUD ──────────────────────────────────────────
 
 
 class SettingsUpdateRequest(BaseModel):
-    thinking_mode: bool | None = None
-    ai_gateway: dict[str, Any] | None = None
-    gateway_llm: dict[str, Any] | None = None
-    fallback_llm: dict[str, Any] | None = None
-    fallback_embedding: dict[str, Any] | None = None
-    multimodal_embedding: dict[str, Any] | None = None
+    model_config = ConfigDict(extra="forbid")
+
     rag: dict[str, Any] | None = None
     vanna: dict[str, Any] | None = None
     analytics: dict[str, Any] | None = None
@@ -61,7 +30,6 @@ class SettingsUpdateRequest(BaseModel):
     compression: dict[str, Any] | None = None
     harness: dict[str, Any] | None = None
     subagents: dict[str, Any] | None = None
-    subagent: dict[str, Any] | None = None
 
 
 class ProviderUpdateRequest(BaseModel):
@@ -118,24 +86,7 @@ async def put_settings(request: SettingsUpdateRequest):
 @router.get("/providers")
 async def get_providers():
     """Provider/endpoint/model metadata only; credentials are always masked."""
-    return get_provider_registry().display(legacy_config=load_config())
-
-
-@router.post("/providers/{provider_id}/credentials/{credential_name}/reveal")
-async def reveal_provider_credential(provider_id: str, credential_name: str):
-    """Reveal one credential only after an explicit user action."""
-    try:
-        value = get_provider_registry().reveal_credential(
-            provider_id,
-            credential_name,
-            legacy_config=load_config(),
-        )
-        return JSONResponse(
-            {"name": credential_name, "value": value},
-            headers={"Cache-Control": "no-store"},
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return get_provider_registry().display()
 
 
 @router.patch("/providers/{provider_id}")
@@ -144,7 +95,6 @@ async def patch_provider(provider_id: str, request: ProviderUpdateRequest):
         return get_provider_registry().update_provider(
             provider_id,
             request.model_dump(exclude_none=True),
-            legacy_config=load_config(),
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -222,15 +172,6 @@ async def test_provider_connection(
 # ── Connection testing ─────────────────────────────────────
 
 
-class TestConnectionRequest(BaseModel):
-    type: str  # "gateway", "llm" or "embedding"
-    provider: str = ""
-    model: str = ""
-    base_url: str
-    api_key: str = ""
-    health_path: str = "/health"
-
-
 class DatabaseConnectionRequest(BaseModel):
     mode: str = "external"
     host: str = "127.0.0.1"
@@ -260,54 +201,6 @@ async def probe_harness_docker(request: DockerProbeRequest):
         "connection": request.connection,
         "context": request.context,
     }
-
-
-@router.post("/settings/test-connection")
-async def test_connection(request: TestConnectionRequest):
-    """Test API key connectivity with a lightweight request."""
-    import time
-
-    start = time.time()
-
-    try:
-        if request.type == "gateway":
-            result = await _test_gateway_connection(
-                request.base_url,
-                request.health_path,
-            )
-        elif request.type == "llm":
-            llm = get_fallback_llm_config()
-            result = await _test_llm_connection(
-                request.provider,
-                request.model,
-                request.base_url,
-                request.api_key or llm.get("api_key", ""),
-            )
-        elif request.type == "embedding":
-            embedding = get_fallback_embedding_config()
-            result = await _test_embedding_connection(
-                request.provider,
-                request.model,
-                request.base_url,
-                request.api_key or embedding.get("api_key", ""),
-            )
-        else:
-            raise HTTPException(status_code=400, detail="type must be 'gateway', 'llm' or 'embedding'")
-
-        latency_ms = int((time.time() - start) * 1000)
-        return {"success": True, "model": request.model, "latency_ms": latency_ms, **result}
-
-    except HTTPException:
-        raise
-    except asyncio.TimeoutError:
-        raise HTTPException(status_code=408, detail="Connection timeout (10s)")
-    except Exception as e:
-        error_msg = str(e)
-        if "401" in error_msg or "Unauthorized" in error_msg:
-            raise HTTPException(status_code=401, detail="Invalid API key")
-        if "403" in error_msg or "Forbidden" in error_msg:
-            raise HTTPException(status_code=403, detail="Access forbidden — check API key permissions")
-        raise HTTPException(status_code=502, detail=f"Connection failed: {error_msg}")
 
 
 @router.post("/settings/database/test")
@@ -430,48 +323,3 @@ async def _test_database_connection(request: DatabaseConnectionRequest) -> dict[
         raise HTTPException(status_code=408, detail=f"PostgreSQL connection timeout/refused: {exc}") from exc
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"PostgreSQL connection failed: {exc}") from exc
-
-
-async def _test_llm_connection(provider: str, model: str, base_url: str, api_key: str) -> dict:
-    """Test LLM connection with a minimal chat completion request."""
-    from openai import AsyncOpenAI
-
-    client = AsyncOpenAI(base_url=base_url, api_key=api_key, timeout=10.0)
-    response = await client.chat.completions.create(
-        model=model,
-        messages=[{"role": "user", "content": "Hi"}],
-        max_tokens=5,
-    )
-    return {"response_model": response.model or model}
-
-
-def _gateway_health_url(base_url: str, health_path: str) -> str:
-    """将 OpenAI `/v1` 入口转换为网关进程的健康检查地址。"""
-    normalized = base_url.rstrip("/")
-    if normalized.endswith("/v1"):
-        normalized = normalized[:-3]
-    return normalized + "/" + health_path.lstrip("/")
-
-
-async def _test_gateway_connection(base_url: str, health_path: str) -> dict:
-    import httpx
-
-    health_url = _gateway_health_url(base_url, health_path)
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        response = await client.get(health_url)
-    if not 200 <= response.status_code < 400:
-        raise HTTPException(status_code=502, detail=f"Gateway health check returned HTTP {response.status_code}")
-    return {"health_url": health_url, "status_code": response.status_code}
-
-
-async def _test_embedding_connection(provider: str, model: str, base_url: str, api_key: str) -> dict:
-    """Test embedding connection with a minimal embedding request."""
-    from openai import AsyncOpenAI
-
-    client = AsyncOpenAI(base_url=base_url, api_key=api_key, timeout=10.0)
-    response = await client.embeddings.create(
-        model=model,
-        input="test",
-    )
-    dim = len(response.data[0].embedding) if response.data else 0
-    return {"dimensions": dim}

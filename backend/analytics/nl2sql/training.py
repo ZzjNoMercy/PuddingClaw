@@ -510,7 +510,9 @@ async def sync_curated_semantic_entities(
     """
 
     schema, table, _qualified = _qualified_table_sql(table_name)
-    registry = get_semantic_asset_registry(Path(__file__).resolve().parents[2])
+    from runtime_identity.paths import PuddingClawPaths
+
+    registry = get_semantic_asset_registry(PuddingClawPaths.from_environment().user_definitions())
     available = registry.list_assets().get("assets") or []
     selected = {str(item) for item in semantic_asset_ids or [] if str(item)}
     definitions: dict[str, set[str]] = {}

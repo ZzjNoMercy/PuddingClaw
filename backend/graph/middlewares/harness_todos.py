@@ -4,6 +4,7 @@ import hashlib
 import time
 from typing import Any, Literal, NotRequired
 
+from deepagents.middleware._utils import append_to_system_message
 from langchain.agents.middleware.types import AgentMiddleware, AgentState
 from langchain.tools import ToolRuntime
 from langchain_core.messages import ToolMessage
@@ -11,6 +12,7 @@ from langchain_core.tools import StructuredTool
 from langgraph.types import Command
 from pydantic import BaseModel, Field, model_validator
 
+from graph.prompt_cache import reorder_system_prompt_sections
 from graph.session_manager import session_manager
 
 
@@ -531,8 +533,9 @@ class HarnessTodoMiddleware(AgentMiddleware[HarnessTodoState, Any, Any]):
 
             system_message = SystemMessage(content=TODO_PATCH_PROMPT)
         else:
+            system_message = append_to_system_message(system_message, TODO_PATCH_PROMPT)
             system_message = system_message.model_copy(
-                update={"content": f"{system_message.content}\n\n{TODO_PATCH_PROMPT}"}
+                update={"content": reorder_system_prompt_sections(system_message.text)}
             )
         return handler(request.override(system_message=system_message))
 
@@ -543,7 +546,8 @@ class HarnessTodoMiddleware(AgentMiddleware[HarnessTodoState, Any, Any]):
 
             system_message = SystemMessage(content=TODO_PATCH_PROMPT)
         else:
+            system_message = append_to_system_message(system_message, TODO_PATCH_PROMPT)
             system_message = system_message.model_copy(
-                update={"content": f"{system_message.content}\n\n{TODO_PATCH_PROMPT}"}
+                update={"content": reorder_system_prompt_sections(system_message.text)}
             )
         return await handler(request.override(system_message=system_message))

@@ -1,6 +1,11 @@
 """semantic_enum_consistency detector: diesel regression and friends."""
 
 import time
+from pathlib import Path
+
+import pytest
+
+import analytics.semantic_assets.registry as semantic_registry_module
 
 from analytics.nl2sql.guardrails import (
     GuardrailAction,
@@ -62,6 +67,46 @@ END AS energy_group, launch_date
 FROM vehicle_model_base
 WHERE vehicle_level IS DISTINCT FROM '皮卡'
 """
+
+
+@pytest.fixture(autouse=True)
+def _temporary_energy_dimension(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Provide the declaration this detector consumes without package assets."""
+
+    home = tmp_path / "puddingclaw-home"
+    monkeypatch.setenv("PUDDINGCLAW_HOME", str(home))
+    monkeypatch.setattr(semantic_registry_module, "_REGISTRIES", {})
+    asset_dir = home / "definitions" / "semantic-assets" / "dimensions" / "energy_type"
+    asset_dir.mkdir(parents=True)
+    (asset_dir / "dimension.md").write_text(
+        """---
+formatter: semantic-asset
+name: 能源类型
+type: dimension
+enum_universe:
+  - 纯电
+  - 插电混合
+  - 增程式纯电动
+  - 汽油
+  - 汽油+48V轻混系统
+  - 油电混合
+  - 汽油电驱
+  - 汽油+24V轻混系统
+classifications:
+  新能源: [纯电, 插电混合, 增程式纯电动]
+  传统能源: [汽油, 汽油+48V轻混系统, 油电混合, 汽油电驱, 汽油+24V轻混系统]
+governed:
+  columns: [energy_type]
+  eav_type_names: [能源类型]
+forbidden_patterns:
+  - pattern: "纯电"
+    message: "禁止使用模糊枚举匹配"
+---
+
+# 能源类型
+""",
+        encoding="utf-8",
+    )
 
 
 def test_diesel_in_explicit_enum_is_rejected_with_diff():

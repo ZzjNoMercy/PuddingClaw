@@ -11,12 +11,14 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from runtime_identity.paths import PuddingClawPaths
+
 logger = logging.getLogger(__name__)
 
-# 数据库文件路径（项目根目录下的 data/ 中）
-DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+# Token accounting is user-owned runtime state, never package state.
+DATA_DIR = PuddingClawPaths.from_environment().usage()
 DB_PATH = DATA_DIR / "token_usage.db"
-JSONL_DIR = DATA_DIR / "stats" / "tokens"
+JSONL_DIR = DATA_DIR / "tokens"
 
 
 def _ensure_dirs() -> None:

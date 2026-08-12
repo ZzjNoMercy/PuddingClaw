@@ -167,17 +167,6 @@ export default function ChatMessage({ message, sessionSources = [], isStreaming 
       ]),
     ).values(),
   );
-  const segmentedToolIds = new Set(
-    message.segments?.flatMap((segment) =>
-      (segment.timeline || [])
-        .filter((item) => item.type === "tool")
-        .map((item) => item.toolCall?.id || item.id)
-        .filter(Boolean),
-    ) || [],
-  );
-  const orphanSkillPlanTimeline = skillPlanTimeline.filter((item) =>
-    item.type !== "tool" || !segmentedToolIds.has(item.toolCall?.id || item.id),
-  );
   const pendingPermissionRequests = (message.permissionRequests || []).filter(
     (request) => request.status !== "resolved"
   );
@@ -268,7 +257,6 @@ export default function ChatMessage({ message, sessionSources = [], isStreaming 
                       analysisByAttachmentId={analysisByAttachmentId}
                     />
                   ) : null}
-                  <SkillPlanCards timeline={orphanSkillPlanTimeline} sessionId={sessionId} />
                   {message.retrievals && message.retrievals.length > 0 && (
                     <RetrievalCard retrievals={message.retrievals} />
                   )}
@@ -297,6 +285,10 @@ export default function ChatMessage({ message, sessionSources = [], isStreaming 
                   {pendingKernelFallbackRequests.map((request) => (
                     <KernelFallbackRequestCard key={request.id} request={request} sessionId={sessionId} />
                   ))}
+                  {/* Skill plans are direct frontend-to-backend actions, not HITL
+                      interruptions. Keep them once at the bottom of the whole turn
+                      so later model segments can never render below the card. */}
+                  <SkillPlanCards timeline={skillPlanTimeline} sessionId={sessionId} />
                   {(message.segments.length > 0 || pendingPermissionRequests.length > 0 || pendingDimensionBuildRuleRequests.length > 0 || pendingLogicalDatasetRuleRequests.length > 0 || pendingDatabaseSqlRevisionRequests.length > 0 || visibleUserInputRequests.length > 0 || visibleSkillSecretRequests.length > 0 || pendingKernelFallbackRequests.length > 0) && (
                     <div className="text-[10px] text-gray-400 mt-1 pl-1">
                       {formatTime(message.timestamp)}
@@ -356,7 +348,6 @@ export default function ChatMessage({ message, sessionSources = [], isStreaming 
                         {!hasTools && thoughtChain}
                         {contentBlock}
                         {hasTools && thoughtChain}
-                        <SkillPlanCards timeline={skillPlanTimeline} sessionId={sessionId} />
                         {outputAttachmentPlacement.unplaced.length ? (
                           <AssistantAttachmentList
                             attachments={outputAttachmentPlacement.unplaced}
@@ -388,6 +379,7 @@ export default function ChatMessage({ message, sessionSources = [], isStreaming 
                         {pendingKernelFallbackRequests.map((request) => (
                           <KernelFallbackRequestCard key={request.id} request={request} sessionId={sessionId} />
                         ))}
+                        <SkillPlanCards timeline={skillPlanTimeline} sessionId={sessionId} />
                         {((message.content || thoughtChain) || pendingPermissionRequests.length > 0 || pendingDimensionBuildRuleRequests.length > 0 || pendingLogicalDatasetRuleRequests.length > 0 || pendingDatabaseSqlRevisionRequests.length > 0 || visibleUserInputRequests.length > 0 || visibleSkillSecretRequests.length > 0 || pendingKernelFallbackRequests.length > 0) && (
                           <div className="text-[10px] text-gray-400 mt-1 pl-1">
                             {formatTime(message.timestamp)}
@@ -1844,7 +1836,6 @@ function SegmentBlock({
       {!hasTools && thoughtChain}
       {contentBlock}
       {hasTools && thoughtChain}
-      <SkillPlanCards timeline={displayTimeline} sessionId={sessionId} />
       {outputAttachments?.length ? (
         <AssistantAttachmentList
           attachments={outputAttachments}

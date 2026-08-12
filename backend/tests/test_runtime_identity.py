@@ -18,7 +18,7 @@ from cryptography.exceptions import InvalidTag
 from langchain.agents.middleware.types import ToolCallRequest
 from langchain_core.messages import AIMessage, ToolMessage
 
-from harness.tool_execution import PolicyDecision, ToolExecutionPipeline
+from harness.tool_execution import PolicyDecision, ToolExecutionPipeline, ToolPolicyResult
 from harness.workspace_backends import (
     ManagedProviderExecutionResult,
     ProjectSandboxManager,
@@ -53,6 +53,7 @@ from runtime_identity.authorization_drivers import (
     LarkAuthorizationDriver,
     ProviderAuthorizationFailure,
 )
+from runtime_identity.composition import LazyManagedCliService
 from runtime_identity.paths import (
     PuddingClawPaths,
     resolve_puddingclaw_home,
@@ -76,6 +77,20 @@ from runtime_identity.service import (
     redact_managed_cli_output,
 )
 from runtime_identity.toolchains import ToolchainManager
+
+
+def test_managed_cli_control_plane_is_constructed_lazily_once():
+    calls: list[str] = []
+
+    class Service:
+        marker = "ready"
+
+    lazy = LazyManagedCliService(lambda: calls.append("build") or Service())
+
+    assert calls == []
+    assert lazy.marker == "ready"
+    assert lazy.marker == "ready"
+    assert calls == ["build"]
 
 
 def _credential_archive(content: bytes = b"{}") -> bytes:
@@ -557,6 +572,10 @@ def test_lark_adapter_rejects_noncanonical_shell_fallbacks(command):
         ("lark-cli sheets +cells-clear --range A1", True),
         ("lark-cli openapi request --method=DELETE", True),
         ("lark-cli auth logout --json", True),
+        (
+            "lark-cli im +messages-send --markdown 'delete / --output=not-a-path'",
+            False,
+        ),
     ],
 )
 def test_lark_personal_autonomy_only_marks_delete_semantics(command, destructive):
@@ -564,6 +583,17 @@ def test_lark_personal_autonomy_only_marks_delete_semantics(command, destructive
     assert match is not None
     assert match.destructive is destructive
     assert is_lark_destructive_argv(match.argv) is destructive
+
+
+def test_lark_adapter_keeps_message_body_out_of_policy_classification():
+    match = ManagedCliRegistry().match(
+        "lark-cli im +messages-send --markdown 'delete / --output=not-a-path'"
+    )
+
+    assert match is not None
+    assert match.argv[-1] == "delete / --output=not-a-path"
+    assert match.destructive is False
+    assert match.workspace_writable is False
 
 
 @pytest.mark.parametrize("flag", ["--yes=true", "--yes=1", "-y=true"])
@@ -2395,7 +2425,85 @@ async def test_pipeline_routes_managed_cli_without_calling_workspace_handler(tmp
 
 
 @pytest.mark.asyncio
-async def test_pipeline_keeps_browser_material_in_ui_artifact_not_model_tool_content(tmp_path):
+async def test_pipeline_does_not_treat_managed_message_slash_as_host_root(tmp_path, monkeypatch):
+    command = (
+        "LARKSUITE_CLI_NO_UPDATE_NOTIFIER=1 "
+        "LARKSUITE_CLI_NO_SKILLS_NOTIFIER=1 "
+        "lark-cli im +messages-send --as bot --user-id ou_test "
+        "--markdown 'Bot 状态：ready / token valid'"
+    )
+    calls: list[str] = []
+
+    class Service:
+        def plan_command(self, raw_command, context):
+            del context
+            match = ManagedCliRegistry().match(raw_command)
+            assert match is not None
+            return SimpleNamespace(match=match, approval_preview=lambda: "frozen-plan")
+
+        def execute(self, plan, context):
+            del plan, context
+            calls.append("managed")
+            return SimpleNamespace(content='{"ok":true}', exit_code=0)
+
+    async def workspace_handler(_request):
+        raise AssertionError("managed command must not reach the project shell")
+
+    request = ToolCallRequest(
+        tool_call={"id": "call", "name": "execute", "args": {"command": command}},
+        tool=None,
+        state={},
+        runtime=SimpleNamespace(context={"workspace_path": str(tmp_path)}),
+    )
+    pipeline = ToolExecutionPipeline(
+        known_tools={"execute"},
+        backend_mode="kernel",
+        managed_cli_service=Service(),
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "_require_external_shell_authority",
+        lambda _request: (_ for _ in ()).throw(
+            AssertionError("managed payload must not be re-parsed as project shell paths")
+        ),
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "_managed_cli_preflight",
+        lambda _plan: ToolPolicyResult(PolicyDecision.ALLOW, "test", "low"),
+    )
+
+    result = await pipeline.awrap_tool_call(request, workspace_handler)
+
+    assert result.status == "success"
+    assert calls == ["managed"]
+
+
+@pytest.mark.asyncio
+async def test_pipeline_keeps_browser_material_in_ui_artifact_not_model_tool_content(tmp_path, monkeypatch):
+    from graph.session_manager import session_manager
+    from harness.models import RunRecord
+
+    # Smart approval now persists a run-bound permission request before the
+    # managed result is returned.  This test only needs an empty durable Home
+    # session store; it must not rely on another test having initialized the
+    # process-global SessionManager first.
+    session_manager.initialize(tmp_path / "puddingclaw-home")
+    session_manager.create_session("session-browser-material")
+    session_manager.start_harness_run(
+        "session-browser-material",
+        RunRecord(
+            run_id="run-browser-material",
+            query_id="query-browser-material",
+            session_id="session-browser-material",
+            objective="managed authorization artifact",
+        ).model_dump(mode="json"),
+    )
+    session_manager.transition_run_status(
+        "session-browser-material",
+        "run-browser-material",
+        "running",
+    )
     authorization = {
         "type": "managed_authorization_request",
         "flow_id": "auth-test",
@@ -2444,12 +2552,26 @@ async def test_pipeline_keeps_browser_material_in_ui_artifact_not_model_tool_con
         },
         tool=None,
         state={},
-        runtime=SimpleNamespace(context={"workspace_path": str(tmp_path)}),
+        runtime=SimpleNamespace(
+            context={
+                "workspace_path": str(tmp_path),
+                "session_id": "session-browser-material",
+                "run_id": "run-browser-material",
+            }
+        ),
     )
     pipeline = ToolExecutionPipeline(
         known_tools={"execute"},
         backend_mode="docker",
         managed_cli_service=Service(),
+    )
+    # The service contract is the subject here. Bypass the separate
+    # credential+network approval gate so this unit test does not need a
+    # LangGraph interrupt runtime.
+    monkeypatch.setattr(
+        pipeline,
+        "_managed_cli_preflight",
+        lambda _plan: ToolPolicyResult(PolicyDecision.ALLOW, "test", "low"),
     )
 
     message = await pipeline.awrap_tool_call(request, workspace_handler)
@@ -2464,16 +2586,16 @@ async def test_pipeline_keeps_browser_material_in_ui_artifact_not_model_tool_con
 @pytest.mark.parametrize(
     ("command", "decision"),
     [
-        ("lark-cli im send --data '{}'", PolicyDecision.ALLOW),
-        ("lark-cli doc create --data '{}'", PolicyDecision.ALLOW),
-        ("lark-cli base update --data '{}'", PolicyDecision.ALLOW),
-        ("lark-cli drive upload --file report.md", PolicyDecision.ALLOW),
-        ("lark-cli drive permissions update --data '{}'", PolicyDecision.ALLOW),
+        ("lark-cli im send --data '{}'", PolicyDecision.ASK),
+        ("lark-cli doc create --data '{}'", PolicyDecision.ASK),
+        ("lark-cli base update --data '{}'", PolicyDecision.ASK),
+        ("lark-cli drive upload --file report.md", PolicyDecision.ASK),
+        ("lark-cli drive permissions update --data '{}'", PolicyDecision.ASK),
         ("lark-cli drive files delete --token abc", PolicyDecision.ASK),
         ("npm install -g @larksuite/cli", PolicyDecision.ASK),
     ],
 )
-def test_managed_lark_policy_defaults_non_delete_network_to_allow(command, decision):
+def test_managed_lark_policy_requires_smart_approval_for_credentialed_network(command, decision):
     match = ManagedCliRegistry().match(command)
     result = ToolExecutionPipeline._managed_cli_preflight(SimpleNamespace(match=match))
     assert result.decision == decision

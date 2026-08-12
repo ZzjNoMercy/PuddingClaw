@@ -156,6 +156,30 @@ Permission Grant（权威）
 
 历史消息、Evidence、Manifest 或模型声称“用户允许了”都不能创建权限。
 
+### 6.3.1 执行模式与 Harness 权限 handoff
+
+执行模式不是 Permission Grant 的替代字段，而是 Run 的执行事实快照。每个 Run 至少记录：
+
+```json
+{
+  "execution": {
+    "configured_mode": "spawn",
+    "effective_runner": "spawn",
+    "fallback": null,
+    "permission_revision": 3,
+    "runtime_binding_digest": "sha256:..."
+  }
+}
+```
+
+- `configured_mode` 是项目/Session 的用户选择，只允许 `spawn` 或 `kernel`；`spawn` 是宿主执行，不是“没有 backend”。
+- `effective_runner` 是本次 Run 实际使用的 runner，例如 `spawn`、`kernel_macos_seatbelt` 或 `kernel_linux_bwrap_seccomp`；Windows 首发 Kernel 通过 WSL2 记录 Linux runner，不记录虚假的原生 Windows sandbox。
+- Kernel 不可用时，稳定部署问题可把项目配置持久化切到 `spawn`；临时故障只能记录 Run 级 fallback。二者都必须有服务端 HITL 事实，不能由前端布尔值或模型消息伪造。
+- `ExecutionPermit` 是一次 Tool Call、一次进程创建的短生命周期 handoff，不写入 `permissions.grants`，不能跨 Run 或跨第二次 spawn 重放。
+- `SandboxGrantProfile`、runtime binding、secret environment、runner binding 和 permit digest 属于执行上下文；模型只看到必要的 capability/状态投影，不能看到 Secret 明文或凭证环境快照。
+
+这保证了“权限事实”“执行模式”“模型可见 Manifest”三者不互相冒充：Grant 决定是否允许，runner 决定 OS 能见范围，permit 只把当前已批准请求安全交给 runner。
+
 ### 6.4 Skill 与 Capability
 
 三者不能混为一谈：
@@ -460,6 +484,12 @@ PuddingClaw 应把 Provider 400 先分类：
         "objective": "整理发布文档",
         "status": "completed",
         "outcome": "completed",
+        "execution": {
+          "configured_mode": "spawn",
+          "effective_runner": "spawn",
+          "fallback": null,
+          "permission_revision": 3
+        },
         "skill_activations": [],
         "capability_manifest": {"manifest_id": "cap_42", "allowed_tool_names": ["read_file"]},
         "permission_manifest": {"manifest_id": "perm_42", "approval_mode": "smart"}

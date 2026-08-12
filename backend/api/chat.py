@@ -11,7 +11,6 @@ import os
 import re
 import time
 import traceback
-from pathlib import Path
 from typing import AsyncGenerator
 
 from fastapi import APIRouter, HTTPException
@@ -22,9 +21,7 @@ from graph.agent import agent_manager
 from graph.live_tool_output import project_live_tool_output
 from graph.session_manager import session_manager
 from graph.citations import dedupe_sources, finalize_citations, normalize_source
-from config import get_cache_config, get_memory_backend, get_middleware_config
-
-BASE_DIR = Path(__file__).resolve().parent.parent
+from config import get_cache_config, get_middleware_config
 
 router = APIRouter()
 
@@ -196,7 +193,9 @@ async def _detect_and_retry_memory_write(
         from llm.model_client import ModelClient
 
         # 读取当前 MEMORY.md
-        memory_path = BASE_DIR / "memory" / "MEMORY.md"
+        from runtime_identity.paths import PuddingClawPaths
+
+        memory_path = PuddingClawPaths.from_environment().memory() / "MEMORY.md"
         if not memory_path.exists():
             return
         from graph.prompt_builder import _read_component
@@ -241,73 +240,6 @@ async def _detect_and_retry_memory_write(
 
     except Exception as e:
         print(f"[ERROR] Memory compensation failed: {e}")
-
-
-_MEM0_CLAIM_PATTERNS = [
-    re.compile(r"已.*保存.*长期记忆", re.IGNORECASE),
-    re.compile(r"已.*记录.*长期记忆", re.IGNORECASE),
-    re.compile(r"已.*写入.*长期记忆", re.IGNORECASE),
-    re.compile(r"已.*更新.*长期记忆", re.IGNORECASE),
-    re.compile(r"长期记忆.*已.*保存", re.IGNORECASE),
-    re.compile(r"已记住", re.IGNORECASE),
-    re.compile(r"记忆.*保存成功", re.IGNORECASE),
-    # 兼容 markdown 模式遗留表述（MEMORY.md）
-    re.compile(r"已.*保存.*MEMORY", re.IGNORECASE),
-    re.compile(r"已.*更新.*MEMORY", re.IGNORECASE),
-    re.compile(r"已.*写入.*MEMORY", re.IGNORECASE),
-]
-
-
-def _llm_claimed_mem0_write(segments: list[dict]) -> bool:
-    """检测 LLM 回复文本中是否声称写入了长期记忆（mem0 模式专用）"""
-    for seg in segments:
-        text = seg.get("content", "")
-        for pattern in _MEM0_CLAIM_PATTERNS:
-            if pattern.search(text):
-                return True
-    return False
-
-
-async def _detect_and_retry_mem0_write(
-    user_message: str, segments: list[dict], session_id: str, user_id: str
-) -> bool:
-    """mem0 模式下的口头写入兜底。
-
-    当 LLM 回复声称"已保存到长期记忆"但未调用任何 save_*_memory 工具时，
-    直接调用 mem0_manager.add() 让 mem0 LLM 裁判从本轮对话提取记忆。
-    返回 True 表示触发了兜底写入（供上层跳过 SmartExtractor 以免重复）。
-    """
-    # 条件一：LLM 声称写入
-    if not _llm_claimed_mem0_write(segments):
-        return False
-    # 条件二：未实际调用 save_*_memory（互斥 SmartExtractor 的 mark_agent_wrote）
-    agent_saved = any(
-        tc.get("tool", "").startswith("save_") and tc.get("tool", "").endswith("_memory")
-        for seg in segments
-        for tc in seg.get("tool_calls", [])
-    )
-    if agent_saved:
-        return False
-
-    print(f"[WARN] Fake mem0 write detected in session {session_id}, triggering compensation")
-    try:
-        from graph.mem0_manager import mem0_manager
-        assistant_reply = "\n".join(seg.get("content", "") for seg in segments if seg.get("content"))
-        messages = [
-            {"role": "user", "content": user_message},
-            {"role": "assistant", "content": assistant_reply},
-        ]
-        # 让 mem0 LLM 裁判自动分类；不手动打 metadata.type（保持与 SmartExtractor 写入路径一致）
-        import asyncio, functools
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(
-            None, functools.partial(mem0_manager.add, messages, user_id)
-        )
-        print(f"[INFO] mem0 compensation write completed for session {session_id}")
-        return True
-    except Exception as e:
-        print(f"[ERROR] mem0 compensation failed: {e}")
-        return False
 
 
 # ── 错误分类（用户友好提示）─────────────────────────────────────────────
@@ -535,9 +467,6 @@ async def event_generator(
     3. Client disconnect (GeneratorExit) → saved in finally block
     """
     query_created_at = float(query_created_at) if query_created_at is not None else time.time()
-    # 设置请求级 user_id，供 memory_tools 中的 @tool 函数读取
-    from tools.memory_tools import current_user_id
-    current_user_id.set(user_id)
     session_manager.update_metadata(
         session_id,
         {
@@ -889,57 +818,7 @@ async def event_generator(
                             ),
                         }
 
-                # 长期记忆写入：根据 memory_backend 选择写入方式
-                memory_backend = get_memory_backend()
-
-                if memory_backend == "mem0":
-                    # mem0 模式：先跑口头写入兜底，再通过 SmartExtractor 节流提取
-                    try:
-                        compensated = await _detect_and_retry_mem0_write(
-                            message, segments, session_id, user_id
-                        )
-                    except Exception as e:
-                        compensated = False
-                        print(f"[mem0] 兜底调度异常（不影响对话）: {e}")
-
-                    try:
-                        from graph.smart_extractor import smart_extractor
-
-                        # user_id already passed as parameter
-                        # 收集本轮对话的 user + assistant 消息
-                        mem0_messages = [{"role": "user", "content": message}]
-                        for seg in segments:
-                            if seg["content"]:
-                                mem0_messages.append({"role": "assistant", "content": seg["content"]})
-
-                        # 互斥检测：Agent 是否在本轮通过 save_*_memory tool 主动写入了记忆
-                        agent_saved = any(
-                            tc.get("tool", "").startswith("save_") and tc.get("tool", "").endswith("_memory")
-                            for s in segments
-                            for tc in s.get("tool_calls", [])
-                        )
-                        # 互斥：agent 本轮直接写入 OR 兜底已触发 → 都让 SmartExtractor 跳过
-                        if agent_saved or compensated:
-                            smart_extractor.mark_agent_wrote(session_id)
-
-                        # fire-and-forget：节流提取不阻塞用户响应
-                        task = asyncio.create_task(
-                            smart_extractor.async_on_turn_end(
-                                mem0_messages, user_id, session_id
-                            )
-                        )
-                        task.add_done_callback(
-                            lambda t: t.exception() and print(
-                                f"[mem0] 后台提取异常: {t.exception()}"
-                            )
-                        )
-                    except Exception as e:
-                        print(f"[mem0] 记忆节流提取调度失败（不影响对话）: {e}")
-                else:
-                    # markdown 模式：保持原有口头写入检测与补偿逻辑
-                    await _detect_and_retry_memory_write(
-                        message, segments, session_id
-                    )
+                await _detect_and_retry_memory_write(message, segments, session_id)
 
     except Exception as e:
         traceback.print_exc()
@@ -1019,9 +898,6 @@ async def chat(request: ChatRequest):
                 query_created_at=request_received_at,
             )
         )
-    # Non-streaming fallback — 同样需要设置请求级 user_id
-    from tools.memory_tools import current_user_id
-    current_user_id.set(request.user_id)
     result = await agent_manager.ainvoke(
         request.message,
         request.session_id,

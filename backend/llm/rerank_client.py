@@ -7,7 +7,7 @@ import httpx
 from dataclasses import dataclass
 from typing import Any
 
-from config import get_rag_rerank_config, load_config
+from config import get_rag_rerank_config
 from provider_registry import get_provider_registry
 
 logger = logging.getLogger(__name__)
@@ -44,7 +44,7 @@ def rerank_documents(
         logger.warning("[rerank] unsupported provider=%s", config.get("provider"))
         return []
 
-    resolved = get_provider_registry().resolve_binding("rerank", legacy_config=load_config())
+    resolved = get_provider_registry().resolve_binding("rerank")
     api_key = str(resolved.get("api_key") or "")
     if not api_key:
         logger.warning("[rerank] skipped because api key is not configured")

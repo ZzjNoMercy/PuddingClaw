@@ -12,12 +12,27 @@ _ORIGINAL_RUBRIC_PROFILE_CLASSIFIER = None
 
 
 @pytest.fixture(autouse=True)
+def isolate_puddingclaw_home(tmp_path, monkeypatch):
+    """Never let unit tests read or mutate the developer's real Home state."""
+
+    monkeypatch.setenv("PUDDINGCLAW_HOME", str(tmp_path / "puddingclaw-home"))
+    import provider_registry
+    from web_search import registry as web_search_registry
+
+    monkeypatch.setattr(provider_registry, "_default_registry_instance", None)
+    monkeypatch.setattr(web_search_registry, "_default_registry", None)
+    yield
+    provider_registry._default_registry_instance = None
+    web_search_registry._default_registry = None
+
+
+@pytest.fixture(autouse=True)
 def isolate_deepagents_from_real_docker(monkeypatch):
     """Keep unit/E2E agent tests from inheriting a developer's Docker setting.
 
     DockerWorkspaceBackend has dedicated contract tests that call its builder
     directly. Tests exercising DeepAgents orchestration must stay hermetic even
-    when ``backend/config.json`` enables the real reusable project sandbox.
+    when the Home sparse config enables the real reusable project sandbox.
     """
 
     from graph import deepagents_manager as manager_module

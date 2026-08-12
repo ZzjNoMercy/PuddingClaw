@@ -15,6 +15,7 @@ from pathlib import Path
 from db import get_sessionmaker
 from knowledge.import_jobs import mark_job_failed, process_vanna_entity_import_job
 from knowledge.models import KnowledgeImportJob
+from runtime_identity.paths import PuddingClawPaths
 
 logger = logging.getLogger(__name__)
 
@@ -40,7 +41,11 @@ async def run_job(job_id: str, *, base_dir: Path) -> int:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run a Vanna entity import job in an isolated subprocess.")
     parser.add_argument("job_id")
-    parser.add_argument("--base-dir", default=str(Path(__file__).resolve().parents[1]))
+    parser.add_argument(
+        "--base-dir",
+        default=str(PuddingClawPaths.from_environment().root),
+        help="PuddingClaw Home root; defaults to PUDDINGCLAW_HOME.",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s - %(message)s")

@@ -306,16 +306,23 @@ def test_database_agent_route_uses_evidence_and_validator() -> None:
     assert "必须优先调用 database_sql_generate" not in decision["routing_prompt"]
 
 
-def test_fallback_policy_only_allows_infrastructure_failures() -> None:
+def test_fallback_policy_fails_closed_for_every_error() -> None:
     from analytics.nl2sql.agent_path_policy import fallback_policy
 
-    assert fallback_policy("database_unavailable")["eligible"] is True
-    assert fallback_policy("evidence_search_failed")["eligible"] is False
-    assert fallback_policy("eav_evidence_required")["eligible"] is False
-    assert fallback_policy("sql_guardrail_conflict")["eligible"] is False
-    assert fallback_policy(
+    for error_code in (
+        "database_unavailable",
         "evidence_search_failed",
-        config={"database_agent_sql_fallback_enabled": False},
+        "eav_evidence_required",
+        "sql_guardrail_conflict",
+    ):
+        policy = fallback_policy(error_code)
+        assert policy["eligible"] is False
+        assert policy["enabled"] is False
+        assert policy["target_path"] == ""
+
+    assert fallback_policy(
+        "database_unavailable",
+        config={"database_agent_sql_fallback_enabled": True},
     )["eligible"] is False
 
 

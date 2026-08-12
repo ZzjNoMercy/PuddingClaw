@@ -10,8 +10,8 @@ import time
 from pathlib import Path
 from typing import Any
 
-from config import load_config
 from provider_registry import LocalCredentialStore, get_provider_registry, user_data_dir
+from runtime_identity.paths import PuddingClawPaths
 
 PROVIDER_IDS = ("tavily", "deepseek", "grok")
 PROVIDER_MANIFEST: dict[str, dict[str, Any]] = {
@@ -121,7 +121,7 @@ def _mask(secret: str) -> str:
 class WebSearchRegistry:
     def __init__(self, root: Path | None = None) -> None:
         self.root = root or user_data_dir()
-        self.path = self.root / "web_search.json"
+        self.path = self.root / "web-search.json"
         self.credentials = LocalCredentialStore(self.root)
 
     def _payload(self) -> dict[str, Any]:
@@ -174,8 +174,8 @@ class WebSearchRegistry:
                 return value, "environment"
         if provider_id == "deepseek":
             try:
-                value = get_provider_registry().reveal_credential(
-                    "deepseek", "default", legacy_config=load_config()
+                value = get_provider_registry().resolve_credential_for_runtime(
+                    "deepseek", "default"
                 )
             except ValueError:
                 value = ""

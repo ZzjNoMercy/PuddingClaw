@@ -38,7 +38,7 @@ class ToolGuideMiddleware(AgentMiddleware[Any, Any, Any]):
 
     def __init__(self, *, base_dir: Path) -> None:
         super().__init__()
-        self.guide_dir = (base_dir / "prompts" / "deepagents" / "tool_guides").resolve()
+        self.guide_dir = (base_dir / "prompts" / "tool_guides").resolve()
         specs = self._load_specs()
         if bool(config.load_config().get("harness", {}).get("prompt_cache", {}).get("ordered_system_sections", True)):
             specs = tuple(sorted(specs, key=lambda spec: (spec.guide_id, spec.content_sha256)))
@@ -160,7 +160,7 @@ class ToolGuideMiddleware(AgentMiddleware[Any, Any, Any]):
         if not activated:
             if ordered_sections and request.system_message is not None:
                 prompt = request.system_message.model_copy(
-                    update={"content": reorder_system_prompt_sections(str(request.system_message.content))}
+                    update={"content": reorder_system_prompt_sections(request.system_message.text)}
                 )
                 return request.override(system_message=prompt)
             return request
@@ -197,7 +197,7 @@ class ToolGuideMiddleware(AgentMiddleware[Any, Any, Any]):
             # chain. Reassemble every known section here so repeated run
             # deltas cannot leave stable runtime material after the volatile
             # tail.
-            prompt = prompt.model_copy(update={"content": reorder_system_prompt_sections(str(prompt.content))})
+            prompt = prompt.model_copy(update={"content": reorder_system_prompt_sections(prompt.text)})
         return request.override(system_message=prompt)
 
     def wrap_model_call(self, request: ModelRequest, handler: Callable[[ModelRequest], ModelResponse]) -> ModelResponse:

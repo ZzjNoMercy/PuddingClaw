@@ -118,8 +118,12 @@ class KnowledgeImportWorkerManager:
         base_dir: Path,
         job_id: str,
     ) -> None:
-        backend_dir = Path(__file__).resolve().parents[1]
-        log_dir = backend_dir / "logs" / "vanna-entity-jobs"
+        package_dir = Path(__file__).resolve().parents[1]
+        if base_dir.expanduser().resolve().name == "backend":
+            from runtime_identity.paths import PuddingClawPaths
+
+            base_dir = PuddingClawPaths.from_environment().root
+        log_dir = base_dir / "logs" / "vanna-entity-jobs"
         log_dir.mkdir(parents=True, exist_ok=True)
         log_path = log_dir / f"{job_id}.log"
 
@@ -132,7 +136,7 @@ class KnowledgeImportWorkerManager:
                 job_id,
                 "--base-dir",
                 str(base_dir),
-                cwd=str(backend_dir),
+                cwd=str(package_dir),
                 stdout=log_file,
                 stderr=log_file,
             )

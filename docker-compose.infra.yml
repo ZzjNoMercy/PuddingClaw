@@ -40,7 +40,9 @@ services:
     ports:
       - "${POSTGRES_PORT:-5432}:5432"
     volumes:
-      - ./data/postgres:/var/lib/postgresql/data
+      - type: bind
+        source: ${PUDDINGCLAW_HOST_HOME:-${HOME}/.puddingclaw}/infrastructure/postgres
+        target: /var/lib/postgresql/data
       - ./scripts/postgres-init:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB} && psql -U $${POSTGRES_USER} -d $${POSTGRES_DB} -Atqc \"select 1 from pg_available_extensions where name='vector'\" | grep -qx 1"]
@@ -58,7 +60,9 @@ services:
       - ETCD_QUOTA_BACKEND_BYTES=4294967296
       - ETCD_SNAPSHOT_COUNT=50000
     volumes:
-      - ./data/milvus/etcd:/etcd
+      - type: bind
+        source: ${PUDDINGCLAW_HOST_HOME:-${HOME}/.puddingclaw}/infrastructure/milvus/etcd
+        target: /etcd
     command: >
       etcd
       --advertise-client-urls=http://milvus-etcd:2379
@@ -80,7 +84,9 @@ services:
     ports:
       - "${MINIO_CONSOLE_PORT:-127.0.0.1:19001}:9001"
     volumes:
-      - ./data/milvus/minio:/minio_data
+      - type: bind
+        source: ${PUDDINGCLAW_HOST_HOME:-${HOME}/.puddingclaw}/infrastructure/milvus/minio
+        target: /minio_data
     command: minio server /minio_data --console-address ":9001"
     restart: unless-stopped
     healthcheck:
@@ -99,7 +105,9 @@ services:
       ETCD_ENDPOINTS: milvus-etcd:2379
       MINIO_ADDRESS: milvus-minio:9000
     volumes:
-      - ./data/milvus/data:/var/lib/milvus
+      - type: bind
+        source: ${PUDDINGCLAW_HOST_HOME:-${HOME}/.puddingclaw}/infrastructure/milvus/data
+        target: /var/lib/milvus
     ports:
       - "19530:19530"
       - "9091:9091"

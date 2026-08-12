@@ -144,8 +144,10 @@ class SemanticDimensionBuildWorkerManager:
             )
             snapshot = dict(job.input_snapshot or {})
 
-        backend_dir = Path(__file__).resolve().parents[1]
-        task_dir = backend_dir / "data" / "semantic-dimension-build-jobs" / job_id
+        runtime_root = base_dir
+        definitions_root = runtime_root / "definitions"
+        package_root = Path(__file__).resolve().parents[1]
+        task_dir = runtime_root / "data" / "semantic-dimension-build-jobs" / job_id
         artifact_dir = task_dir / "artifacts"
         build_rule = snapshot.get("build_rule") if isinstance(snapshot.get("build_rule"), dict) else None
         if job.adapter == "entity_crosswalk_v1":
@@ -160,12 +162,12 @@ class SemanticDimensionBuildWorkerManager:
         else:
             relative_reference = "references/active_crosswalk.json"
         reference_path = task_dir / relative_reference
-        log_dir = backend_dir / "logs" / "semantic-dimension-build-jobs"
+        log_dir = runtime_root / "logs" / "semantic-dimension-build-jobs"
         task_dir.mkdir(parents=True, exist_ok=True)
         log_dir.mkdir(parents=True, exist_ok=True)
         log_path = log_dir / f"{job_id}.log"
         if job.adapter == "entity_crosswalk_v1":
-            script_path = backend_dir / "skills" / "build-semantic-dimension" / "scripts" / "entity_crosswalk_v1.py"
+            script_path = package_root / "skills" / "build-semantic-dimension" / "scripts" / "entity_crosswalk_v1.py"
             rule_path = task_dir / "build-rule.json"
             rule_path.write_text(json.dumps(build_rule, ensure_ascii=False, indent=2), encoding="utf-8")
             command = [
@@ -182,10 +184,10 @@ class SemanticDimensionBuildWorkerManager:
                 "--semantic-reference-path",
                 str(reference_path),
                 "--prior-reference-path",
-                str(backend_dir / "semantic-assets" / "dimensions" / job.dimension_id / relative_reference),
+                str(definitions_root / "semantic-assets" / "dimensions" / job.dimension_id / relative_reference),
             ]
         else:
-            script_path = backend_dir / "skills" / "build-semantic-dimension" / "scripts" / "vehicle_series_full.py"
+            script_path = package_root / "skills" / "build-semantic-dimension" / "scripts" / "vehicle_series_full.py"
             command = [
                 sys.executable,
                 str(script_path),
@@ -194,7 +196,7 @@ class SemanticDimensionBuildWorkerManager:
                 "--semantic-reference-path",
                 str(reference_path),
                 "--prior-reference-path",
-                str(backend_dir / "semantic-assets" / "dimensions" / "vehicle_series" / "references" / "byd_chery_demo.json"),
+                str(definitions_root / "semantic-assets" / "dimensions" / "vehicle_series" / "references" / "byd_chery_demo.json"),
             ]
             sales_file_name = str(snapshot.get("sales_file_name") or "").strip()
             source_id = str(snapshot.get("source_id") or "").strip()
@@ -207,7 +209,7 @@ class SemanticDimensionBuildWorkerManager:
         with log_path.open("ab") as log_file:
             process = await asyncio.create_subprocess_exec(
                 *command,
-                cwd=str(backend_dir),
+                cwd=str(package_root),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=log_file,
             )
@@ -228,7 +230,7 @@ class SemanticDimensionBuildWorkerManager:
         # inputs remain auditable. Jobs, however, should report what the user
         # will actually get after the already-approved manual rules are applied.
         staged_crosswalk = json.loads(reference_path.read_text(encoding="utf-8"))
-        crosswalk_state = load_crosswalk_state(backend_dir, job.dimension_id)
+        crosswalk_state = load_crosswalk_state(definitions_root, job.dimension_id)
         published_preview = materialize_crosswalk(staged_crosswalk, crosswalk_state["overrides"])
         preview_path = artifact_dir / "published-preview-crosswalk.json"
         preview_path.write_text(json.dumps(published_preview, ensure_ascii=False, indent=2), encoding="utf-8")

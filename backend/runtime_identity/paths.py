@@ -22,7 +22,10 @@ def resolve_puddingclaw_home() -> Path:
     candidate = Path(configured).expanduser() if configured else Path.home() / ".puddingclaw"
     if not candidate.is_absolute():
         raise ValueError("PUDDINGCLAW_HOME must be an absolute host path")
-    return candidate.resolve()
+    resolved = candidate.resolve(strict=False)
+    if resolved.exists() and not resolved.is_dir():
+        raise ValueError("PUDDINGCLAW_HOME must point to a directory, not a file")
+    return resolved
 
 
 def trusted_owner_user_id() -> str:
@@ -61,13 +64,124 @@ class PuddingClawPaths:
     def from_environment(cls) -> PuddingClawPaths:
         return cls(resolve_puddingclaw_home())
 
-    def shared_node_runtime(self, runtime_contract: str) -> Path:
-        """Return the user-global declarative Node runtime root.
+    def ensure_root(self) -> Path:
+        """Create and validate the user-owned root without touching package files."""
 
-        The runtime contract and architecture are part of the physical
-        identity because native addons built for one image/architecture must
-        never be consumed by another one.
-        """
+        self.root.mkdir(parents=True, exist_ok=True)
+        if not self.root.is_dir():
+            raise NotADirectoryError(f"PuddingClaw home is not a directory: {self.root}")
+        return self.root
+
+    def sessions(self) -> Path:
+        return self.root / "sessions"
+
+    def session_traces(self) -> Path:
+        return self.sessions() / "traces"
+
+    def session_archive(self) -> Path:
+        return self.sessions() / "archive"
+
+    def user_skills(self) -> Path:
+        return self.root / "skills"
+
+    def config(self) -> Path:
+        return self.root / "config"
+
+    def provider_registry(self) -> Path:
+        return self.config() / "providers.json"
+
+    def mcp_registry(self) -> Path:
+        return self.config() / "mcp.json"
+
+    def web_search_registry(self) -> Path:
+        return self.config() / "web-search.json"
+
+    def evaluation_settings(self) -> Path:
+        return self.config() / "evaluation.json"
+
+    def profile(self) -> Path:
+        return self.root / "profile"
+
+    def memory(self) -> Path:
+        return self.root / "memory"
+
+    def projects(self) -> Path:
+        return self.root / "projects"
+
+    def project_registry(self) -> Path:
+        return self.projects() / "registry.json"
+
+    def user_definitions(self) -> Path:
+        return self.root / "definitions"
+
+    def knowledge(self) -> Path:
+        return self.root / "knowledge"
+
+    def databases(self) -> Path:
+        return self.root / "db"
+
+    def data(self) -> Path:
+        return self.root / "data"
+
+    def usage(self) -> Path:
+        return self.data() / "usage"
+
+    def query_results(self) -> Path:
+        return self.data() / "query-results"
+
+    def agent_workspaces(self) -> Path:
+        return self.data() / "agent-workspaces"
+
+    def state(self) -> Path:
+        return self.root / "state"
+
+    def knowledge_index(self) -> Path:
+        return self.state() / "knowledge_index"
+
+    def knowledge_search(self) -> Path:
+        return self.state() / "knowledge-search"
+
+    def memory_index(self) -> Path:
+        return self.state() / "memory_index"
+
+    def skill_management(self) -> Path:
+        return self.data() / "skill-management"
+
+    def skill_evals(self) -> Path:
+        return self.data() / "skill-evals"
+
+    def cache(self) -> Path:
+        return self.root / "cache"
+
+    def logs(self) -> Path:
+        return self.root / "logs"
+
+    def temporary(self) -> Path:
+        return self.root / "tmp"
+
+    def owner_access(self, owner_user_id: str) -> Path:
+        owner = safe_identity_component(owner_user_id, field="owner_user_id")
+        return self.root / "users" / owner / "access"
+
+    def infrastructure(self) -> Path:
+        return self.root / "infrastructure"
+
+    def migrations(self) -> Path:
+        return self.root / "migrations"
+
+    def credentials_root(self, owner_user_id: str) -> Path:
+        owner = safe_identity_component(owner_user_id, field="owner_user_id")
+        return self.root / "users" / owner / "credentials"
+
+    def skill_secret_registry(self, owner_user_id: str) -> Path:
+        owner = safe_identity_component(owner_user_id, field="owner_user_id")
+        return self.root / "users" / owner / "skill-secrets" / "registry.enc"
+
+    def skill_runtime_bindings(self) -> Path:
+        return self.root / "runtime" / "skill-runtime-bindings.json"
+
+    def shared_node_runtime(self, runtime_contract: str) -> Path:
+        """Return the user-owned shared Node runtime for one contract and architecture."""
 
         contract = re.sub(r"[^A-Za-z0-9_.+-]+", "-", runtime_contract).strip("-")
         if not contract:
@@ -80,7 +194,7 @@ class PuddingClawPaths:
         skill_id: str,
         skill_version: str,
     ) -> Path:
-        """Return one Skill-version-isolated Python runtime root."""
+        """Return one user-owned, Skill-version-isolated Python runtime root."""
 
         contract = re.sub(r"[^A-Za-z0-9_.+-]+", "-", runtime_contract).strip("-")
         if not contract:
@@ -98,7 +212,7 @@ class PuddingClawPaths:
         )
 
     def python_environment_runtime(self, runtime_contract: str) -> Path:
-        """Return the dependency-hash-addressed Python environment store."""
+        """Return the user-owned dependency-hash-addressed Python environment store."""
 
         contract = re.sub(r"[^A-Za-z0-9_.+-]+", "-", runtime_contract).strip("-")
         if not contract:
@@ -108,18 +222,38 @@ class PuddingClawPaths:
     def python_uv_cache(self) -> Path:
         return self.root / "runtime" / "python" / "uv-cache"
 
-    def credentials_root(self, owner_user_id: str) -> Path:
-        owner = safe_identity_component(owner_user_id, field="owner_user_id")
-        return self.root / "users" / owner / "credentials"
-
-    def skill_secret_registry(self, owner_user_id: str) -> Path:
-        owner = safe_identity_component(owner_user_id, field="owner_user_id")
-        return self.root / "users" / owner / "skill-secrets" / "registry.enc"
-
-    def skill_runtime_bindings(self) -> Path:
-        return self.root / "runtime" / "skill-runtime-bindings.json"
-
     def provider_profile(self, owner_user_id: str, provider: str, profile_id: str) -> Path:
         provider_name = safe_identity_component(provider, field="provider")
         profile = safe_identity_component(profile_id, field="profile_id")
         return self.credentials_root(owner_user_id) / provider_name / profile
+
+    def ensure_layout(self) -> None:
+        """Create only user-state directories; bundled assets remain untouched."""
+
+        self.ensure_root()
+        for path in (
+            self.sessions(), self.session_traces(), self.session_archive(),
+            self.user_skills(), self.config(), self.profile(), self.memory() / "global",
+            self.memory() / "projects", self.projects(), self.user_definitions(),
+            self.user_definitions() / "semantic-assets", self.user_definitions() / "analytics-models",
+            self.user_definitions() / "sql-guardrails", self.knowledge(), self.databases(),
+            self.data(), self.usage(), self.query_results(), self.agent_workspaces(),
+            self.state(), self.skill_management(), self.skill_evals(), self.cache(),
+            self.logs(), self.temporary(), self.infrastructure(), self.migrations(),
+        ):
+            path.mkdir(parents=True, exist_ok=True)
+
+
+@dataclass(frozen=True)
+class PuddingClawPackagePaths:
+    """Read-only assets shipped with the application package."""
+
+    root: Path
+
+    @property
+    def bundled_skills(self) -> Path:
+        return self.root / "skills"
+
+    @property
+    def prompts(self) -> Path:
+        return self.root / "prompts"

@@ -168,6 +168,7 @@ def test_every_registered_agent_custom_tool_has_an_explicit_policy() -> None:
     }.issubset(BUSINESS_TOOLSETS["skill_management"])
     assert "edit_file" not in UNCONDITIONAL_TOOL_NAMES
     assert "read_later_save_url" in UNCONDITIONAL_TOOL_NAMES
+    assert "update_memory" in UNCONDITIONAL_TOOL_NAMES
     assert {
         "inspect_file_version",
         "patch_file",
@@ -199,6 +200,7 @@ def test_every_registered_tool_declares_a_control_descriptor() -> None:
     assert validate_tool_control_descriptors() == []
     assert TOOL_CONTROL_DESCRIPTORS["execute"].policy == "dynamic"
     assert TOOL_CONTROL_DESCRIPTORS["task"].policy == "inherit_parent"
+    assert TOOL_CONTROL_DESCRIPTORS["update_memory"].side_effect == "internal_mutation"
     assert TOOL_CONTROL_DESCRIPTORS["commit_external_artifact"].side_effect == "external_mutation"
 
 
@@ -252,7 +254,7 @@ def test_loaded_mcp_tools_are_default_visible_without_skill_activation(tmp_path)
         messages=[],
         tools=[
             {"name": "read_file"},
-            {"name": "database_sql_generate"},
+            {"name": "database_evidence_search"},
             {"name": "zhihuiya_patents_search"},
         ],
         state={"messages": []},
@@ -277,7 +279,7 @@ def test_capability_manifest_drives_prompt_and_visible_schema_from_same_state(tm
         tools=[
             {"name": "read_file"},
             {"name": "execute"},
-            {"name": "database_sql_generate"},
+            {"name": "database_evidence_search"},
         ],
         state=_active_skill_state(middleware, "database-analysis"),
     )
@@ -285,11 +287,11 @@ def test_capability_manifest_drives_prompt_and_visible_schema_from_same_state(tm
     updated = middleware._request_with_capability_manifest(request)
 
     visible = [tool["name"] for tool in updated.tools]
-    assert visible == ["read_file", "execute", "database_sql_generate"]
+    assert visible == ["read_file", "execute", "database_evidence_search"]
     prompt = str(updated.system_message.content)
     assert "Current Capability Manifest" in prompt
     assert '"active_skill_ids": ["database-analysis"]' in prompt
-    assert '"database_sql_generate"' in prompt
+    assert '"database_evidence_search"' in prompt
 
 
 def test_capability_manifest_prompt_is_stable_when_only_audit_time_changes(
@@ -694,7 +696,7 @@ def test_capability_manifest_recommends_concrete_inactive_skill_without_expandin
         system_message=SystemMessage(content="base"),
         tools=[
             {"name": "read_file"},
-            {"name": "database_sql_generate"},
+            {"name": "database_evidence_search"},
         ],
         state={
             "messages": [],
@@ -723,7 +725,8 @@ def test_capability_manifest_recommends_concrete_inactive_skill_without_expandin
     assert "/skills/database-analysis/SKILL.md" not in prompt
     assert "/skills/database-analysis/SKILL.md" in str(updated.messages[-1].content)
     assert '"allowed_tool_names": ["read_file"]' in prompt
-    assert '"reason": "skill_not_activated", "tool": "database_sql_generate"' in prompt
+    assert '"reason": "skill_not_activated"' in prompt
+    assert '"tool": "database_evidence_search"' in prompt
     assert '"activation_skill_ids": ["database-analysis"]' in prompt
     assert "recoverable capability dependency" in prompt
     audit_manifest = middleware._capability_manifest(
@@ -731,7 +734,7 @@ def test_capability_manifest_recommends_concrete_inactive_skill_without_expandin
         middleware._visible_tools(request),
     )
     assert [item.skill_id for item in audit_manifest.recommended_inactive_skills] == ["database-analysis"]
-    unavailable = next(item for item in audit_manifest.unavailable_tools if item["tool"] == "database_sql_generate")
+    unavailable = next(item for item in audit_manifest.unavailable_tools if item["tool"] == "database_evidence_search")
     assert unavailable["activation_skill_ids"] == ["database-analysis"]
 
 
@@ -1065,7 +1068,7 @@ def test_hash_bound_session_cache_fast_activates_only_a_routed_skill(
 
     assert update["active_skill_ids"] == ["database-analysis"]
     assert update["skill_activations"][0]["source_tool_call_id"].startswith("skill-cache:task-profile:")
-    assert "database_sql_generate" in middleware._allowed_tool_names(
+    assert "database_evidence_search" in middleware._allowed_tool_names(
         update,
         policy_epoch=policy_before["policy_epoch"],
     )
@@ -1073,14 +1076,14 @@ def test_hash_bound_session_cache_fast_activates_only_a_routed_skill(
         model=None,
         messages=[HumanMessage(content="继续")],
         system_message=SystemMessage(content="base"),
-        tools=[{"name": "read_file"}, {"name": "database_sql_generate"}],
+        tools=[{"name": "read_file"}, {"name": "database_evidence_search"}],
         state={"messages": [], **update},
         runtime=runtime,
     )
     visible = middleware._request_with_capability_manifest(request)
     assert [item["name"] for item in visible.tools] == [
         "read_file",
-        "database_sql_generate",
+        "database_evidence_search",
     ]
     assert "# Test" in str(visible.system_message.content)
     assert "grants no permissions by itself" in str(visible.system_message.content)
@@ -1228,7 +1231,7 @@ def test_inactive_tool_call_loads_unique_cached_skill_without_execution(
     executed: list[str] = []
     request = ToolCallRequest(
         tool_call={
-            "name": "database_sql_generate",
+            "name": "database_evidence_search",
             "args": {"question": "查看配置项取值"},
             "id": "call-dynamic",
             "type": "tool_call",
@@ -1244,7 +1247,7 @@ def test_inactive_tool_call_loads_unique_cached_skill_without_execution(
             executed.append("executed")
             or ToolMessage(
                 content="should not execute",
-                name="database_sql_generate",
+                name="database_evidence_search",
                 tool_call_id="call-dynamic",
                 status="success",
             )
@@ -1255,7 +1258,7 @@ def test_inactive_tool_call_loads_unique_cached_skill_without_execution(
     assert isinstance(result, ToolMessage)
     assert result.name == "load_skill_context"
     assert result.status == "error"
-    assert "原始 `database_sql_generate` 调用没有执行" in str(result.content)
+    assert "原始 `database_evidence_search` 调用没有执行" in str(result.content)
     persisted = session_manager.get_effective_run_skill_activations(
         run.session_id,
         run.run_id,
@@ -1276,14 +1279,14 @@ def test_inactive_tool_call_loads_unique_cached_skill_without_execution(
             model=None,
             messages=[HumanMessage(content="继续")],
             system_message=SystemMessage(content="base"),
-            tools=[{"name": "read_file"}, {"name": "database_sql_generate"}],
+            tools=[{"name": "read_file"}, {"name": "database_evidence_search"}],
             state={"messages": [], **model_state},
             runtime=runtime,
         )
     )
     assert [item["name"] for item in visible.tools] == [
         "read_file",
-        "database_sql_generate",
+        "database_evidence_search",
     ]
     assert "# Test" in str(visible.system_message.content)
     assert session_manager.list_permission_grants(run.session_id) == []
@@ -1818,9 +1821,12 @@ def test_skill_router_prompt_is_transient_and_preserves_message_identity() -> No
     routed = middleware._request_with_routing_prompt(request)
 
     assert state["messages"] == [original]
-    assert len(routed.messages) == 1
+    assert len(routed.messages) == 2
+    assert routed.messages[0] is original
     assert routed.messages[0].id == "user-message"
-    assert "[系统 Skill 提示]" in str(routed.messages[0].content)
+    assert routed.messages[0].content == original.content
+    assert routed.messages[-1].additional_kwargs["puddingclaw_prompt_control"] is True
+    assert "[PuddingClaw internal control: skill_routing]" in str(routed.messages[-1].content)
 
 
 def test_explicit_skill_token_is_removed_from_model_task_text() -> None:
@@ -1846,10 +1852,11 @@ def test_explicit_skill_token_is_removed_from_model_task_text() -> None:
     )
 
     routed = middleware._request_with_routing_prompt(request)
-    task_text, routing_hint = str(routed.messages[0].content).split("\n\n[系统 Skill 提示]", 1)
-
-    assert task_text == ("重新设计byd_sales_launch_correlation.html的样式，并重新补充比亚迪每个月上市车系和款型明细")
-    assert "/baoyu-design 重新设计byd_sales_launch_correlation.html" not in str(routed.messages[0].content)
+    assert routed.messages[0] is original
+    assert routed.messages[0].content == original.content
+    routing_hint = str(routed.messages[-1].content)
+    assert "规范化任务文本（仅供路由参考）：重新设计byd_sales_launch_correlation.html的样式，并重新补充比亚迪每个月上市车系和款型明细" in routing_hint
+    assert "/baoyu-design 重新设计byd_sales_launch_correlation.html" not in routing_hint
     assert "/baoyu-design 是 Skill 调用标记" in routing_hint
     assert "不得并行调用其他工具" in routing_hint
     assert request.messages == [original]
@@ -2050,5 +2057,8 @@ def test_skill_intent_router_surfaces_explicit_missing_skill() -> None:
 
     routed = middleware._request_with_routing_prompt(request)
 
-    assert "missing-demo" in str(routed.messages[0].content)
-    assert "当前未安装" in str(routed.messages[0].content)
+    assert routed.messages[0] is original
+    assert routed.messages[0].content == original.content
+    control = str(routed.messages[-1].content)
+    assert "missing-demo" in control
+    assert "当前未安装" in control

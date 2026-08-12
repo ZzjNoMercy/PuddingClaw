@@ -734,6 +734,64 @@ def test_host_cli_projection_exposes_only_public_declared_bins(tmp_path):
     assert (roots[0] / "public-bin" / "prettier").resolve(strict=True).is_file()
 
 
+def test_host_installer_can_write_only_its_unpublished_candidate(tmp_path, monkeypatch):
+    from harness import host_skill_runtime
+
+    paths = PuddingClawPaths(tmp_path / ".puddingclaw")
+    host = HostSkillRuntimeBackend(paths)
+    host._ensure_roots()  # noqa: SLF001
+    candidate = host._runtime_root / "candidate"  # noqa: SLF001
+    candidate.mkdir()
+    captured = {}
+
+    class FakeRunner:
+        def __init__(self, profile, *, runtime_root):
+            captured["profile"] = profile
+            captured["runtime_root"] = runtime_root
+            self.home = runtime_root / "home"
+            self.tmp = profile.scratch_root / "tmp"
+
+        @staticmethod
+        def execute(*_args, **_kwargs):
+            return ExecuteResponse(output="ok", exit_code=0)
+
+    monkeypatch.setattr(host_skill_runtime, "MacOSSeatbeltRunner", FakeRunner)
+
+    result = host._run_installer(candidate, "true")  # noqa: SLF001
+
+    assert result.exit_code == 0
+    assert captured["profile"].workspace_root == candidate.resolve()
+    assert captured["profile"].workspace_writable is True
+    assert candidate.resolve() in captured["profile"].write_roots
+
+
+def test_lark_host_credential_projection_round_trips_encrypted_files(tmp_path, monkeypatch):
+    from runtime_identity import host_credentials
+    from runtime_identity.adapters import LarkManagedCliAdapter
+
+    monkeypatch.setattr(host_credentials.sys, "platform", "darwin")
+    spec = LarkManagedCliAdapter().credential_state
+    home = tmp_path / "home"
+    linux = home / ".lark-cli" / ".credential-data" / "lark-cli"
+    linux.mkdir(parents=True)
+    (linux / "master.key").write_bytes(b"k" * 32)
+    (linux / "account.enc").write_bytes(b"old-ciphertext")
+
+    host_credentials.prepare_host_credential_state(spec, home)
+
+    darwin = home / "Library" / "Application Support" / "lark-cli"
+    assert (darwin / "master.key.file").read_bytes() == b"k" * 32
+    assert (darwin / "account.enc").read_bytes() == b"old-ciphertext"
+    (darwin / "account.enc").write_bytes(b"rotated-ciphertext")
+    (darwin / "second.enc").write_bytes(b"new-ciphertext")
+
+    host_credentials.collect_host_credential_state(spec, home)
+
+    assert (linux / "master.key").read_bytes() == b"k" * 32
+    assert (linux / "account.enc").read_bytes() == b"rotated-ciphertext"
+    assert (linux / "second.enc").read_bytes() == b"new-ciphertext"
+
+
 def test_host_node_skill_projection_exposes_declared_skill_bin(tmp_path):
     paths = PuddingClawPaths(tmp_path / ".puddingclaw")
     host = HostSkillRuntimeBackend(paths)

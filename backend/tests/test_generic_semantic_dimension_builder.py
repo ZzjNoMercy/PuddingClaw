@@ -154,12 +154,16 @@ def test_generic_dimension_builder_uses_hitl_selected_canonical_attachment_and_p
     asyncio.run(run())
 
 
-def test_append_source_locks_existing_crosswalk_and_cannot_change_canonical_entities(tmp_path: Path) -> None:
+def test_append_source_locks_existing_crosswalk_and_cannot_change_canonical_entities(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     async def run() -> None:
-        backend_dir = tmp_path / "backend"
-        attachment_store.initialize(backend_dir)
+        home = tmp_path / "puddingclaw-home"
+        definitions = home / "definitions"
+        monkeypatch.setenv("PUDDINGCLAW_HOME", str(home))
+        attachment_store.initialize(home)
         session_id = "append-source-e2e"
-        dimension_dir = backend_dir / "semantic-assets" / "dimensions" / "vehicle_series"
+        dimension_dir = definitions / "semantic-assets" / "dimensions" / "vehicle_series"
         references = dimension_dir / "references"
         references.mkdir(parents=True)
         active = {
@@ -222,7 +226,6 @@ def test_append_source_locks_existing_crosswalk_and_cannot_change_canonical_enti
             build_rule_from_decision(request, wrong)
 
         adapter = _load_generic_adapter()
-        adapter.BASE_DIR = backend_dir
         staging = tmp_path / "staging"
         rule_path = staging / "build-rule.json"
         rule_path.parent.mkdir(parents=True)

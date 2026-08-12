@@ -76,8 +76,10 @@ def test_system_sections_collect_repeated_run_deltas_and_keep_messages_separate(
     prompt = (
         "## Stable Core\ncore\n"
         "## Current Run Delta\nfirst\n"
-        "## Project Context\nproject\n"
+        "## Project AGENTS\nproject\n"
         "## Current Run Delta\nsecond\n"
+        "## Agent Core\ndependency base prompt\n"
+        "## User AGENTS Additions\nuser suffix\n"
         "## Active Skill Instructions\nskill\n"
     )
     changed = prompt.replace("second", "changed")
@@ -100,9 +102,43 @@ def test_system_sections_collect_repeated_run_deltas_and_keep_messages_separate(
     assert first["system_volatile_tail_hash"] != second["system_volatile_tail_hash"]
     assert first["messages_history_hash"] == second["messages_history_hash"]
     ordered = reorder_system_prompt_sections(prompt)
-    assert ordered.index("## Stable Core") < ordered.index("## Project Context")
-    assert ordered.index("## Project Context") < ordered.index("## Active Skill Instructions")
+    assert ordered.index("## Stable Core") < ordered.index("## Project AGENTS")
+    assert ordered.index("## Agent Core") < ordered.index("## Project AGENTS")
+    assert ordered.index("## Agent Core") < ordered.index("## User AGENTS Additions")
+    assert ordered.index("## User AGENTS Additions") < ordered.index("## Project AGENTS")
+    assert ordered.index("## Project AGENTS") < ordered.index("## Active Skill Instructions")
     assert ordered.rindex("## Current Run Delta") > ordered.index("## Active Skill Instructions")
+    assert first["system_user_agents_hash"] == second["system_user_agents_hash"]
+    assert ordered.endswith("second")
+
+
+def test_compatibility_prompt_keeps_system_layers_before_user_agents(tmp_path: Path) -> None:
+    from graph.prompt_builder import build_system_prompt
+
+    prompts = tmp_path / "prompts"
+    prompts.mkdir()
+    for name, content in (
+        ("SOUL.md", "SYSTEM SOUL"),
+        ("IDENTITY.md", "SYSTEM IDENTITY"),
+        ("USER.md", "IGNORED SYSTEM USER"),
+        ("AGENTS.md", "SYSTEM AGENTS"),
+    ):
+        (prompts / name).write_text(content, encoding="utf-8")
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    (profile / "AGENTS.md").write_text("USER AGENT ADDITION", encoding="utf-8")
+    (profile / "IDENTITY.md").write_text("IGNORED USER IDENTITY", encoding="utf-8")
+    (profile / "USER.md").write_text("IGNORED USER PROFILE", encoding="utf-8")
+
+    prompt = build_system_prompt(tmp_path, runtime_root=tmp_path)
+
+    assert prompt.index("SYSTEM SOUL") < prompt.index("SYSTEM IDENTITY")
+    assert prompt.index("SYSTEM IDENTITY") < prompt.index("SYSTEM AGENTS")
+    assert prompt.index("SYSTEM AGENTS") < prompt.index("## User AGENTS Additions")
+    assert "IGNORED SYSTEM USER" not in prompt
+    assert "IGNORED USER IDENTITY" not in prompt
+    assert "IGNORED USER PROFILE" not in prompt
+    assert prompt.endswith("USER AGENT ADDITION")
 
 
 def test_tail_control_preserves_user_message_and_has_one_sorted_tail() -> None:

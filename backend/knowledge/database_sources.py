@@ -20,6 +20,16 @@ from knowledge.models import KnowledgeBase, KnowledgeDatabaseSource, utcnow
 from knowledge.service import DEFAULT_KNOWLEDGE_BASE_ID
 
 
+def _credential_store():
+    from provider_registry import LocalCredentialStore
+
+    return LocalCredentialStore()
+
+
+def _database_credential_ref(source_id: str) -> str:
+    return f"vault://users/local/credentials/database-source-{source_id}"
+
+
 class KnowledgeDatabaseSourceError(RuntimeError):
     """Raised when a database source cannot be loaded or tested."""
 
@@ -111,6 +121,7 @@ def _project_postgres_connection_source(saved: KnowledgeDatabaseSource | None = 
 
 def _public_source_dict(source: KnowledgeDatabaseSource | dict[str, Any]) -> dict[str, Any]:
     if isinstance(source, KnowledgeDatabaseSource):
+        metadata = source.source_metadata if isinstance(source.source_metadata, dict) else {}
         payload = {
             "id": source.id,
             "source_type": source.source_type,
@@ -120,12 +131,13 @@ def _public_source_dict(source: KnowledgeDatabaseSource | dict[str, Any]) -> dic
             "port": source.port,
             "database": source.database,
             "username": source.username,
-            "password": source.password,
+            "password": "",
             "selected_tables": source.selected_tables or [],
             "builtin": bool((source.source_metadata or {}).get("builtin")),
             "created_at": source.created_at.isoformat() if source.created_at else None,
             "updated_at": source.updated_at.isoformat() if source.updated_at else None,
         }
+        payload["password_configured"] = bool(metadata.get("credential_ref") or source.password)
     else:
         payload = dict(source)
     payload["type"] = payload.get("source_type") or payload.get("type") or "postgresql"
@@ -137,13 +149,24 @@ def _public_source_dict(source: KnowledgeDatabaseSource | dict[str, Any]) -> dic
 
 def _connection_source(source: KnowledgeDatabaseSource | dict[str, Any]) -> dict[str, Any]:
     if isinstance(source, KnowledgeDatabaseSource):
+        metadata = source.source_metadata if isinstance(source.source_metadata, dict) else {}
+        reference = str(metadata.get("credential_ref") or _database_credential_ref(source.id))
+        if source.password and not metadata.get("credential_ref"):
+            # One-way compatibility migration for pre-Vault rows.  Do not
+            # continue treating the ORM password column as an ordinary
+            # credential source after it has been imported.
+            reference = _credential_store().put(f"database-source-{source.id}", source.password)
+            metadata = dict(metadata)
+            metadata["credential_ref"] = reference
+            source.source_metadata = metadata
+            source.password = ""
         return {
             "source_type": source.source_type,
             "host": source.host,
             "port": source.port,
             "database": source.database,
             "username": source.username,
-            "password": source.password,
+            "password": _credential_store().get(reference),
         }
     return _sanitize_payload(source)
 
@@ -256,10 +279,14 @@ async def upsert_database_source(
     existing.port = data["port"]
     existing.database = data["database"]
     existing.username = data["username"]
-    if data.get("password"):
-        existing.password = data["password"]
-    elif not existing.password:
-        existing.password = data.get("password") or ""
+    secret = str(data.get("password") or "")
+    metadata = dict(existing.source_metadata or {})
+    if secret:
+        metadata["credential_ref"] = _credential_store().put(f"database-source-{existing.id}", secret)
+    elif existing.password and not metadata.get("credential_ref"):
+        metadata["credential_ref"] = _credential_store().put(f"database-source-{existing.id}", existing.password)
+    existing.password = ""
+    existing.source_metadata = metadata
     existing.selected_tables = data["selected_tables"]
     existing.updated_at = utcnow()
     await session.commit()

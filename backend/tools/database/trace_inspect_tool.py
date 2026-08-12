@@ -8,6 +8,7 @@ from typing import Any, Type
 
 from langchain_core.tools import BaseTool
 from pydantic import BaseModel
+from runtime_identity.paths import PuddingClawPaths
 
 from .models import DatabaseQueryTraceInspectInput
 
@@ -30,7 +31,7 @@ class DatabaseQueryTraceInspectTool(BaseTool):
             sid = str(session_id or "").strip()
             if not sid.startswith("session-"):
                 sid = f"session-{sid}"
-            path = Path(self.base_dir) / "sessions" / f"{sid}.json"
+            path = PuddingClawPaths.from_environment().sessions() / f"{sid}.json"
             if not path.exists():
                 return f"🧮 Trace 检查失败：session 文件不存在：{path}"
             payload = json.loads(path.read_text(encoding="utf-8"))

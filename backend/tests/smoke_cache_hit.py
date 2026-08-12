@@ -75,7 +75,7 @@ def _build_llm():
         print("[SKIP] DEEPSEEK_API_KEY 未配置或仍是占位符。")
         print("       请在以下任一位置设置真实 key：")
         print("         1. backend/.env:        DEEPSEEK_API_KEY=sk-...")
-        print("         2. backend/config.json: fallback_llm.api_key")
+        print("         2. configure the Provider credential in Settings")
         print("         3. shell env:           export DEEPSEEK_API_KEY=sk-...")
         sys.exit(1)
     return ChatDeepSeek(
@@ -140,14 +140,11 @@ async def scenario_b_project_prompt(llm) -> bool:
     print("=" * 70)
 
     from graph.prompt_builder import build_system_prompt
-    from config import get_memory_backend, get_rag_mode
+    from runtime_identity.paths import PuddingClawPaths
 
     system_text = build_system_prompt(
         base_dir=BACKEND_DIR,
-        rag_mode=get_rag_mode(),
-        memory_backend=get_memory_backend(),
-        mem0_context="",
-        rag_context="",
+        runtime_root=PuddingClawPaths.from_environment().root,
         tool_reminder=False,
     )
     print(f"  真实 system_prompt 字节数: {len(system_text.encode('utf-8'))}")

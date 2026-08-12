@@ -38,8 +38,6 @@ attrs==26.1.0
     #   aiohttp
     #   jsonschema
     #   referencing
-backoff==2.2.1
-    # via posthog
 banks==2.4.3
     # via llama-index-core
 beautifulsoup4==4.15.0
@@ -72,6 +70,7 @@ colorama==0.4.6
 cryptography==49.0.0
     # via
     #   google-auth
+    #   puddingclaw-backend
     #   pyjwt
 dataclasses-json==0.6.7
     # via llama-index-core
@@ -90,7 +89,6 @@ distro==1.9.0
     #   google-genai
     #   langsmith
     #   openai
-    #   posthog
 docstring-parser==0.18.0
     # via anthropic
 et-xmlfile==2.0.0
@@ -100,6 +98,7 @@ fastapi==0.138.0
 filelock==3.29.4
     # via
     #   huggingface-hub
+    #   puddingclaw-backend
     #   transformers
 filetype==1.2.0
     # via
@@ -130,19 +129,13 @@ griffelib==2.1.0
     #   griffe
     #   griffecli
 grpcio==1.81.1
-    # via
-    #   pymilvus
-    #   qdrant-client
+    # via pymilvus
 h11==0.16.0
     # via
     #   httpcore
     #   uvicorn
-h2==4.3.0
-    # via httpx
 hf-xet==1.5.1 ; platform_machine == 'aarch64' or platform_machine == 'amd64' or platform_machine == 'arm64' or platform_machine == 'x86_64'
     # via huggingface-hub
-hpack==4.1.0
-    # via h2
 html2text==2025.4.15
     # via puddingclaw-backend
 httpcore==1.0.9
@@ -159,7 +152,6 @@ httpx==0.28.1
     #   mcp
     #   openai
     #   puddingclaw-backend
-    #   qdrant-client
 httpx-sse==0.4.3
     # via
     #   langchain-community
@@ -168,14 +160,14 @@ huggingface-hub==0.36.2
     # via
     #   tokenizers
     #   transformers
-hyperframe==6.1.0
-    # via h2
 idna==3.18
     # via
     #   anyio
     #   httpx
     #   requests
     #   yarl
+jieba==0.42.1
+    # via puddingclaw-backend
 jinja2==3.1.6
     # via banks
 jiter==0.15.0
@@ -280,8 +272,6 @@ marshmallow==3.26.2
     # via dataclasses-json
 mcp==1.28.0
     # via langchain-mcp-adapters
-mem0ai==2.0.7
-    # via puddingclaw-backend
 multidict==6.7.1
     # via
     #   aiohttp
@@ -302,7 +292,6 @@ numpy==2.4.6 ; python_full_version < '3.12'
     #   langchain-community
     #   llama-index-core
     #   pandas
-    #   qdrant-client
     #   rank-bm25
     #   transformers
 numpy==2.5.0 ; python_full_version >= '3.12'
@@ -311,14 +300,12 @@ numpy==2.5.0 ; python_full_version >= '3.12'
     #   langchain-community
     #   llama-index-core
     #   pandas
-    #   qdrant-client
     #   rank-bm25
     #   transformers
 openai==2.43.0
     # via
     #   langchain-openai
     #   llama-index-embeddings-openai
-    #   mem0ai
     #   puddingclaw-backend
 openpyxl==3.1.5
     # via puddingclaw-backend
@@ -351,19 +338,12 @@ platformdirs==4.10.0
     #   llama-index-core
 plotly==6.8.0
     # via puddingclaw-backend
-portalocker==3.2.0
-    # via qdrant-client
-posthog==7.20.2
-    # via mem0ai
 propcache==0.5.2
     # via
     #   aiohttp
     #   yarl
 protobuf==6.33.6
-    # via
-    #   mem0ai
-    #   pymilvus
-    #   qdrant-client
+    # via pymilvus
 pyarrow==24.0.0
     # via puddingclaw-backend
 pyasn1==0.6.3
@@ -389,11 +369,9 @@ pydantic==2.13.4
     #   llama-index-instrumentation
     #   llama-index-workflows
     #   mcp
-    #   mem0ai
     #   openai
     #   puddingclaw-backend
     #   pydantic-settings
-    #   qdrant-client
 pydantic-core==2.46.4
     # via pydantic
 pydantic-settings==2.14.2
@@ -419,12 +397,8 @@ python-multipart==0.0.32
     # via
     #   mcp
     #   puddingclaw-backend
-pytz==2026.2
-    # via mem0ai
 pywin32==312 ; sys_platform == 'win32'
-    # via
-    #   mcp
-    #   portalocker
+    # via mcp
 pyyaml==6.0.3
     # via
     #   huggingface-hub
@@ -435,8 +409,6 @@ pyyaml==6.0.3
     #   puddingclaw-backend
     #   transformers
     #   uvicorn
-qdrant-client==1.18.0
-    # via mem0ai
 rank-bm25==0.2.2
     # via puddingclaw-backend
 referencing==0.37.0
@@ -457,7 +429,6 @@ requests==2.34.2
     #   langchain-community
     #   langsmith
     #   llama-index-core
-    #   posthog
     #   puddingclaw-backend
     #   pymilvus
     #   requests-toolbelt
@@ -492,8 +463,9 @@ sqlalchemy==2.0.51
     #   langchain-classic
     #   langchain-community
     #   llama-index-core
-    #   mem0ai
     #   puddingclaw-backend
+sqlglot==30.13.0
+    # via puddingclaw-backend
 sqlparse==0.5.5
     # via puddingclaw-backend
 sse-starlette==3.4.5
@@ -554,7 +526,6 @@ typing-extensions==4.15.0
     #   llama-index-workflows
     #   mcp
     #   openai
-    #   posthog
     #   pydantic
     #   pydantic-core
     #   referencing
@@ -576,7 +547,7 @@ tzdata==2026.2 ; sys_platform == 'emscripten' or sys_platform == 'win32'
     # via pandas
 urllib3==2.7.0
     # via
-    #   qdrant-client
+    #   puddingclaw-backend
     #   requests
 uuid-utils==0.16.2
     # via

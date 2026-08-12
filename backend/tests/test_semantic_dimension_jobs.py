@@ -116,14 +116,18 @@ def test_semantic_dimension_build_job_is_deduplicated_and_never_auto_published(t
     asyncio.run(run())
 
 
-def test_publish_semantic_dimension_build_activates_crosswalk_and_backwrites_job(tmp_path) -> None:
+def test_publish_semantic_dimension_build_activates_crosswalk_and_backwrites_job(
+    tmp_path, monkeypatch
+) -> None:
     async def run() -> None:
         engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'jobs.db'}")
         async with engine.begin() as connection:
             await connection.run_sync(Base.metadata.create_all)
         sessionmaker = async_sessionmaker(engine, expire_on_commit=False)
 
-        base_dir = tmp_path / "backend"
+        home = tmp_path / "puddingclaw-home"
+        monkeypatch.setenv("PUDDINGCLAW_HOME", str(home))
+        base_dir = home / "definitions"
         dimension_dir = base_dir / "semantic-assets" / "dimensions" / "vehicle_series"
         dimension_dir.mkdir(parents=True)
         (dimension_dir / "dimension.md").write_text(
@@ -213,7 +217,9 @@ def test_baseline_shrink_e2e_keeps_active_unchanged_until_publish_then_inactivat
         async with engine.begin() as connection:
             await connection.run_sync(Base.metadata.create_all)
         sessionmaker = async_sessionmaker(engine, expire_on_commit=False)
-        base_dir = tmp_path / "backend"
+        home = tmp_path / "puddingclaw-home"
+        monkeypatch.setenv("PUDDINGCLAW_HOME", str(home))
+        base_dir = home / "definitions"
         _write_publishable_dimension(base_dir)
         publish_generated_crosswalk(base_dir, "vehicle_series", _crosswalk())
         references = base_dir / "semantic-assets" / "dimensions" / "vehicle_series" / "references"
@@ -223,7 +229,6 @@ def test_baseline_shrink_e2e_keeps_active_unchanged_until_publish_then_inactivat
         staging_path = tmp_path / "staging" / "full_crosswalk.json"
         staging_path.parent.mkdir(parents=True)
         staging_path.write_text(json.dumps(_crosswalk(include_han=False), ensure_ascii=False), encoding="utf-8")
-        monkeypatch.setattr(analytics_api, "BASE_DIR", base_dir)
 
         async with sessionmaker() as session:
             job, _ = await create_semantic_dimension_build_job(
@@ -282,7 +287,9 @@ def test_baseline_shrink_e2e_remove_only_takes_effect_after_publish(tmp_path, mo
         async with engine.begin() as connection:
             await connection.run_sync(Base.metadata.create_all)
         sessionmaker = async_sessionmaker(engine, expire_on_commit=False)
-        base_dir = tmp_path / "backend"
+        home = tmp_path / "puddingclaw-home"
+        monkeypatch.setenv("PUDDINGCLAW_HOME", str(home))
+        base_dir = home / "definitions"
         _write_publishable_dimension(base_dir)
         publish_generated_crosswalk(base_dir, "vehicle_series", _crosswalk())
         references = base_dir / "semantic-assets" / "dimensions" / "vehicle_series" / "references"
@@ -291,7 +298,6 @@ def test_baseline_shrink_e2e_remove_only_takes_effect_after_publish(tmp_path, mo
         staging_path = tmp_path / "staging" / "full_crosswalk.json"
         staging_path.parent.mkdir(parents=True)
         staging_path.write_text(json.dumps(_crosswalk(include_han=False), ensure_ascii=False), encoding="utf-8")
-        monkeypatch.setattr(analytics_api, "BASE_DIR", base_dir)
 
         async with sessionmaker() as session:
             job, _ = await create_semantic_dimension_build_job(session, dimension_id="vehicle_series", adapter="entity_crosswalk_v1")

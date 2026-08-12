@@ -42,7 +42,9 @@ def _write_multimodal_manifest(
     text_result: dict[str, Any],
     multimodal_result: dict[str, Any],
 ) -> str:
-    manifest_path = base_dir / "storage" / "knowledge_index" / "multimodal_manifest.json"
+    from runtime_identity.paths import PuddingClawPaths
+
+    manifest_path = PuddingClawPaths.from_environment().state() / "knowledge_index" / "multimodal_manifest.json"
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
     knowledge_dir = get_knowledge_root(base_dir)
     payload = {
@@ -128,7 +130,9 @@ def refresh_multimodal_knowledge_index(base_dir: Path, progress_callback: Vector
     """
 
     knowledge_dir = get_knowledge_root(base_dir)
-    storage_dir = base_dir / "storage" / "knowledge_index"
+    from runtime_identity.paths import PuddingClawPaths
+
+    storage_dir = PuddingClawPaths.from_environment().state() / "knowledge_index"
     markdown_files = _collect_markdown_files(knowledge_dir) if knowledge_dir.exists() else []
     image_files = _collect_image_files(knowledge_dir) if knowledge_dir.exists() else []
     if not knowledge_dir.exists() or not markdown_files:
@@ -226,7 +230,9 @@ def _try_build_multimodal_index(
     progress_callback: VectorProgressCallback | None = None,
     replace_document_virtual_path: str | None = None,
 ) -> dict[str, Any]:
-    multimodal_storage_dir = base_dir / "storage" / "knowledge_multimodal_index"
+    from runtime_identity.paths import PuddingClawPaths
+
+    multimodal_storage_dir = PuddingClawPaths.from_environment().state() / "knowledge_multimodal_index"
     try:
         from llama_index.core import StorageContext
         from llama_index.core.indices.multi_modal import MultiModalVectorStoreIndex

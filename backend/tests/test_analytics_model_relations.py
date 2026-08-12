@@ -42,6 +42,80 @@ def _prepare_relations(tmp_path) -> tuple[str, str]:
     return binding["id"], direct["id"]
 
 
+def _write_reusable_model_fixture(base_dir: Path) -> str:
+    """Create a complete model bundle used by tests instead of shipped assets."""
+
+    dimension_dir = base_dir / "semantic-assets" / "dimensions" / "energy"
+    dimension_dir.mkdir(parents=True)
+    (dimension_dir / "dimension.md").write_text(
+        """---
+formatter: semantic-asset
+name: Energy
+type: dimension
+enum_universe: [pure, hybrid]
+classifications:
+  electric: [pure]
+  fuel: [hybrid]
+---
+
+# Energy
+""",
+        encoding="utf-8",
+    )
+
+    model_dir = base_dir / "analytics-models" / "reusable"
+    for template_id, assets in {
+        "monthly": ["report-renderer.js", "charts.js"],
+        "topic": ["theme.css", "report-renderer.js", "charts.js"],
+    }.items():
+        template_dir = model_dir / "templates" / template_id
+        template_dir.mkdir(parents=True)
+        (template_dir / "index.html").write_text(
+            '<script id="report-payload" type="application/json"></script>\n'
+            '<script src="report-renderer.js"></script>',
+            encoding="utf-8",
+        )
+        (template_dir / "TEMPLATE.md").write_text(
+            f"""---
+formatter: analytics-template
+id: {template_id}
+semantic_scope:
+  enum_filters:
+    dimension:energy:
+      members: [pure]
+      classifications: [electric]
+---
+# {template_id}
+""",
+            encoding="utf-8",
+        )
+        for asset_name in assets:
+            (template_dir / asset_name).write_text(f"/* {asset_name} */", encoding="utf-8")
+
+    (model_dir / "model.md").write_text(
+        """---
+formatter: analytics-model
+id: reusable
+name: Reusable Analytics
+semantic_assets:
+  dimensions: [dimension:energy]
+templates:
+  monthly:
+    path: templates/monthly/index.html
+    guide: templates/monthly/TEMPLATE.md
+    assets: [templates/monthly/report-renderer.js, templates/monthly/charts.js]
+  topic:
+    path: templates/topic/index.html
+    guide: templates/topic/TEMPLATE.md
+    assets: [templates/topic/theme.css, templates/topic/report-renderer.js, templates/topic/charts.js]
+---
+# Reusable Analytics
+""",
+        encoding="utf-8",
+    )
+    return "reusable"
+
+
 def test_template_paths_have_one_model_relative_canonical_form() -> None:
     assert canonical_model_resource_path("monthly/index.html", root="templates") == "templates/monthly/index.html"
     assert (
@@ -62,95 +136,71 @@ def test_template_paths_have_one_model_relative_canonical_form() -> None:
             canonical_model_resource_path(invalid, root="templates")
 
 
-def test_product_config_monthly_template_resolves_guide_manifest_and_paths() -> None:
-    base_dir = Path(__file__).resolve().parents[1]
+def test_reusable_monthly_template_resolves_guide_manifest_and_paths(tmp_path: Path) -> None:
+    base_dir = tmp_path / "definitions"
+    model_id = _write_reusable_model_fixture(base_dir)
     models = AnalyticsModelRegistry(base_dir)
     models.refresh()
 
-    context = models.get_model_context("产品配置分析")
+    context = models.get_model_context(model_id)
 
-    template = context["resolved_templates"]["monthly_product_config_report"]
-    assert template["virtual_path"] == (
-        "/analytics-models/产品配置分析/templates/monthly_product_config_report/index.html"
-    )
-    assert template["guide_virtual_path"] == (
-        "/analytics-models/产品配置分析/templates/monthly_product_config_report/TEMPLATE.md"
-    )
+    template = context["resolved_templates"]["monthly"]
+    assert template["virtual_path"] == "/analytics-models/reusable/templates/monthly/index.html"
+    assert template["guide_virtual_path"] == "/analytics-models/reusable/templates/monthly/TEMPLATE.md"
     assert template["asset_virtual_paths"] == [
-        "/analytics-models/产品配置分析/templates/monthly_product_config_report/report-renderer.js",
-        "/analytics-models/产品配置分析/templates/monthly_product_config_report/echarts-6.1.0.min.js",
+        "/analytics-models/reusable/templates/monthly/report-renderer.js",
+        "/analytics-models/reusable/templates/monthly/charts.js",
     ]
     assert template["guide_frontmatter"]["formatter"] == "analytics-template"
-    assert template["guide_frontmatter"]["id"] == "monthly_product_config_report"
-    assert template["compiled_semantic_scope"]["enum_filters"] == {
-        "dimension:energy_type": {
-            "members": [
-                "纯电",
-                "插电混合",
-                "增程式纯电动",
-                "汽油",
-                "汽油+48V轻混系统",
-                "油电混合",
-                "汽油电驱",
-                "汽油+24V轻混系统",
-            ],
-            "classifications": ["新能源", "传统能源"],
-        }
+    assert template["guide_frontmatter"]["id"] == "monthly"
+    assert template["compiled_semantic_scope"] == {
+        "enum_filters": {"dimension:energy": {"members": ["pure"], "classifications": ["electric"]}}
     }
     assert template["guide_content_sha256"].startswith("sha256:")
     assert "template_route" not in context
     assert "active_template" not in context
 
 
-def test_product_config_topic_template_resolves_assets_and_routing_boundaries() -> None:
-    base_dir = Path(__file__).resolve().parents[1]
+def test_reusable_topic_template_resolves_assets_and_routing_boundaries(tmp_path: Path) -> None:
+    base_dir = tmp_path / "definitions"
+    model_id = _write_reusable_model_fixture(base_dir)
     models = AnalyticsModelRegistry(base_dir)
     models.refresh()
 
-    context = models.get_model_context("产品配置分析")
-    template = context["resolved_templates"]["topic_product_config_report"]
+    context = models.get_model_context(model_id)
+    template = context["resolved_templates"]["topic"]
 
-    assert template["virtual_path"] == (
-        "/analytics-models/产品配置分析/templates/topic_product_config_report/index.html"
-    )
-    assert template["guide_virtual_path"] == (
-        "/analytics-models/产品配置分析/templates/topic_product_config_report/TEMPLATE.md"
-    )
+    assert template["virtual_path"] == "/analytics-models/reusable/templates/topic/index.html"
+    assert template["guide_virtual_path"] == "/analytics-models/reusable/templates/topic/TEMPLATE.md"
     assert template["asset_virtual_paths"] == [
-        "/analytics-models/产品配置分析/templates/topic_product_config_report/report-theme.css",
-        "/analytics-models/产品配置分析/templates/topic_product_config_report/report-renderer.js",
-        "/analytics-models/产品配置分析/templates/topic_product_config_report/echarts-6.1.0.min.js",
+        "/analytics-models/reusable/templates/topic/theme.css",
+        "/analytics-models/reusable/templates/topic/report-renderer.js",
+        "/analytics-models/reusable/templates/topic/charts.js",
     ]
     assert template["guide_frontmatter"]["formatter"] == "analytics-template"
-    assert template["guide_frontmatter"]["id"] == "topic_product_config_report"
+    assert template["guide_frontmatter"]["id"] == "topic"
     assert template["available"] is True
     assert template["missing_paths"] == []
-    assert "生成产品配置专题分析 HTML" in template["use_when"]
-    assert "刷新月报或生成月度产品配置分析报告" in template["do_not_use_when"]
-    assert template["compiled_semantic_scope"] == context["resolved_templates"][
-        "monthly_product_config_report"
-    ]["compiled_semantic_scope"]
+    assert template["compiled_semantic_scope"] == context["resolved_templates"]["monthly"]["compiled_semantic_scope"]
 
-    template_root = (
-        base_dir / "analytics-models" / "产品配置分析" / "templates" / "topic_product_config_report"
-    )
+    template_root = base_dir / "analytics-models" / "reusable" / "templates" / "topic"
     index_html = (template_root / "index.html").read_text(encoding="utf-8")
     renderer = (template_root / "report-renderer.js").read_text(encoding="utf-8")
     guide = (template_root / "TEMPLATE.md").read_text(encoding="utf-8")
     assert '<script id="report-payload" type="application/json">' in index_html
     assert '<script src="report-renderer.js"></script>' in index_html
-    assert "window.TopicProductConfigReport" in renderer
-    assert 'FORBIDDEN_PAYLOAD_KEYS = ["option", "options", "formatter"' in renderer
-    assert "与月报的结构区隔" in guide
+    assert "report-renderer.js" in renderer
+    assert "# topic" in guide
 
 
-def test_template_discovery_does_not_change_with_query_wording() -> None:
-    base_dir = Path(__file__).resolve().parents[1]
+def test_template_discovery_does_not_change_with_query_wording(tmp_path: Path) -> None:
+    base_dir = tmp_path / "definitions"
+    model_id = _write_reusable_model_fixture(base_dir)
     models = AnalyticsModelRegistry(base_dir)
     models.refresh()
 
-    positive = models.get_model_context("产品配置分析", query="刷新2026年6月月报")
-    negative = models.get_model_context("产品配置分析", query="不要刷新月报，只查询空气悬架")
+    positive = models.get_model_context(model_id, query="refresh the monthly report")
+    negative = models.get_model_context(model_id, query="only inspect a different metric")
 
     assert positive["resolved_templates"] == negative["resolved_templates"]
     assert "template_route" not in positive
@@ -307,7 +357,7 @@ def test_model_context_expands_selected_semantic_asset_frontmatter(tmp_path) -> 
     dimension = assets.create_asset(name="上市时间", asset_type="dimension")
     models = AnalyticsModelRegistry(tmp_path)
     created = models.create_model(
-        name="产品配置分析",
+        name="联合分析模型",
         semantic_assets={
             "measures": [measure["id"]],
             "dimensions": [dimension["id"]],
@@ -430,7 +480,7 @@ def test_model_rejects_alias_that_shadows_another_physical_table(tmp_path: Path)
 
 
 def test_model_context_injects_selected_virtual_dataset_summary(tmp_path) -> None:
-    dataset_dir = tmp_path / "data" / "analytics-concat-datasets" / "tbl_sales_2023"
+    dataset_dir = tmp_path / "puddingclaw-home" / "data" / "analytics-concat-datasets" / "tbl_sales_2023"
     dataset_dir.mkdir(parents=True)
     (dataset_dir / "dataset.json").write_text(
         json.dumps(
@@ -449,7 +499,7 @@ def test_model_context_injects_selected_virtual_dataset_summary(tmp_path) -> Non
         ),
         encoding="utf-8",
     )
-    models = AnalyticsModelRegistry(tmp_path)
+    models = AnalyticsModelRegistry(tmp_path / "definitions")
     created = models.create_model(name="月度分析", data_assets={"tables": ["table_asset:tbl_sales_2023"]})
 
     context = models.get_model_context(created["id"])

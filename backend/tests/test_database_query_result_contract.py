@@ -42,6 +42,99 @@ from tools.database.sql_execute_tool import DatabaseSqlExecuteTool
 from tools.database_knowledge_tool import _format_query_error
 
 
+@pytest.fixture
+def user_semantic_definitions(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Build user-owned semantic fixtures without restoring package assets."""
+
+    home = tmp_path / "puddingclaw-home"
+    definitions = home / "definitions"
+    model = definitions / "analytics-models" / "产品配置分析" / "model.md"
+    measure = definitions / "semantic-assets" / "measures" / "config_rate" / "measure.md"
+    reference = measure.parent / "references" / "air_suspension.md"
+    price_band = definitions / "semantic-assets" / "dimensions" / "price_band" / "dimension.md"
+    for target in (model, measure, reference, price_band):
+        target.parent.mkdir(parents=True, exist_ok=True)
+    model.write_text(
+        """---
+formatter: analytics-model
+id: 产品配置分析
+name: 产品配置分析
+semantic_assets:
+  measures: [measure:config_rate]
+  dimensions: [dimension:price_band]
+---
+# 产品配置分析
+
+## 默认分析范围
+
+- 默认分析中国狭义乘用车。
+- 用户未明确要求包含皮卡时，必须排除车型级别为 `皮卡` 的车型。
+- 回退到 EAV 表时读取 `type_name = '级别'`。
+""",
+        encoding="utf-8",
+    )
+    measure.write_text(
+        """---
+formatter: semantic-asset
+name: 配置率
+type: measure
+description: 统计目标配置的配备率。
+aliases: [搭载率, 配备率]
+---
+# 配置率
+
+按目标统计对象计算配置率。
+""",
+        encoding="utf-8",
+    )
+    reference.write_text(
+        """# 空气悬架配置率口径
+
+适用于空气悬架、空悬和空气悬架配置率；使用 `type_name = '可调悬架种类'`。
+""",
+        encoding="utf-8",
+    )
+    price_band.write_text(
+        """---
+formatter: semantic-asset
+name: 价格段
+type: dimension
+aliases: [价格区间, 价位]
+---
+# 价格段
+
+- 5万元以下
+- 5-10万元
+- 10-15万元
+- 15-20万元
+- 20-30万元
+- 30-40万元
+- 40-50万元
+- 50万元以上
+- 未定价
+
+`未定价` 只包含 `price IS NULL OR price <= 0`。
+
+```sql
+CASE
+  WHEN price IS NULL OR price <= 0 THEN '未定价'
+  WHEN price < 5 THEN '5万元以下'
+  WHEN price < 10 THEN '5-10万元'
+  WHEN price < 15 THEN '10-15万元'
+  WHEN price < 20 THEN '15-20万元'
+  WHEN price < 30 THEN '20-30万元'
+  WHEN price < 40 THEN '30-40万元'
+  WHEN price < 50 THEN '40-50万元'
+  ELSE '50万元以上'
+END
+```
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("PUDDINGCLAW_HOME", str(home))
+    return definitions
+
+
 def test_sql_generator_loads_selected_analytics_model_body(monkeypatch) -> None:
     class _Registry:
         @staticmethod
@@ -66,7 +159,9 @@ def test_sql_generator_loads_selected_analytics_model_body(monkeypatch) -> None:
     assert trace["path"] == "analytics-models/产品配置分析/model.md"
 
 
-def test_product_configuration_model_declares_default_pickup_exclusion() -> None:
+def test_product_configuration_model_declares_default_pickup_exclusion(
+    user_semantic_definitions: Path,
+) -> None:
     prompt, _ = nl2sql_service._format_analytics_model_for_sql_prompt("产品配置分析")
 
     assert "默认分析中国狭义乘用车" in prompt
@@ -74,9 +169,11 @@ def test_product_configuration_model_declares_default_pickup_exclusion() -> None
     assert "type_name = '级别'" in prompt
 
 
-def test_price_band_semantic_asset_is_exhaustive_and_keeps_unpriced_separate() -> None:
+def test_price_band_semantic_asset_is_exhaustive_and_keeps_unpriced_separate(
+    user_semantic_definitions: Path,
+) -> None:
     asset = (
-        Path(__file__).parents[1]
+        user_semantic_definitions
         / "semantic-assets"
         / "dimensions"
         / "price_band"
@@ -157,7 +254,9 @@ async def test_result_store_row_cap_failure_is_actionable(
     assert "重新执行数据库查询" in guidance
 
 
-def test_semantic_resolution_uses_strict_match_then_generalizes_on_real_miss() -> None:
+def test_semantic_resolution_uses_strict_match_then_generalizes_on_real_miss(
+    user_semantic_definitions: Path,
+) -> None:
     matched = nl2sql_service._resolve_request_semantic_assets(
         DatabaseQueryRequest(
             question="按价格段统计空气悬架配置率",
@@ -181,7 +280,9 @@ def test_semantic_resolution_uses_strict_match_then_generalizes_on_real_miss() -
     assert "泛化 SQL" in prompt
 
 
-def test_explicit_semantic_asset_selection_remains_authoritative() -> None:
+def test_explicit_semantic_asset_selection_remains_authoritative(
+    user_semantic_definitions: Path,
+) -> None:
     selected = nl2sql_service._resolve_request_semantic_assets(
         DatabaseQueryRequest(
             question="统计配置情况",
@@ -710,7 +811,7 @@ async def test_explicit_sql_execute_persists_complete_rows_for_pagination(monkey
         persisted.update(kwargs)
         return {
             "result_id": "qr-pagination",
-            "artifact_path": "backend/data/database-query-results/qr-pagination.jsonl",
+            "artifact_path": "data/query-results/qr-pagination.jsonl",
             "expires_at": "2026-07-20T00:00:00+00:00",
             "ttl_hours": 168,
         }
@@ -751,8 +852,7 @@ async def test_persisted_execution_reads_all_206_rows_across_pages(
         async with engine.begin() as connection:
             await connection.run_sync(Base.metadata.create_all)
         sessionmaker = async_sessionmaker(engine, expire_on_commit=False)
-        monkeypatch.setattr(result_store_module, "BASE_DIR", tmp_path)
-        monkeypatch.setattr(result_store_module, "RESULT_DIR", tmp_path / "data" / "database-query-results")
+        monkeypatch.setattr(result_store_module, "RESULT_DIR", tmp_path / "data" / "query-results")
         rows = [{"row_number": index} for index in range(206)]
         execution = SqlExecutionResult(
             columns=["row_number"],
@@ -833,11 +933,10 @@ async def test_database_result_adapts_to_generic_source_reference_without_rows(
         async with engine.begin() as connection:
             await connection.run_sync(Base.metadata.create_all)
         sessionmaker = async_sessionmaker(engine, expire_on_commit=False)
-        monkeypatch.setattr(result_store_module, "BASE_DIR", tmp_path)
         monkeypatch.setattr(
             result_store_module,
             "RESULT_DIR",
-            tmp_path / "data" / "database-query-results",
+            tmp_path / "data" / "query-results",
         )
         monkeypatch.setattr(
             result_source_tool_module,
@@ -916,11 +1015,10 @@ async def test_backfill_query_result_catalog_recovers_legacy_owner(
         async with engine.begin() as connection:
             await connection.run_sync(Base.metadata.create_all)
         sessionmaker = async_sessionmaker(engine, expire_on_commit=False)
-        monkeypatch.setattr(result_store_module, "BASE_DIR", tmp_path)
         monkeypatch.setattr(
             result_store_module,
             "RESULT_DIR",
-            tmp_path / "data" / "database-query-results",
+            tmp_path / "data" / "query-results",
         )
         session_manager.initialize(tmp_path)
         session_manager.create_session("legacy-result-session")
@@ -951,7 +1049,7 @@ async def test_backfill_query_result_catalog_recovers_legacy_owner(
                     columns=["id"],
                     row_count=1,
                     profile_json={},
-                    artifact_path="data/database-query-results/qr-legacy-owner.jsonl",
+                    artifact_path="qr-legacy-owner.jsonl",
                     artifact_format="jsonl",
                     status="ready",
                     created_at=now,
@@ -993,8 +1091,7 @@ async def test_expired_result_cleanup_retains_retryable_tombstone_on_unlink_fail
         async with engine.begin() as connection:
             await connection.run_sync(Base.metadata.create_all)
         sessionmaker = async_sessionmaker(engine, expire_on_commit=False)
-        result_dir = tmp_path / "data" / "database-query-results"
-        monkeypatch.setattr(result_store_module, "BASE_DIR", tmp_path)
+        result_dir = tmp_path / "data" / "query-results"
         monkeypatch.setattr(result_store_module, "RESULT_DIR", result_dir)
         artifact = result_dir / "qr-expired.jsonl"
         catalog = result_dir / ".catalog" / "qr-expired.json"
@@ -1013,7 +1110,7 @@ async def test_expired_result_cleanup_retains_retryable_tombstone_on_unlink_fail
                     columns=["id"],
                     row_count=1,
                     profile_json={},
-                    artifact_path=str(artifact.relative_to(tmp_path)),
+                    artifact_path=artifact.name,
                     artifact_format="jsonl",
                     status="ready",
                     created_at=now - timedelta(hours=2),
@@ -1062,10 +1159,9 @@ async def test_orphan_scavenger_uses_database_ownership_and_grace_window(
         async with engine.begin() as connection:
             await connection.run_sync(Base.metadata.create_all)
         sessionmaker = async_sessionmaker(engine, expire_on_commit=False)
-        result_dir = tmp_path / "data" / "database-query-results"
+        result_dir = tmp_path / "data" / "query-results"
         catalog_dir = result_dir / ".catalog"
         catalog_dir.mkdir(parents=True)
-        monkeypatch.setattr(result_store_module, "BASE_DIR", tmp_path)
         monkeypatch.setattr(result_store_module, "RESULT_DIR", result_dir)
 
         owned_artifact = result_dir / "qr-owned.jsonl"
@@ -1088,7 +1184,7 @@ async def test_orphan_scavenger_uses_database_ownership_and_grace_window(
                     columns=["id"],
                     row_count=1,
                     profile_json={},
-                    artifact_path=str(owned_artifact.relative_to(tmp_path)),
+                    artifact_path=owned_artifact.name,
                     artifact_format="jsonl",
                     status="ready",
                     created_at=now,
@@ -1136,8 +1232,7 @@ async def test_persist_registers_creating_owner_before_publishing_final_files(
         async with engine.begin() as connection:
             await connection.run_sync(Base.metadata.create_all)
         sessionmaker = async_sessionmaker(engine, expire_on_commit=False)
-        result_dir = tmp_path / "data" / "database-query-results"
-        monkeypatch.setattr(result_store_module, "BASE_DIR", tmp_path)
+        result_dir = tmp_path / "data" / "query-results"
         monkeypatch.setattr(result_store_module, "RESULT_DIR", result_dir)
         monkeypatch.setattr(
             result_store_module,

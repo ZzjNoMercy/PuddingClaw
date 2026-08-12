@@ -5,7 +5,6 @@ import {
   Bot,
   Database,
   FileText,
-  Sliders,
   Brain,
   Save,
   Loader2,
@@ -38,7 +37,6 @@ import {
   getSettings,
   updateSettings,
   resetKnowledgeVectorCollections,
-  testConnection,
   testDatabaseConnection,
   getCapabilities,
   getProviders,
@@ -48,7 +46,6 @@ import {
   discoverProviderModels,
   testProviderConnection,
   addProviderModel,
-  type SystemSettings,
   type Capabilities,
   type SubAgentItem,
   type ProviderRegistry,
@@ -58,12 +55,9 @@ import {
 } from "@/lib/settingsApi";
 import { useApp } from "@/lib/store";
 import {
-  getProjectContext,
   getLlmWikiWorkspaceStatus,
   initializeLlmWikiGbrain,
-  updateProjectContext,
   type LlmWikiWorkspaceStatus,
-  type ProjectContextDocument,
 } from "@/lib/api";
 import MemoryEditor from "@/components/settings/MemoryEditor";
 import CapabilitiesStatus from "@/components/settings/CapabilitiesStatus";
@@ -104,15 +98,6 @@ const HARNESS_SECTIONS: HarnessSection[] = [
 const DATABASE_QA_SECTIONS: HarnessSection[] = [
   { id: "preview", label: "结果预览", description: "直传、摘要与读取体量", icon: Database },
   { id: "storage", label: "持久化存储", description: "落盘、保留与导出", icon: FileText },
-];
-
-const LLM_PROVIDERS = [
-  { value: "deepseek", label: "DeepSeek", baseUrl: "https://api.deepseek.com" },
-  { value: "qwen", label: "Qwen / DashScope", baseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1" },
-];
-
-const EMBEDDING_PROVIDERS = [
-  { value: "qwen", label: "Qwen / DashScope", baseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1" },
 ];
 
 const SETTINGS_CATEGORY_KEY = "settings:activeCategory";
@@ -364,10 +349,6 @@ export default function SettingsPage() {
   const {
     sidebarOpen,
     toggleSidebar,
-    thinkingMode,
-    setThinkingMode,
-    currentProjectId,
-    projects,
     sessionId,
     setSessionId,
     setWorkspaceView,
@@ -399,8 +380,12 @@ export default function SettingsPage() {
     const valid = SETTINGS_CATEGORIES.some((c) => c.key === saved);
     return (valid ? (saved as SettingsCategory) : "ai");
   });
-  const [settings, setSettings] = useState<SystemSettings | null>(null);
   const [providerRegistry, setProviderRegistry] = useState<ProviderRegistry | null>(null);
+  const agentModels = providerRegistry?.providers.flatMap((provider) =>
+    provider.models
+      .filter((model) => model.capability === "llm")
+      .map((model) => model.name)
+  ) || [];
   const multimodalEmbeddingSelection = (() => {
     const modelId = providerRegistry?.bindings?.multimodal_embedding;
     if (!modelId) return null;
@@ -438,53 +423,18 @@ export default function SettingsPage() {
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [toast, setToast] = useState<{ type: "success" | "error"; message: string } | null>(null);
-  const currentProject = projects.find((project) => project.project_id === currentProjectId) || null;
-
-  // AI Gateway form state
-  const [gatewayBaseUrl, setGatewayBaseUrl] = useState("");
-  const [gatewayHealthPath, setGatewayHealthPath] = useState("/health");
-  const [gatewayFallback, setGatewayFallback] = useState(true);
-  const [gatewayEnvironmentOverride, setGatewayEnvironmentOverride] = useState(false);
-  const [gatewayTesting, setGatewayTesting] = useState(false);
-  const [gatewayTestResult, setGatewayTestResult] = useState<{ ok: boolean; msg: string } | null>(null);
-  const [gatewayModels, setGatewayModels] = useState<string[]>([]);
-  const [gatewayModel, setGatewayModel] = useState("deepseek-v4-flash");
   const [capabilities, setCapabilities] = useState<Capabilities | null>(null);
 
   useEffect(() => {
     localStorage.setItem(SETTINGS_CATEGORY_KEY, category);
   }, [category]);
 
-  // LLM form state
-  const [llmProvider, setLlmProvider] = useState("deepseek");
-  const [llmModel, setLlmModel] = useState("deepseek-chat");
-  const [llmBaseUrl, setLlmBaseUrl] = useState("https://api.deepseek.com");
-  const [llmApiKey, setLlmApiKey] = useState("");
-  const [llmApiKeyMasked, setLlmApiKeyMasked] = useState("");
-  const [showLlmKey, setShowLlmKey] = useState(false);
-  const [temperature, setTemperature] = useState(0.7);
-  const [maxTokens, setMaxTokens] = useState(4096);
-  const [llmTesting, setLlmTesting] = useState(false);
-  const [llmTestResult, setLlmTestResult] = useState<{ ok: boolean; msg: string } | null>(null);
-
-  // Embedding form state
-  const [embProvider, setEmbProvider] = useState("qwen");
-  const [embModel, setEmbModel] = useState("text-embedding-v3");
-  const [embDimension, setEmbDimension] = useState("1024");
-  const [embBatchSize, setEmbBatchSize] = useState("20");
-  const [embBaseUrl, setEmbBaseUrl] = useState("https://dashscope.aliyuncs.com/compatible-mode/v1");
-  const [embApiKey, setEmbApiKey] = useState("");
-  const [embApiKeyMasked, setEmbApiKeyMasked] = useState("");
-  const [showEmbKey, setShowEmbKey] = useState(false);
-  const [embTesting, setEmbTesting] = useState(false);
-  const [embTestResult, setEmbTestResult] = useState<{ ok: boolean; msg: string } | null>(null);
-
   // RAG form state
-  const [ragTopK, setRagTopK] = useState(3);
-  const [ragThreshold, setRagThreshold] = useState(0.7);
-  const [ragTextVectorWeight, setRagTextVectorWeight] = useState(0.45);
-  const [ragImageVectorWeight, setRagImageVectorWeight] = useState(0.35);
-  const [ragHybridCandidateTopK, setRagHybridCandidateTopK] = useState(10);
+  const [ragTopK, setRagTopK] = useState(10);
+  const [ragThreshold, setRagThreshold] = useState(0.5);
+  const [ragTextVectorWeight, setRagTextVectorWeight] = useState(0.7);
+  const [ragImageVectorWeight, setRagImageVectorWeight] = useState(0.4);
+  const [ragHybridCandidateTopK, setRagHybridCandidateTopK] = useState(30);
   const [ragRerankEnabled, setRagRerankEnabled] = useState(true);
   const [ragRerankCandidateTopK, setRagRerankCandidateTopK] = useState(50);
   const ragBm25Weight = Math.max(0, Math.min(1, 1 - ragTextVectorWeight));
@@ -497,7 +447,7 @@ export default function SettingsPage() {
   const [dbQaFullRowsHardRowCap, setDbQaFullRowsHardRowCap] = useState("200");
   const [dbQaFullRowsHardColumnCap, setDbQaFullRowsHardColumnCap] = useState("20");
   const [dbQaMaxCellCharsForLlm, setDbQaMaxCellCharsForLlm] = useState("500");
-  const [dbQaResultMaterializationRowCap, setDbQaResultMaterializationRowCap] = useState("5000");
+  const [dbQaResultMaterializationRowCap, setDbQaResultMaterializationRowCap] = useState("99999");
   const [dbQaQueryTimeoutSeconds, setDbQaQueryTimeoutSeconds] = useState("30");
   const [dbQaSqlGenerationTimeoutSeconds, setDbQaSqlGenerationTimeoutSeconds] = useState("210");
   const [dbQaResultStoreEnabled, setDbQaResultStoreEnabled] = useState(true);
@@ -506,10 +456,7 @@ export default function SettingsPage() {
   const [dbQaMaxPageSize, setDbQaMaxPageSize] = useState("500");
   const [dbQaExportEnabled, setDbQaExportEnabled] = useState(false);
   const [dbQaProfileEnabled, setDbQaProfileEnabled] = useState(true);
-  const [dbQaAgentSqlPathEnabled, setDbQaAgentSqlPathEnabled] = useState(false);
-  const [dbQaAgentSqlRolloutPercentage, setDbQaAgentSqlRolloutPercentage] = useState("1");
   const [dbQaAgentSqlFallbackEnabled, setDbQaAgentSqlFallbackEnabled] = useState(true);
-  const [dbQaAgentSqlShadowCompareEnabled, setDbQaAgentSqlShadowCompareEnabled] = useState(false);
 
   // Knowledge base
   const [databaseMode, setDatabaseMode] = useState<"bundled" | "external">("bundled");
@@ -551,9 +498,6 @@ export default function SettingsPage() {
   const [kbMilvusUri, setKbMilvusUri] = useState("http://localhost:19530");
   const [kbTextCollection, setKbTextCollection] = useState("puddingclaw_knowledge_text");
   const [kbImageCollection, setKbImageCollection] = useState("puddingclaw_knowledge_image");
-
-  // Compression
-  const [compRatio, setCompRatio] = useState(0.5);
 
   // Harness context engineering (DeepAgents only)
   const [contextSummaryModelId, setContextSummaryModelId] = useState("");
@@ -601,12 +545,6 @@ export default function SettingsPage() {
   const [subagentItems, setSubagentItems] = useState<SubAgentItem[]>([]);
   const [refreshingModels, setRefreshingModels] = useState(false);
 
-  // Project context
-  const [projectContextDoc, setProjectContextDoc] = useState<ProjectContextDocument | null>(null);
-  const [projectContextContent, setProjectContextContent] = useState("");
-  const [projectContextLoading, setProjectContextLoading] = useState(false);
-  const [projectContextSaving, setProjectContextSaving] = useState(false);
-
   const makeDefaultSubAgentItem = useCallback((models: string[]): SubAgentItem => {
     return {
       enabled: true,
@@ -634,42 +572,16 @@ export default function SettingsPage() {
 
     getSettings()
       .then((s) => {
-        setSettings(s);
         setProviderRegistry(s.provider_registry || null);
-        setGatewayBaseUrl(s.ai_gateway.base_url);
-        setGatewayHealthPath(s.ai_gateway.health_path);
-        setGatewayFallback(s.ai_gateway.fallback_to_direct);
-        setGatewayEnvironmentOverride(s.ai_gateway.environment_override);
-        setGatewayModels(s.ai_gateway.routed_models || []);
-        setGatewayModel(s.gateway_llm?.model || s.fallback_llm.model);
-        // Populate LLM fields
-        setLlmProvider(s.fallback_llm.provider);
-        setLlmModel(s.fallback_llm.model);
-        setLlmBaseUrl(s.fallback_llm.base_url);
-        setLlmApiKeyMasked(s.fallback_llm.api_key_masked);
-        setTemperature(s.fallback_llm.temperature);
-        setMaxTokens(s.fallback_llm.max_tokens);
-        // Populate Embedding fields
-        const validEmbProvider = EMBEDDING_PROVIDERS.some((p) => p.value === s.fallback_embedding.provider)
-          ? s.fallback_embedding.provider
-          : "qwen";
-        setEmbProvider(validEmbProvider);
-        setEmbModel(s.fallback_embedding.model);
-        setEmbDimension(String(s.fallback_embedding.dimension || 1024));
-        setEmbBatchSize(String(s.fallback_embedding.batch_size || 10));
-        setEmbBaseUrl(
-          EMBEDDING_PROVIDERS.find((p) => p.value === validEmbProvider)?.baseUrl ?? s.fallback_embedding.base_url
-        );
-        setEmbApiKeyMasked(s.fallback_embedding.api_key_masked);
         // Populate RAG fields
         setRagTopK(s.rag.top_k);
         setRagThreshold(s.rag.similarity_threshold);
-        const textWeight = s.rag.hybrid?.text_vector_weight ?? 0.45;
-        const keywordWeight = s.rag.hybrid?.bm25_weight ?? 0.2;
+        const textWeight = s.rag.hybrid?.text_vector_weight ?? 0.7;
+        const keywordWeight = s.rag.hybrid?.bm25_weight ?? 0.3;
         const textMixTotal = textWeight + keywordWeight;
         setRagTextVectorWeight(textMixTotal > 0 ? textWeight / textMixTotal : 0.7);
-        setRagImageVectorWeight(s.rag.hybrid?.image_vector_weight ?? 0.35);
-        setRagHybridCandidateTopK(s.rag.hybrid?.candidate_top_k ?? 10);
+        setRagImageVectorWeight(s.rag.hybrid?.image_vector_weight ?? 0.4);
+        setRagHybridCandidateTopK(s.rag.hybrid?.candidate_top_k ?? 30);
         setRagRerankEnabled(s.rag.rerank?.enabled ?? true);
         setRagRerankCandidateTopK(s.rag.rerank?.candidate_top_k ?? 50);
         const databaseQa = s.analytics?.database_qa;
@@ -679,33 +591,32 @@ export default function SettingsPage() {
         setDbQaFullRowsHardRowCap(String(databaseQa?.full_rows_hard_row_cap ?? 200));
         setDbQaFullRowsHardColumnCap(String(databaseQa?.full_rows_hard_column_cap ?? 20));
         setDbQaMaxCellCharsForLlm(String(databaseQa?.max_cell_chars_for_llm ?? 500));
-        setDbQaResultMaterializationRowCap(String(databaseQa?.result_materialization_row_cap ?? 5000));
+        setDbQaResultMaterializationRowCap(String(databaseQa?.result_materialization_row_cap ?? 99999));
         setDbQaQueryTimeoutSeconds(String(Math.max(1, Math.round((databaseQa?.query_timeout_ms ?? 30000) / 1000))));
         setDbQaSqlGenerationTimeoutSeconds(String(Math.max(30, Math.round((databaseQa?.sql_generation_timeout_ms ?? 210000) / 1000))));
         setDbQaResultStoreEnabled(databaseQa?.result_store_enabled ?? true);
         setDbQaResultStoreTtlHours(String(databaseQa?.result_store_ttl_hours ?? 168));
         setDbQaDefaultPageSize(String(databaseQa?.default_page_size ?? 100));
         setDbQaMaxPageSize(String(databaseQa?.max_page_size ?? 500));
-        setDbQaExportEnabled(databaseQa?.export_enabled ?? false);
+        setDbQaExportEnabled(databaseQa?.export_enabled ?? true);
         setDbQaProfileEnabled(databaseQa?.profile_enabled ?? true);
-        setDbQaAgentSqlPathEnabled(databaseQa?.database_agent_sql_path_enabled ?? false);
-        setDbQaAgentSqlRolloutPercentage(String(databaseQa?.database_agent_sql_path_rollout_percentage ?? 1));
         setDbQaAgentSqlFallbackEnabled(databaseQa?.database_agent_sql_fallback_enabled ?? true);
-        setDbQaAgentSqlShadowCompareEnabled(databaseQa?.database_agent_sql_shadow_compare_enabled ?? false);
         // Knowledge base
         setDatabaseMode(s.database?.mode === "external" ? "external" : "bundled");
         setDatabaseHost(s.database?.host || "127.0.0.1");
         setDatabasePort(String(s.database?.port || 5432));
         setDatabaseName(s.database?.database || "puddingclaw");
         setDatabaseUsername(s.database?.username || "puddingclaw");
-        setDatabasePassword(s.database?.password || "puddingclaw");
+        // Passwords are write-only. An empty field means "keep the stored
+        // credential" when the rest of the settings form is saved.
+        setDatabasePassword("");
         setDatabaseConfiguredBy(s.database?.configured_by || "default");
         setDatabaseEnvOverride(Boolean(s.database?.environment_override));
         setKnowledgeRootDir(s.knowledge?.root_dir || "");
         setKnowledgeConfiguredBy(s.knowledge?.configured_by || "default");
         setKnowledgeEnvOverride(Boolean(s.knowledge?.environment_override));
         setWikiCompilerModelId(s.knowledge?.llm_wiki?.compiler_agent?.model_id || "");
-        setWikiHybridEnabled(s.knowledge?.llm_wiki?.retrieval?.hybrid_enabled ?? false);
+        setWikiHybridEnabled(s.knowledge?.llm_wiki?.retrieval?.hybrid_enabled ?? true);
         setWikiGbrainEmbeddingModelId(s.knowledge?.llm_wiki?.gbrain?.embedding_model_id || "");
         setWikiGbrainThinkModelId(s.knowledge?.llm_wiki?.gbrain?.think_model_id || "");
         setGbrainDatabaseHost(s.database?.host || "127.0.0.1");
@@ -726,17 +637,15 @@ export default function SettingsPage() {
             }
           })
           .catch(() => {});
-        setMmBatchSize(String(s.multimodal_embedding?.batch_size || 10));
+        setMmBatchSize(String(s.knowledge?.multimodal_index?.embedding_batch_size || 10));
         setKbIndexEnabled(s.knowledge?.multimodal_index?.enabled ?? true);
         setKbVectorStore(s.knowledge?.multimodal_index?.vector_store || "milvus");
         setKbMilvusUri(s.knowledge?.multimodal_index?.milvus_uri || "http://localhost:19530");
         setKbTextCollection(s.knowledge?.multimodal_index?.text_collection || "puddingclaw_knowledge_text");
         setKbImageCollection(s.knowledge?.multimodal_index?.image_collection || "puddingclaw_knowledge_image");
-        // Compression
-        setCompRatio(s.compression.ratio);
         setContextSummaryModelId(s.compression.deepagents?.summarization?.model_id || "");
         setContextSummaryTriggerTokens(
-          String(s.compression.deepagents?.summarization?.trigger_tokens ?? 160000)
+          String(s.compression.deepagents?.summarization?.trigger_tokens ?? 272000)
         );
         setContextSummaryKeepTokens(
           String(s.compression.deepagents?.summarization?.keep_tokens ?? 64000)
@@ -768,7 +677,7 @@ export default function SettingsPage() {
         setModelCallExitBehavior(modelLimit?.exit_behavior === "error" ? "error" : "end");
         const rubric = s.harness?.completion?.rubric;
         setRubricEnabled(rubric?.enabled ?? false);
-        setRubricMaxIterations(String(rubric?.max_iterations ?? 2));
+        setRubricMaxIterations(String(rubric?.max_iterations ?? 3));
         setRubricMaxStagnantRepairs(String(rubric?.max_stagnant_repairs ?? 2));
         setCustomRubricRulesEnabled(rubric?.custom_rules_enabled ?? false);
         setCustomRubricRules(
@@ -789,7 +698,12 @@ export default function SettingsPage() {
           setSubagentItems(items);
           setSelectedSubagentIndex(0);
         } else {
-          setSubagentItems([makeDefaultSubAgentItem(s.ai_gateway.routed_models || [])]);
+          const registryModels = (s.provider_registry?.providers || []).flatMap((provider) =>
+            provider.models
+              .filter((model) => model.capability === "llm")
+              .map((model) => model.name)
+          );
+          setSubagentItems([makeDefaultSubAgentItem(registryModels)]);
           setSelectedSubagentIndex(0);
         }
       })
@@ -1069,51 +983,6 @@ export default function SettingsPage() {
     openModelCategoryEditor(provider, endpointId, name.trim());
   }, [openModelCategoryEditor]);
 
-  useEffect(() => {
-    if (!currentProjectId) {
-      setProjectContextDoc(null);
-      setProjectContextContent("");
-      return;
-    }
-
-    let cancelled = false;
-    setProjectContextLoading(true);
-    getProjectContext(currentProjectId)
-      .then((doc) => {
-        if (cancelled) return;
-        setProjectContextDoc(doc);
-        setProjectContextContent(doc.content);
-      })
-      .catch((err) => {
-        if (cancelled) return;
-        setProjectContextDoc(null);
-        setProjectContextContent("");
-        showToast("error", err instanceof Error ? err.message : "加载项目上下文失败");
-      })
-      .finally(() => {
-        if (!cancelled) setProjectContextLoading(false);
-      });
-
-    return () => {
-      cancelled = true;
-    };
-  }, [currentProjectId, showToast]);
-
-  const handleSaveProjectContext = useCallback(async () => {
-    if (!currentProjectId) return;
-    setProjectContextSaving(true);
-    try {
-      const doc = await updateProjectContext(currentProjectId, projectContextContent);
-      setProjectContextDoc(doc);
-      setProjectContextContent(doc.content);
-      showToast("success", "项目上下文已保存");
-    } catch (err) {
-      showToast("error", err instanceof Error ? err.message : "项目上下文保存失败");
-    } finally {
-      setProjectContextSaving(false);
-    }
-  }, [currentProjectId, projectContextContent, showToast]);
-
   const handleSave = useCallback(async () => {
     setSaving(true);
     try {
@@ -1138,32 +1007,7 @@ export default function SettingsPage() {
         throw new Error("工具上下文保留预算必须在 1,000 到 500,000 tokens 之间");
       }
       await updateSettings({
-        ai_gateway: {
-          base_url: gatewayBaseUrl,
-          health_path: gatewayHealthPath,
-          fallback_to_direct: gatewayFallback,
-        },
-        gateway_llm: {
-          model: gatewayModel,
-        },
-        fallback_llm: {
-          provider: llmProvider,
-          model: llmModel,
-          base_url: llmBaseUrl,
-          ...(llmApiKey ? { api_key: llmApiKey } : {}),
-          temperature,
-          max_tokens: maxTokens,
-        },
-        fallback_embedding: {
-          provider: embProvider,
-          model: embModel,
-          dimension: Number.parseInt(embDimension, 10) || 1024,
-          batch_size: Number.parseInt(embBatchSize, 10) || 10,
-          base_url: embBaseUrl,
-          ...(embApiKey ? { api_key: embApiKey } : {}),
-        },
         rag: {
-          enabled: true,
           top_k: ragTopK,
           similarity_threshold: ragThreshold,
           hybrid: {
@@ -1180,7 +1024,6 @@ export default function SettingsPage() {
             model: "qwen3-vl-rerank",
             top_n: ragTopK,
             candidate_top_k: ragRerankCandidateTopK,
-            base_url: "",
           },
         },
         analytics: {
@@ -1191,7 +1034,7 @@ export default function SettingsPage() {
             full_rows_hard_row_cap: positiveIntOrNull(dbQaFullRowsHardRowCap) ?? 200,
             full_rows_hard_column_cap: positiveIntOrNull(dbQaFullRowsHardColumnCap) ?? 20,
             max_cell_chars_for_llm: positiveIntOrNull(dbQaMaxCellCharsForLlm) ?? 500,
-            result_materialization_row_cap: positiveIntOrNull(dbQaResultMaterializationRowCap) ?? 5000,
+            result_materialization_row_cap: positiveIntOrNull(dbQaResultMaterializationRowCap) ?? 99999,
             query_timeout_ms: (positiveIntOrNull(dbQaQueryTimeoutSeconds) ?? 30) * 1000,
             sql_generation_timeout_ms: (positiveIntOrNull(dbQaSqlGenerationTimeoutSeconds) ?? 210) * 1000,
             result_store_enabled: dbQaResultStoreEnabled,
@@ -1200,15 +1043,7 @@ export default function SettingsPage() {
             max_page_size: positiveIntOrNull(dbQaMaxPageSize) ?? 500,
             export_enabled: dbQaExportEnabled,
             profile_enabled: dbQaProfileEnabled,
-            database_agent_sql_path_enabled: dbQaAgentSqlPathEnabled,
-            database_agent_sql_path_rollout_percentage: Math.max(
-              0,
-              Math.min(100, Number.isFinite(Number.parseInt(dbQaAgentSqlRolloutPercentage, 10))
-                ? Number.parseInt(dbQaAgentSqlRolloutPercentage, 10)
-                : 100),
-            ),
             database_agent_sql_fallback_enabled: dbQaAgentSqlFallbackEnabled,
-            database_agent_sql_shadow_compare_enabled: dbQaAgentSqlShadowCompareEnabled,
           },
         },
         database: {
@@ -1219,9 +1054,6 @@ export default function SettingsPage() {
           username: databaseUsername || "puddingclaw",
           password: databasePassword,
           url: "",
-        },
-        multimodal_embedding: {
-          batch_size: Number.parseInt(mmBatchSize, 10) || 10,
         },
         knowledge: {
           root_dir: knowledgeRootDir,
@@ -1243,10 +1075,10 @@ export default function SettingsPage() {
             milvus_uri: kbMilvusUri,
             text_collection: kbTextCollection,
             image_collection: kbImageCollection,
+            embedding_batch_size: Number.parseInt(mmBatchSize, 10) || 10,
           },
         },
         compression: {
-          ratio: compRatio,
           deepagents: {
             summarization: {
               model_id: contextSummaryModelId,
@@ -1279,7 +1111,7 @@ export default function SettingsPage() {
           completion: {
             rubric: {
               enabled: rubricEnabled,
-              max_iterations: positiveIntOrNull(rubricMaxIterations) ?? 2,
+              max_iterations: positiveIntOrNull(rubricMaxIterations) ?? 3,
               max_stagnant_repairs: positiveIntOrNull(rubricMaxStagnantRepairs) ?? 2,
               custom_rules_enabled: customRubricRulesEnabled,
               custom_rules: customRubricRules.filter((rule) => rule.statement.trim()),
@@ -1300,25 +1132,19 @@ export default function SettingsPage() {
         subagents: subagentItemsToConfig(subagentItems),
       });
       showToast("success", "设置已保存，将从下一次 Agent 运行生效");
-      // Clear raw keys after save
-      setLlmApiKey("");
-      setEmbApiKey("");
-      // Reload to get fresh masked keys
       const fresh = await getSettings();
-      setLlmApiKeyMasked(fresh.fallback_llm.api_key_masked);
-      setEmbApiKeyMasked(fresh.fallback_embedding.api_key_masked);
       setDatabaseConfiguredBy(fresh.database?.configured_by || "default");
       setDatabaseEnvOverride(Boolean(fresh.database?.environment_override));
       setKnowledgeConfiguredBy(fresh.knowledge?.configured_by || "default");
       setKnowledgeEnvOverride(Boolean(fresh.knowledge?.environment_override));
-      setWikiHybridEnabled(fresh.knowledge?.llm_wiki?.retrieval?.hybrid_enabled ?? false);
+      setWikiHybridEnabled(fresh.knowledge?.llm_wiki?.retrieval?.hybrid_enabled ?? true);
       getLlmWikiWorkspaceStatus().then(setGbrainWorkspace).catch(() => {});
     } catch (err) {
       showToast("error", err instanceof Error ? err.message : "保存失败");
     } finally {
       setSaving(false);
     }
-  }, [gatewayBaseUrl, gatewayHealthPath, gatewayFallback, gatewayModel, thinkingMode, llmProvider, llmModel, llmBaseUrl, llmApiKey, temperature, maxTokens, embProvider, embModel, embDimension, embBatchSize, embBaseUrl, embApiKey, ragTopK, ragThreshold, ragTextVectorWeight, ragImageVectorWeight, ragBm25Weight, ragHybridCandidateTopK, ragRerankEnabled, ragRerankCandidateTopK, dbQaFullRowsTokenBudget, dbQaPreviewRowsTokenBudget, dbQaProfileTokenBudget, dbQaFullRowsHardRowCap, dbQaFullRowsHardColumnCap, dbQaMaxCellCharsForLlm, dbQaResultMaterializationRowCap, dbQaQueryTimeoutSeconds, dbQaSqlGenerationTimeoutSeconds, dbQaResultStoreEnabled, dbQaResultStoreTtlHours, dbQaDefaultPageSize, dbQaMaxPageSize, dbQaExportEnabled, dbQaProfileEnabled, dbQaAgentSqlPathEnabled, dbQaAgentSqlRolloutPercentage, dbQaAgentSqlFallbackEnabled, dbQaAgentSqlShadowCompareEnabled, databaseMode, databaseHost, databasePort, databaseName, databaseUsername, databasePassword, mmBatchSize, knowledgeRootDir, wikiCompilerModelId, wikiHybridEnabled, wikiGbrainEmbeddingModelId, wikiGbrainThinkModelId, kbIndexEnabled, kbVectorStore, kbMilvusUri, kbTextCollection, kbImageCollection, compRatio, contextSummaryTriggerTokens, contextSummaryKeepTokens, toolContextEnabled, immediateToolCompactionEnabled, singleToolTriggerTokens, backgroundMinResultTokens, retainToolContextTokens, modelCallLimitEnabled, modelCallRunLimit, modelCallThreadLimit, modelCallExitBehavior, rubricEnabled, rubricMaxIterations, rubricMaxStagnantRepairs, customRubricRulesEnabled, customRubricRules, goalsEnabled, goalMaxRounds, executionMode, subagentItems, showToast]);
+  }, [ragTopK, ragThreshold, ragTextVectorWeight, ragImageVectorWeight, ragBm25Weight, ragHybridCandidateTopK, ragRerankEnabled, ragRerankCandidateTopK, dbQaFullRowsTokenBudget, dbQaPreviewRowsTokenBudget, dbQaProfileTokenBudget, dbQaFullRowsHardRowCap, dbQaFullRowsHardColumnCap, dbQaMaxCellCharsForLlm, dbQaResultMaterializationRowCap, dbQaQueryTimeoutSeconds, dbQaSqlGenerationTimeoutSeconds, dbQaResultStoreEnabled, dbQaResultStoreTtlHours, dbQaDefaultPageSize, dbQaMaxPageSize, dbQaExportEnabled, dbQaProfileEnabled, dbQaAgentSqlFallbackEnabled, databaseMode, databaseHost, databasePort, databaseName, databaseUsername, databasePassword, mmBatchSize, knowledgeRootDir, wikiCompilerModelId, wikiHybridEnabled, wikiGbrainEmbeddingModelId, wikiGbrainThinkModelId, kbIndexEnabled, kbVectorStore, kbMilvusUri, kbTextCollection, kbImageCollection, contextSummaryTriggerTokens, contextSummaryKeepTokens, toolContextEnabled, immediateToolCompactionEnabled, singleToolTriggerTokens, backgroundMinResultTokens, retainToolContextTokens, modelCallLimitEnabled, modelCallRunLimit, modelCallThreadLimit, modelCallExitBehavior, rubricEnabled, rubricMaxIterations, rubricMaxStagnantRepairs, customRubricRulesEnabled, customRubricRules, goalsEnabled, goalMaxRounds, executionMode, subagentItems, showToast]);
 
   const handleWikiHybridChange = useCallback(async (enabled: boolean) => {
     if (wikiHybridSaving) return;
@@ -1334,7 +1160,7 @@ export default function SettingsPage() {
         },
       });
       const fresh = await getSettings();
-      const persisted = fresh.knowledge?.llm_wiki?.retrieval?.hybrid_enabled ?? false;
+      const persisted = fresh.knowledge?.llm_wiki?.retrieval?.hybrid_enabled ?? true;
       if (persisted !== enabled) {
         throw new Error("后端未返回刚保存的混合检索配置");
       }
@@ -1355,10 +1181,10 @@ export default function SettingsPage() {
     if (mode === "bundled") {
       setDatabaseName("puddingclaw");
       setDatabaseUsername("puddingclaw");
-      setDatabasePassword("puddingclaw");
+      setDatabasePassword("");
     } else if (mode === "external") {
       setDatabaseName("postgres");
-      setDatabaseUsername("pet");
+      setDatabaseUsername("");
       setDatabasePassword("");
     }
   }, []);
@@ -1514,83 +1340,16 @@ export default function SettingsPage() {
     }
   }, [showToast]);
 
-  const handleRefreshGatewayModels = useCallback(async () => {
+  const handleRefreshAgentModels = useCallback(async () => {
     setRefreshingModels(true);
     try {
-      const fresh = await getSettings();
-      setGatewayModels(fresh.ai_gateway.routed_models || []);
-      setSettings(fresh);
+      await refreshProviders();
     } catch (err) {
       showToast("error", err instanceof Error ? err.message : "刷新模型列表失败");
     } finally {
       setRefreshingModels(false);
     }
-  }, [showToast]);
-
-  const handleTestGateway = useCallback(async () => {
-    setGatewayTesting(true);
-    setGatewayTestResult(null);
-    try {
-      const result = await testConnection({
-        type: "gateway",
-        base_url: gatewayBaseUrl || "http://higress:8080/v1",
-        health_path: gatewayHealthPath,
-      });
-      setGatewayTestResult({ ok: true, msg: `网关可用 (${result.latency_ms}ms)` });
-    } catch (err) {
-      setGatewayTestResult({ ok: false, msg: err instanceof Error ? err.message : "网关不可用" });
-    } finally {
-      setGatewayTesting(false);
-    }
-  }, [gatewayBaseUrl, gatewayHealthPath]);
-
-  const handleTestLlm = useCallback(async () => {
-    const key = llmApiKey || settings?.fallback_llm.api_key_masked || "";
-    if (!key || key === "***") {
-      setLlmTestResult({ ok: false, msg: "请先输入 API Key" });
-      return;
-    }
-    setLlmTesting(true);
-    setLlmTestResult(null);
-    try {
-      const result = await testConnection({
-        type: "llm",
-        provider: llmProvider,
-        model: llmModel,
-        base_url: llmBaseUrl,
-        api_key: llmApiKey || "",
-      });
-      setLlmTestResult({ ok: true, msg: `连接成功 (${result.latency_ms}ms)` });
-    } catch (err) {
-      setLlmTestResult({ ok: false, msg: err instanceof Error ? err.message : "连接失败" });
-    } finally {
-      setLlmTesting(false);
-    }
-  }, [llmApiKey, llmProvider, llmModel, llmBaseUrl, settings]);
-
-  const handleTestEmb = useCallback(async () => {
-    const key = embApiKey || settings?.fallback_embedding.api_key_masked || "";
-    if (!key || key === "***") {
-      setEmbTestResult({ ok: false, msg: "请先输入 API Key" });
-      return;
-    }
-    setEmbTesting(true);
-    setEmbTestResult(null);
-    try {
-      const result = await testConnection({
-        type: "embedding",
-        provider: embProvider,
-        model: embModel,
-        base_url: embBaseUrl,
-        api_key: embApiKey || "",
-      });
-      setEmbTestResult({ ok: true, msg: `连接成功 (${result.dimensions}维, ${result.latency_ms}ms)` });
-    } catch (err) {
-      setEmbTestResult({ ok: false, msg: err instanceof Error ? err.message : "连接失败" });
-    } finally {
-      setEmbTesting(false);
-    }
-  }, [embApiKey, embProvider, embModel, embBaseUrl, settings]);
+  }, [refreshProviders, showToast]);
 
   const handleChooseKnowledgeFolder = useCallback(async () => {
     if (!window.electron?.selectKnowledgeFolder) {
@@ -1608,7 +1367,7 @@ export default function SettingsPage() {
       const newItem: SubAgentItem = {
         enabled: false,
         name: `subagent_${prev.length + 1}`,
-        model: gatewayModels[0] || "",
+        model: agentModels[0] || "",
         description: "",
         route_trigger: "",
         tools: { mode: "inherit" },
@@ -1619,7 +1378,7 @@ export default function SettingsPage() {
       setSelectedSubagentIndex(next.length - 1);
       return next;
     });
-  }, [gatewayModels]);
+  }, [agentModels]);
 
   const handleToggleSubAgent = useCallback((index: number, checked: boolean) => {
     if (!checked) {
@@ -1796,7 +1555,7 @@ export default function SettingsPage() {
         <main className="workspace-content-frame flex min-w-0 flex-1 flex-col overflow-hidden">
           <div className="flex-1 overflow-y-auto px-8 pb-8 pt-6">
             <div className={`${
-              category === "ai" ? "max-w-none" : category === "databaseQa" || category === "harness" || category === "project" ? "max-w-6xl" : "max-w-2xl"
+              category === "ai" ? "max-w-none" : category === "databaseQa" || category === "harness" ? "max-w-6xl" : "max-w-2xl"
             } mx-auto space-y-6`}>
             {category === "ai" && (
               <section className="provider-light min-h-[calc(100vh-96px)] overflow-hidden rounded-2xl border border-slate-200 bg-white text-slate-900 shadow-xl shadow-slate-200/50" data-screen-label="模型服务">
@@ -1978,224 +1737,6 @@ export default function SettingsPage() {
                 </div>
               </section>
             )}
-            {false && category === "ai" && (
-              <>
-                <div className="flex items-center justify-between gap-4">
-                  <div>
-                    <h1 className="text-[22px] font-semibold tracking-tight text-gray-900">AI 网关</h1>
-                    <p className="mt-1 text-[12px] text-gray-500">
-                      管理请求经过哪里、使用哪个模型，以及每一层的访问凭证。
-                    </p>
-                  </div>
-                  <div className="inline-flex items-center gap-1.5 rounded-full bg-emerald-50 px-2.5 py-1 text-[10px] font-medium text-emerald-700">
-                    <span className="h-1.5 w-1.5 rounded-full bg-current" />
-                    内部网关
-                  </div>
-                </div>
-
-                <div className="grid grid-cols-[1fr_28px_1fr_28px_1fr] items-center rounded-2xl border border-black/[0.055] bg-white p-4 shadow-sm">
-                  <RouteNode title="PuddingClaw" detail="ModelClient · 统一入口" status="运行中" tone="green" />
-                  <Route className="mx-auto h-4 w-4 text-gray-300" />
-                  <RouteNode
-                    title="内部网关"
-                    detail="Provider Registry · 统一模型路由"
-                    status="已启用"
-                    tone="green"
-                  />
-                  <Route className="mx-auto h-4 w-4 text-gray-300" />
-                  <RouteNode title={gatewayModel} detail="网关模型" status="主模型" tone="blue" />
-                </div>
-
-                <div className="rounded-2xl border border-black/[0.055] bg-white p-5 shadow-sm">
-                  <div className="mb-5 flex items-center justify-between gap-4">
-                    <div className="flex items-center gap-3">
-                      <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-[#002fa7]/8 text-[#002fa7]">
-                        <Network className="h-4 w-4" />
-                      </div>
-                      <div>
-                        <h2 className="text-[14px] font-semibold text-gray-800">AI Gateway</h2>
-                        <p className="mt-0.5 text-[11px] text-gray-500">内部网关 · Provider Registry</p>
-                        {gatewayEnvironmentOverride && (
-                          <p className="mt-1 text-[10px] font-medium text-amber-600">当前值由环境变量覆盖，页面保存不会改变运行时覆盖值</p>
-                        )}
-                      </div>
-                    </div>
-                    <a
-                      href="http://localhost:8001"
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="flex shrink-0 items-center gap-1.5 rounded-lg bg-[#002fa7]/10 px-3 py-2 text-[11px] font-medium text-[#002fa7] transition-colors hover:bg-[#002fa7]/15"
-                    >
-                      <ExternalLink className="h-3.5 w-3.5" />
-                      打开 Console
-                    </a>
-                  </div>
-                  <div className="grid gap-4 md:grid-cols-2">
-                    <FormField label="Gateway 覆盖地址（可选）">
-                      <input value={gatewayBaseUrl} onChange={(e) => setGatewayBaseUrl(e.target.value)} className="form-input" placeholder="留空则自动探测 http://higress:8080/v1" />
-                    </FormField>
-                    <FormField label="健康检查路径">
-                      <input value={gatewayHealthPath} onChange={(e) => setGatewayHealthPath(e.target.value)} className="form-input" placeholder="/health" />
-                    </FormField>
-                    <FormField label="失败策略">
-                      <label className="flex h-[34px] items-center justify-between rounded-lg border border-black/[0.08] bg-white/70 px-3 text-[11px] text-gray-600">
-                        首个 token 前失败时回退 Provider 直连
-                        <input type="checkbox" checked={gatewayFallback} onChange={(e) => setGatewayFallback(e.target.checked)} className="accent-[#002fa7]" />
-                      </label>
-                    </FormField>
-                    <div className="flex items-center justify-between gap-4 rounded-xl border border-black/[0.06] bg-white/55 px-3 py-2.5">
-                      <p className="text-[10px] leading-relaxed text-gray-500">
-                        内部网关负责统一路由、Token 统计与模型切换；模型访问始终使用对应 Provider Key。
-                      </p>
-                      <button onClick={handleTestGateway} disabled={gatewayTesting} className="flex shrink-0 items-center gap-1.5 rounded-lg bg-[#002fa7]/10 px-3 py-2 text-[11px] font-medium text-[#002fa7] transition-colors hover:bg-[#002fa7]/15 disabled:opacity-50">
-                        {gatewayTesting ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Zap className="h-3.5 w-3.5" />}
-                        测试网关
-                      </button>
-                    </div>
-                    {gatewayTestResult && <div className="col-span-2"><ConnectionResult result={gatewayTestResult!} /></div>}
-                  </div>
-
-                  {/* Higress Routed Models */}
-                  {gatewayModels.length > 0 && (
-                    <div className="mt-5 border-t border-black/[0.06] pt-5">
-                      <div className="flex items-center gap-3 mb-4">
-                        <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-emerald-50 text-emerald-600">
-                          <Route className="h-3.5 w-3.5" />
-                        </div>
-                        <div>
-                          <h3 className="text-[13px] font-semibold text-gray-800">网关模型</h3>
-                          <p className="mt-0.5 text-[11px] text-gray-500">当前：{gatewayModel}，点击下方路由切换，保存后生效</p>
-                        </div>
-                      </div>
-                      <div className="flex flex-wrap gap-2">
-                        {gatewayModels.map((model) => {
-                          const active = model === gatewayModel;
-                          return (
-                            <button
-                              key={model}
-                              onClick={() => setGatewayModel(model)}
-                              className={`inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-[11px] font-medium transition-all border ${
-                                active
-                                  ? "bg-[#002fa7] text-white border-[#002fa7] shadow-sm"
-                                  : "bg-white/70 text-gray-600 border-black/[0.06] hover:bg-white hover:border-[#002fa7]/30"
-                              }`}
-                              title={active ? "当前网关模型已匹配此路由" : "点击将网关模型设为此值"}
-                            >
-                              {active && <CheckCircle2 className="h-3 w-3" />}
-                              {model}
-                            </button>
-                          );
-                        })}
-                      </div>
-                    </div>
-                  )}
-                </div>
-
-                {/* Thinking Mode */}
-                <div className="mt-5 rounded-xl border border-black/[0.06] bg-white/55 px-4 py-3.5">
-                  <div className="flex items-center justify-between gap-4">
-                    <div className="flex items-center gap-3 min-w-0">
-                      <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-[#002fa7]/8 text-[#002fa7]">
-                        <Brain className="h-4 w-4" />
-                      </div>
-                      <div className="min-w-0">
-                        <h3 className="text-[13px] font-semibold text-gray-800">思考模式</h3>
-                        <p className="mt-0.5 text-[11px] text-gray-500 truncate">
-                          {thinkingMode
-                            ? "使用 deepseek-v4-pro 并输出思维链"
-                            : "使用默认模型，不输出思维链"}
-                        </p>
-                      </div>
-                    </div>
-                    <button
-                      type="button"
-                      role="switch"
-                      aria-checked={thinkingMode}
-                      aria-label="启用思考模式"
-                      onClick={() => setThinkingMode(!thinkingMode)}
-                      className={`relative inline-flex h-6 w-11 shrink-0 cursor-pointer rounded-full transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#002fa7]/40 ${
-                        thinkingMode ? "bg-[#002fa7]" : "bg-gray-300"
-                      }`}
-                    >
-                      <span
-                        className={`pointer-events-none mt-0.5 inline-block h-5 w-5 rounded-full bg-white shadow-sm transition-transform ${
-                          thinkingMode ? "translate-x-[22px]" : "translate-x-0.5"
-                        }`}
-                      />
-                    </button>
-                  </div>
-                </div>
-              </>
-            )}
-
-            {category === "project" && (
-              <div className="space-y-5">
-                <div className="flex items-center justify-between gap-4">
-                  <div>
-                    <h1 className="text-[22px] font-semibold tracking-tight text-gray-900">项目上下文</h1>
-                    <p className="mt-1 text-[12px] text-gray-500">
-                      编辑当前项目注入 DeepAgents system prompt 的项目级上下文。
-                    </p>
-                  </div>
-                  {currentProject && (
-                    <span className="rounded-full bg-[#002fa7]/8 px-3 py-1 text-[11px] font-medium text-[#002fa7]">
-                      {currentProject.name}
-                    </span>
-                  )}
-                </div>
-
-                {!currentProjectId ? (
-                  <div className="rounded-2xl border border-dashed border-black/[0.08] bg-white/70 p-8 text-center shadow-sm">
-                    <FileText className="mx-auto h-8 w-8 text-gray-300" />
-                    <h2 className="mt-3 text-[14px] font-semibold text-gray-800">还没有选择项目</h2>
-                    <p className="mx-auto mt-2 max-w-md text-[12px] leading-relaxed text-gray-500">
-                      先在侧边栏或输入框添加本地项目。PuddingClaw 会在项目根目录创建
-                      <code className="mx-1 rounded bg-gray-100 px-1 py-0.5">.puddingclaw/PROJECT_CONTEXT.md</code>
-                      ，之后这里就能编辑。
-                    </p>
-                  </div>
-                ) : (
-                  <SettingsCard title="PROJECT_CONTEXT.md" icon={FileText} color="#002fa7">
-                    <div className="mb-4 grid gap-3 lg:grid-cols-[1fr_auto]">
-                      <div className="rounded-xl border border-black/[0.06] bg-white/55 px-3.5 py-3">
-                        <p className="text-[11px] font-semibold uppercase tracking-wide text-gray-400">文件位置</p>
-                        <p className="mt-1 break-all font-mono text-[11px] text-gray-600">
-                          {projectContextDoc?.path || `${currentProject?.path || ""}/.puddingclaw/PROJECT_CONTEXT.md`}
-                        </p>
-                        <p className="mt-2 text-[11px] text-gray-400">
-                          {projectContextDoc?.is_project_local
-                            ? "项目本地副本，随项目迁移和版本管理。"
-                            : "当前使用默认模板；保存后会写入项目本地副本。"}
-                        </p>
-                      </div>
-                      <button
-                        type="button"
-                        onClick={handleSaveProjectContext}
-                        disabled={projectContextSaving || projectContextLoading}
-                        className="inline-flex h-full min-h-[72px] items-center justify-center gap-2 rounded-xl bg-[#002fa7] px-5 text-[12px] font-semibold text-white shadow-sm transition-colors hover:bg-[#00298f] disabled:cursor-not-allowed disabled:opacity-50"
-                      >
-                        {projectContextSaving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
-                        保存项目上下文
-                      </button>
-                    </div>
-
-                    <textarea
-                      value={projectContextContent}
-                      onChange={(event) => setProjectContextContent(event.target.value)}
-                      disabled={projectContextLoading}
-                      spellCheck={false}
-                      className="min-h-[520px] w-full resize-y rounded-xl border border-black/[0.08] bg-white/80 p-4 font-mono text-[12px] leading-relaxed text-gray-800 outline-none transition-colors focus:border-[#002fa7]/40 focus:ring-4 focus:ring-[#002fa7]/8 disabled:opacity-60"
-                      placeholder={projectContextLoading ? "正在加载项目上下文..." : "写入当前项目的业务背景、架构约束、目录约定和稳定决策。"}
-                    />
-
-                    <div className="mt-3 rounded-xl border border-amber-100 bg-amber-50/60 px-3.5 py-3 text-[11px] leading-relaxed text-amber-700">
-                      这里不要维护 skills 列表或工具 schema；skills 由 SkillsMiddleware 运行时注入，tools 通过 API tools 字段进入模型。
-                    </div>
-                  </SettingsCard>
-                )}
-              </div>
-            )}
-
             {category === "databaseQa" && (
               <div className="flex flex-col gap-5 lg:flex-row">
                 <aside className="flex w-full flex-col gap-4 lg:sticky lg:top-6 lg:w-56 lg:self-start lg:shrink-0">
@@ -2388,42 +1929,13 @@ export default function SettingsPage() {
                     />
                   </div>
                 </SettingsCard>
-                <SettingsCard title="Agent SQL 路径灰度" icon={Route} color="#7c3aed">
-                  <div className="rounded-xl border border-violet-100 bg-violet-50/60 px-3.5 py-3 text-[10px] leading-4 text-violet-700">
-                    新路径默认关闭。开启后按<strong>模型、Run、Session 的稳定哈希</strong>灰度，业务歧义、越权和缺失证据不会自动切回旧路径。
-                  </div>
+                <SettingsCard title="SQL 可靠性" icon={Route} color="#7c3aed">
                   <ToggleRow
-                    label="启用 Agent SQL 路径"
-                    description="启用 evidence search → Agent SQL → 独立 Validator → Receipt 执行链。"
-                    checked={dbQaAgentSqlPathEnabled}
-                    onChange={setDbQaAgentSqlPathEnabled}
+                    label="允许基础设施故障回退"
+                    description="仅当 evidence search 超时、数据库不可用或 Agent 协议不可用时，允许临时调用兼容生成器；业务歧义、越权和证据不足不会回退。"
+                    checked={dbQaAgentSqlFallbackEnabled}
+                    onChange={setDbQaAgentSqlFallbackEnabled}
                   />
-                  <div className="grid gap-4 md:grid-cols-2">
-                    <DatabaseQaParameterField
-                      label="灰度比例"
-                      description="0 表示不放量，100 表示所有符合条件的 Run。"
-                      unit="%"
-                      value={dbQaAgentSqlRolloutPercentage}
-                      onChange={setDbQaAgentSqlRolloutPercentage}
-                      disabled={!dbQaAgentSqlPathEnabled}
-                    />
-                    <div className="space-y-3 rounded-xl border border-violet-100 bg-violet-50/30 px-3.5 py-3">
-                      <ToggleRow
-                        label="允许基础设施 fallback"
-                        description="仅 evidence search 基础设施故障等明确可靠性错误允许切回 legacy generator。"
-                        checked={dbQaAgentSqlFallbackEnabled}
-                        onChange={setDbQaAgentSqlFallbackEnabled}
-                        disabled={!dbQaAgentSqlPathEnabled}
-                      />
-                      <ToggleRow
-                        label="记录 shadow compare 请求"
-                        description="记录新旧路径对比所需的 case/指标，不改变 Agent 路径的执行结果。"
-                        checked={dbQaAgentSqlShadowCompareEnabled}
-                        onChange={setDbQaAgentSqlShadowCompareEnabled}
-                        disabled={!dbQaAgentSqlPathEnabled}
-                      />
-                    </div>
-                  </div>
                 </SettingsCard>
                   </>
                 )}
@@ -2512,203 +2024,6 @@ export default function SettingsPage() {
                 )}
                 </div>
               </div>
-            )}
-
-            {/* Fallback Settings */}
-            {false && category === "ai" && (
-              <SettingsCard title="Fallback 直连配置" icon={Bot} color="#6b7280">
-                <div className="rounded-xl border border-amber-100/80 bg-amber-50/50 px-3.5 py-3 mb-4">
-                  <p className="text-[11px] leading-relaxed text-amber-700">
-                    <strong>说明：</strong>LLM / Embedding 请求统一经过内部网关路由；以下配置仅作为旧配置兼容保留。
-                  </p>
-                </div>
-
-                <h3 className="mb-3 text-[13px] font-semibold text-gray-700">LLM 模型</h3>
-                <FormField label="Provider">
-                  <select
-                    value={llmProvider}
-                    onChange={(e) => {
-                      setLlmProvider(e.target.value);
-                      const p = LLM_PROVIDERS.find((p) => p.value === e.target.value);
-                      if (p && p.baseUrl) setLlmBaseUrl(p.baseUrl);
-                    }}
-                    className="form-select"
-                  >
-                    {LLM_PROVIDERS.map((p) => (
-                      <option key={p.value} value={p.value}>{p.label}</option>
-                    ))}
-                  </select>
-                </FormField>
-                <FormField label="Model">
-                  <input
-                    type="text"
-                    value={llmModel}
-                    onChange={(e) => setLlmModel(e.target.value)}
-                    className="form-input"
-                    placeholder="deepseek-chat"
-                  />
-                </FormField>
-                <FormField label="Base URL">
-                  <input
-                    type="text"
-                    value={llmBaseUrl}
-                    onChange={(e) => setLlmBaseUrl(e.target.value)}
-                    className="form-input"
-                    placeholder="https://api.deepseek.com"
-                  />
-                </FormField>
-                <FormField label="API Key">
-                  <div className="flex gap-2">
-                    <div className="relative flex-1">
-                      <input
-                        type={showLlmKey ? "text" : "password"}
-                        value={llmApiKey}
-                        onChange={(e) => setLlmApiKey(e.target.value)}
-                        className="form-input pr-8"
-                        placeholder={llmApiKeyMasked || "sk-..."}
-                      />
-                      <button
-                        onClick={() => setShowLlmKey((v) => !v)}
-                        className="absolute right-2 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600"
-                      >
-                        {showLlmKey ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
-                      </button>
-                    </div>
-                    <button
-                      onClick={handleTestLlm}
-                      disabled={llmTesting}
-                      className="px-3 py-1.5 text-[11px] font-medium rounded-lg bg-[#002fa7]/10 text-[#002fa7] hover:bg-[#002fa7]/20 transition-colors disabled:opacity-50 flex items-center gap-1.5 shrink-0"
-                    >
-                      {llmTesting ? <Loader2 className="w-3 h-3 animate-spin" /> : <Zap className="w-3 h-3" />}
-                      测试连接
-                    </button>
-                  </div>
-                  {llmTestResult && (
-                    <div className={`mt-1.5 flex items-center gap-1 text-[11px] ${llmTestResult!.ok ? "text-emerald-600" : "text-red-500"}`}>
-                      {llmTestResult!.ok ? <CheckCircle2 className="w-3 h-3" /> : <XCircle className="w-3 h-3" />}
-                      {llmTestResult!.msg}
-                    </div>
-                  )}
-                </FormField>
-                <FormField label={`Temperature: ${temperature}`}>
-                  <input
-                    type="range"
-                    min="0"
-                    max="2"
-                    step="0.1"
-                    value={temperature}
-                    onChange={(e) => setTemperature(parseFloat(e.target.value))}
-                    className="w-full accent-[#002fa7]"
-                  />
-                  <div className="flex justify-between text-[10px] text-gray-400 mt-0.5">
-                    <span>精确 (0)</span>
-                    <span>创意 (2)</span>
-                  </div>
-                </FormField>
-                <FormField label="Max Tokens">
-                  <input
-                    type="number"
-                    min="256"
-                    max="128000"
-                    value={maxTokens}
-                    onChange={(e) => setMaxTokens(parseInt(e.target.value) || 4096)}
-                    className="form-input"
-                  />
-                </FormField>
-
-                <div className="my-5 border-t border-black/[0.06]" />
-                <h3 className="mb-3 text-[13px] font-semibold text-gray-700">Embedding 模型</h3>
-                <FormField label="Provider">
-                  <select
-                    value={embProvider}
-                    onChange={(e) => {
-                      setEmbProvider(e.target.value);
-                      const p = EMBEDDING_PROVIDERS.find((p) => p.value === e.target.value);
-                      if (p && p.baseUrl) setEmbBaseUrl(p.baseUrl);
-                    }}
-                    className="form-select"
-                  >
-                    {EMBEDDING_PROVIDERS.map((p) => (
-                      <option key={p.value} value={p.value}>{p.label}</option>
-                    ))}
-                  </select>
-                </FormField>
-                <FormField label="Model">
-                  <input
-                    type="text"
-                    value={embModel}
-                    onChange={(e) => setEmbModel(e.target.value)}
-                    className="form-input"
-                    placeholder="text-embedding-v3"
-                  />
-                </FormField>
-                <div className="grid gap-4 md:grid-cols-2">
-                  <FormField label="文本向量维度">
-                    <input
-                      type="number"
-                      min="1"
-                      value={embDimension}
-                      onChange={(e) => setEmbDimension(e.target.value)}
-                      className="form-input"
-                      placeholder="1024"
-                    />
-                  </FormField>
-                  <FormField label="文本批量大小">
-                    <input
-                      type="number"
-                      min="1"
-                      value={embBatchSize}
-                      onChange={(e) => setEmbBatchSize(e.target.value)}
-                      className="form-input"
-                    placeholder="10"
-                    />
-                    <p className="mt-1 text-[10px] text-gray-400">
-                      text-embedding-v3/v4 单次最多处理 10 条文本。
-                    </p>
-                  </FormField>
-                </div>
-                <FormField label="Base URL">
-                  <input
-                    type="text"
-                    value={embBaseUrl}
-                    onChange={(e) => setEmbBaseUrl(e.target.value)}
-                    className="form-input"
-                  />
-                </FormField>
-                <FormField label="API Key">
-                  <div className="flex gap-2">
-                    <div className="relative flex-1">
-                      <input
-                        type={showEmbKey ? "text" : "password"}
-                        value={embApiKey}
-                        onChange={(e) => setEmbApiKey(e.target.value)}
-                        className="form-input pr-8"
-                        placeholder={embApiKeyMasked || "sk-..."}
-                      />
-                      <button
-                        onClick={() => setShowEmbKey((v) => !v)}
-                        className="absolute right-2 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600"
-                      >
-                        {showEmbKey ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
-                      </button>
-                    </div>
-                    <button
-                      onClick={handleTestEmb}
-                      disabled={embTesting}
-                      className="px-3 py-1.5 text-[11px] font-medium rounded-lg bg-amber-500/10 text-amber-600 hover:bg-amber-500/20 transition-colors disabled:opacity-50 flex items-center gap-1.5 shrink-0"
-                    >
-                      {embTesting ? <Loader2 className="w-3 h-3 animate-spin" /> : <Zap className="w-3 h-3" />}
-                      测试连接
-                    </button>
-                  </div>
-                  {embTestResult && (
-                    <div className={`mt-1.5 flex items-center gap-1 text-[11px] ${embTestResult!.ok ? "text-emerald-600" : "text-red-500"}`}>
-                      {embTestResult!.ok ? <CheckCircle2 className="w-3 h-3" /> : <XCircle className="w-3 h-3" />}
-                      {embTestResult!.msg}
-                    </div>
-                  )}
-                </FormField>
-              </SettingsCard>
             )}
 
             {/* RAG Settings */}
@@ -3452,13 +2767,13 @@ export default function SettingsPage() {
                             <SubAgentEditorPanel
                               index={selectedSubagentIndex}
                               item={subagentItems[selectedSubagentIndex]}
-                              gatewayModels={gatewayModels}
+                              agentModels={agentModels}
                               imageAnalyzerModels={imageAnalyzerProviderModels
                                 .map((model) => ({ id: model.id, name: model.name, providerName: model.provider.name }))}
                               imageAnalyzerModelId={imageAnalyzerBoundId}
                               refreshingModels={refreshingModels}
                               onChange={updateSubAgentItem}
-                              onRefreshModels={handleRefreshGatewayModels}
+                              onRefreshModels={handleRefreshAgentModels}
                               onBindImageAnalyzer={(modelId) => handleBindProvider("image_analyzer", modelId)}
                               onDelete={handleDeleteSubAgent}
                               onClose={() => setSelectedSubagentIndex(null)}
@@ -3627,7 +2942,7 @@ export default function SettingsPage() {
                               deepagents: {
                                 summarization: {
                                   model_id: contextSummaryModelId,
-                                  trigger_tokens: positiveIntOrNull(contextSummaryTriggerTokens) ?? 160000,
+                                  trigger_tokens: positiveIntOrNull(contextSummaryTriggerTokens) ?? 272000,
                                   keep_tokens: positiveIntOrNull(contextSummaryKeepTokens) ?? 64000,
                                 },
                                 tool_context: {
@@ -4043,13 +3358,13 @@ export default function SettingsPage() {
                         <SubAgentEditorPanel
                           index={selectedSubagentIndex}
                           item={subagentItems[selectedSubagentIndex]}
-                          gatewayModels={gatewayModels}
+                          agentModels={agentModels}
                           imageAnalyzerModels={imageAnalyzerProviderModels
                             .map((model) => ({ id: model.id, name: model.name, providerName: model.provider.name }))}
                           imageAnalyzerModelId={imageAnalyzerBoundId}
                           refreshingModels={refreshingModels}
                           onChange={updateSubAgentItem}
-                          onRefreshModels={handleRefreshGatewayModels}
+                          onRefreshModels={handleRefreshAgentModels}
                           onBindImageAnalyzer={(modelId) => handleBindProvider("image_analyzer", modelId)}
                           onDelete={handleDeleteSubAgent}
                           onClose={() => setSelectedSubagentIndex(null)}
@@ -4100,27 +3415,6 @@ export default function SettingsPage() {
               </div>
             )}
 
-            {/* Advanced Settings */}
-            {category === "advanced" && (
-              <SettingsCard title="高级设置" icon={Sliders} color="#6b7280">
-                <FormField label={`压缩比例: ${Math.round(compRatio * 100)}%`}>
-                  <input
-                    type="range"
-                    min="0.2"
-                    max="0.8"
-                    step="0.05"
-                    value={compRatio}
-                    onChange={(e) => setCompRatio(parseFloat(e.target.value))}
-                    className="w-full accent-gray-500"
-                  />
-                  <div className="flex justify-between text-[10px] text-gray-400 mt-0.5">
-                    <span>少压缩 (20%)</span>
-                    <span>多压缩 (80%)</span>
-                  </div>
-                </FormField>
-              </SettingsCard>
-            )}
-
             {/* System Status */}
             {category === "system" && (
               <SettingsCard title="系统状态" icon={Activity} color="#002fa7">
@@ -4129,7 +3423,7 @@ export default function SettingsPage() {
             )}
 
             {/* Save Button */}
-            {category !== "ai" && category !== "databaseQa" && category !== "worker" && category !== "system" && <div className="flex justify-end pt-2 pb-8">
+            {category !== "ai" && category !== "databaseQa" && category !== "memory" && category !== "worker" && category !== "system" && <div className="flex justify-end pt-2 pb-8">
               <button
                 onClick={handleSave}
                 disabled={saving}
@@ -4281,7 +3575,7 @@ type SubAgentEditorTab = (typeof SUBAGENT_EDITOR_TABS)[number]["key"];
 function SubAgentEditorPanel({
   index,
   item,
-  gatewayModels,
+  agentModels,
   imageAnalyzerModels,
   imageAnalyzerModelId,
   refreshingModels,
@@ -4294,7 +3588,7 @@ function SubAgentEditorPanel({
 }: {
   index: number;
   item: SubAgentItem;
-  gatewayModels: string[];
+  agentModels: string[];
   imageAnalyzerModels: Array<{ id: string; name: string; providerName: string }>;
   imageAnalyzerModelId: string;
   refreshingModels: boolean;
@@ -4409,12 +3703,12 @@ function SubAgentEditorPanel({
                       value={item.model}
                       onChange={(e) => onChange(index, (it) => ({ ...it, model: e.target.value }))}
                       className="form-select"
-                      disabled={gatewayModels.length === 0}
+                      disabled={agentModels.length === 0}
                     >
-                      {gatewayModels.length === 0 ? (
+                      {agentModels.length === 0 ? (
                         <option value="">暂无可用模型</option>
                       ) : (
-                        gatewayModels.map((model) => (
+                        agentModels.map((model) => (
                           <option key={model} value={model}>
                             {model}
                           </option>
@@ -4591,42 +3885,6 @@ function SwitchButton({
         }`}
       />
     </button>
-  );
-}
-
-function RouteNode({
-  title,
-  detail,
-  status,
-  tone,
-}: {
-  title: string;
-  detail: string;
-  status: string;
-  tone: "green" | "amber" | "blue";
-}) {
-  const tones = {
-    green: "bg-emerald-50 text-emerald-700",
-    amber: "bg-amber-50 text-amber-700",
-    blue: "bg-[#002fa7]/8 text-[#002fa7]",
-  };
-  return (
-    <div className="min-w-0 rounded-xl border border-black/[0.06] bg-white px-3 py-2.5">
-      <div className="flex items-center justify-between gap-2">
-        <span className="truncate text-[11px] font-semibold text-gray-800">{title}</span>
-        <span className={`shrink-0 rounded-full px-1.5 py-0.5 text-[9px] font-medium ${tones[tone]}`}>{status}</span>
-      </div>
-      <p className="mt-1.5 truncate text-[10px] text-gray-400" title={detail}>{detail}</p>
-    </div>
-  );
-}
-
-function ConnectionResult({ result }: { result: { ok: boolean; msg: string } }) {
-  return (
-    <div className={`mt-1.5 flex items-center gap-1 text-[11px] ${result.ok ? "text-emerald-600" : "text-red-500"}`}>
-      {result.ok ? <ShieldCheck className="h-3 w-3" /> : <XCircle className="h-3 w-3" />}
-      {result.msg}
-    </div>
   );
 }
 

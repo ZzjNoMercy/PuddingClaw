@@ -484,17 +484,15 @@ def test_read_evidence_resolves_large_result_from_source_query(tmp_path):
     session_manager.initialize(tmp_path / "backend")
     session_manager.create_session("evidence-session")
     workspace = tmp_path / "workspace"
-    raw_dir = (
-        workspace
-        / ".puddingclaw"
-        / "large_tool_results"
-        / "evidence-session"
-        / "query-old"
-    )
-    raw_dir.mkdir(parents=True)
     raw_text = "complete historical payload"
-    (raw_dir / "call-large").write_text(raw_text, encoding="utf-8")
-    source_hash = "sha256:" + hashlib.sha256(raw_text.encode()).hexdigest()
+    raw_ref = session_manager.materialize_large_tool_result(
+        workspace_path=workspace,
+        session_id="evidence-session",
+        query_id="query-old",
+        tool_call_id="call-large",
+        output=raw_text,
+    )
+    source_hash = raw_ref["source_hash"]
     session_manager.upsert_assistant_message(
         "evidence-session",
         content="old result",
@@ -506,6 +504,7 @@ def test_read_evidence_resolves_large_result_from_source_query(tmp_path):
                 "input": {"file_path": "/workspace/big.txt"},
                 "output": "Result saved to /large_tool_results/call-large",
                 "source_hash": source_hash,
+                "raw_output_ref": raw_ref,
             }
         ],
     )
@@ -515,21 +514,23 @@ def test_read_evidence_resolves_large_result_from_source_query(tmp_path):
     restored = session_manager.read_evidence(
         "evidence-session",
         evidence_id,
-        workspace_path=workspace,
     )
 
     assert restored["status"] == "success"
     assert restored["content"] == raw_text
     assert restored["raw_result_available"] is True
     assert restored["hash_matches"] is True
+    assert raw_ref["workspace_digest"] == hashlib.sha256(
+        str(workspace.resolve()).encode("utf-8")
+    ).hexdigest()[:20]
 
 
 def test_read_sql_evidence_pages_saved_jsonl_without_preview_fallback(tmp_path):
-    base_dir = tmp_path / "backend"
+    base_dir = tmp_path / "home"
     base_dir.mkdir()
     session_manager.initialize(base_dir)
     session_manager.create_session("sql-evidence-session")
-    result_dir = base_dir / "data" / "database-query-results"
+    result_dir = base_dir / "data" / "query-results"
     result_dir.mkdir(parents=True)
     (result_dir / "qr-evidence.jsonl").write_text(
         '{"id":1}\n{"id":2}\n{"id":3}\n',
@@ -544,7 +545,7 @@ def test_read_sql_evidence_pages_saved_jsonl_without_preview_fallback(tmp_path):
                 "result_id": "qr-evidence",
                 "session_id": "sql-evidence-session",
                 "tool_call_id": "call-sql",
-                "artifact_path": "data/database-query-results/qr-evidence.jsonl",
+                "artifact_path": "qr-evidence.jsonl",
                 "artifact_format": "jsonl",
                 "artifact_sha256": f"sha256:{hashlib.sha256(artifact.read_bytes()).hexdigest()}",
                 "row_count": 3,
@@ -595,11 +596,11 @@ def test_read_sql_evidence_pages_saved_jsonl_without_preview_fallback(tmp_path):
 
 
 def test_sql_evidence_rejects_wrong_owner_expiry_and_tampering(tmp_path):
-    base_dir = tmp_path / "backend"
+    base_dir = tmp_path / "home"
     base_dir.mkdir()
     session_manager.initialize(base_dir)
     session_manager.create_session("sql-owner-session")
-    result_dir = base_dir / "data" / "database-query-results"
+    result_dir = base_dir / "data" / "query-results"
     catalog_dir = result_dir / ".catalog"
     catalog_dir.mkdir(parents=True)
     artifact = result_dir / "qr-secure.jsonl"
@@ -608,7 +609,7 @@ def test_sql_evidence_rejects_wrong_owner_expiry_and_tampering(tmp_path):
         "result_id": "qr-secure",
         "session_id": "sql-owner-session",
         "tool_call_id": "call-secure",
-        "artifact_path": "data/database-query-results/qr-secure.jsonl",
+        "artifact_path": "qr-secure.jsonl",
         "artifact_format": "jsonl",
         "artifact_sha256": f"sha256:{hashlib.sha256(artifact.read_bytes()).hexdigest()}",
         "row_count": 1,

@@ -45,7 +45,9 @@ class EvaluationSettingsStore:
     _CREDENTIAL_ID = "puddingclaw-langsmith"
 
     def __init__(self, path: Path | str | None = None) -> None:
-        default = Path(__file__).resolve().parent.parent / "data" / "evaluation-settings.json"
+        from runtime_identity.paths import PuddingClawPaths
+
+        default = PuddingClawPaths.from_environment().evaluation_settings()
         self.path = Path(path or os.getenv("PUDDINGCLAW_EVALUATION_SETTINGS") or default)
 
     def _load_file(self) -> dict[str, Any]:
@@ -60,25 +62,24 @@ class EvaluationSettingsStore:
     def load(self) -> LangSmithSettings:
         payload = self._load_file()
         from provider_registry import LocalCredentialStore
+        from runtime_identity.paths import trusted_owner_user_id
 
         credential_store = LocalCredentialStore()
-        explicit_key_reference = "api_key_ref" in payload
-        reference = str(payload.pop("api_key_ref", "") or f"local-file://{self._CREDENTIAL_ID}")
+        reference = str(payload.pop("api_key_ref", "") or "")
+        if not reference.startswith("vault://"):
+            reference = f"vault://users/{trusted_owner_user_id()}/credentials/{self._CREDENTIAL_ID}"
         legacy_key = str(payload.pop("api_key", "") or "")
         if legacy_key:
             reference = credential_store.put(self._CREDENTIAL_ID, legacy_key)
-            explicit_key_reference = True
         stored_key = credential_store.get(reference)
         if stored_key:
             payload["api_key"] = stored_key
-        env_key = os.getenv("LANGSMITH_API_KEY")
         env_endpoint = os.getenv("LANGSMITH_ENDPOINT")
         env_project = os.getenv("LANGSMITH_PROJECT")
         # Evaluation UI settings are an explicit, isolated provider profile.
-        # Environment variables are bootstrap fallbacks only; otherwise an old
-        # process-level key silently overrides a key the user just saved.
-        if env_key and not explicit_key_reference:
-            payload["api_key"] = env_key
+        # API keys are resolved only through Credential Vault. Environment
+        # variables must never become a second secret source or resurrect a
+        # key after the user explicitly cleared it.
         if env_endpoint and not payload.get("endpoint"):
             payload["endpoint"] = env_endpoint
         if env_project and not payload.get("project"):
@@ -114,7 +115,8 @@ class EvaluationSettingsStore:
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
                 payload = validated.model_dump(exclude={"api_key"})
-                payload["api_key_ref"] = f"local-file://{self._CREDENTIAL_ID}"
+                if validated.api_key:
+                    payload["api_key_ref"] = credential_store.put(self._CREDENTIAL_ID, validated.api_key)
                 json.dump(payload, handle, ensure_ascii=False, indent=2)
                 handle.flush()
                 os.fsync(handle.fileno())

@@ -21,7 +21,7 @@ _DEFAULT_TRIGGERS = ["帮我记得", "提醒我", "需要做"]
 # 排除词：包含这些词的请求不会被当作任务
 _EXCLUDE_KEYWORDS = ["查看", "列出", "显示", "标记", "完成", "清理", "删除", "归档"]
 
-# 全局 dedup 缓存：跨 middleware 实例共享，避免 mem0 模式下每次重建导致缓存丢失
+# 全局 dedup 缓存：跨 middleware 实例共享，避免实例重建导致缓存丢失
 # key = md5(user_text), value = True
 _GLOBAL_DEDUP_CACHE: collections.OrderedDict[str, bool] = collections.OrderedDict()
 _GLOBAL_DEDUP_MAX = 200
@@ -33,7 +33,7 @@ class TaskStateMiddleware(AgentMiddleware):
     设计要点：
     - 继承 AgentMiddleware，使用 after_model hook 由 LangChain 框架自动触发
     - 纯副作用：返回 None 不修改 state
-    - 使用全局 dedup 缓存，避免 mem0 模式下每次重建 middleware 导致缓存丢失
+    - 使用全局 dedup 缓存，避免重建 middleware 导致缓存丢失
     - 文件写失败不阻断 pipeline（logger.warning + return None）
     """
 
@@ -90,7 +90,7 @@ class TaskStateMiddleware(AgentMiddleware):
     def _is_duplicate(self, text: str) -> bool:
         """检查并标记 dedup。命中返回 True；未命中插入新 hash 并返回 False。
 
-        使用全局缓存，避免 mem0 模式下每次重建 middleware 导致缓存丢失。
+        使用全局缓存，避免重建 middleware 导致缓存丢失。
         """
         h = hashlib.md5(text.encode("utf-8", errors="replace")).hexdigest()
         if h in _GLOBAL_DEDUP_CACHE:
@@ -155,8 +155,9 @@ def build_write_middlewares(base_dir: Path, config: dict) -> list:
 
     task_cfg = config.get("task_state", {})
     if task_cfg.get("enabled", True):
-        todo_rel = task_cfg.get("todo_path", "workspace/TODO.md")
-        todo_path = base_dir / todo_rel if not Path(todo_rel).is_absolute() else Path(todo_rel)
+        from runtime_identity.paths import PuddingClawPaths
+
+        todo_path = PuddingClawPaths.from_environment().agent_workspaces() / "unscoped" / "default" / "TODO.md"
         # 仅在未配置 (None) 时 fallback；显式传入 [] 视为"静默模式"（中间件挂载但不触发）
         triggers = task_cfg.get("triggers")
         if triggers is None:

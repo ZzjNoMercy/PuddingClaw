@@ -314,7 +314,7 @@ class ModelClient:
     def _thinking_kwargs(self, cfg: dict[str, Any]) -> dict[str, Any]:
         """构造思考模式参数（reasoning_effort / extra_body.thinking）。
 
-        当 thinking_mode 开启且配置中存在这些参数时，统一传递给底层模型。
+        当会话/调用方显式选择推理强度时，统一传递给底层模型。
         DeepSeek 官方 API 以及 Higress 透传场景均支持这些参数。
         """
         kwargs: dict[str, Any] = {}

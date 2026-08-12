@@ -37,7 +37,7 @@ def test_mcp_warmup_flattens_taskgroup_and_disambiguates_ready_gbrain(
     monkeypatch.setattr(
         config,
         "load_config",
-        lambda: {"mcp": {"enabled": [], "auto_enable_gbrain": True}},
+        lambda: {"mcp": {"enabled": []}},
     )
     monkeypatch.setattr(
         servers,
@@ -78,7 +78,7 @@ def test_mcp_warmup_retries_one_transient_stdio_failure(
     monkeypatch.setattr(
         config,
         "load_config",
-        lambda: {"mcp": {"enabled": [], "auto_enable_gbrain": True}},
+        lambda: {"mcp": {"enabled": []}},
     )
     monkeypatch.setattr(
         servers,

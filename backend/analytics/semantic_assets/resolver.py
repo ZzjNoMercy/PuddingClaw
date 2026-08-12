@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from runtime_identity.paths import PuddingClawPaths
+
 from .registry import get_semantic_asset_registry
 
 TOKEN_RE = re.compile(r"[0-9A-Za-z_\u4e00-\u9fff]+")
@@ -243,7 +245,9 @@ def resolve_semantic_assets(
     """
 
     registry = get_semantic_asset_registry(base_dir)
-    resolved_base_dir = (base_dir or Path(__file__).resolve().parents[2]).resolve()
+    resolved_base_dir = (
+        base_dir or PuddingClawPaths.from_environment().user_definitions()
+    ).resolve()
     snapshot = registry.list_assets()
     requested = {item.strip() for item in (requested_ids or []) if item and item.strip()}
     allowed = (

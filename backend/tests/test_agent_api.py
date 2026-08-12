@@ -43,6 +43,51 @@ def test_stream_agent_persists_user_message_before_stream(monkeypatch, tmp_path)
     assert history[0]["content"] == "新任务先落盘"
 
 
+def test_agent_inherits_default_model_thinking_profile(monkeypatch, tmp_path):
+    from api import agent as agent_api
+    from graph.session_manager import session_manager
+
+    session_manager.initialize(tmp_path)
+    session_manager.create_session("agent-default-thinking")
+
+    def fake_llm_config(*, model_id_override=None, thinking_level=None, **_kwargs):
+        assert model_id_override is None
+        assert thinking_level is None
+        return {
+            "model_id": "deepseek:deepseek-openai:deepseek-v4-flash:llm",
+            "provider": "deepseek",
+            "model": "deepseek-v4-flash",
+            "thinking_enabled": True,
+            "thinking_level": "high",
+            "credential_name": "default",
+        }
+
+    async def fake_astream(**kwargs):
+        assert kwargs["llm_model_id"] is None
+        assert kwargs["thinking_level"] == "high"
+        assert kwargs["credential_name"] is None
+        yield {"event": "done", "data": "{}"}
+
+    monkeypatch.setattr(agent_api, "get_fallback_llm_config", fake_llm_config)
+    monkeypatch.setattr(agent_api.deepagents_agent_manager, "astream", fake_astream)
+
+    app = FastAPI()
+    app.include_router(agent_api.router, prefix="/api")
+    response = TestClient(app).post(
+        "/api/agent",
+        json={
+            "message": "默认开启思考",
+            "session_id": "agent-default-thinking",
+            "stream": True,
+        },
+    )
+
+    assert response.status_code == 200
+    metadata = session_manager.get_metadata("agent-default-thinking")
+    assert "llm_model_id" not in metadata
+    assert "thinking_level" not in metadata
+
+
 def test_agent_request_model_selection_overrides_persisted_session_selection(monkeypatch, tmp_path):
     from api import agent as agent_api
     from graph.session_manager import session_manager

@@ -4,55 +4,7 @@
 
 const API_BASE = "/api";
 
-export interface FallbackLlmSettings {
-  provider: string;
-  model: string;
-  base_url: string;
-  api_key_masked: string;
-  temperature: number;
-  max_tokens: number;
-  context_window?: number;
-}
-
-export interface GatewayLlmSettings {
-  model: string;
-}
-
-export interface GatewaySettings {
-  enabled: boolean;
-  base_url: string;
-  health_path: string;
-  fallback_to_direct: boolean;
-  environment_override: boolean;
-  routed_models: string[];
-}
-
-export interface FallbackEmbeddingSettings {
-  provider: string;
-  model: string;
-  base_url: string;
-  dimension?: number;
-  batch_size?: number;
-  api_key_masked: string;
-}
-
-export interface MultimodalEmbeddingSettings {
-  provider: string;
-  model: string;
-  dimension: number;
-  batch_size?: number;
-  base_url: string;
-  route_path: string;
-  prefer_gateway: boolean;
-  api_key_masked: string;
-  effective_model?: string;
-  effective_dimension?: number;
-  gateway_route_required?: boolean;
-  openai_compatible?: boolean;
-}
-
 export interface RagSettings {
-  enabled: boolean;
   top_k: number;
   similarity_threshold: number;
   hybrid?: {
@@ -69,8 +21,6 @@ export interface RagSettings {
     model: string;
     top_n: number;
     candidate_top_k: number;
-    base_url?: string;
-    api_key_masked?: string;
   };
 }
 
@@ -100,10 +50,7 @@ export interface DatabaseQaSettings {
   max_page_size: number;
   export_enabled: boolean;
   profile_enabled: boolean;
-  database_agent_sql_path_enabled: boolean;
-  database_agent_sql_path_rollout_percentage: number;
   database_agent_sql_fallback_enabled: boolean;
-  database_agent_sql_shadow_compare_enabled: boolean;
 }
 
 export interface AnalyticsSettings {
@@ -139,6 +86,7 @@ export interface KnowledgeSettings {
     legacy_text_collection?: string;
     image_collection: string;
     bm25_enabled?: boolean;
+    embedding_batch_size?: number;
     overwrite?: boolean;
   };
 }
@@ -157,7 +105,6 @@ export interface DatabaseSettings {
 }
 
 export interface CompressionSettings {
-  ratio: number;
   deepagents?: {
     summarization?: {
       enabled?: boolean;
@@ -240,12 +187,6 @@ export interface SubAgentSettings {
 }
 
 export interface SystemSettings {
-  thinking_mode: boolean;
-  ai_gateway: GatewaySettings;
-  gateway_llm: GatewayLlmSettings;
-  fallback_llm: FallbackLlmSettings;
-  fallback_embedding: FallbackEmbeddingSettings;
-  multimodal_embedding: MultimodalEmbeddingSettings;
   rag: RagSettings;
   vanna?: VannaSettings;
   analytics?: AnalyticsSettings;
@@ -318,7 +259,6 @@ export interface ProviderRegistry {
   version: number;
   providers: ProviderService[];
   bindings: Record<string, string>;
-  migration: { state: string };
 }
 
 export async function getSettings(): Promise<SystemSettings> {
@@ -452,34 +392,6 @@ export async function resetKnowledgeVectorCollections(): Promise<ResetKnowledgeV
   if (!resp.ok) {
     const data = await resp.json().catch(() => ({}));
     throw new Error(data.detail || `Failed to reset vector collections: ${resp.status}`);
-  }
-  return resp.json();
-}
-
-export interface TestConnectionResult {
-  success: boolean;
-  model: string;
-  latency_ms: number;
-  response_model?: string;
-  dimensions?: number;
-}
-
-export async function testConnection(params: {
-  type: "gateway" | "llm" | "embedding";
-  provider?: string;
-  model?: string;
-  base_url: string;
-  api_key?: string;
-  health_path?: string;
-}): Promise<TestConnectionResult> {
-  const resp = await fetch(`${API_BASE}/settings/test-connection`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(params),
-  });
-  if (!resp.ok) {
-    const data = await resp.json().catch(() => ({}));
-    throw new Error(data.detail || `Connection test failed: ${resp.status}`);
   }
   return resp.json();
 }

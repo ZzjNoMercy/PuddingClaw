@@ -141,4 +141,12 @@ class InspectSkillTool(BaseTool):
 
 
 def create_skill_inspection_tool(base_dir: Path) -> InspectSkillTool:
-    return InspectSkillTool(skills_dir=str(base_dir / "skills"))
+    skills_root = base_dir / "skills"
+    if base_dir.name == "backend":
+        from runtime_identity.paths import PuddingClawPaths
+        from tools.skills_scanner import materialize_skill_view
+
+        paths = PuddingClawPaths.from_environment()
+        skills_root = paths.data() / "skill-runtime-view"
+        materialize_skill_view(base_dir, paths.user_skills(), skills_root)
+    return InspectSkillTool(skills_dir=str(skills_root))

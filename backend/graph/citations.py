@@ -68,10 +68,18 @@ def _clean_text(value: Any, limit: int | None = None) -> str:
 
 def make_source_id(source: dict[str, Any]) -> str:
     """Create a deterministic source id without exposing local paths."""
-    identity = "|".join(
-        _clean_text(source.get(key))
-        for key in ("document_id", "chunk_id", "uri", "title", "page", "quote")
-    )
+    uri = _clean_text(source.get("uri"))
+    source_type = _clean_text(source.get("source_type"))
+    if source_type in {"web", "x"} and urlsplit(uri).scheme in {"http", "https"}:
+        # Search providers can describe the same URL with different numeric
+        # citation labels or excerpts across calls. Its identity must remain
+        # stable so the model cannot see duplicate source ids for one page.
+        identity = f"{source_type}|{uri}"
+    else:
+        identity = "|".join(
+            _clean_text(source.get(key))
+            for key in ("document_id", "chunk_id", "uri", "title", "page", "quote")
+        )
     digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16]
     return f"src_{digest}"
 
@@ -202,13 +210,16 @@ def format_sources_for_model(
     catalog = []
     for source in sources:
         location = f"，第 {source['page']} 页" if source.get("page") not in (None, "") else ""
+        uri = _clean_text(source.get("uri"))
+        link = f"\n  链接：{uri}" if urlsplit(uri).scheme in {"http", "https"} else ""
         if include_evidence:
             catalog.append(
                 f"- {source['source_id']}: {source['title']}{location}\n"
                 f"  证据：{source.get('quote') or '见工具返回内容'}"
+                f"{link}"
             )
         else:
-            catalog.append(f"- {source['source_id']}: {source['title']}{location}")
+            catalog.append(f"- {source['source_id']}: {source['title']}{location}{link}")
     omitted_note = ""
     if not include_evidence:
         # Tell the model the omission is deliberate and recoverable, otherwise

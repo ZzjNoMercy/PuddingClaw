@@ -15,6 +15,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from runtime_identity.paths import PuddingClawPaths
+
 
 current_session_id: contextvars.ContextVar[str] = contextvars.ContextVar(
     "llm_input_session_id", default=""
@@ -22,10 +24,19 @@ current_session_id: contextvars.ContextVar[str] = contextvars.ContextVar(
 current_user_id: contextvars.ContextVar[str] = contextvars.ContextVar(
     "llm_input_user_id", default=""
 )
+_SAFE_METADATA_KEYS = frozenset(
+    {"phase", "history_count", "system_prompt_tokens_estimate", "middleware", "request_type"}
+)
 
 
 def _enabled() -> bool:
     return os.getenv("LLM_INPUT_LOG_ENABLED", "1").lower() not in {"0", "false", "no"}
+
+
+def _body_enabled() -> bool:
+    """Full prompt bodies are an explicit, temporary debugging capability."""
+
+    return os.getenv("LLM_INPUT_LOG_BODY_ENABLED", "0").lower() in {"1", "true", "yes"}
 
 
 def _max_chars() -> int:
@@ -36,8 +47,18 @@ def _max_chars() -> int:
 
 
 def _log_dir() -> Path:
-    default_dir = Path(__file__).resolve().parent.parent / "logs" / "llm-input"
+    default_dir = PuddingClawPaths.from_environment().logs() / "llm-input"
     return Path(os.getenv("LLM_INPUT_LOG_DIR", str(default_dir)))
+
+
+def _safe_metadata(metadata: dict[str, Any] | None) -> dict[str, Any]:
+    """Keep only known structural fields; prompt-like metadata is never logged."""
+
+    return {
+        key: value
+        for key, value in (metadata or {}).items()
+        if key in _SAFE_METADATA_KEYS and isinstance(value, (str, int, float, bool, type(None)))
+    }
 
 
 def _content_to_text(content: Any) -> str:
@@ -63,31 +84,36 @@ def _serialize_tool_calls(tool_calls: Any) -> list[dict[str, Any]]:
     for tc in tool_calls or []:
         if isinstance(tc, dict):
             args = tc.get("args", tc.get("input", ""))
-            args_text, args_truncated = _maybe_truncate(_content_to_text(args))
-            result.append({
+            raw_args = _content_to_text(args)
+            args_text, args_truncated = _maybe_truncate(raw_args)
+            item = {
                 "id": tc.get("id", ""),
                 "name": tc.get("name") or tc.get("tool", ""),
-                "args": args_text,
-                "args_len": len(_content_to_text(args)),
+                "args_len": len(raw_args),
+                "args_sha256": hashlib.sha256(raw_args.encode("utf-8", errors="replace")).hexdigest(),
                 "args_truncated": args_truncated,
-            })
+            }
         else:
             args = getattr(tc, "args", "")
-            args_text, args_truncated = _maybe_truncate(_content_to_text(args))
-            result.append({
+            raw_args = _content_to_text(args)
+            args_text, args_truncated = _maybe_truncate(raw_args)
+            item = {
                 "id": getattr(tc, "id", ""),
                 "name": getattr(tc, "name", ""),
-                "args": args_text,
-                "args_len": len(_content_to_text(args)),
+                "args_len": len(raw_args),
+                "args_sha256": hashlib.sha256(raw_args.encode("utf-8", errors="replace")).hexdigest(),
                 "args_truncated": args_truncated,
-            })
+            }
+        if _body_enabled():
+            item["args"] = args_text
+        result.append(item)
     return result
 
 
 def _serialize_message(message: Any, index: int) -> dict[str, Any]:
     content = _content_to_text(getattr(message, "content", ""))
     content_logged, content_truncated = _maybe_truncate(content)
-    return {
+    item = {
         "index": index,
         "type": getattr(message, "type", type(message).__name__),
         "role": getattr(message, "role", ""),
@@ -97,12 +123,14 @@ def _serialize_message(message: Any, index: int) -> dict[str, Any]:
         "content_len": len(content),
         "content_sha256": hashlib.sha256(content.encode("utf-8", errors="replace")).hexdigest(),
         "content_truncated": content_truncated,
-        "content": content_logged,
         "tool_calls": _serialize_tool_calls(getattr(message, "tool_calls", None)),
         "additional_kwargs_keys": sorted(
             list((getattr(message, "additional_kwargs", {}) or {}).keys())
         ),
     }
+    if _body_enabled():
+        item["content"] = content_logged
+    return item
 
 
 def log_llm_input(
@@ -130,18 +158,20 @@ def log_llm_input(
         "session_id": sid,
         "user_id": uid,
         "message_count": len(messages),
-        "metadata": metadata or {},
+        "body_logging_enabled": _body_enabled(),
+        "metadata": _safe_metadata(metadata),
         "system": {
             "content_len": len(system_content),
             "content_sha256": hashlib.sha256(system_content.encode("utf-8", errors="replace")).hexdigest(),
             "content_truncated": system_truncated,
-            "content": system_logged,
         },
         "messages": [
             _serialize_message(message, idx)
             for idx, message in enumerate(messages)
         ],
     }
+    if _body_enabled():
+        entry["system"]["content"] = system_logged
 
     log_dir = _log_dir()
     log_dir.mkdir(parents=True, exist_ok=True)

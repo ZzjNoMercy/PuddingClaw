@@ -2,7 +2,7 @@
 
 import { useEffect, useId, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { AlertTriangle, Loader2 } from "lucide-react";
+import { AlertTriangle, Loader2, ShieldCheck } from "lucide-react";
 
 interface ConfirmDialogProps {
   open: boolean;
@@ -11,6 +11,7 @@ interface ConfirmDialogProps {
   confirmLabel: string;
   cancelLabel?: string;
   busy?: boolean;
+  tone?: "danger" | "trust";
   onConfirm: () => void;
   onClose: () => void;
 }
@@ -22,6 +23,7 @@ export default function ConfirmDialog({
   confirmLabel,
   cancelLabel = "取消",
   busy = false,
+  tone = "danger",
   onConfirm,
   onClose,
 }: ConfirmDialogProps) {
@@ -49,6 +51,14 @@ export default function ConfirmDialog({
 
   if (!mounted || !open) return null;
 
+  const Icon = tone === "trust" ? ShieldCheck : AlertTriangle;
+  const iconClass = tone === "trust"
+    ? "bg-[#e8edff] text-[#002fa7]"
+    : "bg-rose-50 text-rose-600";
+  const confirmClass = tone === "trust"
+    ? "bg-[#002fa7] hover:bg-[#001f7a]"
+    : "bg-rose-600 hover:bg-rose-700";
+
   return createPortal(
     <div
       className="fixed inset-0 z-[160] flex items-center justify-center bg-slate-950/25 px-4 py-6 backdrop-blur-[3px]"
@@ -64,8 +74,8 @@ export default function ConfirmDialog({
         className="w-full max-w-[440px] rounded-[28px] border border-black/[0.08] bg-white p-5 shadow-2xl shadow-slate-950/20"
       >
         <div className="flex items-start gap-3">
-          <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-2xl bg-rose-50 text-rose-600">
-            <AlertTriangle className="h-5 w-5" />
+          <div className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-2xl ${iconClass}`}>
+            <Icon className="h-5 w-5" />
           </div>
           <div className="min-w-0 flex-1 pt-0.5">
             <h2 id={titleId} className="text-[16px] font-bold text-slate-950">
@@ -91,7 +101,7 @@ export default function ConfirmDialog({
             type="button"
             disabled={busy}
             onClick={onConfirm}
-            className="inline-flex h-10 min-w-24 items-center justify-center gap-2 rounded-xl bg-rose-600 px-4 text-[13px] font-semibold text-white shadow-sm transition hover:bg-rose-700 disabled:cursor-wait disabled:opacity-65"
+            className={`inline-flex h-10 min-w-24 items-center justify-center gap-2 rounded-xl px-4 text-[13px] font-semibold text-white shadow-sm transition disabled:cursor-wait disabled:opacity-65 ${confirmClass}`}
           >
             {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
             {busy ? "处理中…" : confirmLabel}

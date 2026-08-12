@@ -24,12 +24,11 @@ import {
   getCurrentSessionTodos as apiGetCurrentSessionTodos,
   compactAgentSession as apiCompactAgentSession,
   clearSession as apiClearSession,
-  getRagMode as apiGetRagMode,
-  setRagMode as apiSetRagMode,
   listMcpServers as apiListMcpServers,
   listProjects as apiListProjects,
   registerProject as apiRegisterProject,
   updateProject as apiUpdateProject,
+  setProjectTrust as apiSetProjectTrust,
   removeProject as apiRemoveProject,
   updateSessionAnalyticsModel as apiUpdateSessionAnalyticsModel,
   updateSessionLlmSelection as apiUpdateSessionLlmSelection,
@@ -74,10 +73,6 @@ import {
   releaseOrphanedPlaceholderLock,
   rebindSessionScopedLock,
 } from "./sessionConcurrency";
-import {
-  getSettings as apiGetSettings,
-  updateSettings as apiUpdateSettings,
-} from "./settingsApi";
 
 // ── Types ──────────────────────────────────────────────────
 
@@ -378,6 +373,7 @@ interface AppState {
   loadProjects: () => void;
   registerProject: (path: string) => Promise<ProjectMeta | null>;
   updateProject: (projectId: string, update: { name?: string; pinned?: boolean }) => Promise<ProjectMeta | null>;
+  trustProject: (projectId: string, state: "pending" | "trusted" | "denied") => Promise<ProjectMeta>;
   removeProject: (projectId: string) => Promise<boolean>;
 
   // Chat
@@ -491,14 +487,6 @@ interface AppState {
 
   // Clear
   clearCurrentSession: () => Promise<void>;
-
-  // RAG mode
-  ragMode: boolean;
-  toggleRagMode: () => void;
-
-  // Thinking mode
-  thinkingMode: boolean;
-  setThinkingMode: (value: boolean) => Promise<void>;
 
   // Context usage
   contextUsage: ContextUsage;
@@ -1169,8 +1157,6 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const [sidebarWidth, setSidebarWidth] = useState(260);
   const [inspectorWidth, setInspectorWidth] = useState(360);
   const [isCompressing, setIsCompressing] = useState(false);
-  const [ragMode, setRagMode] = useState(false);
-  const [thinkingMode, setThinkingModeRaw] = useState(false);
   const [contextUsage, setContextUsage] = useState<ContextUsage>({
     used: 0,
     total: 200000,
@@ -1409,30 +1395,6 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       // ignore storage errors
     } finally {
       setRuntimeReady(true);
-    }
-  }, []);
-
-  // Load RAG mode on mount
-  useEffect(() => {
-    apiGetRagMode()
-      .then((data) => setRagMode(data.rag_mode))
-      .catch(() => {});
-  }, []);
-
-  // Load thinking mode on mount
-  useEffect(() => {
-    apiGetSettings()
-      .then((s) => setThinkingModeRaw(Boolean(s.thinking_mode)))
-      .catch(() => {});
-  }, []);
-
-  const setThinkingMode = useCallback(async (value: boolean) => {
-    setThinkingModeRaw(value);
-    try {
-      await apiUpdateSettings({ thinking_mode: value });
-    } catch {
-      // Revert on error so UI stays consistent with backend.
-      setThinkingModeRaw((prev) => !value);
     }
   }, []);
 
@@ -1806,6 +1768,17 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       } catch {
         return null;
       }
+    },
+    []
+  );
+
+  const trustProject = useCallback(
+    async (projectId: string, state: "pending" | "trusted" | "denied"): Promise<ProjectMeta> => {
+      const project = await apiSetProjectTrust(projectId, state);
+      setProjects((prev) =>
+        sortProjects(prev.map((item) => (item.project_id === project.project_id ? project : item)))
+      );
+      return project;
     },
     []
   );
@@ -2299,12 +2272,6 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   }, [contextUsage.total, contextUsage.used, isCompressing, runtimeMode, sessionId, streamingSessions]);
 
   // ── RAG mode ────────────────────────────────────────
-
-  const toggleRagMode = useCallback(() => {
-    const newMode = !ragMode;
-    setRagMode(newMode);
-    apiSetRagMode(newMode).catch(() => setRagMode(ragMode));
-  }, [ragMode]);
 
   // ── Clear session ───────────────────────────────────
 
@@ -4629,6 +4596,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         loadProjects,
         registerProject,
         updateProject,
+        trustProject,
         removeProject,
         messages,
         sessionHistoryLoading,
@@ -4702,10 +4670,6 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         isCompressing,
         compactCurrentAgentSession,
         clearCurrentSession,
-        ragMode,
-        toggleRagMode,
-        thinkingMode,
-        setThinkingMode,
         contextUsage,
         setContextUsage,
         maintenanceStatus,

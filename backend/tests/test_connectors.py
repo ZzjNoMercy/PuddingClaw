@@ -255,6 +255,45 @@ def test_installed_adapter_is_automatically_projected_into_connector_catalog(tmp
     assert fixture["capabilities"] == ["记录", "查询"]
 
 
+def test_connector_counts_effective_home_skills(tmp_path):
+    paths = PuddingClawPaths(tmp_path / ".puddingclaw")
+    skill = paths.user_skills() / "fixture-records"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text(
+        "---\nname: fixture-records\ndescription: fixture\n---\n",
+        encoding="utf-8",
+    )
+
+    class FixtureAdapter:
+        adapter_id = "fixture-cli"
+        provider = "fixture"
+        executables = frozenset({"fixture-cli"})
+        toolchain_package = ToolchainPackageSpec(
+            ecosystem="node",
+            package="@fixture/cli",
+            executable="fixture-cli",
+        )
+        credential_state = CredentialStateSpec(paths=(".fixture-cli",))
+        connector = ManagedConnectorSpec(
+            connector_id="fixture",
+            display_name="Fixture Cloud",
+            description="Fixture managed CLI connector",
+            capabilities=("记录",),
+            skill_prefix="fixture-",
+        )
+
+        def claims(self, _command):
+            return False
+
+        def parse(self, _tokens, _env):
+            return None
+
+    registry = ManagedCliRegistry((FixtureAdapter(),))
+    connector = ConnectorRegistry(paths, "test", managed_registry=registry)
+
+    assert connector._installed_skill_count(connector.definitions["fixture"]) == 1
+
+
 def test_connector_catalog_ignores_obsolete_per_adapter_release(tmp_path):
     paths = PuddingClawPaths(tmp_path / ".puddingclaw")
     root = paths.root / "runtime" / "toolchains" / "node" / "obsolete" / "adapters" / "lark-cli"

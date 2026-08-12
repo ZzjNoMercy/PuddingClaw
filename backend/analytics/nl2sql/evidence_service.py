@@ -14,7 +14,6 @@ import time
 from collections.abc import Iterable
 from typing import Any
 
-from analytics.nl2sql.agent_path_policy import record_database_path_event
 from analytics.nl2sql.schemas import DatabaseQueryRequest, to_plain_dict
 from analytics.nl2sql.service import (
     _collect_vanna_references,
@@ -22,7 +21,7 @@ from analytics.nl2sql.service import (
 )
 from analytics.nl2sql.table_router import route_database_tables, summarize_table_route
 from analytics.semantic_runtime import compile_semantic_query_context, normalize_selected_semantic_asset_ids
-from config import get_database_qa_config, get_vanna_config
+from config import get_vanna_config
 from db import get_sessionmaker
 from graph.database_evidence import database_evidence_registry
 from graph.database_schema_evidence import database_schema_evidence_registry
@@ -333,18 +332,4 @@ async def search_database_evidence(
     # receipt is registered; callers must not confuse the two hashes.
     payload["payload_sha256"] = payload_sha256
     payload["evidence_sha256"] = evidence["sha256"]
-    if get_database_qa_config().get("database_agent_sql_shadow_compare_enabled", False):
-        record_database_path_event(
-            session_id=session_id,
-            query_id=query_id,
-            run_id=str(context.get("run_id") or ""),
-            goal_id=str(context.get("goal_id") or ""),
-            goal_revision=context.get("goal_revision"),
-            event_type="shadow_compare_requested",
-            error_code="",
-            source_path="agent",
-            target_path="legacy_generation_shadow",
-            evidence_search_id=evidence["id"],
-            metadata={"evidence_sha256": evidence["sha256"]},
-        )
     return to_plain_dict(payload)

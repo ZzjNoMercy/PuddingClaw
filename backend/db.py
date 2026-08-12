@@ -14,9 +14,10 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 from sqlalchemy.pool import NullPool
 
 from config import get_database_config
+from runtime_identity.paths import PuddingClawPaths
 
 BASE_DIR = Path(__file__).resolve().parent
-DEFAULT_SQLITE_URL = f"sqlite+aiosqlite:///{BASE_DIR / 'data' / 'puddingclaw.db'}"
+DEFAULT_SQLITE_URL = ""
 
 _engine: AsyncEngine | None = None
 _sessionmaker: async_sessionmaker[AsyncSession] | None = None
@@ -24,7 +25,10 @@ _last_error: str | None = None
 
 
 def get_database_url() -> str:
-    return get_database_config().get("url") or DEFAULT_SQLITE_URL
+    configured = get_database_config().get("url") or DEFAULT_SQLITE_URL
+    if configured:
+        return configured
+    return f"sqlite+aiosqlite:///{PuddingClawPaths.from_environment().databases() / 'catalog.sqlite3'}"
 
 
 def _engine_kwargs(url: str) -> dict[str, object]:
@@ -43,7 +47,7 @@ def get_engine() -> AsyncEngine:
     global _engine, _sessionmaker
     if _engine is None:
         url = get_database_url()
-        Path(BASE_DIR / "data").mkdir(parents=True, exist_ok=True)
+        PuddingClawPaths.from_environment().databases().mkdir(parents=True, exist_ok=True)
         _engine = create_async_engine(url, **_engine_kwargs(url))
         _sessionmaker = async_sessionmaker(_engine, expire_on_commit=False)
     return _engine

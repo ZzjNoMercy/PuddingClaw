@@ -41,6 +41,8 @@ def test_create_session_atomically_persists_model_and_approval_mode(tmp_path):
         "approval_mode": "smart",
         "policy_epoch": 1,
         "policy_version": "tool-execution-v4",
+        "permission_rules_revision": 0,
+        "rules": [],
     }
 
 
@@ -159,7 +161,7 @@ def test_permission_mode_api_rejects_stale_epoch_and_active_run(tmp_path):
 
     changed = client.patch(
         "/api/sessions/session-1/permissions/mode",
-        json={"approval_mode": "smart", "expected_epoch": 1},
+        json={"approval_mode": "strict", "expected_epoch": 1},
     )
     assert changed.status_code == 200
     assert changed.json()["policy_epoch"] == 2

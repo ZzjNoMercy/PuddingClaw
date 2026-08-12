@@ -21,12 +21,7 @@ from graph.session_manager import SessionManager  # noqa: E402
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--base-dir",
-        type=Path,
-        default=BACKEND_DIR,
-        help="Backend base directory containing sessions/",
-    )
+    parser.add_argument("--base-dir", type=Path, default=None, help="Optional explicit test/runtime root")
     parser.add_argument(
         "--release-id",
         required=True,
@@ -40,7 +35,12 @@ def main() -> int:
     args = parser.parse_args()
 
     manager = SessionManager()
-    base_dir = args.base_dir.expanduser().resolve()
+    if args.base_dir is None:
+        from runtime_identity.paths import PuddingClawPaths
+
+        base_dir = PuddingClawPaths.from_environment().root
+    else:
+        base_dir = args.base_dir.expanduser().resolve()
     manager.initialize(base_dir)
     reports: list[dict[str, object]] = []
     for path in sorted((base_dir / "sessions").glob("*.json")):

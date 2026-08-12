@@ -9,7 +9,7 @@ MinerU 是 PuddingClaw 的可选解析服务，通过 backend/pyproject.toml 中
 2. 推荐并执行合适的部署方式
 3. 用 uv 安装/同步依赖（含 mineru optional）
 4. 启动 mineru-api 服务
-5. 将 MinerU 地址写回 backend/config.json
+5. 将 MinerU 地址作为稀疏覆盖写入 PUDDINGCLAW_HOME/config.json
 
 用法：
     python scripts/setup-mineru.py [--mode native|docker] [--port 8002] [--dry-run]
@@ -38,8 +38,17 @@ from typing import Literal
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 BACKEND_DIR = REPO_ROOT / "backend"
-CONFIG_FILE = BACKEND_DIR / "config.json"
-MINERU_RUNTIME_DIR = REPO_ROOT / "data" / "mineru-runtime"
+
+
+def _puddingclaw_home() -> Path:
+    configured = os.environ.get("PUDDINGCLAW_HOME", "").strip()
+    home = Path(configured).expanduser() if configured else Path.home() / ".puddingclaw"
+    if not home.is_absolute():
+        raise ValueError("PUDDINGCLAW_HOME must be an absolute host path")
+    return home.resolve(strict=False)
+
+
+MINERU_RUNTIME_DIR = _puddingclaw_home() / "tmp" / "mineru-runtime"
 
 DEFAULT_PORT = 8002
 
@@ -418,25 +427,14 @@ def start_mineru_docker(port: int, gpu: str) -> None:
 # ==================== 项目配置 ====================
 
 def update_config_file(mineru_url: str) -> None:
-    """将 MinerU 地址写回 backend/config.json。"""
-    CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    """Use the canonical sparse settings writer instead of package files."""
+    sys.path.insert(0, str(BACKEND_DIR))
+    from config import update_settings
+    from runtime_identity.paths import PuddingClawPaths
 
-    config: dict = {}
-    if CONFIG_FILE.exists():
-        try:
-            config = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
-            log(f"{CONFIG_FILE} 不是合法 JSON，跳过自动写入。", level="warn")
-            return
-
-    knowledge = config.setdefault("knowledge", {})
-    mineru = knowledge.setdefault("mineru", {})
-    mineru["base_url"] = mineru_url
-    mineru.setdefault("runtime_output_dir", "data/mineru-runtime/output")
-    mineru.setdefault("keep_runtime_output", False)
-
-    CONFIG_FILE.write_text(json.dumps(config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    log(f"已更新 {CONFIG_FILE}: knowledge.mineru.base_url={mineru_url}")
+    update_settings({"knowledge": {"mineru": {"base_url": mineru_url}}})
+    config_file = PuddingClawPaths.from_environment().root / "config.json"
+    log(f"已更新 {config_file}: knowledge.mineru.base_url={mineru_url}")
 
 
 # ==================== 主流程 ====================

@@ -40,7 +40,6 @@ from tools.llm_wiki_tools import (
 @pytest.fixture()
 def wiki_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> LlmWikiService:
     monkeypatch.setenv("PUDDINGCLAW_KNOWLEDGE_DIR", str(tmp_path / "knowledge"))
-    monkeypatch.delenv("PUDDINGCLAW_GBRAIN_HOME", raising=False)
     # Unit tests must never inherit the developer machine's hybrid setting and
     # accidentally connect to a real embedding provider or Milvus on publish.
     monkeypatch.setattr(
@@ -821,6 +820,8 @@ def test_initialize_dedicated_gbrain_runtime_uses_existing_postgres(
 
     def fake_run(command, **kwargs):
         captured["command"] = command
+        if command and command[0] == "security":
+            return SimpleNamespace(returncode=1, stdout="", stderr="")
         environment = kwargs["env"]
         runtime_home = Path(environment["GBRAIN_HOME"])
         config_path = runtime_home / ".gbrain" / "config.json"
@@ -1697,10 +1698,8 @@ def test_real_gbrain_validates_published_wiki(wiki_env: LlmWikiService) -> None:
     assert "0 issue(s)" in compiled["checks"][-1]["stdout"]
 
 
-def test_validate_only_compile_does_not_touch_configured_gbrain_home(
+def test_validate_only_compile_does_not_touch_knowledge_gbrain_home(
     wiki_env: LlmWikiService,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     if not shutil.which("gbrain"):
         pytest.skip("gbrain CLI is unavailable")
@@ -1718,11 +1717,9 @@ def test_validate_only_compile_does_not_touch_configured_gbrain_home(
         model="test:model",
         raw_paths=[raw["snapshot_path"]],
     )
-    configured_home = tmp_path / "production-gbrain"
-    pack_path = configured_home / ".gbrain" / "schema-packs" / "puddingclaw-wiki" / "pack.yaml"
+    pack_path = wiki_env.gbrain_runtime_home / ".gbrain" / "schema-packs" / "puddingclaw-wiki" / "pack.yaml"
     pack_path.parent.mkdir(parents=True)
     pack_path.write_text("sentinel\n", encoding="utf-8")
-    monkeypatch.setenv("PUDDINGCLAW_GBRAIN_HOME", str(configured_home))
     result = wiki_env.compile_gbrain(import_pages=False)
     assert result["ok"] is True
     assert result["runtime_home"] == "isolated-temporary-home"

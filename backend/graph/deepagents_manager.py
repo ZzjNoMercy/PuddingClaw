@@ -27,7 +27,7 @@ from deepagents import (
     create_deep_agent,
     register_harness_profile,
 )
-from deepagents.backends import CompositeBackend, FilesystemBackend
+from deepagents.backends import FilesystemBackend
 from deepagents.middleware.memory import MemoryMiddleware
 from deepagents.middleware.rubric import RUBRIC_GRADER_MESSAGE_SOURCE, GraderResponse
 from deepagents.middleware.subagents import SubAgent
@@ -118,6 +118,7 @@ from graph.middlewares.toolset import (
     discover_skill_catalog,
     discover_skill_toolsets,
 )
+from graph.middlewares.user_agents_prompt import UserAgentsPromptMiddleware
 from graph.middlewares.user_input_boundary import UserInputBoundaryMiddleware
 from graph.middlewares.workspace_path_router import WorkspacePathRouterMiddleware
 from graph.permission_middleware import ExternalFilePermissionMiddleware
@@ -130,6 +131,7 @@ from graph.skill_plan_resume import skill_plan_resume_registry
 from graph.skill_secret_resume import skill_secret_resume_registry
 from graph.tool_result_adapter import tool_result_adapter
 from graph.trace_collector import TraceCollector, TraceSpan
+from graph.user_agents import build_user_agents_additions
 from graph.user_input_resume import user_input_resume_registry
 from harness.artifact_paths import (
     extract_local_directory_paths,
@@ -178,6 +180,7 @@ from llm.model_client import (
 )
 from observability import emit_harness_metric
 from projects.registry import project_registry
+from runtime_identity.composition import lazy_managed_cli_service
 from runtime_identity.paths import PuddingClawPaths
 from tools import get_all_tools
 from tools.filesystem.factory import VersionedPatchMiddleware
@@ -185,6 +188,7 @@ from tools.package_install import create_install_packages_tool
 from tools.request_skill_runtime_tool import create_request_skill_runtime_tool
 from tools.request_skill_secret_tool import create_request_skill_secret_tool
 from tools.request_user_input_tool import create_request_user_input_tool
+from tools.skills_scanner import materialize_skill_view
 from tools.toolsets import agent_custom_tool_names, tool_control_descriptor
 from tools.update_goal_tool import create_update_goal_tool
 from utils.json_serialization import to_json_compatible
@@ -2932,13 +2936,27 @@ class DeepAgentsAgentManager:
 
     def __init__(self) -> None:
         self._base_dir: Path | None = None
+        self._user_root: Path | None = None
         self._checkpointer: Any | None = None
         self._checkpointer_info: dict[str, Any] | None = None
         self._run_coordinator = HarnessRunCoordinator(session_manager)
         self._active_goal_tasks: dict[tuple[str, str], asyncio.Task[Any]] = {}
 
-    def initialize(self, base_dir: Path) -> None:
+    def initialize(self, base_dir: Path, *, user_root: Path | None = None) -> None:
         self._base_dir = base_dir
+        self._user_root = (
+            user_root or PuddingClawPaths.from_environment().root
+        ).expanduser().resolve()
+
+    def _skills_runtime_root(self) -> Path:
+        assert self._base_dir is not None
+        user_root = self._user_root or PuddingClawPaths.from_environment().root
+        target = user_root / "data" / "skill-runtime-view"
+        materialize_skill_view(self._base_dir, user_root / "skills", target)
+        return target
+
+    def _definitions_root(self) -> Path:
+        return (self._user_root or PuddingClawPaths.from_environment().root) / "definitions"
 
     def cancel_active_goal_run(self, session_id: str, goal_id: str) -> bool:
         """Cooperatively stop the in-process SSE task for a controlled Goal."""
@@ -2956,6 +2974,8 @@ class DeepAgentsAgentManager:
         project_id: str | None,
     ) -> tuple[Path, dict[str, Any]]:
         if project_id:
+            if not project_registry.is_trusted(project_id):
+                raise PermissionError("project trust decision required before Agent execution")
             project_path = project_registry.resolve(project_id)
             return project_path, {
                 "runtime_mode": "agent",
@@ -2974,35 +2994,64 @@ class DeepAgentsAgentManager:
             "workspace_path": str(workspace_path),
         }
 
-    def _memory_dir_for(self, project_id: str | None) -> Path:
-        """Return the on-disk directory that holds runtime project memory."""
-
-        assert self._base_dir is not None
+    def _memory_root(self) -> Path:
+        if self._user_root is None:
+            raise RuntimeError("DeepAgentsAgentManager must be initialized with a user Home")
         evaluation_root = os.getenv("PUDDINGCLAW_EVALUATION_RUNTIME_ROOT")
-        memory_root = (
+        return (
             Path(evaluation_root).resolve() / "memory"
             if evaluation_root
-            else self._base_dir / "data" / "deepagents-memory"
+            else self._user_root / "memory"
         )
+
+    @staticmethod
+    def _validate_memory_scope(memory_root: Path, target: Path) -> None:
+        root = memory_root.absolute()
+        candidate = target.absolute()
+        try:
+            relative = candidate.relative_to(root)
+        except ValueError as exc:
+            raise PermissionError("Memory path is outside the configured Home memory root") from exc
+        current = root
+        for part in ("", *relative.parts):
+            current = current if not part else current / part
+            if current.exists() and current.is_symlink():
+                raise PermissionError(f"Memory scope cannot contain symbolic links: {current}")
+        if not candidate.resolve(strict=False).is_relative_to(root.resolve(strict=False)):
+            raise PermissionError("Memory path resolves outside the configured Home memory root")
+
+    def _memory_dir_for(self, project_id: str | None) -> Path:
+        """Return the Home-backed directory that holds current-scope memory."""
+
+        memory_root = self._memory_root()
         if project_id:
-            return memory_root / "projects" / project_id
-        return memory_root / "global"
+            memory_dir = memory_root / "projects" / project_id
+        else:
+            memory_dir = memory_root / "global"
+        self._validate_memory_scope(memory_root, memory_dir)
+        return memory_dir
 
     def _ensure_memory_md(self, memory_dir: Path) -> Path:
         """Create or migrate the runtime MEMORY.md file for a project."""
 
+        memory_root = self._memory_root()
+        self._validate_memory_scope(memory_root, memory_dir)
         memory_dir.mkdir(parents=True, exist_ok=True)
         memory_md = memory_dir / "MEMORY.md"
         legacy_agents_md = memory_dir / "AGENTS.md"
+        self._validate_memory_scope(memory_root, memory_md)
+        if legacy_agents_md.is_symlink():
+            raise PermissionError("Legacy Memory AGENTS.md cannot be a symbolic link")
         if not memory_md.exists() and legacy_agents_md.exists():
             legacy_agents_md.replace(memory_md)
         if not memory_md.exists():
+            scope_name = "Global" if memory_dir.name == "global" else "Project"
             memory_md.write_text(
-                "# Project Memory\n\n"
+                f"# {scope_name} Memory\n\n"
                 "<!--\n"
                 "This file is injected into the Agent's system prompt via DeepAgents MemoryMiddleware.\n"
-                "Put stable, long-lived project conventions here (tech stack, coding style, naming rules).\n"
-                "Do NOT put session-specific or frequently changing data here — it hurts prompt caching.\n"
+                "Keep only durable, reusable facts, preferences, corrections, and decisions here.\n"
+                "Do not store task state, transcripts, secrets, guesses, or frequently changing data.\n"
                 "-->\n",
                 encoding="utf-8",
             )
@@ -3019,33 +3068,35 @@ class DeepAgentsAgentManager:
         goal_revision: int | None = None,
     ):
         assert self._base_dir is not None
+        user_root = self._user_root or PuddingClawPaths.from_environment().root
         evaluation_root_raw = os.getenv("PUDDINGCLAW_EVALUATION_RUNTIME_ROOT")
         reference_root = Path(evaluation_root_raw).resolve() / "reference" if evaluation_root_raw else None
-        skills_dir = reference_root / "skills" if reference_root else self._base_dir / "skills"
-        semantic_assets_dir = (
-            reference_root / "semantic-assets" if reference_root else self._base_dir / "semantic-assets"
-        )
+        skills_dir = reference_root / "skills" if reference_root else self._skills_runtime_root()
+        semantic_assets_dir = reference_root / "semantic-assets" if reference_root else user_root / "definitions" / "semantic-assets"
         sql_guardrails_dir = (
-            reference_root / "sql-guardrails" if reference_root else self._base_dir / "sql-guardrails"
+            reference_root / "sql-guardrails" if reference_root else user_root / "definitions" / "sql-guardrails"
         )
         analytics_models_dir = (
-            reference_root / "analytics-models" if reference_root else self._base_dir / "analytics-models"
+            reference_root / "analytics-models" if reference_root else user_root / "definitions" / "analytics-models"
         )
-        knowledge_dir = reference_root / "knowledge" if reference_root else get_knowledge_root(self._base_dir)
-        skills_dir.mkdir(parents=True, exist_ok=True)
+        knowledge_dir = reference_root / "knowledge" if reference_root else user_root / "knowledge"
+        if reference_root:
+            skills_dir.mkdir(parents=True, exist_ok=True)
         knowledge_dir.mkdir(parents=True, exist_ok=True)
         semantic_assets_dir.mkdir(parents=True, exist_ok=True)
         sql_guardrails_dir.mkdir(parents=True, exist_ok=True)
         analytics_models_dir.mkdir(parents=True, exist_ok=True)
+        workspace_digest = hashlib.sha256(str(workspace_path.resolve()).encode("utf-8")).hexdigest()[:20]
         large_tool_results_dir = (
-            workspace_path
-            / ".puddingclaw"
-            / "large_tool_results"
+            user_root
+            / "data"
+            / "large-tool-results"
+            / "projects"
+            / workspace_digest
             / (session_id or "anonymous-session")
             / (query_id or "unscoped-query")
         )
         large_tool_results_dir.mkdir(parents=True, exist_ok=True)
-        workspace_digest = hashlib.sha256(str(workspace_path.resolve()).encode("utf-8")).hexdigest()[:20]
         safe_session = re.sub(r"[^A-Za-z0-9_-]+", "_", session_id or "anonymous-session")
         safe_query = re.sub(r"[^A-Za-z0-9_-]+", "_", query_id or "unscoped-query")
         safe_goal = re.sub(r"[^A-Za-z0-9_-]+", "_", goal_id)
@@ -3053,7 +3104,7 @@ class DeepAgentsAgentManager:
         scratch_root = (
             Path(evaluation_root_raw).resolve() / "scratch"
             if evaluation_root_raw
-            else self._base_dir / "data" / "harness-scratch"
+            else user_root / "data" / "harness-scratch"
         )
         scratch_project_root = scratch_root / "projects" / workspace_digest
         scratch_relative = f"{safe_session}/{scratch_scope}"
@@ -3165,6 +3216,7 @@ class DeepAgentsAgentManager:
         backend_mode: str = "spawn",
         permission_context: RunPermissionContext | None = None,
         workspace_backend: Any | None = None,
+        managed_cli_service: Any | None = None,
         permission_reviewer: PermissionReviewer | None = None,
         evaluation_builtin_tool_allowlist: set[str] | None = None,
         rubric_config: dict[str, Any] | None = None,
@@ -3183,44 +3235,23 @@ class DeepAgentsAgentManager:
 
         assert self._base_dir is not None
 
-        # 1) Project-scoped or global runtime MEMORY.md
+        # Project-scoped or global runtime MEMORY.md
         memory_dir = self._memory_dir_for(project_id)
         self._ensure_memory_md(memory_dir)
+        memory_store_backend = FilesystemBackend(root_dir=memory_dir, virtual_mode=True)
 
-        # 2) Optional gstack skill index
-        gstack_path = (self._base_dir / "gstack" / "AGENTS.md").resolve()
-        gstack_sources: list[str] = []
-        gstack_route: FilesystemBackend | None = None
-        if gstack_path.exists():
-            gstack_route = FilesystemBackend(
-                root_dir=str(gstack_path.parent),
-                virtual_mode=True,
-            )
-            gstack_sources.append("/gstack/AGENTS.md")
-
-        # Use a single MemoryMiddleware with a composite backend to avoid
-        # DeepAgents' "duplicate middleware instances" assertion.
-        sources = ["/MEMORY.md", *gstack_sources]
-        if gstack_route is not None:
-            memory_backend: FilesystemBackend | CompositeBackend = CompositeBackend(
-                default=FilesystemBackend(root_dir=memory_dir, virtual_mode=True),
-                routes={"/gstack/": gstack_route},
-            )
-        else:
-            memory_backend = FilesystemBackend(root_dir=memory_dir, virtual_mode=True)
-
-        toolset_mapping = skill_toolsets or discover_skill_toolsets(self._base_dir / "skills")
+        toolset_mapping = skill_toolsets or discover_skill_toolsets(self._skills_runtime_root())
         middlewares: list[Any] = [
             *(
                 [EvaluationToolBoundaryMiddleware(evaluation_builtin_tool_allowlist)]
                 if evaluation_builtin_tool_allowlist is not None
                 else []
             ),
-            MemoryMiddleware(backend=memory_backend, sources=sources),
+            MemoryMiddleware(backend=memory_store_backend, sources=["/MEMORY.md"]),
             RunScopeMiddleware(),
             *([AttachmentAuthorityBoundaryMiddleware()] if attachment_observation_only else []),
-            AnalysisTemplateMiddleware(base_dir=self._base_dir),
-            SemanticAssetsMiddleware(base_dir=self._base_dir),
+            AnalysisTemplateMiddleware(base_dir=self._definitions_root()),
+            SemanticAssetsMiddleware(base_dir=self._definitions_root()),
             ExternalFilePermissionMiddleware(
                 backend_mode=backend_mode,
                 approval_mode=(
@@ -3249,7 +3280,7 @@ class DeepAgentsAgentManager:
             UserInputBoundaryMiddleware(),
             SkillIntentRouterMiddleware(),
             ToolsetMiddleware(
-                skills_dir=self._base_dir / "skills",
+                skills_dir=self._skills_runtime_root(),
                 toolsets_by_skill=toolset_mapping,
                 mcp_tool_names=mcp_tool_names,
             ),
@@ -3265,6 +3296,7 @@ class DeepAgentsAgentManager:
                 base_dir=self._base_dir,
                 reviewer=permission_reviewer,
                 workspace_backend=getattr(workspace_backend, "execution_backend", workspace_backend),
+                managed_cli_service=managed_cli_service,
             ),
             LargeToolResultOffloadMiddleware(
                 workspace_path=workspace_path,
@@ -3385,6 +3417,7 @@ class DeepAgentsAgentManager:
     def _build_tools(
         self,
         workspace_path: Path,
+        project_id: str | None = None,
         session_id: str = "",
         query_id: str = "",
         run_id: str = "",
@@ -3423,10 +3456,10 @@ class DeepAgentsAgentManager:
                     "path_aliases": {
                         "/workspace": str(workspace_path),
                         "/knowledge": str(get_knowledge_root(self._base_dir)),
-                        "/skills": str(self._base_dir / "skills"),
-                        "/semantic-assets": str(self._base_dir / "semantic-assets"),
-                        "/sql-guardrails": str(self._base_dir / "sql-guardrails"),
-                        "/analytics-models": str(self._base_dir / "analytics-models"),
+                        "/skills": str(self._skills_runtime_root()),
+                        "/semantic-assets": str(self._definitions_root() / "semantic-assets"),
+                        "/sql-guardrails": str(self._definitions_root() / "sql-guardrails"),
+                        "/analytics-models": str(self._definitions_root() / "analytics-models"),
                     },
                 }
                 try:
@@ -3449,6 +3482,18 @@ class DeepAgentsAgentManager:
                     tool = tool.model_copy(update=resource_updates)
                 except Exception:
                     for key, value in resource_updates.items():
+                        setattr(tool, key, value)
+            elif getattr(tool, "name", "") == "update_memory":
+                memory_updates = {
+                    "memory_file": str(
+                        self._ensure_memory_md(self._memory_dir_for(project_id))
+                    ),
+                    "memory_root": str(self._memory_root()),
+                }
+                try:
+                    tool = tool.model_copy(update=memory_updates)
+                except Exception:
+                    for key, value in memory_updates.items():
                         setattr(tool, key, value)
             elif getattr(tool, "name", "") == "read_evidence":
                 evidence_updates = {
@@ -3546,7 +3591,7 @@ class DeepAgentsAgentManager:
             tools.append(
                 create_install_packages_tool(
                     installer,
-                    skills_dir=self._base_dir / "skills",
+                    skills_dir=self._skills_runtime_root(),
                 )
             )
         # This tool is attached only to the main Agent.  The middleware owns
@@ -3568,14 +3613,18 @@ class DeepAgentsAgentManager:
                 run_id=run_id,
                 goal_id=goal_id,
                 goal_revision=goal_revision,
-                skills_dir=self._base_dir / "skills",
-                paths=PuddingClawPaths.from_environment(),
+                skills_dir=self._skills_runtime_root(),
+                paths=PuddingClawPaths(
+                    self._user_root or PuddingClawPaths.from_environment().root
+                ),
             )
         )
         tools.append(
             create_request_skill_runtime_tool(
-                skills_dir=self._base_dir / "skills",
-                paths=PuddingClawPaths.from_environment(),
+                skills_dir=self._skills_runtime_root(),
+                paths=PuddingClawPaths(
+                    self._user_root or PuddingClawPaths.from_environment().root
+                ),
             )
         )
         return tools
@@ -3822,7 +3871,7 @@ class DeepAgentsAgentManager:
                 "in_system_prompt": True,
                 "href": f"/skills?skill={item['skill_id']}",
             }
-            for item in discover_skill_catalog(self._base_dir / "skills")
+            for item in discover_skill_catalog(self._skills_runtime_root())
         ]
 
     @staticmethod
@@ -3894,26 +3943,26 @@ class DeepAgentsAgentManager:
             },
             {
                 "virtual_path": "/semantic-assets/",
-                "root_dir": str(self._base_dir / "semantic-assets"),
-                "exists": (self._base_dir / "semantic-assets").exists(),
+                "root_dir": str(self._definitions_root() / "semantic-assets"),
+                "exists": (self._definitions_root() / "semantic-assets").exists(),
                 "role": "semantic assets",
             },
             {
                 "virtual_path": "/sql-guardrails/",
-                "root_dir": str(self._base_dir / "sql-guardrails"),
-                "exists": (self._base_dir / "sql-guardrails").exists(),
+                "root_dir": str(self._definitions_root() / "sql-guardrails"),
+                "exists": (self._definitions_root() / "sql-guardrails").exists(),
                 "role": "sql guardrail assets",
             },
             {
                 "virtual_path": "/analytics-models/",
-                "root_dir": str(self._base_dir / "analytics-models"),
-                "exists": (self._base_dir / "analytics-models").exists(),
+                "root_dir": str(self._definitions_root() / "analytics-models"),
+                "exists": (self._definitions_root() / "analytics-models").exists(),
                 "role": "analytics model playbooks",
             },
             {
                 "virtual_path": "/skills/",
-                "root_dir": str(self._base_dir / "skills"),
-                "exists": (self._base_dir / "skills").exists(),
+                "root_dir": str(self._skills_runtime_root()),
+                "exists": self._skills_runtime_root().exists(),
                 "role": "skills",
             },
         ]
@@ -4781,7 +4830,7 @@ class DeepAgentsAgentManager:
             return "", None
         assert self._base_dir is not None
         try:
-            model = get_analytics_model_registry(self._base_dir).get_model_context(
+            model = get_analytics_model_registry(self._definitions_root()).get_model_context(
                 analytics_model_id,
                 query=query,
             )
@@ -5782,13 +5831,15 @@ class DeepAgentsAgentManager:
             workspace_path=str(Path(workspace_path).expanduser().resolve()) if workspace_path else "",
         )
         if raw_ref.get("kind") == "deepagents_large_tool_result":
-            origin_workspace = str(raw_ref.get("workspace_path") or "")
+            workspace_digest = str(raw_ref.get("workspace_digest") or "")
             artifact_name = str(raw_ref.get("artifact_name") or "")
-            if origin_workspace and artifact_name:
+            if session_manager._base_dir is not None and workspace_digest and artifact_name:
                 artifact = (
-                    Path(origin_workspace)
-                    / ".puddingclaw"
-                    / "large_tool_results"
+                    session_manager._base_dir
+                    / "data"
+                    / "large-tool-results"
+                    / "projects"
+                    / workspace_digest
                     / str(raw_ref.get("session_id") or "")
                     / str(raw_ref.get("source_query_id") or "")
                     / artifact_name
@@ -6743,7 +6794,7 @@ class DeepAgentsAgentManager:
                     baseline = self._build_preflight_task_profile(
                         objective=revised_objective,
                         analytics_model_id=analytics_model_id,
-                        skill_catalog=discover_skill_catalog(self._base_dir / "skills"),
+                        skill_catalog=discover_skill_catalog(self._skills_runtime_root()),
                         explicit_skill_hints=skill_hints,
                     )
                     yield self._sse(
@@ -7149,7 +7200,7 @@ class DeepAgentsAgentManager:
                     "label": "正在准备权限、附件与任务上下文",
                 },
             )
-            skill_catalog = discover_skill_catalog(self._base_dir / "skills")
+            skill_catalog = discover_skill_catalog(self._skills_runtime_root())
             attachment_promotion = self._attachment_instruction_promotion(message, attachments)
             required_file_type_hints = self._required_attachment_file_type_hints(attachments)
             profile_objective = run_objective or message
@@ -7631,7 +7682,7 @@ class DeepAgentsAgentManager:
                 )
             )
             agent_skills = ["/skills/"]
-            skill_toolsets = discover_skill_toolsets(self._base_dir / "skills")
+            skill_toolsets = discover_skill_toolsets(self._skills_runtime_root())
             agent_backend = self._build_backend(
                 workspace_path,
                 project_id=project_id,
@@ -7643,6 +7694,7 @@ class DeepAgentsAgentManager:
             )
             agent_tools = self._build_tools(
                 workspace_path,
+                project_id=project_id,
                 session_id=session_id,
                 query_id=query_id,
                 run_id=run_record.run_id,
@@ -7665,10 +7717,7 @@ class DeepAgentsAgentManager:
             mcp_config = config.load_config().get("mcp", {})
             from mcp_clients.servers import effective_mcp_server_names
 
-            enabled_mcp = effective_mcp_server_names(
-                mcp_config.get("enabled", []),
-                auto_enable_gbrain=bool(mcp_config.get("auto_enable_gbrain", False)),
-            )
+            enabled_mcp = effective_mcp_server_names(mcp_config.get("enabled", []))
             mcp_tool_names: set[str] = set()
             if enabled_mcp and not disable_mcp:
                 try:
@@ -7705,6 +7754,11 @@ class DeepAgentsAgentManager:
                 },
             )
             permission_context = RunPermissionContext.from_config_snapshot(run_record.config_snapshot)
+            # Managed integration CLIs are a separate control plane from the
+            # project Spawn/Kernel runner.  The lazy handle preserves that
+            # boundary while the control plane itself uses Host Toolchain +
+            # kernel sandboxing rather than Docker.
+            managed_cli_service = lazy_managed_cli_service(workspace_path)
             agent_middlewares = self._build_middlewares(
                 project_id,
                 rubric_model=rubric_model,
@@ -7714,6 +7768,7 @@ class DeepAgentsAgentManager:
                 backend_mode=backend_mode,
                 permission_context=permission_context,
                 workspace_backend=agent_backend,
+                managed_cli_service=managed_cli_service,
                 permission_reviewer=permission_reviewer,
                 evaluation_builtin_tool_allowlist=evaluation_builtin_tool_allowlist,
                 rubric_config=(
@@ -7740,6 +7795,13 @@ class DeepAgentsAgentManager:
                     context_trigger_tokens=context_trigger_tokens,
                 )
             )
+            user_agents_prompt = build_user_agents_additions(
+                self._user_root or PuddingClawPaths.from_environment().root
+            )
+            if user_agents_prompt:
+                # Inject after DeepAgents has assembled Agent Core, then place
+                # this stable Home layer before project/runtime buckets.
+                agent_middlewares.append(UserAgentsPromptMiddleware(user_agents_prompt))
             checkpointer = await self._build_checkpointer()
             runtime_inventory = self._runtime_inventory(
                 tools=agent_tools,
@@ -7761,7 +7823,8 @@ class DeepAgentsAgentManager:
             subagent_tools = [
                 tool
                 for tool in agent_tools
-                if str(getattr(tool, "name", "")) not in {"update_goal", "request_user_input"}
+                if str(getattr(tool, "name", ""))
+                not in {"update_goal", "update_memory", "request_user_input"}
             ]
 
             def build_subagent_middlewares() -> list[Any]:
@@ -7773,15 +7836,15 @@ class DeepAgentsAgentManager:
                     ),
                     SubagentProgressMiddleware(),
                     RunScopeMiddleware(),
-                    AnalysisTemplateMiddleware(base_dir=self._base_dir),
-                    SemanticAssetsMiddleware(base_dir=self._base_dir),
+                    AnalysisTemplateMiddleware(base_dir=self._definitions_root()),
+                    SemanticAssetsMiddleware(base_dir=self._definitions_root()),
                     ExternalFilePermissionMiddleware(backend_mode=backend_mode),
                     WorkspacePathRouterMiddleware(agent_backend),
                     VerificationActivationMiddleware(),
                     VersionedPatchMiddleware(agent_backend, compact_model_surface=True),
                     SkillIntentRouterMiddleware(),
                     ToolsetMiddleware(
-                        skills_dir=self._base_dir / "skills",
+                        skills_dir=self._skills_runtime_root(),
                         toolsets_by_skill=skill_toolsets,
                         mcp_tool_names=mcp_tool_names,
                     ),
@@ -7796,6 +7859,7 @@ class DeepAgentsAgentManager:
                         base_dir=self._base_dir,
                         reviewer=permission_reviewer,
                         workspace_backend=getattr(agent_backend, "execution_backend", agent_backend),
+                        managed_cli_service=managed_cli_service,
                     ),
                     LargeToolResultOffloadMiddleware(
                         workspace_path=workspace_path,
@@ -7822,6 +7886,8 @@ class DeepAgentsAgentManager:
                         emit_context_usage=False,
                     )
                 )
+                if user_agents_prompt:
+                    middlewares.append(UserAgentsPromptMiddleware(user_agents_prompt))
                 return middlewares
 
             subagents = _build_subagents(
@@ -7830,7 +7896,11 @@ class DeepAgentsAgentManager:
                 middleware_factory=build_subagent_middlewares,
                 context_prompt=analytics_model_prompt,
             )
-            system_prompt = build_deepagents_system_prompt(self._base_dir, workspace_path)
+            system_prompt = build_deepagents_system_prompt(
+                self._base_dir,
+                workspace_path,
+                project_id=project_id,
+            )
             dependency_prompt = dependency_plan_prompt(getattr(agent_backend, "execution_dependency_plan", None))
             if dependency_prompt:
                 system_prompt += f"\n\n## Current Run Delta\n\n{dependency_prompt}"
@@ -7851,6 +7921,10 @@ class DeepAgentsAgentManager:
                     run=run_record,
                     todos=persisted_todos,
                 )
+            # create_deep_agent appends its dependency-owned BASE_AGENT_PROMPT
+            # to this string. Anchor that text as stable system material so
+            # the final cache-aware reorder keeps it before runtime sections.
+            system_prompt += "\n\n## Agent Core"
             agent = create_deep_agent(
                 model=model,
                 tools=agent_tools,

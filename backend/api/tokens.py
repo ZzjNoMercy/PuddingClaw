@@ -22,7 +22,6 @@ from config import (
     get_compaction_trigger_tokens,
     get_deepagents_summarization_config,
     get_deepagents_tool_context_config,
-    get_rag_mode,
 )
 from graph.prompt_builder import build_system_prompt
 from graph.session_manager import session_manager
@@ -120,7 +119,12 @@ async def get_session_token_count(
     返回的 total_tokens 分母按运行时选择：Chat 使用原 compact 阈值，
     DeepAgents 使用其独立的全局 summarize 阈值（默认 200K）。
     """
-    system_prompt = build_system_prompt(BASE_DIR, rag_mode=get_rag_mode())
+    from runtime_identity.paths import PuddingClawPaths
+
+    system_prompt = build_system_prompt(
+        BASE_DIR,
+        runtime_root=PuddingClawPaths.from_environment().root,
+    )
     system_tokens = _count_tokens(system_prompt)
 
     messages = session_manager.load_session(session_id)
@@ -200,9 +204,11 @@ async def get_file_token_counts(request: FileTokenRequest) -> dict[str, Any]:
     """Count tokens for a list of files."""
     results: list[dict[str, Any]] = []
     for rel_path in request.paths:
-        normalized = rel_path.replace("\\", "/").lstrip("./")
-        full_path = (BASE_DIR / normalized).resolve()
-        if not str(full_path).startswith(str(BASE_DIR)):
+        try:
+            from api.files import _validate_path
+
+            full_path = _validate_path(rel_path)
+        except Exception:
             results.append({"path": rel_path, "tokens": 0})
             continue
         if not full_path.exists():

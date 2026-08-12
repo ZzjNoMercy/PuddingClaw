@@ -24,8 +24,9 @@ def _shell_bindings(*, workspace_id: str = "workspace:one"):
         "approval_mode": "strict",
         "policy_epoch": 1,
         "policy_version": "tool-execution-v4",
+        "permission_rules_revision": 0,
         "workspace_id": workspace_id,
-        "isolation_policy_id": "kernel-docker-shared-v1",
+        "isolation_policy_id": "spawn-kernel-shared-v1",
         "profile_schema": "sandbox-grant-profile-v1",
     }
 

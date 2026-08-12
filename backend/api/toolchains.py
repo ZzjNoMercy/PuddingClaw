@@ -7,7 +7,7 @@ import asyncio
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
-from api.connectors import _sandbox_manager
+from api.connectors import _managed_service
 from runtime_identity.service import ManagedCliService
 
 router = APIRouter(prefix="/toolchains", tags=["toolchains"])
@@ -24,7 +24,7 @@ class RollbackCommitRequest(BaseModel):
 
 
 def _service() -> ManagedCliService:
-    return ManagedCliService(_sandbox_manager())
+    return _managed_service()
 
 
 @router.get("/{adapter_id}/revisions")

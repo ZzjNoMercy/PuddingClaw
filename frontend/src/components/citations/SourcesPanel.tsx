@@ -2134,6 +2134,7 @@ const SourceItem = React.forwardRef<HTMLDivElement, {
 }>(function SourceItem({ source, citationIndex, isActive }, ref) {
   const openUrl = sourceOpenUrl(source);
   const isLocalSource = isLocalResourceUri(source.uri);
+  const displayTitle = sourceDisplayTitle(source);
 
   return (
     <div
@@ -2155,8 +2156,8 @@ const SourceItem = React.forwardRef<HTMLDivElement, {
                 {citationIndex}
               </span>
             )}
-            <p className="truncate text-[13px] font-medium text-slate-800" title={source.title}>
-              {source.title}
+            <p className="truncate text-[13px] font-medium text-slate-800" title={displayTitle}>
+              {displayTitle}
             </p>
           </div>
           {source.quote && (
@@ -2184,6 +2185,32 @@ const SourceItem = React.forwardRef<HTMLDivElement, {
     </div>
   );
 });
+
+function sourceDisplayTitle(source: SourceRecord): string {
+  const title = String(source.title || "").trim();
+  const uri = source.uri || "";
+  const genericTitle = /^\[?\d+\]?$/.test(title)
+    || ["", "x.com", "twitter.com", "网页来源", "未命名来源"].includes(title.toLowerCase());
+  if (!genericTitle || !isHttpUrl(uri)) {
+    return title || "未命名来源";
+  }
+  try {
+    const url = new URL(uri);
+    const parts = url.pathname.split("/").filter(Boolean);
+    if (source.source_type === "x" && parts.length > 0 && parts[0].toLowerCase() !== "i") {
+      return parts.slice(1).includes("status")
+        ? `@${parts[0]} 的 X 帖子`
+        : `@${parts[0]} 的 X 主页`;
+    }
+    if (source.source_type !== "x") {
+      const slug = decodeURIComponent(parts.at(-1) || "").replace(/\.[^.]+$/, "").replace(/[-_]+/g, " ").trim();
+      return slug ? `${slug} · ${url.hostname.replace(/^www\./, "")}` : url.hostname.replace(/^www\./, "");
+    }
+  } catch {
+    // Keep a stable generic fallback for malformed historical source URLs.
+  }
+  return source.source_type === "x" ? "X 帖子" : "网页来源";
+}
 
 function metadataString(source: SourceRecord, key: string): string {
   const value = source.metadata?.[key];

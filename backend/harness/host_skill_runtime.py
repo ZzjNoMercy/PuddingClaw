@@ -9,19 +9,25 @@ ordinary Skill package execution surface.
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import os
 import platform
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import sysconfig
+import tarfile
 import tempfile
+import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 from deepagents.backends.protocol import ExecuteResponse
 
@@ -64,10 +70,30 @@ class HostExecutionProjection:
         yield self.read_roots
 
 
+@dataclass
+class _ManagedBrowserJob:
+    job_id: str
+    owner_user_id: str
+    provider: str
+    profile_id: str
+    adapter_id: str
+    authorization_contract_fingerprint: str
+    credential_state_fingerprint: str
+    operation: Path
+    home: Path
+    output_path: Path
+    output_handle: Any
+    process: subprocess.Popen[str]
+    state_paths: tuple[str, ...]
+    created_at: float
+
+
 class HostSkillRuntimeBackend:
     """Build PuddingClaw-owned Node/Python environments on the local ABI."""
 
     contract_schema = "host-skill-runtime-v1"
+    _browser_jobs: dict[str, _ManagedBrowserJob] = {}
+    _browser_jobs_lock = threading.RLock()
 
     def __init__(
         self,
@@ -250,7 +276,10 @@ class HostSkillRuntimeBackend:
             profile = SandboxGrantProfile.build(
                 workspace_root=candidate,
                 scratch_root=operation,
-                workspace_writable=False,
+                # ``candidate`` is the transaction's unpublished staging
+                # root. Installers must be able to materialize its lockfile
+                # and package tree; the project workspace is not mounted here.
+                workspace_writable=True,
                 external_read_roots=read_roots,
                 external_write_roots=(self._node_cache, self._python_cache),
                 network_allowed=True,
@@ -578,6 +607,505 @@ class HostSkillRuntimeBackend:
             expected_runtime_image_digest=runtime_digest,
             expected_base_revision=base_revision,
         )
+
+    def resolve_managed_node_cli(
+        self,
+        *,
+        distribution: str,
+        package: str,
+    ) -> HostNodePackageResolution:
+        """Resolve an Adapter-owned CLI on the same immutable host runtime."""
+
+        return self.resolve_generic_node_cli(distribution=distribution, package=package)
+
+    @staticmethod
+    def _credential_paths(spec: object | None) -> tuple[str, ...]:
+        from harness.workspace_backends import _credential_state_paths
+
+        if spec is None:
+            return ()
+        return _credential_state_paths(tuple(getattr(spec, "paths", ())), allow_empty=True)
+
+    @staticmethod
+    def _import_credential_state(home: Path, state_paths: tuple[str, ...], payload: bytes) -> None:
+        from runtime_identity.profiles import validate_credential_archive
+
+        for relative in state_paths:
+            target = home / relative
+            target.mkdir(parents=True, mode=0o700, exist_ok=True)
+        if not payload:
+            return
+        validate_credential_archive(payload, allowed_roots=state_paths)
+        with tarfile.open(fileobj=io.BytesIO(payload), mode="r:gz") as archive:
+            archive.extractall(home, filter="data")
+
+    @staticmethod
+    def _export_credential_state(
+        home: Path,
+        state_paths: tuple[str, ...],
+        credential_state_spec: object | None = None,
+    ) -> bytes | None:
+        if not state_paths:
+            return None
+        from runtime_identity.adapters import CredentialStateSpec
+        from runtime_identity.host_credentials import collect_host_credential_state
+        from runtime_identity.profiles import validate_credential_archive
+
+        if isinstance(credential_state_spec, CredentialStateSpec):
+            collect_host_credential_state(credential_state_spec, home)
+
+        output = io.BytesIO()
+        with tarfile.open(fileobj=output, mode="w:gz", dereference=False) as archive:
+            for relative in state_paths:
+                target = home / relative
+                if not target.is_dir() or target.is_symlink():
+                    raise ValueError("managed credential state root is invalid")
+                archive.add(target, arcname=relative, recursive=True)
+        payload = output.getvalue()
+        return validate_credential_archive(payload, allowed_roots=state_paths)
+
+    def _managed_runner(
+        self,
+        *,
+        workspace: Path,
+        toolchain_path: Path,
+        operation: Path,
+        network_enabled: bool,
+        workspace_writable: bool,
+        timeout: int,
+        max_output_bytes: int,
+    ) -> MacOSSeatbeltRunner:
+        workspace = workspace.expanduser().resolve(strict=True)
+        toolchain_path = toolchain_path.expanduser().resolve(strict=True)
+        profile = SandboxGrantProfile.build(
+            workspace_root=workspace,
+            scratch_root=operation,
+            external_read_roots=(toolchain_path,),
+            workspace_writable=workspace_writable,
+            network_allowed=network_enabled,
+            timeout_seconds=timeout,
+            max_output_bytes=max_output_bytes,
+        )
+        return MacOSSeatbeltRunner(profile, runtime_root=operation / "runner")
+
+    def _managed_environment(
+        self,
+        *,
+        release: Path,
+        home: Path,
+        command_environment: dict[str, str],
+        credential_state_spec: object | None,
+    ) -> dict[str, str]:
+        credential_environment = dict(getattr(credential_state_spec, "env", ()))
+        if set(command_environment) & set(credential_environment):
+            raise ValueError("command environment cannot override Adapter credential-state environment")
+        environment = {
+            "PATH": ":".join(
+                dict.fromkeys(
+                    (
+                        str(release / "bin"),
+                        str(self.node.parent) if self.node is not None else "",
+                        "/opt/homebrew/bin",
+                        "/usr/local/bin",
+                        "/usr/bin",
+                        "/bin",
+                        "/usr/sbin",
+                        "/sbin",
+                    )
+                )
+            ),
+            "NODE_PATH": str(release / "lib" / "node_modules"),
+            **command_environment,
+        }
+        for key, value in credential_environment.items():
+            rendered = str(value).replace("/home/puddingclaw", str(home))
+            if "/home/puddingclaw" in rendered:
+                raise ValueError("credential environment contains an invalid runner HOME projection")
+            environment[str(key)] = rendered
+        return environment
+
+    def run_managed_provider_cli(
+        self,
+        workspace: Path,
+        *,
+        argv: list[str],
+        environment: dict[str, str],
+        credential_state_spec: object | None,
+        toolchain_path: Path,
+        container_path: str,
+        credential_state: bytes,
+        network_enabled: bool,
+        workspace_writable: bool,
+        expected_runtime_image_digest: str,
+        continuation_secret: bytes | None = None,
+        continuation_argument: str | None = None,
+        continuation_trailing_argv: tuple[str, ...] = (),
+        timeout: int = 120,
+        max_output_bytes: int = 100_000,
+    ) -> object:
+        """Run exact Adapter argv in a private Seatbelt HOME."""
+
+        del container_path
+        from harness.workspace_backends import (
+            ManagedProviderExecutionResult,
+            _shared_runtime_executable,
+        )
+
+        self._ensure_roots()
+        self._require_digest(expected_runtime_image_digest)
+        release = toolchain_path.expanduser().resolve(strict=True)
+        if not argv:
+            raise ValueError("managed provider command requires an executable")
+        executable = _shared_runtime_executable(release, argv[0], expected_runtime_image_digest)
+        state_paths = self._credential_paths(credential_state_spec)
+        if not state_paths and (credential_state or getattr(credential_state_spec, "env", ())):
+            raise ValueError("credentialless managed command cannot receive provider state")
+        if continuation_secret is not None and not (
+            continuation_argument and re.fullmatch(r"--[a-z0-9][a-z0-9-]*", continuation_argument)
+        ):
+            raise ValueError("continuation secret requires a trusted Driver argument contract")
+        if continuation_secret is None and (continuation_argument is not None or continuation_trailing_argv):
+            raise ValueError("continuation arguments require a continuation secret")
+        if any(not value or "\x00" in value for value in continuation_trailing_argv):
+            raise ValueError("continuation trailing argv is invalid")
+        operation = Path(tempfile.mkdtemp(prefix="provider-", dir=self._operations)).resolve(strict=True)
+        try:
+            runner = self._managed_runner(
+                workspace=workspace,
+                toolchain_path=release,
+                operation=operation,
+                network_enabled=network_enabled,
+                workspace_writable=workspace_writable,
+                timeout=timeout,
+                max_output_bytes=max_output_bytes,
+            )
+            self._import_credential_state(runner.home, state_paths, credential_state)
+            from runtime_identity.adapters import CredentialStateSpec
+            from runtime_identity.host_credentials import prepare_host_credential_state
+
+            if isinstance(credential_state_spec, CredentialStateSpec):
+                prepare_host_credential_state(credential_state_spec, runner.home)
+            run_environment = self._managed_environment(
+                release=release,
+                home=runner.home,
+                command_environment=environment,
+                credential_state_spec=credential_state_spec,
+            )
+            base_argv = [str(release / "bin" / executable), *argv[1:]]
+            if continuation_secret is None:
+                # Adapter planning has already normalized the command to argv.
+                # Keep payload values (Markdown, JSON, IDs) opaque all the way
+                # into sandbox-exec; do not round-trip them through a shell.
+                response = runner.execute_argv(
+                    base_argv,
+                    timeout=timeout,
+                    environment=run_environment,
+                    cwd=workspace.expanduser().resolve(strict=True),
+                )
+            else:
+                secret = continuation_secret.decode("utf-8")
+                if "\x00" in secret:
+                    raise ValueError("authorization continuation contains a NUL byte")
+                continuation_command = shlex.join([*base_argv, str(continuation_argument)])
+                trailing = shlex.join(list(continuation_trailing_argv))
+                command = (
+                    f'secret="$(cat)"; exec {continuation_command} "$secret"'
+                    + (f" {trailing}" if trailing else "")
+                )
+                # The continuation secret is deliberately absent from the
+                # host argv and environment. A tiny shell inside Seatbelt reads
+                # it from stdin and appends it to the trusted Driver argv.
+                response = runner.execute(
+                    command,
+                    timeout=timeout,
+                    environment=run_environment,
+                    cwd=workspace.expanduser().resolve(strict=True),
+                    input_text=secret,
+                )
+            exported = self._export_credential_state(
+                runner.home,
+                state_paths,
+                credential_state_spec,
+            )
+            return ManagedProviderExecutionResult(
+                output=response.output,
+                exit_code=response.exit_code,
+                credential_state=exported,
+                truncated=response.truncated,
+            )
+        finally:
+            shutil.rmtree(operation, ignore_errors=True)
+
+    @staticmethod
+    def _managed_browser_job_id(owner_user_id: str, provider: str, profile_id: str) -> str:
+        return hashlib.sha256(f"{owner_user_id}\0{provider}\0{profile_id}".encode()).hexdigest()[:24]
+
+    @staticmethod
+    def _browser_output(job: _ManagedBrowserJob, max_output_bytes: int) -> tuple[str, bool]:
+        job.output_handle.flush()
+        data = job.output_path.read_bytes()
+        truncated = len(data) > max_output_bytes
+        if truncated:
+            data = data[-max_output_bytes:]
+        output = data.decode("utf-8", errors="replace") or "<no output>"
+        if truncated:
+            output = f"... Earlier output truncated.\n{output}"
+        return output, truncated
+
+    def collect_managed_browser_auth_cli(
+        self,
+        *,
+        owner_user_id: str,
+        provider: str,
+        profile_id: str,
+        credential_state_spec: object,
+        adapter_id: str,
+        authorization_contract_fingerprint: str,
+        max_output_bytes: int = 100_000,
+    ) -> object:
+        from harness.workspace_backends import ManagedProviderExecutionResult
+
+        job_id = self._managed_browser_job_id(owner_user_id, provider, profile_id)
+        with self._browser_jobs_lock:
+            job = self._browser_jobs.get(job_id)
+        fingerprint = str(getattr(credential_state_spec, "fingerprint", ""))
+        if (
+            job is None
+            or job.owner_user_id != owner_user_id
+            or job.provider != provider
+            or job.profile_id != profile_id
+            or job.adapter_id != adapter_id
+            or job.authorization_contract_fingerprint != authorization_contract_fingerprint
+            or job.credential_state_fingerprint != fingerprint
+        ):
+            return ManagedProviderExecutionResult(
+                output="Managed browser authorization job is missing or expired.",
+                exit_code=1,
+                credential_state=None,
+                browser_status="missing",
+                browser_job_id=job_id,
+            )
+        if time.time() - job.created_at > 1500 and job.process.poll() is None:
+            os.killpg(job.process.pid, signal.SIGTERM)
+            try:
+                job.process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                os.killpg(job.process.pid, signal.SIGKILL)
+        output, truncated = self._browser_output(job, max_output_bytes)
+        exit_code = job.process.poll()
+        if exit_code is None:
+            return ManagedProviderExecutionResult(
+                output=output,
+                exit_code=0,
+                credential_state=None,
+                truncated=truncated,
+                browser_status="awaiting_user_browser",
+                browser_job_id=job_id,
+            )
+        try:
+            state = self._export_credential_state(job.home, job.state_paths, credential_state_spec)
+        except (OSError, ValueError) as exc:
+            output = f"{output.rstrip()}\n\nCredential export failed: {type(exc).__name__}: {exc}"
+            exit_code = exit_code or 1
+            state = None
+        if exit_code:
+            output = f"{output.rstrip()}\n\nExit code: {exit_code}"
+        return ManagedProviderExecutionResult(
+            output=output,
+            exit_code=int(exit_code or 0),
+            credential_state=state,
+            truncated=truncated,
+            browser_status="completed" if exit_code == 0 else "failed",
+            browser_job_id=job_id,
+        )
+
+    def run_managed_browser_auth_cli(
+        self,
+        workspace: Path,
+        *,
+        argv: list[str],
+        environment: dict[str, str],
+        credential_state_spec: object,
+        toolchain_path: Path,
+        container_path: str,
+        credential_state: bytes,
+        owner_user_id: str,
+        provider: str,
+        profile_id: str,
+        adapter_id: str,
+        authorization_contract_fingerprint: str,
+        expected_runtime_image_digest: str,
+        wait_for_url_seconds: float = 30.0,
+        max_output_bytes: int = 100_000,
+    ) -> object:
+        del container_path
+        from harness.workspace_backends import (
+            ManagedProviderExecutionResult,
+            _shared_runtime_executable,
+        )
+
+        self._ensure_roots()
+        self._require_digest(expected_runtime_image_digest)
+        if not re.fullmatch(r"[a-z0-9][a-z0-9_.-]*", adapter_id):
+            raise ValueError("managed browser Adapter id is invalid")
+        if not re.fullmatch(r"[0-9a-f]{64}", authorization_contract_fingerprint):
+            raise ValueError("managed browser authorization contract is invalid")
+        release = toolchain_path.expanduser().resolve(strict=True)
+        if not argv:
+            raise ValueError("managed browser command requires an executable")
+        executable = _shared_runtime_executable(release, argv[0], expected_runtime_image_digest)
+        state_paths = self._credential_paths(credential_state_spec)
+        job_id = self._managed_browser_job_id(owner_user_id, provider, profile_id)
+        existing = self.collect_managed_browser_auth_cli(
+            owner_user_id=owner_user_id,
+            provider=provider,
+            profile_id=profile_id,
+            credential_state_spec=credential_state_spec,
+            adapter_id=adapter_id,
+            authorization_contract_fingerprint=authorization_contract_fingerprint,
+            max_output_bytes=max_output_bytes,
+        )
+        if existing.browser_status != "missing":
+            return existing
+        operation = Path(tempfile.mkdtemp(prefix="browser-auth-", dir=self._operations)).resolve(strict=True)
+        output_handle = None
+        try:
+            runner = self._managed_runner(
+                workspace=workspace,
+                toolchain_path=release,
+                operation=operation,
+                network_enabled=True,
+                workspace_writable=False,
+                timeout=1500,
+                max_output_bytes=max_output_bytes,
+            )
+            self._import_credential_state(runner.home, state_paths, credential_state)
+            from runtime_identity.adapters import CredentialStateSpec
+            from runtime_identity.host_credentials import prepare_host_credential_state
+
+            if isinstance(credential_state_spec, CredentialStateSpec):
+                prepare_host_credential_state(credential_state_spec, runner.home)
+            run_environment = self._managed_environment(
+                release=release,
+                home=runner.home,
+                command_environment=environment,
+                credential_state_spec=credential_state_spec,
+            )
+            output_path = operation / "browser-output.log"
+            output_handle = output_path.open("w", encoding="utf-8")
+            process = runner.start_background_argv(
+                [str(release / "bin" / executable), *argv[1:]],
+                environment=run_environment,
+                cwd=workspace.expanduser().resolve(strict=True),
+                output=output_handle,
+            )
+            job = _ManagedBrowserJob(
+                job_id=job_id,
+                owner_user_id=owner_user_id,
+                provider=provider,
+                profile_id=profile_id,
+                adapter_id=adapter_id,
+                authorization_contract_fingerprint=authorization_contract_fingerprint,
+                credential_state_fingerprint=str(getattr(credential_state_spec, "fingerprint", "")),
+                operation=operation,
+                home=runner.home,
+                output_path=output_path,
+                output_handle=output_handle,
+                process=process,
+                state_paths=state_paths,
+                created_at=time.time(),
+            )
+            with self._browser_jobs_lock:
+                if job_id in self._browser_jobs:
+                    os.killpg(process.pid, signal.SIGTERM)
+                    raise ValueError("managed browser authorization job already exists")
+                self._browser_jobs[job_id] = job
+            deadline = time.monotonic() + max(1.0, wait_for_url_seconds)
+            output_seen_at: float | None = None
+            while True:
+                result = self.collect_managed_browser_auth_cli(
+                    owner_user_id=owner_user_id,
+                    provider=provider,
+                    profile_id=profile_id,
+                    credential_state_spec=credential_state_spec,
+                    adapter_id=adapter_id,
+                    authorization_contract_fingerprint=authorization_contract_fingerprint,
+                    max_output_bytes=max_output_bytes,
+                )
+                if result.browser_status != "awaiting_user_browser":
+                    return result
+                if result.output.strip() and result.output != "<no output>":
+                    output_seen_at = output_seen_at or time.monotonic()
+                    if time.monotonic() - output_seen_at >= 0.5:
+                        return result
+                if time.monotonic() >= deadline:
+                    self.finalize_managed_browser_auth_cli(
+                        owner_user_id=owner_user_id,
+                        provider=provider,
+                        profile_id=profile_id,
+                        browser_job_id=job_id,
+                    )
+                    return ManagedProviderExecutionResult(
+                        output="Browser authorization did not emit public output in time.",
+                        exit_code=1,
+                        credential_state=None,
+                        browser_status="failed",
+                        browser_job_id=job_id,
+                    )
+                time.sleep(0.25)
+        except Exception:
+            with self._browser_jobs_lock:
+                registered = self._browser_jobs.pop(job_id, None)
+            if registered is not None and registered.process.poll() is None:
+                os.killpg(registered.process.pid, signal.SIGKILL)
+            if output_handle is not None:
+                output_handle.close()
+            shutil.rmtree(operation, ignore_errors=True)
+            raise
+
+    def finalize_managed_browser_auth_cli(
+        self,
+        *,
+        owner_user_id: str,
+        provider: str,
+        profile_id: str,
+        browser_job_id: str,
+    ) -> bool:
+        expected = self._managed_browser_job_id(owner_user_id, provider, profile_id)
+        if browser_job_id != expected:
+            raise ValueError("browser authorization job identity mismatch")
+        with self._browser_jobs_lock:
+            job = self._browser_jobs.pop(expected, None)
+        if job is None:
+            return False
+        try:
+            if job.process.poll() is None:
+                os.killpg(job.process.pid, signal.SIGTERM)
+                try:
+                    job.process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    os.killpg(job.process.pid, signal.SIGKILL)
+                    job.process.wait(timeout=5)
+            return True
+        finally:
+            job.output_handle.close()
+            shutil.rmtree(job.operation, ignore_errors=True)
+
+    def list_managed_browser_auth_jobs(self, *, owner_user_id: str) -> list[dict[str, str]]:
+        with self._browser_jobs_lock:
+            jobs = tuple(self._browser_jobs.values())
+        return [
+            {
+                "provider": job.provider,
+                "profile_id": job.profile_id,
+                "browser_job_id": job.job_id,
+                "adapter_id": job.adapter_id,
+                "authorization_contract_fingerprint": job.authorization_contract_fingerprint,
+                "credential_state_fingerprint": job.credential_state_fingerprint,
+            }
+            for job in jobs
+            if job.owner_user_id == owner_user_id
+        ]
 
     def project_cli_execution(self, command: str) -> HostExecutionProjection:
         """Expose only verified credentialless CLI bins to a Seatbelt command."""

@@ -46,6 +46,17 @@ def _request_from(host: str) -> Request:
     })
 
 
+def _register_test_worker_project(tmp_path: Path) -> str:
+    """Register the fake worker project through the same trusted path as production."""
+
+    project_registry.initialize(tmp_path)
+    return project_registry.register(
+        str(tmp_path),
+        name="puddingclaw-test",
+        trusted=True,
+    ).project_id
+
+
 def test_headless_request_rejects_caller_selected_model():
     with pytest.raises(ValidationError):
         HeadlessRunRequest(message="分析销售", analytics_model_id="sales")
@@ -338,6 +349,7 @@ async def test_expired_headless_session_cannot_be_reused(tmp_path: Path, monkeyp
 @pytest.mark.asyncio
 async def test_new_headless_run_returns_session_retention_metadata(tmp_path: Path, monkeypatch):
     session_manager.initialize(tmp_path)
+    project_id = _register_test_worker_project(tmp_path)
     monkeypatch.setenv("PUDDINGCLAW_HEADLESS_SESSION_TTL_HOURS", "24")
     monkeypatch.setattr(headless_api, "_model_options", lambda _principal: [{"id": "analysis"}])
     monkeypatch.setattr(
@@ -349,7 +361,7 @@ async def test_new_headless_run_returns_session_retention_metadata(tmp_path: Pat
             "authority_profile": "smart",
         },
     )
-    monkeypatch.setattr(headless_api, "_ensure_worker_project", lambda: ("project-test", tmp_path))
+    monkeypatch.setattr(headless_api, "_ensure_worker_project", lambda: (project_id, tmp_path))
     logged: dict[str, object] = {}
 
     async def fake_record(**kwargs):
@@ -392,6 +404,8 @@ async def test_new_headless_run_returns_session_retention_metadata(tmp_path: Pat
 def test_worker_access_key_is_one_time_and_revocable(tmp_path: Path):
     store = WorkerAccessStore()
     store.initialize(tmp_path)
+    key_path = tmp_path / "users" / "local" / "access" / "worker-access-keys.json"
+    assert key_path.stat().st_mode & 0o777 == 0o600
     public, secret = store.create(name="teams", scopes=["worker:models:read"])
     assert public["prefix"] == secret[:12]
     assert "secret_hash" not in public
@@ -521,7 +535,7 @@ def test_worker_access_store_does_not_persist_secret(tmp_path: Path):
     store = WorkerAccessStore()
     store.initialize(tmp_path)
     _public, secret = store.create(name="private")
-    contents = (tmp_path / "data" / "worker-access-keys.json").read_text()
+    contents = (tmp_path / "users" / "local" / "access" / "worker-access-keys.json").read_text()
     assert secret not in contents
     assert "secret_hash" in contents
 
@@ -824,6 +838,7 @@ async def test_ambiguous_model_route_does_not_create_or_run_session(tmp_path: Pa
 @pytest.mark.asyncio
 async def test_continuous_session_reuses_bound_model_without_rerouting(tmp_path: Path, monkeypatch):
     session_manager.initialize(tmp_path)
+    project_id = _register_test_worker_project(tmp_path)
     session_id = "worker-session-continuous"
     session_manager.create_session(
         session_id,
@@ -840,7 +855,7 @@ async def test_continuous_session_reuses_bound_model_without_rerouting(tmp_path:
         lambda _authorization, _scope: {"key_id": "key-owner", "authority_profile": "smart"},
     )
     monkeypatch.setattr(headless_api, "_model_options", lambda _principal: [{"id": "product"}])
-    monkeypatch.setattr(headless_api, "_ensure_worker_project", lambda: ("project-test", tmp_path))
+    monkeypatch.setattr(headless_api, "_ensure_worker_project", lambda: (project_id, tmp_path))
 
     async def fail_route(_message, _principal):
         raise AssertionError("a continuous session must reuse its bound model")
@@ -870,6 +885,7 @@ async def test_continuous_session_reuses_bound_model_without_rerouting(tmp_path:
 @pytest.mark.asyncio
 async def test_general_route_runs_session_without_model(tmp_path: Path, monkeypatch):
     session_manager.initialize(tmp_path)
+    project_id = _register_test_worker_project(tmp_path)
     monkeypatch.setattr(
         headless_api,
         "_principal_for_scope",
@@ -880,7 +896,7 @@ async def test_general_route_runs_session_without_model(tmp_path: Path, monkeypa
         "_model_options",
         lambda _principal: [{"id": "sales"}, {"id": "product"}],
     )
-    monkeypatch.setattr(headless_api, "_ensure_worker_project", lambda: ("project-test", tmp_path))
+    monkeypatch.setattr(headless_api, "_ensure_worker_project", lambda: (project_id, tmp_path))
 
     async def fake_route(_message, _principal):
         return AnalyticsModelRoute("general", None, 0.9, "semantic", "weather_question")
@@ -914,6 +930,7 @@ async def test_general_route_runs_session_without_model(tmp_path: Path, monkeypa
 @pytest.mark.asyncio
 async def test_continuous_general_session_reroutes_and_can_bind_later(tmp_path: Path, monkeypatch):
     session_manager.initialize(tmp_path)
+    project_id = _register_test_worker_project(tmp_path)
     session_id = "worker-session-general"
     session_manager.create_session(
         session_id,
@@ -934,7 +951,7 @@ async def test_continuous_general_session_reroutes_and_can_bind_later(tmp_path: 
         "_model_options",
         lambda _principal: [{"id": "sales"}, {"id": "product"}],
     )
-    monkeypatch.setattr(headless_api, "_ensure_worker_project", lambda: ("project-test", tmp_path))
+    monkeypatch.setattr(headless_api, "_ensure_worker_project", lambda: (project_id, tmp_path))
 
     routes = [
         AnalyticsModelRoute("general", None, 0.9, "semantic", "weather_question"),

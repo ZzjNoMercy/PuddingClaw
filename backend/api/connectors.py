@@ -14,11 +14,10 @@ from typing import Literal
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
-from config import load_config
 from connectors.kimi_webbridge.lifecycle import KimiWebBridgeLifecycle
-from harness.workspace_backends import ProjectSandboxManager
 from runtime_identity.adapters import ManagedCliRegistry
 from runtime_identity.authorization_drivers import AuthorizationDriverRegistry
+from runtime_identity.composition import build_managed_integration_backend
 from runtime_identity.connectors import ConnectorRegistry
 from runtime_identity.paths import PuddingClawPaths
 from runtime_identity.service import ManagedCliService
@@ -36,28 +35,20 @@ class RevokeConnectorRequest(BaseModel):
     confirmed: bool = False
 
 
-def _sandbox_manager() -> ProjectSandboxManager:
-    terminal = load_config().get("harness", {}).get("terminal", {})
-    # Connector managed-runtime Docker is an internal compatibility path,
-    # not a user-selectable Agent execution mode. Availability is checked by
-    # the manager when the connector operation actually needs it.
-    return ProjectSandboxManager(dict(terminal.get("docker", {}) or {}))
-
-
 def _connector_registry() -> ConnectorRegistry:
-    manager = _sandbox_manager()
+    backend = build_managed_integration_backend()
     return ConnectorRegistry(
         PuddingClawPaths.from_environment(),
-        manager.runtime_contract,
+        backend.runtime_contract,
         managed_registry=_MANAGED_REGISTRY,
         authorization_drivers=_AUTHORIZATION_DRIVERS,
-        runtime_image_digest=manager.inspect_managed_runtime_image_digest(),
+        runtime_image_digest=backend.managed_runtime_image_digest(),
     )
 
 
 def _managed_service() -> ManagedCliService:
     return ManagedCliService(
-        _sandbox_manager(),
+        build_managed_integration_backend(),
         registry=_MANAGED_REGISTRY,
         authorization_drivers=_AUTHORIZATION_DRIVERS,
     )

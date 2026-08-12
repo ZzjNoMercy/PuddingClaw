@@ -1,7 +1,7 @@
 """读取本地 Higress 配置，提取 AI 路由模型列表。
 
-Higress all-in-one 将 K8s 资源以 YAML 形式持久化在 /app/data/higress
-（通过 docker-compose 挂载）。backend 直接读取这些文件，无需访问
+Higress all-in-one 将 K8s 资源以 YAML 形式持久化在用户 Home 的
+``infrastructure/higress``（或显式 ``HIGRESS_DATA_DIR``）。backend 直接读取这些文件，无需访问
 Higress apiserver 的 18443 端口。
 """
 
@@ -12,6 +12,8 @@ import os
 from pathlib import Path
 from typing import Any
 
+from runtime_identity.paths import PuddingClawPaths
+
 logger = logging.getLogger(__name__)
 
 def _default_higress_data_dir() -> Path:
@@ -19,15 +21,11 @@ def _default_higress_data_dir() -> Path:
 
     Priority:
     1. HIGRESS_DATA_DIR environment variable
-    2. Project-local data/higress (for local development)
-    3. Docker default /app/data/higress
+    2. PUDDINGCLAW_HOME/infrastructure/higress
     """
     if env_dir := os.getenv("HIGRESS_DATA_DIR"):
-        return Path(env_dir)
-    project_local = Path(__file__).resolve().parent.parent / "data" / "higress"
-    if project_local.exists():
-        return project_local
-    return Path("/app/data/higress")
+        return Path(env_dir).expanduser().resolve(strict=False)
+    return PuddingClawPaths.from_environment().infrastructure() / "higress"
 
 
 DEFAULT_HIGRESS_DATA_DIR = _default_higress_data_dir()
@@ -73,7 +71,7 @@ def get_higress_routed_models(data_dir: Path | str | None = None, *, include_emb
     """返回 Higress 当前配置中所有 AI 路由模型名。
 
     Args:
-        data_dir: Higress 数据目录，默认 /app/data/higress
+        data_dir: Higress 数据目录，默认 PUDDINGCLAW_HOME/infrastructure/higress
         include_embeddings: 是否包含 embeddings 路由（path=/v1/embeddings）的模型
 
     Returns:

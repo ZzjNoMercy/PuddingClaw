@@ -217,7 +217,12 @@ def _validate_package_dir(package_dir: Path) -> str | None:
 def _acquire_file_lock(base_dir: Path):
     if fcntl is None:
         return None
-    lock_path = base_dir / "data" / ".puddingclaw-cli-install.lock"
+    if base_dir.name == "backend":
+        from runtime_identity.paths import PuddingClawPaths
+
+        lock_path = PuddingClawPaths.from_environment().data() / ".puddingclaw-cli-install.lock"
+    else:
+        lock_path = base_dir / "data" / ".puddingclaw-cli-install.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     handle = lock_path.open("a+", encoding="utf-8")
     try:

@@ -25,9 +25,6 @@ logger = logging.getLogger(__name__)
 from langchain_core.messages import HumanMessage, AIMessage, AIMessageChunk
 
 from config import (
-    get_rag_mode,
-    get_memory_backend,
-    get_smart_extractor_config,
     load_config,
     get_compaction_trigger_tokens,
     get_middleware_config,
@@ -36,15 +33,6 @@ from config import (
     get_write_middleware_config,
     get_fallback_llm_config,
 )
-
-# Claude Code 记忆类型标签映射
-_MEM0_TYPE_LABELS: dict[str, str] = {
-    "user": "用户偏好",
-    "feedback": "行为规则",
-    "project": "项目上下文",
-    "reference": "参考信息",
-}
-
 
 def _extract_stream_text(msg: Any) -> str:
     """Extract visible text from streamed model chunks.
@@ -87,17 +75,6 @@ def _extract_stream_text(msg: Any) -> str:
     return ""
 
 
-def _format_mem0_context(typed_context: dict[str, list[str]]) -> str:
-    sections: list[str] = []
-    for mem_type in ("user", "feedback", "project", "reference"):
-        items = typed_context.get(mem_type, [])
-        if items:
-            label = _MEM0_TYPE_LABELS[mem_type]
-            bullet_list = "\n".join(f"- {item}" for item in items)
-            sections.append(f"**{label}**\n{bullet_list}")
-    return "\n\n".join(sections)
-
-
 # ========== Context Rot 阈值 ==========
 CONTEXT_ROT_WARNING_RATIO = 0.40
 CONTEXT_ROT_CRITICAL_RATIO = 0.85
@@ -117,10 +94,10 @@ def _agent_model_config_signature() -> tuple[str, str]:
     AgentManager only needs a cache invalidation signature here; actual model
     construction stays delegated to ModelClientChatModel and Provider Registry.
     """
-    fallback_llm_cfg = get_fallback_llm_config()
-    signature_payload = {"provider_binding": fallback_llm_cfg}
+    agent_llm_cfg = get_fallback_llm_config()
+    signature_payload = {"provider_binding": agent_llm_cfg}
     signature = json.dumps(signature_payload, ensure_ascii=False, sort_keys=True, default=str)
-    display_model = fallback_llm_cfg.get("model", "deepseek-chat")
+    display_model = agent_llm_cfg.get("model", "deepseek-chat")
     return signature, str(display_model)
 
 
@@ -211,6 +188,7 @@ class AgentManager:
 
     def __init__(self) -> None:
         self._base_dir: Path | None = None
+        self._user_root: Path | None = None
         self._tools: list = []
         self._llm = None
         self._config_sig: str = ""
@@ -219,8 +197,11 @@ class AgentManager:
         self._mcp_client = None
         self._mcp_server_names: list[str] = []
 
-    def initialize(self, base_dir: Path) -> None:
+    def initialize(self, base_dir: Path, *, sessions_dir: Path | None = None) -> None:
         self._base_dir = base_dir
+        from runtime_identity.paths import PuddingClawPaths
+
+        self._user_root = PuddingClawPaths.from_environment().root
         self._tools = get_all_tools(base_dir)
 
         self._llm = ModelClientChatModel(role="agent", streaming=True)
@@ -233,7 +214,10 @@ class AgentManager:
         if _missing:
             logger.warning("[agent] ToolIntentRouter preferred_tools not in loaded tools: %s", _missing)
 
-        session_manager.initialize(base_dir)
+        if sessions_dir is not None:
+            session_manager.initialize(sessions_dir=sessions_dir)
+        elif not session_manager.is_initialized:
+            session_manager.initialize(base_dir)
         print(f"🤖 Agent initialized with {len(self._tools)} tools (model: {model})")
 
     def _refresh_llm_if_needed(self):
@@ -245,12 +229,9 @@ class AgentManager:
     def _get_prompt_files_sig(self) -> str:
         assert self._base_dir is not None
         files = [
-            self._base_dir / "SKILLS_SNAPSHOT.md",
-            self._base_dir / "workspace" / "SOUL.md",
-            self._base_dir / "workspace" / "IDENTITY.md",
-            self._base_dir / "workspace" / "USER.md",
-            self._base_dir / "workspace" / "AGENTS.md",
-            self._base_dir / "memory" / "MEMORY.md",
+            self._user_root / "data" / "skill-management" / "SKILLS_SNAPSHOT.md",
+            self._user_root / "profile" / "AGENTS.md",
+            self._user_root / "memory" / "MEMORY.md",
         ]
         mtimes = []
         for f in files:
@@ -260,7 +241,7 @@ class AgentManager:
                 mtimes.append("0")
         return "|".join(mtimes)
 
-    def _get_full_cache_key(self, rag_mode: bool, memory_backend: str, tool_reminder: bool) -> str:
+    def _get_full_cache_key(self, tool_reminder: bool) -> str:
         import json as _json
 
         from config import get_middleware_config, get_write_middleware_config, get_tool_intent_router_config, get_cache_config
@@ -270,9 +251,9 @@ class AgentManager:
         write_sig = _json.dumps(get_write_middleware_config(), sort_keys=True)
         tool_intent_sig = _json.dumps(get_tool_intent_router_config(), sort_keys=True)
         cache_sig = _json.dumps(get_cache_config(), sort_keys=True)
-        return f"{config_sig}|{prompt_sig}|{rag_mode}|{memory_backend}|{tool_reminder}|{mw_sig}|{write_sig}|{tool_intent_sig}|{cache_sig}"
+        return f"{config_sig}|{prompt_sig}|{tool_reminder}|{mw_sig}|{write_sig}|{tool_intent_sig}|{cache_sig}"
 
-    def _build_agent_core(self, tools: list, mem0_context: str = "", rag_context: str = "", tool_reminder: bool = False):
+    def _build_agent_core(self, tools: list, tool_reminder: bool = False):
         """构建 Agent 的纯逻辑，不涉及缓存。"""
         from langchain.agents import create_agent
         from graph.middlewares import (
@@ -283,16 +264,10 @@ class AgentManager:
         )
 
         assert self._llm is not None
-        memory_backend = get_memory_backend()
-        rag_mode = get_rag_mode()
-
         system_prompt = build_system_prompt(
             self._base_dir,
-            rag_mode=rag_mode,
-            memory_backend=memory_backend,
-            mem0_context=mem0_context,
-            rag_context=rag_context,
             tool_reminder=tool_reminder,
+            runtime_root=self._user_root,
         )
 
         # Context Engineering 推荐顺序：
@@ -318,7 +293,7 @@ class AgentManager:
             middleware=all_middlewares,
         )
 
-    def _build_agent(self, mem0_context: str = "", rag_context: str = "", tool_reminder: bool = False, extra_tools: list | None = None):
+    def _build_agent(self, tool_reminder: bool = False, extra_tools: list | None = None):
         """Build agent, using cache when possible.
 
         Args:
@@ -330,18 +305,13 @@ class AgentManager:
             tools.extend(extra_tools)
 
         if extra_tools:
-            return self._build_agent_core(tools, mem0_context, rag_context, tool_reminder)
+            return self._build_agent_core(tools, tool_reminder)
 
-        memory_backend = get_memory_backend()
-        rag_mode = get_rag_mode()
-        if memory_backend == "mem0":
-            return self._build_agent_core(tools, mem0_context, rag_context, tool_reminder)
-
-        cache_key = self._get_full_cache_key(rag_mode, memory_backend, tool_reminder)
+        cache_key = self._get_full_cache_key(tool_reminder)
         if self._cached_agent is not None and self._cached_agent_key == cache_key:
             return self._cached_agent
 
-        agent = self._build_agent_core(tools, mem0_context, rag_context, tool_reminder)
+        agent = self._build_agent_core(tools, tool_reminder)
         self._cached_agent = agent
         self._cached_agent_key = cache_key
         return agent
@@ -356,10 +326,7 @@ class AgentManager:
         mcp_cfg = cfg.get("mcp", {})
         from mcp_clients.servers import effective_mcp_server_names
 
-        enabled = effective_mcp_server_names(
-            mcp_cfg.get("enabled", []),
-            auto_enable_gbrain=bool(mcp_cfg.get("auto_enable_gbrain", False)),
-        )
+        enabled = effective_mcp_server_names(mcp_cfg.get("enabled", []))
         if not enabled:
             return
 
@@ -384,10 +351,7 @@ class AgentManager:
         mcp_cfg = cfg.get("mcp", {})
         from mcp_clients.servers import effective_mcp_server_names
 
-        return effective_mcp_server_names(
-            mcp_cfg.get("enabled", []),
-            auto_enable_gbrain=bool(mcp_cfg.get("auto_enable_gbrain", False)),
-        )
+        return effective_mcp_server_names(mcp_cfg.get("enabled", []))
 
     @staticmethod
     def _looks_like_mcp_required(message: str, history: list[dict[str, Any]]) -> bool:
@@ -909,61 +873,12 @@ class AgentManager:
     async def astream(
         self, message: str, history: list[dict[str, Any]], user_id: str = "default_user", session_id: str = ""
     ) -> AsyncGenerator[dict[str, Any], None]:
-        memory_backend = get_memory_backend()
-        rag_mode = get_rag_mode()
-        rag_context = ""
-        mem0_context = ""
-
-        if memory_backend == "mem0":
-            from graph.mem0_manager import mem0_manager
-            se_cfg = get_smart_extractor_config()
-            import asyncio, functools
-            loop = asyncio.get_running_loop()
-            typed_context, raw_results = await loop.run_in_executor(
-                None,
-                functools.partial(
-                    mem0_manager.get_typed_context,
-                    message, user_id=user_id,
-                    score_threshold=se_cfg["score_threshold"],
-                    stale_days=se_cfg["stale_days"],
-                ),
-            )
-            if typed_context:
-                yield {
-                    "type": "retrieval",
-                    "query": message,
-                    "results": [
-                        {"text": r["memory"], "score": r.get("score", 0), "source": "mem0"}
-                        for r in raw_results if r.get("memory")
-                    ],
-                }
-                mem0_context = _format_mem0_context(typed_context)
-
-        elif rag_mode and self._base_dir:
-            from graph.memory_indexer import get_memory_indexer
-            indexer = get_memory_indexer(self._base_dir)
-            results = indexer.retrieve(message)
-            if results:
-                yield {
-                    "type": "retrieval",
-                    "query": message,
-                    "results": results,
-                }
-                snippets = "\n\n".join(
-                    f"[片段 {i+1}] (score: {r['score']})\n{r['text']}"
-                    for i, r in enumerate(results)
-                )
-                rag_context = f"[记忆检索结果]\n{snippets}"
-
         messages = self._build_messages(message, history)
 
         system_prompt = build_system_prompt(
             self._base_dir,
-            rag_mode=rag_mode,
-            memory_backend=memory_backend,
-            mem0_context=mem0_context,
-            rag_context=rag_context,
             tool_reminder=len(history) >= 12,
+            runtime_root=self._user_root,
         )
         system_prompt_tokens = _estimate_tokens(system_prompt)
         try:
@@ -976,8 +891,6 @@ class AgentManager:
                 metadata={
                     "phase": "astream",
                     "history_count": len(history),
-                    "rag_context_len": len(rag_context),
-                    "mem0_context_len": len(mem0_context),
                     "system_prompt_tokens_estimate": system_prompt_tokens,
                 },
             )
@@ -1023,8 +936,6 @@ class AgentManager:
 
                         agent = self._build_agent_core(
                             tools=list(self._tools) + all_mcp_tools,
-                            mem0_context=mem0_context,
-                            rag_context=rag_context,
                             tool_reminder=len(history) >= 12,
                         )
                         async for event in self._run_agent_stream(agent, messages, system_prompt_tokens, user_id, session_id):
@@ -1072,8 +983,6 @@ class AgentManager:
 
         # 原有非 MCP 逻辑
         agent = self._build_agent(
-            mem0_context=mem0_context,
-            rag_context=rag_context,
             tool_reminder=len(history) >= 12,
         )
         async for event in self._run_agent_stream(agent, messages, system_prompt_tokens, user_id, session_id):
@@ -1089,8 +998,6 @@ class AgentManager:
     ) -> str:
         query_created_at = float(query_created_at) if query_created_at is not None else time.time()
         history = session_manager.load_session_for_agent(session_id)
-        rag_context, mem0_context, _ = await self._retrieve_memory_context(message, user_id)
-
         # MCP 持久 session 模式
         await self._ensure_mcp_client()
         if self._mcp_client:
@@ -1113,8 +1020,6 @@ class AgentManager:
 
                         agent = self._build_agent_core(
                             tools=list(self._tools) + all_mcp_tools,
-                            mem0_context=mem0_context,
-                            rag_context=rag_context,
                             tool_reminder=len(history) >= 12,
                         )
                         messages = self._build_messages(message, history)
@@ -1123,11 +1028,8 @@ class AgentManager:
                                 source="pre_agent",
                                 system_message=build_system_prompt(
                                     self._base_dir,
-                                    rag_mode=get_rag_mode(),
-                                    memory_backend=get_memory_backend(),
-                                    mem0_context=mem0_context,
-                                    rag_context=rag_context,
                                     tool_reminder=len(history) >= 12,
+                                    runtime_root=self._user_root,
                                 ),
                                 messages=messages,
                                 session_id=session_id,
@@ -1163,8 +1065,6 @@ class AgentManager:
                     logger.warning("Persistent MCP session failed in ainvoke, falling back to local tools: %s", e)
 
         agent = self._build_agent(
-            mem0_context=mem0_context,
-            rag_context=rag_context,
             tool_reminder=len(history) >= 12,
         )
         messages = self._build_messages(message, history)
@@ -1173,11 +1073,8 @@ class AgentManager:
                 source="pre_agent",
                 system_message=build_system_prompt(
                     self._base_dir,
-                    rag_mode=get_rag_mode(),
-                    memory_backend=get_memory_backend(),
-                    mem0_context=mem0_context,
-                    rag_context=rag_context,
                     tool_reminder=len(history) >= 12,
+                    runtime_root=self._user_root,
                 ),
                 messages=messages,
                 session_id=session_id,
@@ -1207,42 +1104,5 @@ class AgentManager:
                 session_manager.save_message(session_id, "assistant", response)
                 return response
         return "No response generated."
-
-    async def _retrieve_memory_context(self, message, user_id):
-        """供 astream/ainvoke 使用，统一的记忆检索入口。"""
-        memory_backend = get_memory_backend()
-        rag_mode = get_rag_mode()
-        rag_context = ""
-        mem0_context = ""
-
-        if memory_backend == "mem0":
-            from graph.mem0_manager import mem0_manager
-            se_cfg = get_smart_extractor_config()
-            import asyncio, functools
-            loop = asyncio.get_running_loop()
-            typed_context, raw_results = await loop.run_in_executor(
-                None,
-                functools.partial(
-                    mem0_manager.get_typed_context,
-                    message, user_id=user_id,
-                    score_threshold=se_cfg["score_threshold"],
-                    stale_days=se_cfg["stale_days"],
-                ),
-            )
-            if typed_context:
-                mem0_context = _format_mem0_context(typed_context)
-        elif rag_mode and self._base_dir:
-            from graph.memory_indexer import get_memory_indexer
-            indexer = get_memory_indexer(self._base_dir)
-            results = indexer.retrieve(message)
-            if results:
-                snippets = "\n\n".join(
-                    f"[片段 {i+1}] (score: {r['score']})\n{r['text']}"
-                    for i, r in enumerate(results)
-                )
-                rag_context = f"[记忆检索结果]\n{snippets}"
-
-        return rag_context, mem0_context, None
-
 
 agent_manager = AgentManager()

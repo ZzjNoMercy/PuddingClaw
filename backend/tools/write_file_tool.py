@@ -6,6 +6,7 @@ from typing import Type
 from langchain_core.tools import BaseTool
 from pydantic import BaseModel, Field
 
+from runtime_identity.paths import PuddingClawPaths
 from utils.file_cache import file_cache
 
 
@@ -37,7 +38,7 @@ class SandboxedWriteFileTool(BaseTool):
             if len(content) > MAX_FILE_SIZE:
                 return f"❌ Content too large: {len(content)} characters (max {MAX_FILE_SIZE})"
 
-            root = Path(self.root_dir)
+            root = Path(self.root_dir).expanduser().resolve()
             # Normalize path
             normalized = file_path.replace("\\", "/").lstrip("./")
 
@@ -56,10 +57,22 @@ class SandboxedWriteFileTool(BaseTool):
                     "(only skills/, semantic-assets/, sql-guardrails/, analytics-models/, workspace/, memory/ allowed)"
                 )
 
-            full_path = (root / normalized).resolve()
+            user = PuddingClawPaths.from_environment()
+            roots = {
+                "skills/": user.user_skills(),
+                "semantic-assets/": user.user_definitions() / "semantic-assets",
+                "sql-guardrails/": user.user_definitions() / "sql-guardrails",
+                "analytics-models/": user.user_definitions() / "analytics-models",
+                "workspace/": user.agent_workspaces() / "unscoped" / "default",
+                "memory/": user.memory(),
+            }
+            target_root = next((target for prefix, target in roots.items() if normalized.startswith(prefix)), None)
+            if target_root is None:
+                return f"❌ Access denied: {file_path}"
+            full_path = (target_root / normalized.split("/", 1)[1]).resolve()
 
             # Sandbox check: prevent path traversal
-            if not str(full_path).startswith(str(root.resolve())):
+            if not full_path.is_relative_to(target_root.resolve()):
                 return f"❌ Access denied: path escapes project root"
 
             # Create parent directories if needed
@@ -72,7 +85,7 @@ class SandboxedWriteFileTool(BaseTool):
                 try:
                     from analytics.models import get_analytics_model_registry
 
-                    get_analytics_model_registry(root).refresh()
+                    get_analytics_model_registry(user.user_definitions() / "analytics-models").refresh()
                 except Exception:
                     pass
 
@@ -83,4 +96,4 @@ class SandboxedWriteFileTool(BaseTool):
 
 
 def create_write_file_tool(base_dir: Path) -> SandboxedWriteFileTool:
-    return SandboxedWriteFileTool(root_dir=str(base_dir))
+    return SandboxedWriteFileTool(root_dir=str(PuddingClawPaths.from_environment().root))

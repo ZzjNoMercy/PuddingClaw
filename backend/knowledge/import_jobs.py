@@ -60,13 +60,14 @@ def _database_source_snapshot(source: KnowledgeDatabaseSource | dict[str, Any]) 
             "port": source.port,
             "database": source.database,
             "username": source.username,
-            "password": source.password,
+            "credential_ref": (source.source_metadata or {}).get("credential_ref", ""),
             "selected_tables": source.selected_tables or [],
         }
     payload = dict(source)
     payload["source_type"] = payload.get("source_type") or payload.get("type") or "postgresql"
     payload["type"] = payload.get("type") or payload["source_type"]
     payload["selected_tables"] = payload.get("selected_tables") if isinstance(payload.get("selected_tables"), list) else []
+    payload.pop("password", None)
     return payload
 
 

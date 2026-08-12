@@ -15,8 +15,9 @@ from sqlglot import exp
 
 from analytics.nl2sql.guardrail_runtime import detector_failed, scope_status
 
-BASE_DIR = Path(__file__).resolve().parents[2]
-GUARDRAILS_ROOT = BASE_DIR / "sql-guardrails"
+from runtime_identity.paths import PuddingClawPaths
+
+GUARDRAILS_ROOT = PuddingClawPaths.from_environment().user_definitions() / "sql-guardrails"
 GUARDRAILS_RULES_DIR = GUARDRAILS_ROOT / "rules"
 GUARDRAILS_DRAFTS_DIR = GUARDRAILS_ROOT / "drafts"
 GUARDRAIL_FILENAME = "guardrail.md"
@@ -342,7 +343,7 @@ def _rule_document_payload(rule: GuardrailRule, path: Path, body: str, content: 
     data = rule.model_dump(mode="json")
     data.update(
         {
-            "document_path": path.relative_to(BASE_DIR).as_posix(),
+            "document_path": path.relative_to(GUARDRAILS_ROOT.parent).as_posix(),
             "document_body": body,
             "document_content": content,
         }
@@ -450,12 +451,12 @@ def _load_markdown_guardrails() -> GuardrailRuleSet:
         try:
             rule = _rule_from_markdown(path)
             if rule.id in seen_ids:
-                diagnostics.append({"path": path.relative_to(BASE_DIR).as_posix(), "error": f"duplicate id: {rule.id}"})
+                diagnostics.append({"path": path.relative_to(GUARDRAILS_ROOT.parent).as_posix(), "error": f"duplicate id: {rule.id}"})
                 continue
             seen_ids.add(rule.id)
             rules.append(rule)
         except Exception as exc:
-            diagnostics.append({"path": path.relative_to(BASE_DIR).as_posix(), "error": str(exc)})
+            diagnostics.append({"path": path.relative_to(GUARDRAILS_ROOT.parent).as_posix(), "error": str(exc)})
     return GuardrailRuleSet(guardrails=rules, diagnostics=diagnostics)
 
 

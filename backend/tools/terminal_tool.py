@@ -8,6 +8,7 @@ from typing import Type
 
 from langchain_core.tools import BaseTool
 from pydantic import BaseModel, Field
+from runtime_identity.paths import PuddingClawPaths
 
 
 BLACKLISTED_COMMANDS = [
@@ -104,4 +105,6 @@ class SafeTerminalTool(BaseTool):
 
 
 def create_terminal_tool(base_dir: Path) -> SafeTerminalTool:
-    return SafeTerminalTool(root_dir=str(base_dir))
+    return SafeTerminalTool(
+        root_dir=str(PuddingClawPaths.from_environment().agent_workspaces() / "unscoped" / "default")
+    )

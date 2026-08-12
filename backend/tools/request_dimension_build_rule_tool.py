@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field
 
 from graph.dimension_build_resume import dimension_build_resume_registry
 from knowledge.semantic_dimension_crosswalk import list_registered_sources
+from runtime_identity.paths import PuddingClawPaths
 
 
 class DimensionBuildCandidateInput(BaseModel):
@@ -66,7 +67,7 @@ class RequestDimensionBuildRuleTool(BaseTool):
         if not self.session_id:
             return "❌ 无法创建维度构建确认：缺少会话标识。"
         tool_call_id = str(kwargs.pop("tool_call_id", "") or "")
-        base_dir = Path(__file__).resolve().parents[1]
+        base_dir = PuddingClawPaths.from_environment().user_definitions()
         dimension_id = str(kwargs["dimension_id"])
         operation = str(kwargs["operation"] or "refresh")
         candidates = [item.model_dump() if isinstance(item, BaseModel) else dict(item) for item in kwargs["candidates"]]

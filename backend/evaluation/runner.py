@@ -46,7 +46,9 @@ class EvaluationRunner:
         self.backend_dir = backend_dir.resolve()
 
     def _runtime_root(self, experiment_id: str) -> Path:
-        return self.backend_dir / "data" / "evaluation-runs" / experiment_id
+        from runtime_identity.paths import PuddingClawPaths
+
+        return PuddingClawPaths.from_environment().data() / "evaluation-runs" / experiment_id
 
     def _initialize_isolated_runtime(self, root: Path) -> None:
         root.mkdir(parents=True, exist_ok=True)
@@ -61,10 +63,10 @@ class EvaluationRunner:
         from graph.session_manager import session_manager
         from projects.registry import project_registry
 
-        session_manager.initialize(root)
+        session_manager.initialize(sessions_dir=root / "sessions")
         project_registry.initialize(root)
         attachment_store.initialize(root)
-        deepagents_agent_manager.initialize(self.backend_dir)
+        deepagents_agent_manager.initialize(self.backend_dir, user_root=root)
 
     @staticmethod
     def _event_payload(event: dict[str, str]) -> dict[str, Any]:
@@ -145,7 +147,11 @@ class EvaluationRunner:
                 raise ValueError(
                     f"Fixture {fixture.fixture_id} is not materialized in the safe evaluation fixture store"
                 )
-        record = project_registry.register(str(workspace), name=f"Eval {case.name}")
+        record = project_registry.register(
+            str(workspace),
+            name=f"Eval {case.name}",
+            trusted=True,
+        )
         return workspace, record.project_id
 
     async def _run_case(

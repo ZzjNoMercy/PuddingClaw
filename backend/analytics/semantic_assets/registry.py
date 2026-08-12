@@ -18,6 +18,8 @@ from typing import Any, BinaryIO
 
 import yaml
 
+from runtime_identity.paths import PuddingClawPaths
+
 
 class SemanticAssetError(ValueError):
     """Raised when semantic asset input or filesystem state is invalid."""
@@ -83,11 +85,6 @@ class SemanticAsset:
         data = self.to_summary()
         data.update({"body": self.body, "frontmatter": self.frontmatter or {}})
         return data
-
-
-def _base_dir_from_here() -> Path:
-    return Path(__file__).resolve().parents[2]
-
 
 def _parse_frontmatter(text: str) -> tuple[dict, str]:
     if not text.startswith("---"):
@@ -308,7 +305,9 @@ def _semantic_relative_path(original_path: str) -> Path | None:
 
 class SemanticAssetRegistry:
     def __init__(self, base_dir: Path | None = None):
-        self.base_dir = base_dir or _base_dir_from_here()
+        self.base_dir = (
+            base_dir or PuddingClawPaths.from_environment().user_definitions()
+        ).expanduser().resolve()
         self.root_dir = self.base_dir / "semantic-assets"
         self._lock = RLock()
         self._assets: dict[str, SemanticAsset] = {}
@@ -683,7 +682,7 @@ _REGISTRIES_LOCK = RLock()
 
 
 def get_semantic_asset_registry(base_dir: Path | None = None) -> SemanticAssetRegistry:
-    resolved = (base_dir or _base_dir_from_here()).resolve()
+    resolved = (base_dir or PuddingClawPaths.from_environment().user_definitions()).resolve()
     with _REGISTRIES_LOCK:
         registry = _REGISTRIES.get(resolved)
         if registry is None:

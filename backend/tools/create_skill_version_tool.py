@@ -8,6 +8,7 @@ from typing import Type
 
 from langchain_core.tools import BaseTool
 from pydantic import BaseModel, Field
+from runtime_identity.paths import PuddingClawPaths
 
 
 class CreateSkillVersionInput(BaseModel):
@@ -94,4 +95,4 @@ class CreateSkillVersionTool(BaseTool):
 
 
 def create_skill_version_tool(base_dir: Path) -> CreateSkillVersionTool:
-    return CreateSkillVersionTool(root_dir=str(base_dir))
+    return CreateSkillVersionTool(root_dir=str(PuddingClawPaths.from_environment().root))

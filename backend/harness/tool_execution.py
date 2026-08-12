@@ -3323,9 +3323,16 @@ class ToolExecutionPipeline(AgentMiddleware):
                     request,
                     f"Managed CLI planning failed: {type(exc).__name__}: {exc}",
                 )
-        shell_authority_result = self._require_external_shell_authority(request)
-        if shell_authority_result is not None:
-            return shell_authority_result
+        # A claimed Managed CLI command has already been parsed into a frozen
+        # Adapter plan and never reaches the project shell runner. Re-parsing
+        # its payload as shell text is both redundant and incorrect: ordinary
+        # message bodies such as ``ready / token`` can otherwise be mistaken
+        # for a request to mount the host root directory. Managed runners
+        # receive only the workspace and the exact Toolchain revision.
+        if managed_cli is None:
+            shell_authority_result = self._require_external_shell_authority(request)
+            if shell_authority_result is not None:
+                return shell_authority_result
         result = (
             self._managed_cli_preflight(managed_cli) if managed_cli is not None else await self._apreflight(request)
         )
@@ -3482,9 +3489,10 @@ class ToolExecutionPipeline(AgentMiddleware):
                     request,
                     f"Managed CLI planning failed: {type(exc).__name__}: {exc}",
                 )
-        shell_authority_result = self._require_external_shell_authority(request)
-        if shell_authority_result is not None:
-            return shell_authority_result
+        if managed_cli is None:
+            shell_authority_result = self._require_external_shell_authority(request)
+            if shell_authority_result is not None:
+                return shell_authority_result
         result = self._managed_cli_preflight(managed_cli) if managed_cli is not None else self._preflight(request)
         if result.decision == PolicyDecision.ALLOW:
             delta_denial = self._delta_repair_denial(request)

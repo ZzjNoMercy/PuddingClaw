@@ -21,11 +21,33 @@ from typing import Any
 import httpx
 
 from llm.thinking_mapping import thinking_profile
+from runtime_identity.paths import PuddingClawPaths, trusted_owner_user_id
+from runtime_identity.profiles import CredentialVault, MasterKeyProvider
 
 REGISTRY_VERSION = 2
 DEFAULT_CREDENTIAL_NAME = "default"
 CREDENTIAL_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 DEFAULT_NATIVE_MM_PATH = "/api/v1/services/embeddings/multimodal-embedding/multimodal-embedding"
+DEFAULT_AGENT_MODEL = {
+    "provider": "deepseek",
+    "model": "deepseek-v4-flash",
+    "base_url": "https://api.deepseek.com",
+    "temperature": 0.7,
+    "max_tokens": 4096,
+    "context_window": 1000000,
+    "thinking": {
+        "model": "deepseek-v4-flash",
+        "reasoning_effort": "high",
+        "extra_body": {"thinking": {"type": "enabled"}},
+    },
+}
+DEFAULT_TEXT_EMBEDDING_MODEL = {
+    "provider": "qwen",
+    "model": "text-embedding-v4",
+    "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    "dimension": 1024,
+    "batch_size": 10,
+}
 DASHSCOPE_NATIVE_DISCOVERY_TIMEOUT_SECONDS = 3.0
 DASHSCOPE_NATIVE_DISCOVERY_CACHE_TTL_SECONDS = 300.0
 DASHSCOPE_NATIVE_MODEL_CATALOG = (
@@ -57,17 +79,8 @@ logger = logging.getLogger(__name__)
 
 
 def user_data_dir() -> Path:
-    """Return the OS user-data directory, with Electron taking precedence."""
-    configured = os.getenv("PUDDINGDATA_USER_DATA_DIR") or os.getenv("PUDDINGCLAW_USER_DATA_DIR")
-    if configured:
-        return Path(configured).expanduser()
-    if os.name == "nt":
-        return Path(os.getenv("APPDATA") or Path.home() / "AppData" / "Roaming") / "PuddingData"
-    if os.getenv("XDG_CONFIG_HOME"):
-        return Path(os.environ["XDG_CONFIG_HOME"]) / "PuddingData"
-    if os.sys.platform == "darwin":
-        return Path.home() / "Library" / "Application Support" / "PuddingData"
-    return Path.home() / ".config" / "PuddingData"
+    """Return the canonical PuddingClaw configuration directory."""
+    return PuddingClawPaths.from_environment().config()
 
 
 def _atomic_json_write(path: Path, payload: dict[str, Any], *, mode: int) -> None:
@@ -99,6 +112,30 @@ def _read_json(path: Path, default: dict[str, Any]) -> dict[str, Any]:
         return copy.deepcopy(default)
 
 
+def _read_json_bytes(raw: bytes) -> dict[str, Any]:
+    try:
+        value = json.loads(raw.decode("utf-8"))
+        return value if isinstance(value, dict) else {"version": 1, "credentials": {}}
+    except (UnicodeDecodeError, ValueError, json.JSONDecodeError):
+        return {"version": 1, "credentials": {}}
+
+
+def _atomic_bytes_write(path: Path, payload: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd, raw_path = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            if os.name != "nt":
+                os.fchmod(handle.fileno(), 0o600)
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(raw_path, path)
+    finally:
+        if os.path.exists(raw_path):
+            os.unlink(raw_path)
+
+
 def _slug(value: str) -> str:
     return "".join(char.lower() if char.isalnum() else "-" for char in value).strip("-") or "model"
 
@@ -112,20 +149,60 @@ def _mask(secret: str) -> str:
 
 
 class LocalCredentialStore:
-    """Phase-one, file-backed credential store outside the repository.
+    """Owner-scoped encrypted Credential Vault compatibility adapter."""
 
-    Values are deliberately not encrypted in phase one.  Directory and file
-    permissions, atomic writes, and opaque references avoid accidental
-    leakage into project files, API responses, and logs.  Phase two can keep
-    these references and replace this implementation with OS keyring calls.
-    """
-
-    def __init__(self, root: Path | None = None) -> None:
-        self.root = root or user_data_dir()
-        self.path = self.root / "credentials.json"
+    def __init__(self, root: Path | None = None, *, owner_user_id: str | None = None) -> None:
+        configured_root = (root or user_data_dir()).expanduser().resolve()
+        self.root = configured_root
+        self.owner_user_id = owner_user_id or trusted_owner_user_id()
+        home_root = configured_root.parent if configured_root.name == "config" else configured_root
+        self.paths = PuddingClawPaths(home_root)
+        self.path = self.paths.credentials_root(self.owner_user_id) / "provider-registry.enc"
+        self.legacy_paths = (configured_root / "credentials.json", home_root / "credentials.json")
+        self.vault = CredentialVault(MasterKeyProvider(self.paths, self.owner_user_id).get_or_create())
 
     def _payload(self) -> dict[str, Any]:
-        return _read_json(self.path, {"version": 1, "credentials": {}})
+        if self.path.is_file():
+            raw = self.vault.open(
+                self.path.read_bytes(),
+                owner_user_id=self.owner_user_id,
+                provider="provider-registry",
+                profile_id="default",
+            )
+            return _read_json_bytes(raw)
+        for legacy in self.legacy_paths:
+            if not legacy.is_file():
+                continue
+            payload = _read_json(legacy, {"version": 1, "credentials": {}})
+            self._write_payload(payload)
+            # A successful authenticated read-back is the safety boundary for
+            # removing the old plaintext source.
+            if self._payload_from_disk().get("credentials") == payload.get("credentials"):
+                legacy.unlink(missing_ok=True)
+            return payload
+        return {"version": 1, "credentials": {}}
+
+    def _payload_from_disk(self) -> dict[str, Any]:
+        if not self.path.is_file():
+            return {}
+        raw = self.vault.open(
+            self.path.read_bytes(),
+            owner_user_id=self.owner_user_id,
+            provider="provider-registry",
+            profile_id="default",
+        )
+        return _read_json_bytes(raw)
+
+    def _write_payload(self, payload: dict[str, Any]) -> None:
+        encoded = (json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode()
+        envelope = self.vault.seal(
+            encoded,
+            owner_user_id=self.owner_user_id,
+            provider="provider-registry",
+            profile_id="default",
+        )
+        self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        _atomic_bytes_write(self.path, envelope)
 
     def put(self, ref: str, value: str) -> str:
         if not value:
@@ -133,48 +210,112 @@ class LocalCredentialStore:
         payload = self._payload()
         credentials = payload.setdefault("credentials", {})
         credentials[ref] = {"value": value, "updated_at": int(time.time())}
-        _atomic_json_write(self.path, payload, mode=0o600)
-        return f"local-file://{ref}"
+        self._write_payload(payload)
+        return f"vault://users/{self.owner_user_id}/credentials/{ref}"
 
     def get(self, reference: str) -> str:
         if not reference:
             return ""
         if reference.startswith("env://"):
             return os.getenv(reference.removeprefix("env://"), "")
-        if not reference.startswith("local-file://"):
+        if not reference.startswith("vault://"):
             return ""
-        item = self._payload().get("credentials", {}).get(reference.removeprefix("local-file://"), {})
+        item = self._payload().get("credentials", {}).get(reference.rsplit("/", 1)[-1], {})
         return str(item.get("value") or "") if isinstance(item, dict) else ""
 
     def delete(self, ref: str) -> None:
-        key = ref.removeprefix("local-file://")
+        key = ref.rsplit("/", 1)[-1]
         payload = self._payload()
         credentials = payload.setdefault("credentials", {})
         if key in credentials:
             del credentials[key]
-            _atomic_json_write(self.path, payload, mode=0o600)
+            self._write_payload(payload)
 
     def display(self, reference: str) -> str:
         return _mask(self.get(reference))
 
     def updated_at(self, reference: str) -> int:
-        if not reference.startswith("local-file://"):
+        if not reference.startswith("vault://"):
             return 0
-        item = self._payload().get("credentials", {}).get(reference.removeprefix("local-file://"), {})
+        item = self._payload().get("credentials", {}).get(reference.rsplit("/", 1)[-1], {})
         return int(item.get("updated_at") or 0) if isinstance(item, dict) else 0
 
 
 def _provider_presets() -> list[dict[str, Any]]:
     return [
-        {"id": "deepseek", "name": "DeepSeek", "enabled": True, "website": "https://platform.deepseek.com", "credentials": {}, "endpoints": [{"id": "deepseek-openai", "protocol": "deepseek", "base_url": "https://api.deepseek.com", "credential_ref": "", "capabilities": ["llm"]}], "models": []},
-        {"id": "dashscope", "name": "阿里云百炼", "enabled": True, "website": "https://bailian.console.aliyun.com", "credential_scope": "provider", "credentials": {}, "endpoints": [{"id": "dashscope-compatible", "protocol": "openai_compatible", "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1", "credential_ref": "", "capabilities": ["llm", "text_embedding"]}, {"id": "dashscope-native-mm", "protocol": "dashscope_multimodal_embedding", "base_url": "https://dashscope.aliyuncs.com", "route_path": DEFAULT_NATIVE_MM_PATH, "credential_ref": "", "capabilities": ["multimodal_embedding", "rerank"]}], "models": []},
+        {
+            "id": "deepseek",
+            "name": "DeepSeek",
+            "enabled": True,
+            "website": "https://platform.deepseek.com",
+            "credentials": {DEFAULT_CREDENTIAL_NAME: "env://DEEPSEEK_API_KEY"},
+            "endpoints": [{"id": "deepseek-openai", "protocol": "deepseek", "base_url": "https://api.deepseek.com", "credential_ref": "env://DEEPSEEK_API_KEY", "capabilities": ["llm"]}],
+            "models": [
+                {
+                    "id": "deepseek:deepseek-openai:deepseek-v4-flash:llm",
+                    "name": "deepseek-v4-flash",
+                    "endpoint_id": "deepseek-openai",
+                    "capability": "llm",
+                    "categories": ["llm"],
+                    "temperature": 0.7,
+                    "max_tokens": 4096,
+                    "context_window": 1000000,
+                    "thinking": copy.deepcopy(DEFAULT_AGENT_MODEL["thinking"]),
+                },
+                {
+                    "id": "deepseek:deepseek-openai:deepseek-v4-pro:llm",
+                    "name": "deepseek-v4-pro",
+                    "endpoint_id": "deepseek-openai",
+                    "capability": "llm",
+                    "categories": ["llm"],
+                    "temperature": 0.7,
+                    "max_tokens": 8192,
+                    "context_window": 1000000,
+                    "thinking": {
+                        "model": "deepseek-v4-pro",
+                        "reasoning_effort": "high",
+                        "extra_body": {"thinking": {"type": "enabled"}},
+                    },
+                },
+            ],
+        },
+        {
+            "id": "dashscope",
+            "name": "阿里云百炼",
+            "enabled": True,
+            "website": "https://bailian.console.aliyun.com",
+            "credential_scope": "provider",
+            "credentials": {DEFAULT_CREDENTIAL_NAME: "env://DASHSCOPE_API_KEY"},
+            "endpoints": [
+                {"id": "dashscope-compatible", "protocol": "openai_compatible", "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1", "credential_ref": "env://DASHSCOPE_API_KEY", "capabilities": ["llm", "text_embedding"]},
+                {"id": "dashscope-native-mm", "protocol": "dashscope_multimodal_embedding", "base_url": "https://dashscope.aliyuncs.com", "route_path": DEFAULT_NATIVE_MM_PATH, "credential_ref": "env://DASHSCOPE_API_KEY", "capabilities": ["multimodal_embedding", "rerank"]},
+            ],
+            "models": [
+                {"id": "dashscope:dashscope-compatible:text-embedding-v4:text_embedding", "name": "text-embedding-v4", "endpoint_id": "dashscope-compatible", "capability": "text_embedding", "categories": ["text_embedding"], "dimension": 1024, "batch_size": 10},
+                {"id": "dashscope:dashscope-native-mm:qwen3-vl-embedding:multimodal_embedding", "name": "qwen3-vl-embedding", "endpoint_id": "dashscope-native-mm", "capability": "multimodal_embedding", "categories": ["multimodal_embedding"], "dimension": 1024, "batch_size": 10, "route_path": DEFAULT_NATIVE_MM_PATH},
+                {"id": "dashscope:dashscope-native-mm:qwen3-vl-rerank:rerank", "name": "qwen3-vl-rerank", "endpoint_id": "dashscope-native-mm", "capability": "rerank", "categories": ["rerank"], "top_n": 10, "candidate_top_k": 50, "route_path": "/api/v1/services/rerank/text-rerank/text-rerank"},
+                {"id": "dashscope:dashscope-compatible:qwen3-7-plus:llm", "name": "qwen3.7-plus", "endpoint_id": "dashscope-compatible", "capability": "llm", "categories": ["llm", "multimodal_llm"]},
+            ],
+        },
         {"id": "kimi", "name": "Kimi", "enabled": False, "website": "https://platform.moonshot.cn", "credentials": {}, "endpoints": [{"id": "kimi-openai", "protocol": "openai_compatible", "base_url": "https://api.moonshot.cn/v1", "credential_ref": "", "capabilities": ["llm"]}], "models": []},
         {"id": "siliconflow", "name": "硅基流动", "enabled": False, "website": "https://siliconflow.cn", "credentials": {}, "endpoints": [{"id": "siliconflow-openai", "protocol": "openai_compatible", "base_url": "https://api.siliconflow.cn/v1", "credential_ref": "", "capabilities": ["llm", "text_embedding"]}], "models": []},
     ]
 
 
 def _default_registry() -> dict[str, Any]:
-    return {"version": REGISTRY_VERSION, "providers": _provider_presets(), "bindings": {}, "migration": {"state": "not_started"}}
+    return {
+        "version": REGISTRY_VERSION,
+        "providers": _provider_presets(),
+        "bindings": {
+            "agent": "deepseek:deepseek-openai:deepseek-v4-flash:llm",
+            "image_analyzer": "dashscope:dashscope-compatible:qwen3-7-plus:llm",
+            "text_embedding": "dashscope:dashscope-compatible:text-embedding-v4:text_embedding",
+            "multimodal_embedding": "dashscope:dashscope-native-mm:qwen3-vl-embedding:multimodal_embedding",
+            "rerank": "dashscope:dashscope-native-mm:qwen3-vl-rerank:rerank",
+            "vanna_llm": "deepseek:deepseek-openai:deepseek-v4-pro:llm",
+            "vanna_embedding": "dashscope:dashscope-compatible:text-embedding-v4:text_embedding",
+        },
+    }
 
 
 class ProviderRegistry:
@@ -187,10 +328,39 @@ class ProviderRegistry:
         ] = {}
 
     def _payload(self) -> dict[str, Any]:
-        payload = _read_json(self.path, _default_registry())
-        payload.setdefault("providers", _provider_presets())
-        payload.setdefault("bindings", {})
-        payload.setdefault("migration", {"state": "not_started"})
+        if not self.path.is_file():
+            return _default_registry()
+        try:
+            payload = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError(f"Invalid Provider Registry JSON: {self.path}") from exc
+        if not isinstance(payload, dict):
+            raise ValueError("Provider Registry must be a JSON object")
+        unknown = sorted(set(payload) - {"version", "providers", "bindings"})
+        if unknown:
+            raise ValueError(f"Unsupported Provider Registry fields: {', '.join(unknown)}")
+        if payload.get("version") != REGISTRY_VERSION:
+            raise ValueError(f"Unsupported Provider Registry version: {payload.get('version')}")
+        if not isinstance(payload.get("providers"), list) or not isinstance(payload.get("bindings"), dict):
+            raise ValueError("Provider Registry requires providers and bindings")
+        model_ids = {
+            str(model.get("id") or "")
+            for provider in payload["providers"]
+            if isinstance(provider, dict)
+            for model in provider.get("models", [])
+            if isinstance(model, dict)
+        }
+        required_bindings = set(_default_registry()["bindings"])
+        missing_bindings = sorted(required_bindings - set(payload["bindings"]))
+        if missing_bindings:
+            raise ValueError(f"Provider Registry is missing bindings: {', '.join(missing_bindings)}")
+        dangling_bindings = sorted(
+            binding
+            for binding, model_id in payload["bindings"].items()
+            if str(model_id) not in model_ids
+        )
+        if dangling_bindings:
+            raise ValueError(f"Provider Registry has unknown bound models: {', '.join(dangling_bindings)}")
         return payload
 
     def _save(self, payload: dict[str, Any]) -> None:
@@ -199,39 +369,6 @@ class ProviderRegistry:
         # Endpoint URLs and credentials may have changed. Never serve discovery
         # results cached against registry state that has just been replaced.
         self._dashscope_native_discovery_cache.clear()
-
-    @staticmethod
-    def _backfill_bindings(payload: dict[str, Any]) -> bool:
-        """Add newly introduced workload bindings without changing user choices."""
-        bindings = payload.setdefault("bindings", {})
-        agent_model_id = bindings.get("agent")
-        if agent_model_id and not bindings.get("image_analyzer"):
-            # Existing installations initially share the assistant model. The
-            # user can select a vision-capable LLM independently afterwards.
-            bindings["image_analyzer"] = agent_model_id
-            return True
-        return False
-
-    @staticmethod
-    def _backfill_model_categories(payload: dict[str, Any]) -> bool:
-        """Give pre-category registry models a neutral capability-based category."""
-        changed = False
-        for provider in payload.get("providers", []):
-            for model in provider.get("models", []):
-                capability = str(model.get("capability") or "")
-                raw_categories = model.get("categories")
-                categories = [
-                    str(category)
-                    for category in raw_categories
-                    if isinstance(category, str)
-                    and MODEL_CATEGORY_CAPABILITIES.get(category) == capability
-                ] if isinstance(raw_categories, list) else []
-                if not categories and DEFAULT_MODEL_CATEGORY.get(capability):
-                    categories = [DEFAULT_MODEL_CATEGORY[capability]]
-                if categories != raw_categories:
-                    model["categories"] = categories
-                    changed = True
-        return changed
 
     @staticmethod
     def _provider(payload: dict[str, Any], provider_id: str) -> dict[str, Any]:
@@ -247,61 +384,6 @@ class ProviderRegistry:
                 return endpoint
         raise ValueError(f"Unknown endpoint: {endpoint_id}")
 
-    def _put_legacy_credential(self, name: str, value: str, *, env_name: str = "") -> str:
-        if value:
-            return self.credentials.put(name, value)
-        return f"env://{env_name}" if env_name else ""
-
-    def _set_endpoint_credential(self, provider: dict[str, Any], endpoint_id: str, reference: str) -> None:
-        if not reference:
-            return
-        endpoint = self._endpoint(provider, endpoint_id)
-        current = str(endpoint.get("credential_ref") or "")
-        # Legacy re-import runs again whenever config.json regains a legacy
-        # api_key (e.g. saved via the old settings UI).  Migration owns
-        # legacy-* and env:// references, but a provider-scoped local-file
-        # reference is an explicit user edit from the Provider page and must
-        # never be overwritten by a re-import.
-        if current.startswith("local-file://") and not current.startswith("local-file://legacy-"):
-            return
-        endpoint["credential_ref"] = reference
-
-    def _normalize_shared_provider_credentials(self, payload: dict[str, Any]) -> bool:
-        """Make provider-scoped credentials identical across all endpoints."""
-        changed = False
-        for provider in payload.get("providers", []):
-            if provider.get("id") == "dashscope" and provider.get("credential_scope") != "provider":
-                provider["credential_scope"] = "provider"
-                changed = True
-            if provider.get("credential_scope") != "provider":
-                continue
-            candidates = [
-                (endpoint, str(endpoint.get("credential_ref") or ""))
-                for endpoint in provider.get("endpoints", [])
-                if endpoint.get("credential_ref")
-            ]
-            if not candidates:
-                continue
-            usable = [candidate for candidate in candidates if self.credentials.get(candidate[1])]
-            pool = usable or candidates
-
-            def priority(candidate: tuple[dict[str, Any], str]) -> tuple[int, int, int]:
-                endpoint, reference = candidate
-                explicit_local = reference.startswith("local-file://") and not reference.startswith("local-file://legacy-")
-                compatible_endpoint = endpoint.get("id") == "dashscope-compatible"
-                return int(explicit_local), int(compatible_endpoint), self.credentials.updated_at(reference)
-
-            selected_reference = max(pool, key=priority)[1]
-            credentials = provider.get("credentials")
-            if isinstance(credentials, dict) and credentials.get(DEFAULT_CREDENTIAL_NAME) != selected_reference:
-                credentials[DEFAULT_CREDENTIAL_NAME] = selected_reference
-                changed = True
-            for endpoint in provider.get("endpoints", []):
-                if endpoint.get("credential_ref") != selected_reference:
-                    endpoint["credential_ref"] = selected_reference
-                    changed = True
-        return changed
-
     @staticmethod
     def _normalize_credential_name(value: Any) -> str:
         name = str(value or "").strip()
@@ -310,36 +392,6 @@ class ProviderRegistry:
                 "Credential name must be 1-64 characters using letters, numbers, '.', '_' or '-'"
             )
         return name
-
-    @staticmethod
-    def _backfill_provider_credentials(payload: dict[str, Any]) -> bool:
-        """Promote the former endpoint credential to provider key `default`."""
-        changed = False
-        for provider in payload.get("providers", []):
-            credentials = provider.get("credentials")
-            if not isinstance(credentials, dict):
-                credentials = {}
-                provider["credentials"] = credentials
-                changed = True
-            if DEFAULT_CREDENTIAL_NAME not in credentials:
-                reference = next(
-                    (
-                        str(endpoint.get("credential_ref") or "")
-                        for endpoint in provider.get("endpoints", [])
-                        if endpoint.get("credential_ref")
-                    ),
-                    "",
-                )
-                if reference:
-                    credentials[DEFAULT_CREDENTIAL_NAME] = reference
-                    changed = True
-            default_reference = str(credentials.get(DEFAULT_CREDENTIAL_NAME) or "")
-            if default_reference:
-                for endpoint in provider.get("endpoints", []):
-                    if endpoint.get("credential_ref") != default_reference:
-                        endpoint["credential_ref"] = default_reference
-                        changed = True
-        return changed
 
     def _credential_reference(
         self,
@@ -356,98 +408,12 @@ class ProviderRegistry:
             raise ValueError(f"本地未保存 {provider['name']} 的 API Key：{name}")
         return name, reference
 
-    def ensure_migrated(self, legacy_config: dict[str, Any]) -> None:
-        """Import effective legacy direct/Higress values once without deleting sources."""
-        payload = self._payload()
-        bindings_backfilled = self._backfill_bindings(payload)
-        categories_backfilled = self._backfill_model_categories(payload)
-        shared_credentials_backfilled = self._normalize_shared_provider_credentials(payload)
-        provider_credentials_backfilled = self._backfill_provider_credentials(payload)
-        migration_complete = payload.get("migration", {}).get("state") == "complete"
-        legacy_secret_present = any(
-            isinstance(item, dict) and bool(item.get("api_key"))
-            for item in (
-                legacy_config.get("fallback_llm"),
-                legacy_config.get("fallback_embedding"),
-                legacy_config.get("multimodal_embedding"),
-                (legacy_config.get("rag", {}) or {}).get("rerank"),
-                (legacy_config.get("vanna", {}) or {}).get("llm"),
-                (legacy_config.get("vanna", {}) or {}).get("embedding"),
-            )
-        )
-        if migration_complete and not legacy_secret_present:
-            if bindings_backfilled or categories_backfilled or shared_credentials_backfilled or provider_credentials_backfilled:
-                self._save(payload)
-            return
-        deepseek = self._provider(payload, "deepseek")
-        dashscope = self._provider(payload, "dashscope")
-        llm = legacy_config.get("fallback_llm", {}) or {}
-        embedding = legacy_config.get("fallback_embedding", {}) or {}
-        multimodal = legacy_config.get("multimodal_embedding", {}) or {}
-        rerank = (legacy_config.get("rag", {}) or {}).get("rerank", {}) or {}
-
-        llm_value = str(llm.get("api_key") or "")
-        llm_ref = self._put_legacy_credential("legacy-deepseek", llm_value, env_name="DEEPSEEK_API_KEY") if llm_value or not migration_complete else ""
-        self._set_endpoint_credential(deepseek, "deepseek-openai", llm_ref)
-        embedding_value = str(embedding.get("api_key") or "")
-        embedding_ref = self._put_legacy_credential("legacy-dashscope-text", embedding_value, env_name="OPENAI_API_KEY") if embedding_value or not migration_complete else ""
-        self._set_endpoint_credential(dashscope, "dashscope-compatible", embedding_ref)
-
-        mm_value = str(multimodal.get("api_key") or "")
-        if not mm_value and not migration_complete:
-            # One-time legacy importer only. It is intentionally never used by
-            # a request path after registry migration.
-            try:
-                from higress_config_reader import get_higress_dashscope_api_key
-                mm_value = get_higress_dashscope_api_key()
-            except Exception:
-                mm_value = ""
-        mm_ref = self._put_legacy_credential("legacy-dashscope-multimodal", mm_value, env_name="DASHSCOPE_API_KEY") if mm_value or not migration_complete else ""
-        self._set_endpoint_credential(dashscope, "dashscope-native-mm", mm_ref)
-        if not embedding_ref and mm_ref:
-            self._set_endpoint_credential(dashscope, "dashscope-compatible", mm_ref)
-
-        def add_model(provider: dict[str, Any], endpoint_id: str, name: str, capability: str, **extra: Any) -> str:
-            model_id = f"{provider['id']}:{endpoint_id}:{_slug(name)}:{capability}"
-            existing = next((item for item in provider["models"] if item.get("id") == model_id), None)
-            item = {"id": model_id, "name": name, "endpoint_id": endpoint_id, "capability": capability, **extra}
-            if existing is None:
-                provider["models"].append(item)
-            else:
-                existing.update(item)
-            return model_id
-
-        llm_provider = str(llm.get("provider") or "deepseek").lower()
-        active_llm_provider = deepseek if llm_provider == "deepseek" else dashscope
-        active_llm_endpoint = "deepseek-openai" if active_llm_provider is deepseek else "dashscope-compatible"
-        if active_llm_provider is not deepseek:
-            self._endpoint(active_llm_provider, active_llm_endpoint)["base_url"] = str(llm.get("base_url") or self._endpoint(active_llm_provider, active_llm_endpoint)["base_url"])
-            self._set_endpoint_credential(active_llm_provider, active_llm_endpoint, llm_ref)
-        llm_id = add_model(active_llm_provider, active_llm_endpoint, str(llm.get("model") or "deepseek-chat"), "llm", categories=["llm"], temperature=llm.get("temperature", 0.7), max_tokens=llm.get("max_tokens", 4096), context_window=llm.get("context_window", 1000000), thinking=llm.get("thinking", {}))
-        text_id = add_model(dashscope, "dashscope-compatible", str(embedding.get("model") or "text-embedding-v4"), "text_embedding", categories=["text_embedding"], dimension=int(embedding.get("dimension") or 1024), batch_size=int(embedding.get("batch_size") or 10))
-        mm_id = add_model(dashscope, "dashscope-native-mm", str(multimodal.get("model") or "qwen3-vl-embedding"), "multimodal_embedding", categories=["multimodal_embedding"], dimension=int(multimodal.get("dimension") or 1024), batch_size=int(multimodal.get("batch_size") or 10), route_path=str(multimodal.get("route_path") or DEFAULT_NATIVE_MM_PATH))
-        rerank_id = add_model(dashscope, "dashscope-native-mm", str(rerank.get("model") or "qwen3-vl-rerank"), "rerank", categories=["rerank"], top_n=int(rerank.get("top_n") or 5), candidate_top_k=int(rerank.get("candidate_top_k") or 20), route_path="/api/v1/services/rerank/text-rerank/text-rerank")
-        bindings = payload["bindings"]
-        bindings.setdefault("agent", llm_id)
-        bindings.setdefault("image_analyzer", bindings["agent"])
-        bindings.setdefault("text_embedding", text_id)
-        bindings.setdefault("multimodal_embedding", mm_id)
-        bindings.setdefault("rerank", rerank_id)
-        bindings.setdefault("vanna_llm", llm_id)
-        bindings.setdefault("vanna_embedding", text_id)
-        payload["migration"] = {"state": "complete", "completed_at": int(time.time()), "sources": ["config.json", "environment references", "higress data (read-only import)"], "legacy_gateway": {"ai_gateway": legacy_config.get("ai_gateway", {}), "gateway_llm": legacy_config.get("gateway_llm", {})}}
-        self._normalize_shared_provider_credentials(payload)
-        self._backfill_provider_credentials(payload)
-        self._save(payload)
-
     def resolve_binding(
         self,
         binding: str,
         *,
-        legacy_config: dict[str, Any],
         credential_name: str | None = None,
     ) -> dict[str, Any]:
-        self.ensure_migrated(legacy_config)
         payload = self._payload()
         model_id = payload["bindings"].get(binding)
         if not model_id:
@@ -479,13 +445,11 @@ class ProviderRegistry:
         self,
         model_id: str,
         *,
-        legacy_config: dict[str, Any],
         expected_capability: str = "llm",
         credential_name: str | None = None,
     ) -> dict[str, Any]:
         """Resolve an explicit registered model without switching providers."""
 
-        self.ensure_migrated(legacy_config)
         payload = self._payload()
         for provider in payload["providers"]:
             for model in provider.get("models", []):
@@ -538,8 +502,7 @@ class ProviderRegistry:
             **copy.deepcopy(model),
         }
 
-    def display(self, *, legacy_config: dict[str, Any]) -> dict[str, Any]:
-        self.ensure_migrated(legacy_config)
+    def display(self) -> dict[str, Any]:
         payload = self._payload()
         result = copy.deepcopy(payload)
         for provider in result["providers"]:
@@ -555,14 +518,22 @@ class ProviderRegistry:
                     "is_default": name == DEFAULT_CREDENTIAL_NAME,
                     "credential_configured": bool(self.credentials.get(reference)),
                     "api_key_masked": self.credentials.display(reference),
-                    "credential_source": "environment" if reference.startswith("env://") else "local_file" if reference else "",
+                    "credential_source": (
+                        "environment" if reference.startswith("env://")
+                        else "vault" if reference.startswith("vault://")
+                        else "" if not reference else "legacy"
+                    ),
                 })
             for endpoint in provider.get("endpoints", []):
                 reference = str(raw_credentials.get(DEFAULT_CREDENTIAL_NAME) or endpoint.pop("credential_ref", ""))
                 endpoint.pop("credential_ref", None)
                 endpoint["credential_configured"] = bool(self.credentials.get(reference))
                 endpoint["api_key_masked"] = self.credentials.display(reference)
-                endpoint["credential_source"] = "environment" if reference.startswith("env://") else "local_file" if reference else ""
+                endpoint["credential_source"] = (
+                    "environment" if reference.startswith("env://")
+                    else "vault" if reference.startswith("vault://")
+                    else "" if not reference else "legacy"
+                )
             for model in provider.get("models", []):
                 model["thinking_profile"] = thinking_profile(
                     provider_id=str(provider.get("id") or ""),
@@ -571,15 +542,17 @@ class ProviderRegistry:
                 )
         return result
 
-    def reveal_credential(
+    def resolve_credential_for_runtime(
         self,
         provider_id: str,
         credential_name: str,
-        *,
-        legacy_config: dict[str, Any],
     ) -> str:
-        """Return one secret only for an explicit local reveal action."""
-        self.ensure_migrated(legacy_config)
+        """Resolve one credential for an internal provider request only.
+
+        This method is intentionally named as a runtime resolver rather than a
+        reveal operation; callers must not expose its return value to HTTP/UI
+        responses, logs, prompts, or tool results.
+        """
         payload = self._payload()
         provider = self._provider(payload, provider_id)
         endpoints = provider.get("endpoints", [])
@@ -599,14 +572,7 @@ class ProviderRegistry:
         self,
         provider_id: str,
         update: dict[str, Any],
-        *,
-        legacy_config: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        # Migration may create the initial registry and environment references.
-        # It must finish before applying an explicit user edit; otherwise the
-        # display call below could migrate afterwards and overwrite a newly
-        # saved local credential with a legacy environment reference.
-        self.ensure_migrated(legacy_config or {})
         payload = self._payload()
         provider = self._provider(payload, provider_id)
         for key in ("name", "enabled"):
@@ -658,7 +624,7 @@ class ProviderRegistry:
                 for provider_endpoint in provider.get("endpoints", []):
                     provider_endpoint["credential_ref"] = reference
         self._save(payload)
-        return self.display(legacy_config={})
+        return self.display()
 
     def set_binding(self, binding: str, model_id: str) -> None:
         payload = self._payload()

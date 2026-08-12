@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field
 
 from config import get_knowledge_multimodal_index_config, get_rag_config, get_rag_hybrid_config
 from knowledge.paths import get_knowledge_root
+from runtime_identity.paths import PuddingClawPaths
 
 logger = logging.getLogger(__name__)
 
@@ -40,7 +41,7 @@ class LlamaIndexKnowledgeQueryTool(BaseTool):
         if self._index is not None:
             return self._index
 
-        storage_dir = Path(self.base_dir) / "storage" / "knowledge_index"
+        storage_dir = PuddingClawPaths.from_environment().knowledge_index()
         if not storage_dir.exists() or not any(storage_dir.iterdir()):
             self._index_error = "No manually published local knowledge index is available"
             return None

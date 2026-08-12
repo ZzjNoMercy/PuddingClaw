@@ -356,7 +356,9 @@ def build_catalog(root: Path, config: dict[str, Any]) -> dict[str, Any]:
 
 
 def _catalog_path(base_dir: Path) -> Path:
-    return base_dir / "storage" / "knowledge_search" / "catalog.json"
+    from runtime_identity.paths import PuddingClawPaths
+
+    return PuddingClawPaths.from_environment().state() / "knowledge-search" / "catalog.json"
 
 
 def load_catalog(base_dir: Path) -> dict[str, Any] | None:

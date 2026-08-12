@@ -1,229 +1,380 @@
 "use client";
 
-import { useState, useEffect, useCallback, useRef } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import dynamic from "next/dynamic";
-import { readFile, saveFile, getFileTokenCounts } from "@/lib/api";
 import {
-  Save,
-  FileText,
-  Loader2,
-  CheckCircle2,
+  getFileTokenCounts,
+  listProjects,
+  readFile,
+  saveFile,
+  type ProjectMeta,
+} from "@/lib/api";
+import {
   AlertCircle,
   Brain,
-  Sparkles,
+  CheckCircle2,
+  FolderOpen,
+  Globe2,
+  Loader2,
+  RefreshCw,
+  Save,
 } from "lucide-react";
 import "@/lib/monaco-config";
 
 const MonacoEditor = dynamic(() => import("@monaco-editor/react"), {
   ssr: false,
   loading: () => (
-    <div className="flex items-center justify-center h-full text-gray-400 text-sm">
-      <Loader2 className="w-4 h-4 animate-spin mr-2" />Loading editor...
+    <div className="flex h-full items-center justify-center text-sm text-gray-400">
+      <Loader2 className="mr-2 h-4 w-4 animate-spin" />正在加载编辑器…
     </div>
   ),
 });
 
-const MEMORY_FILES = [
-  { label: "MEMORY.md", path: "memory/MEMORY.md", icon: Brain, color: "#7c3aed" },
-  { label: "SOUL.md", path: "workspace/SOUL.md", icon: Sparkles, color: "#f59e0b" },
-  { label: "IDENTITY.md", path: "workspace/IDENTITY.md", icon: FileText, color: "#6b7280" },
-  { label: "USER.md", path: "workspace/USER.md", icon: FileText, color: "#6b7280" },
-  { label: "AGENTS.md", path: "workspace/AGENTS.md", icon: FileText, color: "#10b981" },
-  { label: "SKILLS_SNAPSHOT.md", path: "SKILLS_SNAPSHOT.md", icon: Sparkles, color: "#f59e0b" },
-];
+type MemoryScope = {
+  id: string;
+  label: string;
+  description: string;
+  path: string;
+  kind: "global" | "project";
+};
+
+const GLOBAL_MEMORY: MemoryScope = {
+  id: "global",
+  label: "全局记忆",
+  description: "用于未绑定项目的 Agent 运行",
+  path: "memory/global/MEMORY.md",
+  kind: "global",
+};
+
+function projectMemory(project: ProjectMeta): MemoryScope {
+  return {
+    id: project.project_id,
+    label: project.name,
+    description: "仅用于该项目的 Agent 运行",
+    path: `memory/projects/${project.project_id}/MEMORY.md`,
+    kind: "project",
+  };
+}
 
 export default function MemoryEditor() {
-  const [selectedPath, setSelectedPath] = useState<string | null>(null);
+  const [projects, setProjects] = useState<ProjectMeta[]>([]);
+  const [projectsLoading, setProjectsLoading] = useState(true);
+  const [selectedPath, setSelectedPath] = useState(GLOBAL_MEMORY.path);
   const [content, setContent] = useState("");
   const [originalContent, setOriginalContent] = useState("");
-  const [loading, setLoading] = useState(false);
+  const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
+  const [reloadVersion, setReloadVersion] = useState(0);
+  const [loadNotice, setLoadNotice] = useState<"missing" | "error" | null>(null);
   const [saveStatus, setSaveStatus] = useState<"idle" | "saved" | "error">("idle");
   const [tokenCounts, setTokenCounts] = useState<Record<string, number>>({});
-  const editorRef = useRef<unknown>(null);
 
+  const scopes = useMemo(
+    () => [GLOBAL_MEMORY, ...projects.map(projectMemory)],
+    [projects],
+  );
+  const selectedScope = scopes.find((scope) => scope.path === selectedPath) ?? GLOBAL_MEMORY;
   const isDirty = content !== originalContent;
-  const fileName = selectedPath?.split("/").pop() || "";
-  const fileExt = fileName.split(".").pop() || "md";
-  const language = fileExt === "md" ? "markdown" : fileExt === "json" ? "json" : "markdown";
+  const selectedTokenCount = tokenCounts[selectedPath] ?? 0;
 
-  useEffect(() => {
-    const paths = MEMORY_FILES.map((f) => f.path);
-    getFileTokenCounts(paths)
-      .then((data) => {
-        const counts: Record<string, number> = {};
-        for (const f of data.files) {
-          counts[f.path] = f.tokens;
-        }
-        setTokenCounts(counts);
-      })
-      .catch(() => {});
+  const refreshTokenCounts = useCallback(async (paths: string[]) => {
+    try {
+      const data = await getFileTokenCounts(paths);
+      const counts: Record<string, number> = {};
+      for (const file of data.files) counts[file.path] = file.tokens;
+      setTokenCounts(counts);
+    } catch {
+      // Token counts are informational and should never block editing.
+    }
   }, []);
 
   useEffect(() => {
-    if (!selectedPath) {
-      setContent("");
-      setOriginalContent("");
-      return;
-    }
-    setLoading(true);
-    setSaveStatus("idle");
-    readFile(selectedPath)
-      .then((t) => {
-        setContent(t);
-        setOriginalContent(t);
+    let cancelled = false;
+    setProjectsLoading(true);
+    listProjects()
+      .then((items) => {
+        if (!cancelled) setProjects(items);
       })
       .catch(() => {
-        setContent("# Error loading file");
-        setOriginalContent("");
+        if (!cancelled) setProjects([]);
       })
-      .finally(() => setLoading(false));
-  }, [selectedPath]);
+      .finally(() => {
+        if (!cancelled) setProjectsLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    void refreshTokenCounts(scopes.map((scope) => scope.path));
+  }, [refreshTokenCounts, scopes]);
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    setLoadNotice(null);
+    setSaveStatus("idle");
+    readFile(selectedPath)
+      .then((text) => {
+        if (cancelled) return;
+        setContent(text);
+        setOriginalContent(text);
+      })
+      .catch((error: unknown) => {
+        if (cancelled) return;
+        const missing = error instanceof Error && error.message.includes(": 404");
+        setContent("");
+        setOriginalContent("");
+        setLoadNotice(missing ? "missing" : "error");
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [reloadVersion, selectedPath]);
+
+  const selectScope = useCallback((path: string) => {
+    if (path === selectedPath) return;
+    if (isDirty && !window.confirm("当前 Memory 有未保存的修改，确定要切换范围吗？")) return;
+    setSelectedPath(path);
+  }, [isDirty, selectedPath]);
 
   const handleSave = useCallback(async () => {
-    if (!selectedPath || saving) return;
+    if (saving || !isDirty || loadNotice === "error") return;
     setSaving(true);
     setSaveStatus("idle");
     try {
       await saveFile(selectedPath, content);
       setOriginalContent(content);
+      setLoadNotice(null);
       setSaveStatus("saved");
-      setTimeout(() => setSaveStatus("idle"), 2000);
-      // Refresh token counts after save
-      const data = await getFileTokenCounts(MEMORY_FILES.map((f) => f.path));
-      const counts: Record<string, number> = {};
-      for (const f of data.files) {
-        counts[f.path] = f.tokens;
-      }
-      setTokenCounts(counts);
+      await refreshTokenCounts(scopes.map((scope) => scope.path));
+      window.setTimeout(() => setSaveStatus("idle"), 2000);
     } catch {
       setSaveStatus("error");
     } finally {
       setSaving(false);
     }
-  }, [selectedPath, content, saving]);
+  }, [content, isDirty, loadNotice, refreshTokenCounts, saving, scopes, selectedPath]);
 
   useEffect(() => {
-    const h = (e: KeyboardEvent) => {
-      if ((e.ctrlKey || e.metaKey) && e.key === "s") {
-        e.preventDefault();
-        handleSave();
+    const handleShortcut = (event: KeyboardEvent) => {
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "s") {
+        event.preventDefault();
+        void handleSave();
       }
     };
-    window.addEventListener("keydown", h);
-    return () => window.removeEventListener("keydown", h);
+    window.addEventListener("keydown", handleShortcut);
+    return () => window.removeEventListener("keydown", handleShortcut);
   }, [handleSave]);
 
   return (
-    <div className="flex flex-col h-full bg-white/60 backdrop-blur-xl rounded-2xl border border-black/[0.06] shadow-sm overflow-hidden">
-      <div className="flex-1 flex min-h-0">
-        {/* File list */}
-        <div className="w-52 shrink-0 border-r border-black/[0.06] p-2 overflow-y-auto">
-          <p className="px-3 pt-1 pb-1 text-[10px] font-semibold text-gray-400 uppercase tracking-widest">
-            Workspace
-          </p>
-          <div className="space-y-0.5">
-            {MEMORY_FILES.map((f) => {
-              const Icon = f.icon;
-              const active = selectedPath === f.path;
-              const count = tokenCounts[f.path];
-              return (
-                <button
-                  key={f.path}
-                  onClick={() => setSelectedPath(f.path)}
-                  className={`w-full flex items-center gap-2 px-3 py-2 text-[12px] rounded-lg transition-all text-left relative ${
-                    active
-                      ? "bg-white/70 text-gray-800 font-medium shadow-sm"
-                      : "text-gray-500 hover:bg-white/40"
-                  }`}
-                >
-                  {active && (
-                    <div
-                      className="absolute left-0 top-1/2 -translate-y-1/2 w-[3px] h-4 rounded-r-full"
-                      style={{ background: f.color }}
-                    />
-                  )}
-                  <Icon className="w-3.5 h-3.5 shrink-0" style={{ color: f.color }} />
-                  <span className="truncate flex-1">{f.label}</span>
-                  {count !== undefined && count > 0 && (
-                    <span className="text-[10px] text-gray-400 shrink-0">{count}t</span>
-                  )}
-                </button>
-              );
-            })}
+    <div className="flex h-full min-h-[560px] flex-col overflow-hidden rounded-2xl border border-black/[0.06] bg-white/70 shadow-sm backdrop-blur-xl">
+      <header className="flex shrink-0 flex-wrap items-center justify-between gap-4 border-b border-black/[0.06] px-5 py-4">
+        <div className="flex min-w-0 items-center gap-3">
+          <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-violet-100 text-violet-700">
+            <Brain className="h-5 w-5" />
+          </span>
+          <div className="min-w-0">
+            <h2 className="text-[15px] font-semibold text-gray-900">Memory 管理</h2>
+            <p className="mt-0.5 text-[11px] text-gray-500">
+              管理 Agent 会跨任务复用的持久事实、偏好、纠正和决定。
+            </p>
           </div>
         </div>
+        <div className="flex items-center gap-2 text-[10px] text-gray-500">
+          <span className="rounded-full bg-violet-50 px-2.5 py-1 font-medium text-violet-700">
+            {selectedTokenCount.toLocaleString()} Token
+          </span>
+          <span className="rounded-full bg-gray-100 px-2.5 py-1">
+            {selectedScope.kind === "global" ? "全局作用域" : "项目作用域"}
+          </span>
+        </div>
+      </header>
 
-        {/* Editor */}
-        <div className="flex-1 flex flex-col min-w-0">
-          {selectedPath ? (
-            <>
-              <div className="shrink-0 flex items-center justify-between px-3 py-2 border-b border-black/[0.06] bg-white/50">
-                <div className="flex items-center gap-2 min-w-0">
-                  <FileText className="w-3.5 h-3.5 text-[#ff6723] shrink-0" />
-                  <div className="text-[12px] font-semibold text-gray-700 truncate">
-                    {fileName}
-                    {isDirty && <span className="ml-1.5 w-1.5 h-1.5 bg-amber-400 rounded-full inline-block align-middle" />}
-                  </div>
-                </div>
-                <div className="flex items-center gap-1.5">
-                  {saveStatus === "saved" && <CheckCircle2 className="w-3.5 h-3.5 text-emerald-500" />}
-                  {saveStatus === "error" && <AlertCircle className="w-3.5 h-3.5 text-red-500" />}
-                  <button
-                    onClick={handleSave}
-                    disabled={saving || !isDirty}
-                    className="flex items-center gap-1 px-2.5 py-1.5 rounded-md text-[11px] font-medium text-white bg-[#ff6723] disabled:opacity-25 hover:bg-[#e55a1b] transition-all active:scale-95"
-                    title="Save (Ctrl+S)"
-                  >
-                    {saving ? <Loader2 className="w-3 h-3 animate-spin" /> : <Save className="w-3 h-3" />}
-                    Save
-                  </button>
-                </div>
+      <div className="flex min-h-0 flex-1 flex-col md:flex-row">
+        <aside className="flex max-h-52 w-full shrink-0 flex-col border-b border-black/[0.06] bg-slate-50/55 p-3 md:max-h-none md:w-64 md:border-b-0 md:border-r">
+          <p className="px-2 pb-2 pt-1 text-[10px] font-semibold uppercase tracking-widest text-gray-400">
+            记忆范围
+          </p>
+          <ScopeButton
+            scope={GLOBAL_MEMORY}
+            active={selectedPath === GLOBAL_MEMORY.path}
+            tokens={tokenCounts[GLOBAL_MEMORY.path] ?? 0}
+            onSelect={selectScope}
+          />
+
+          <div className="my-3 h-px bg-black/[0.05]" />
+          <div className="mb-1 flex items-center justify-between px-2">
+            <p className="text-[10px] font-semibold uppercase tracking-widest text-gray-400">项目记忆</p>
+            {!projectsLoading && (
+              <span className="text-[10px] tabular-nums text-gray-400">{projects.length}</span>
+            )}
+          </div>
+          <div className="min-h-0 flex-1 space-y-1 overflow-y-auto">
+            {projectsLoading ? (
+              <div className="flex items-center gap-2 px-2 py-3 text-[11px] text-gray-400">
+                <Loader2 className="h-3.5 w-3.5 animate-spin" />正在加载项目…
               </div>
-              <div className="flex-1 min-h-0">
-                {loading ? (
-                  <div className="flex items-center justify-center h-full">
-                    <Loader2 className="w-5 h-5 animate-spin text-gray-400" />
-                  </div>
-                ) : (
-                  <MonacoEditor
-                    height="100%"
-                    language={language}
-                    value={content}
-                    theme="vs"
-                    onChange={(val) => setContent(val || "")}
-                    onMount={(editor) => {
-                      editorRef.current = editor;
-                    }}
-                    options={{
-                      minimap: { enabled: false },
-                      fontSize: 13,
-                      lineNumbers: "on",
-                      wordWrap: "on",
-                      scrollBeyondLastLine: false,
-                      padding: { top: 10, bottom: 10 },
-                      renderLineHighlight: "none",
-                      overviewRulerBorder: false,
-                      hideCursorInOverviewRuler: true,
-                      automaticLayout: true,
-                      fontFamily: "'SF Mono','JetBrains Mono','Fira Code',Consolas,monospace",
-                      lineHeight: 20,
-                      cursorBlinking: "smooth",
-                      smoothScrolling: true,
-                    }}
+            ) : projects.length ? (
+              projects.map((project) => {
+                const scope = projectMemory(project);
+                return (
+                  <ScopeButton
+                    key={scope.id}
+                    scope={scope}
+                    active={selectedPath === scope.path}
+                    tokens={tokenCounts[scope.path] ?? 0}
+                    onSelect={selectScope}
                   />
+                );
+              })
+            ) : (
+              <p className="px-2 py-3 text-[11px] leading-5 text-gray-400">暂无已注册项目。</p>
+            )}
+          </div>
+
+          <div className="mt-3 rounded-xl border border-amber-100 bg-amber-50/70 p-3 text-[10px] leading-4 text-amber-800">
+            不要在 Memory 中保存密钥、临时任务状态、完整对话或未经确认的推测。
+          </div>
+        </aside>
+
+        <section className="flex min-w-0 flex-1 flex-col">
+          <div className="flex shrink-0 flex-wrap items-center justify-between gap-3 border-b border-black/[0.06] bg-white/60 px-4 py-3">
+            <div className="min-w-0">
+              <div className="flex items-center gap-2">
+                {selectedScope.kind === "global" ? (
+                  <Globe2 className="h-4 w-4 shrink-0 text-violet-600" />
+                ) : (
+                  <FolderOpen className="h-4 w-4 shrink-0 text-blue-600" />
                 )}
+                <h3 className="truncate text-[13px] font-semibold text-gray-800">{selectedScope.label}</h3>
+                {isDirty && <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-amber-400" />}
               </div>
-            </>
-          ) : (
-            <div className="flex flex-col items-center justify-center flex-1 text-gray-400">
-              <Brain className="w-10 h-10 mb-2 text-gray-300" />
-              <p className="text-sm font-medium text-gray-500">No memory file selected</p>
-              <p className="text-[11px] mt-1 text-gray-400">Choose a file from the list to edit</p>
+              <p className="mt-0.5 truncate pl-6 text-[10px] text-gray-400">{selectedScope.description}</p>
+            </div>
+            <div className="flex items-center gap-1.5">
+              {saveStatus === "saved" && (
+                <span className="flex items-center gap-1 text-[10px] text-emerald-600">
+                  <CheckCircle2 className="h-3.5 w-3.5" />已保存
+                </span>
+              )}
+              {saveStatus === "error" && (
+                <span className="flex items-center gap-1 text-[10px] text-red-600">
+                  <AlertCircle className="h-3.5 w-3.5" />保存失败
+                </span>
+              )}
+              <button
+                type="button"
+                onClick={() => {
+                  if (isDirty && !window.confirm("确定放弃当前未保存的修改并重新加载吗？")) return;
+                  setReloadVersion((version) => version + 1);
+                }}
+                disabled={loading || saving}
+                className="rounded-lg p-2 text-gray-400 transition-colors hover:bg-black/[0.04] hover:text-gray-700 disabled:opacity-40"
+                title="重新加载"
+              >
+                <RefreshCw className={`h-3.5 w-3.5 ${loading ? "animate-spin" : ""}`} />
+              </button>
+              <button
+                type="button"
+                onClick={() => void handleSave()}
+                disabled={saving || !isDirty || loadNotice === "error"}
+                className="flex items-center gap-1.5 rounded-lg bg-[#002fa7] px-3 py-2 text-[11px] font-medium text-white transition-all hover:bg-[#001f7a] active:scale-95 disabled:opacity-30"
+                title="保存 Memory（⌘/Ctrl + S）"
+              >
+                {saving ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Save className="h-3.5 w-3.5" />}
+                保存 Memory
+              </button>
+            </div>
+          </div>
+
+          {loadNotice && (
+            <div className={`mx-4 mt-3 flex items-start gap-2 rounded-lg border px-3 py-2 text-[11px] leading-5 ${
+              loadNotice === "missing"
+                ? "border-blue-100 bg-blue-50 text-blue-700"
+                : "border-red-100 bg-red-50 text-red-700"
+            }`}>
+              <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+              {loadNotice === "missing"
+                ? "这个范围还没有 MEMORY.md。输入内容并保存即可创建。"
+                : "无法读取这个 Memory。请检查后端状态后重新加载；为避免覆盖，当前禁止保存。"}
             </div>
           )}
-        </div>
+
+          <div className="min-h-0 flex-1">
+            {loading ? (
+              <div className="flex h-full items-center justify-center text-sm text-gray-400">
+                <Loader2 className="mr-2 h-5 w-5 animate-spin" />正在读取 Memory…
+              </div>
+            ) : (
+              <MonacoEditor
+                height="100%"
+                language="markdown"
+                value={content}
+                theme="vs"
+                onChange={(value) => setContent(value || "")}
+                options={{
+                  minimap: { enabled: false },
+                  fontSize: 13,
+                  lineNumbers: "on",
+                  wordWrap: "on",
+                  scrollBeyondLastLine: false,
+                  padding: { top: 14, bottom: 14 },
+                  renderLineHighlight: "none",
+                  overviewRulerBorder: false,
+                  hideCursorInOverviewRuler: true,
+                  automaticLayout: true,
+                  fontFamily: "'SF Mono','JetBrains Mono','Fira Code',Consolas,monospace",
+                  lineHeight: 21,
+                  cursorBlinking: "smooth",
+                  smoothScrolling: true,
+                  readOnly: loadNotice === "error",
+                }}
+              />
+            )}
+          </div>
+          <footer className="flex shrink-0 items-center justify-between border-t border-black/[0.05] bg-slate-50/50 px-4 py-2 text-[10px] text-gray-400">
+            <span>MEMORY.md · Markdown</span>
+            <span>⌘/Ctrl + S 保存</span>
+          </footer>
+        </section>
       </div>
     </div>
+  );
+}
+
+function ScopeButton({
+  scope,
+  active,
+  tokens,
+  onSelect,
+}: {
+  scope: MemoryScope;
+  active: boolean;
+  tokens: number;
+  onSelect: (path: string) => void;
+}) {
+  const Icon = scope.kind === "global" ? Globe2 : FolderOpen;
+  return (
+    <button
+      type="button"
+      onClick={() => onSelect(scope.path)}
+      className={`relative flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2.5 text-left transition-all ${
+        active
+          ? "bg-white text-gray-900 shadow-sm ring-1 ring-black/[0.04]"
+          : "text-gray-500 hover:bg-white/65 hover:text-gray-800"
+      }`}
+    >
+      {active && <span className="absolute inset-y-2 left-0 w-[3px] rounded-r-full bg-violet-500" />}
+      <Icon className={`h-3.5 w-3.5 shrink-0 ${scope.kind === "global" ? "text-violet-600" : "text-blue-500"}`} />
+      <span className="min-w-0 flex-1">
+        <span className="block truncate text-[12px] font-medium">{scope.label}</span>
+        <span className="mt-0.5 block truncate text-[9px] text-gray-400">{tokens.toLocaleString()} Token</span>
+      </span>
+    </button>
   );
 }

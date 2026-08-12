@@ -42,14 +42,24 @@ class WorkerAccessStore:
         self._path: Path | None = None
         self._lock = threading.RLock()
 
-    def initialize(self, base_dir: Path) -> None:
+    def initialize(self, base_dir: Path, *, owner_user_id: str | None = None) -> None:
         with self._lock:
+            from runtime_identity.paths import PuddingClawPaths, trusted_owner_user_id
+
+            paths = PuddingClawPaths(base_dir.expanduser().resolve())
             self._base_dir = base_dir
-            data_dir = base_dir / "data"
-            data_dir.mkdir(parents=True, exist_ok=True)
-            self._path = data_dir / "worker-access-keys.json"
+            access_dir = paths.owner_access(owner_user_id or trusted_owner_user_id())
+            access_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+            access_dir.chmod(0o700)
+            self._path = access_dir / "worker-access-keys.json"
+
+            # One-way layout migration. Runtime reads only the owner-scoped path.
+            legacy_path = paths.data() / "worker-access-keys.json"
+            if legacy_path.is_file() and not self._path.exists():
+                legacy_path.replace(self._path)
             if not self._path.exists():
                 self._write({})
+            self._path.chmod(0o600)
 
     def _ready(self) -> Path:
         if self._path is None:
@@ -73,6 +83,7 @@ class WorkerAccessStore:
             raise WorkerAccessError("Worker Access Key store is not initialized")
         temp = path.with_name(f".{path.name}.{secrets.token_hex(8)}.tmp")
         temp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        temp.chmod(0o600)
         temp.replace(path)
 
     @staticmethod

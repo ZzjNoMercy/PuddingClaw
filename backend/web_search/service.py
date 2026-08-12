@@ -60,11 +60,16 @@ class WebSearchService:
         resolved_source: str,
         payload: dict[str, Any],
     ) -> list[str]:
+        requires_grok_media = bool(
+            request.enable_image_understanding
+            or request.enable_image_search
+            or request.enable_video_understanding
+        )
         if request.provider != "auto":
             if resolved_source in {"x", "both"} and request.provider != "grok":
                 raise WebSearchError("X Search 只能由 Grok 执行", category="invalid_route", retryable=False)
             order = [request.provider]
-        elif resolved_source in {"x", "both"}:
+        elif resolved_source in {"x", "both"} or requires_grok_media:
             order = ["grok"]
         else:
             order = list(payload["routing"][resolved_scope])
@@ -91,7 +96,12 @@ class WebSearchService:
             if request.provider != "auto":
                 message = f"{request.provider} 未启用或未通过连接测试"
             else:
-                message = "Grok X Search 未配置或未启用" if resolved_source in {"x", "both"} else "没有已启用且通过测试的联网搜索供应商"
+                if resolved_source in {"x", "both"}:
+                    message = "Grok X Search 未配置或未启用"
+                elif request.enable_image_understanding or request.enable_image_search:
+                    message = "Grok 图像搜索能力未配置或未启用"
+                else:
+                    message = "没有已启用且通过测试的联网搜索供应商"
             raise WebSearchError(message, category="unavailable", retryable=False)
 
         max_attempts = 1

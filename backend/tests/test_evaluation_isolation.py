@@ -12,8 +12,8 @@ from graph.deepagents_manager import DeepAgentsAgentManager, EvaluationToolBound
 def test_evaluation_hooks_are_opt_in_and_normal_memory_path_is_unchanged(tmp_path: Path, monkeypatch):
     monkeypatch.delenv("PUDDINGCLAW_EVALUATION_RUNTIME_ROOT", raising=False)
     manager = DeepAgentsAgentManager()
-    manager.initialize(tmp_path)
-    assert manager._memory_dir_for(None) == tmp_path / "data" / "deepagents-memory" / "global"
+    manager.initialize(tmp_path / "backend", user_root=tmp_path)
+    assert manager._memory_dir_for(None) == tmp_path / "memory" / "global"
 
     signature = inspect.signature(manager.astream)
     assert signature.parameters["callbacks_override"].default is None
@@ -68,6 +68,36 @@ def test_candidate_fingerprint_captures_effective_model_binding(tmp_path: Path, 
     harness.mkdir()
     (harness / "policy.py").write_text("VERSION = 2", encoding="utf-8")
     assert "source_manifest_hash" in verify_candidate_snapshot(tmp_path, first)
+
+
+def test_candidate_fingerprint_captures_user_home_skills(tmp_path: Path, monkeypatch):
+    import config
+
+    home = tmp_path / ".puddingclaw"
+    skill = home / "skills" / "user-skill" / "SKILL.md"
+    skill.parent.mkdir(parents=True)
+    skill.write_text("# User Skill\n\nversion one\n", encoding="utf-8")
+    monkeypatch.setenv("PUDDINGCLAW_HOME", str(home))
+    monkeypatch.setattr(
+        config,
+        "get_fallback_llm_config",
+        lambda **_kwargs: {"model": "fixture"},
+    )
+
+    candidate = resolve_candidate(tmp_path, CandidateRequest(name="skills"))
+    assert candidate.config["user_skill_hash"]
+    assert candidate.config["bundled_skill_hash"]
+
+    skill.write_text("# User Skill\n\nversion two\n", encoding="utf-8")
+    drift = verify_candidate_snapshot(tmp_path, candidate)
+    assert "user_skill_hash" in drift
+    assert "skill_hash" in drift
+
+    changed = resolve_candidate(tmp_path, CandidateRequest(name="skills"))
+    (skill.parent / "run.js").write_text("export default 1;\n", encoding="utf-8")
+    script_drift = verify_candidate_snapshot(tmp_path, changed)
+    assert "user_skill_hash" in script_drift
+    assert "skill_hash" in script_drift
 
 
 def test_evaluation_boundary_filters_and_rejects_deepagents_builtin_tools():

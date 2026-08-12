@@ -3971,13 +3971,8 @@ export interface ProjectMeta {
   updated_at: number;
   pinned?: boolean;
   execution_mode?: "spawn" | "kernel" | null;
-}
-
-export interface ProjectContextDocument {
-  project_id: string;
-  content: string;
-  path: string;
-  is_project_local: boolean;
+  trust_state: "pending" | "trusted" | "denied";
+  identity_digest?: string;
 }
 
 export async function listProjects(): Promise<ProjectMeta[]> {
@@ -3991,7 +3986,9 @@ export async function registerProject(path: string, name?: string): Promise<Proj
   const resp = await fetch(`${API_BASE}/projects/register`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ path, name }),
+    // Selecting or pasting a local directory in PuddingClaw is the user's
+    // explicit authorization of that exact workspace identity.
+    body: JSON.stringify({ path, name, authorize: true }),
   });
   if (!resp.ok) throw new Error(`Failed to register project: ${resp.status}`);
   return resp.json();
@@ -4029,30 +4026,27 @@ export async function updateProject(
   return resp.json();
 }
 
+export async function setProjectTrust(
+  projectId: string,
+  state: "pending" | "trusted" | "denied",
+): Promise<ProjectMeta> {
+  const resp = await fetch(`${API_BASE}/projects/${encodeURIComponent(projectId)}/trust`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ state }),
+  });
+  if (!resp.ok) {
+    const responseText = await resp.text();
+    throw new Error(apiErrorMessage(responseText, `Failed to update project trust: ${resp.status}`));
+  }
+  return resp.json();
+}
+
 export async function removeProject(projectId: string): Promise<void> {
   const resp = await fetch(`${API_BASE}/projects/${encodeURIComponent(projectId)}`, {
     method: "DELETE",
   });
   if (!resp.ok) throw new Error(`Failed to remove project: ${resp.status}`);
-}
-
-export async function getProjectContext(projectId: string): Promise<ProjectContextDocument> {
-  const resp = await fetch(`${API_BASE}/projects/${encodeURIComponent(projectId)}/context`);
-  if (!resp.ok) throw new Error(`Failed to get project context: ${resp.status}`);
-  return resp.json();
-}
-
-export async function updateProjectContext(
-  projectId: string,
-  content: string
-): Promise<ProjectContextDocument> {
-  const resp = await fetch(`${API_BASE}/projects/${encodeURIComponent(projectId)}/context`, {
-    method: "PUT",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ content }),
-  });
-  if (!resp.ok) throw new Error(`Failed to update project context: ${resp.status}`);
-  return resp.json();
 }
 
 export async function listSessionPermissions(sessionId: string): Promise<SessionPermissionState> {
@@ -4443,7 +4437,6 @@ export interface McpServerConfig {
 
 export interface McpConfig {
   enabled: string[];
-  auto_enable_gbrain: boolean;
   servers: Record<string, McpServerConfig>;
 }
 
@@ -4681,29 +4674,5 @@ export async function clearSession(
     { method: "POST" }
   );
   if (!resp.ok) throw new Error(`Failed to clear session: ${resp.status}`);
-  return resp.json();
-}
-
-/**
- * Get current RAG mode status.
- */
-export async function getRagMode(): Promise<{ rag_mode: boolean }> {
-  const resp = await fetch(`${API_BASE}/config/rag-mode`);
-  if (!resp.ok) throw new Error(`Failed to get RAG mode: ${resp.status}`);
-  return resp.json();
-}
-
-/**
- * Set RAG mode enabled/disabled.
- */
-export async function setRagMode(
-  enabled: boolean
-): Promise<{ rag_mode: boolean }> {
-  const resp = await fetch(`${API_BASE}/config/rag-mode`, {
-    method: "PUT",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ enabled }),
-  });
-  if (!resp.ok) throw new Error(`Failed to set RAG mode: ${resp.status}`);
   return resp.json();
 }

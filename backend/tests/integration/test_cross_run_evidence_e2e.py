@@ -55,7 +55,7 @@ def test_followup_reads_saved_sql_evidence_without_replaying_old_tool_events(
     session_manager.initialize(tmp_path)
     project_registry.initialize(tmp_path)
     session_manager.create_session("cross-run-e2e")
-    result_dir = tmp_path / "data" / "database-query-results"
+    result_dir = tmp_path / "data" / "query-results"
     result_dir.mkdir(parents=True)
     artifact = result_dir / "qr-cross-run.jsonl"
     artifact.write_text(
@@ -70,7 +70,7 @@ def test_followup_reads_saved_sql_evidence_without_replaying_old_tool_events(
                 "result_id": "qr-cross-run",
                 "session_id": "cross-run-e2e",
                 "tool_call_id": "call-old-sql",
-                "artifact_path": "data/database-query-results/qr-cross-run.jsonl",
+                "artifact_path": "qr-cross-run.jsonl",
                 "artifact_format": "jsonl",
                 "artifact_sha256": f"sha256:{hashlib.sha256(artifact.read_bytes()).hexdigest()}",
                 "row_count": 3,
@@ -178,7 +178,7 @@ def test_real_deep_agent_graph_executes_cross_run_evidence_tool(
 
     session_manager.initialize(tmp_path)
     session_manager.create_session("real-cross-run-e2e")
-    result_dir = tmp_path / "data" / "database-query-results"
+    result_dir = tmp_path / "data" / "query-results"
     catalog_dir = result_dir / ".catalog"
     catalog_dir.mkdir(parents=True)
     artifact = result_dir / "qr-real-cross-run.jsonl"
@@ -214,10 +214,7 @@ def test_real_deep_agent_graph_executes_cross_run_evidence_tool(
                 "source_query_id": "query-old",
                 "source_run_id": "",
                 "owner_binding_version": "strict-v1",
-                "artifact_path": (
-                    "data/database-query-results/"
-                    "qr-real-cross-run.jsonl"
-                ),
+                "artifact_path": "qr-real-cross-run.jsonl",
                 "artifact_format": "jsonl",
                 "artifact_sha256": (
                     "sha256:"

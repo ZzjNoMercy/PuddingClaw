@@ -142,11 +142,13 @@ export default function ChatInput() {
     setInputDraft,
     runtimeMode,
     runtimeReady,
+    projectsLoaded,
     setRuntimeMode,
     currentProjectId,
     setCurrentProjectId,
     projects,
     registerProject,
+    trustProject,
     llmModelId,
     thinkingLevel,
     credentialName,
@@ -186,13 +188,16 @@ export default function ChatInput() {
   const [inputError, setInputError] = useState<string | null>(null);
   const [goalCancelPending, setGoalCancelPending] = useState(false);
   const [goalCancelConfirmationOpen, setGoalCancelConfirmationOpen] = useState(false);
+  const [projectTrustConfirmationOpen, setProjectTrustConfirmationOpen] = useState(false);
+  const [projectTrustPending, setProjectTrustPending] = useState(false);
+  const [resumeAfterProjectTrust, setResumeAfterProjectTrust] = useState(false);
   const isUploading = uploadingCount > 0;
   const approvalLocked =
     hasActiveRun ||
     approvalModeSaving ||
     Boolean(currentRun && !terminalRunStatuses.has(currentRun.status));
   const isSubmitting = isSessionSubmitting(submittingSessionIds, sessionId);
-  const disabled = sessionHistoryLoading || isStreaming || isCompressing || approvalModeSaving || isSubmitting || isUploading || currentRun?.status === "waiting_hitl";
+  const disabled = !projectsLoaded || sessionHistoryLoading || isStreaming || isCompressing || approvalModeSaving || isSubmitting || isUploading || currentRun?.status === "waiting_hitl";
   const configurationBusy = isSubmitting || isUploading;
   const [analyticsModels, setAnalyticsModels] = useState<AnalyticsModelSummary[]>([]);
   const [providerRegistry, setProviderRegistry] = useState<ProviderRegistry | null>(null);
@@ -490,6 +495,10 @@ export default function ChatInput() {
       await executeCompactCommand(submittedText.trim(), compactMatch[1] || "");
       return;
     }
+    if (selectedProject && selectedProject.trust_state !== "trusted") {
+      setProjectTrustConfirmationOpen(true);
+      return;
+    }
     const submittedAttachments = attachments;
     const submittedSkillHintRecords = (
       selectedSkillHintsBySessionRef.current.get(sessionId) || []
@@ -553,11 +562,18 @@ export default function ChatInput() {
     attachments,
     disabled,
     executeCompactCommand,
+    selectedProject,
     sendMessage,
     sessionId,
     setPendingInput,
     text,
   ]);
+
+  useEffect(() => {
+    if (!resumeAfterProjectTrust || selectedProject?.trust_state !== "trusted") return;
+    setResumeAfterProjectTrust(false);
+    void handleSubmit();
+  }, [handleSubmit, resumeAfterProjectTrust, selectedProject?.trust_state]);
 
   const handleAttachmentFiles = useCallback(async (files: FileList | File[] | null, source: "upload" | "paste" = "upload") => {
     if (!files || files.length === 0) return;
@@ -1293,6 +1309,38 @@ export default function ChatInput() {
         Powered by DeepSeek · PuddingClaw v0.1
       </p>
     </div>
+    <ConfirmDialog
+      open={projectTrustConfirmationOpen}
+      title="信任此项目？"
+      description={selectedProject
+        ? `信任“${selectedProject.name}”（${selectedProject.path}）后，Agent 才能读取项目 AGENTS.md、使用项目文件作为工作区，并按当前权限策略执行工具。`
+        : "需要先选择并信任项目，Agent 才能在该项目中运行。"}
+      confirmLabel="信任并继续"
+      busy={projectTrustPending}
+      tone="trust"
+      onClose={() => {
+        if (projectTrustPending) return;
+        setProjectTrustConfirmationOpen(false);
+        setResumeAfterProjectTrust(false);
+      }}
+      onConfirm={() => {
+        if (!selectedProject || projectTrustPending) return;
+        setProjectTrustPending(true);
+        setInputError(null);
+        void trustProject(selectedProject.project_id, "trusted")
+          .then((project) => {
+            if (project.trust_state !== "trusted") {
+              throw new Error("项目未能进入可信状态，请重试。");
+            }
+            setResumeAfterProjectTrust(true);
+            setProjectTrustConfirmationOpen(false);
+          })
+          .catch((error) => {
+            setInputError(error instanceof Error ? error.message : "项目信任失败，请重试。");
+          })
+          .finally(() => setProjectTrustPending(false));
+      }}
+    />
     <ConfirmDialog
       open={goalCancelConfirmationOpen}
       title="结束当前 Goal？"

@@ -21,8 +21,9 @@ from knowledge.models import AnalyticsQueryResult, new_id, utcnow
 
 from .schemas import SqlExecutionResult
 
-BASE_DIR = Path(__file__).resolve().parents[2]
-RESULT_DIR = BASE_DIR / "data" / "database-query-results"
+from runtime_identity.paths import PuddingClawPaths
+
+RESULT_DIR = PuddingClawPaths.from_environment().query_results()
 logger = logging.getLogger(__name__)
 
 
@@ -117,7 +118,9 @@ async def persist_query_result(
         columns=columns,
         row_count=len(rows),
         profile_json={**profile, "_artifact_sha256": artifact_sha256},
-        artifact_path=str(artifact.relative_to(BASE_DIR)),
+        # Store a path relative to the user-owned result root.  The package
+        # directory is immutable and may be on a different filesystem.
+        artifact_path=str(artifact.relative_to(RESULT_DIR)),
         artifact_format="jsonl",
         status="creating",
         created_at=now,
@@ -174,7 +177,7 @@ async def persist_query_result(
         raise
     return {
         "enabled": True,
-        "artifact_path": f"backend/{record.artifact_path}",
+        "artifact_path": f"data/query-results/{record.artifact_path}",
         "storage_path": record.artifact_path,
         "artifact_format": record.artifact_format,
         "expires_at": expires_at.isoformat(),
@@ -337,7 +340,7 @@ async def get_query_result_page(
 
 def _record_to_summary(record: AnalyticsQueryResult, *, include_profile: bool = True) -> dict[str, Any]:
     config = get_database_qa_config()
-    artifact = BASE_DIR / record.artifact_path
+    artifact = RESULT_DIR / record.artifact_path
     expired = _is_expired(record.expires_at)
     summary = {
         "result_id": record.id,
@@ -347,7 +350,7 @@ def _record_to_summary(record: AnalyticsQueryResult, *, include_profile: bool = 
         "sql": record.sql,
         "columns": record.columns,
         "row_count": record.row_count,
-        "artifact_path": f"backend/{record.artifact_path}",
+        "artifact_path": f"data/query-results/{record.artifact_path}",
         "storage_path": record.artifact_path,
         "artifact_format": record.artifact_format,
         "status": "expired" if expired else record.status,
@@ -452,7 +455,7 @@ def _verified_result_artifact(
     ):
         raise QueryResultStoreError("查询结果目录所有权或格式不匹配。")
     artifact = _safe_result_store_path(
-        BASE_DIR / str(catalog.get("artifact_path") or ""),
+        RESULT_DIR / str(catalog.get("artifact_path") or ""),
         root=RESULT_DIR,
     )
     if not artifact.is_file():
@@ -487,7 +490,7 @@ async def backfill_query_result_catalogs(session: AsyncSession) -> int:
     from graph.session_manager import session_manager
 
     for record in records:
-        artifact = BASE_DIR / record.artifact_path
+        artifact = RESULT_DIR / record.artifact_path
         if not artifact.is_file() or record.artifact_format != "jsonl":
             continue
         digest = hashlib.sha256()
@@ -626,7 +629,7 @@ async def cleanup_expired_query_results(session: AsyncSession) -> int:
     for record in records:
         try:
             artifact = _safe_result_store_path(
-                BASE_DIR / record.artifact_path,
+                RESULT_DIR / record.artifact_path,
                 root=RESULT_DIR,
             )
             catalog = _safe_result_store_path(

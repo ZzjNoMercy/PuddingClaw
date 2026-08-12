@@ -40,7 +40,8 @@ async def test_raw_to_wiki_to_postgres_to_filtered_mcp(
     if not database_url or not binary:
         pytest.skip("set PUDDINGCLAW_GBRAIN_E2E_DATABASE_URL and install gbrain")
 
-    runtime_home = tmp_path / "gbrain-home"
+    knowledge_root = tmp_path / "knowledge"
+    runtime_home = knowledge_root / "llm-wiki" / ".puddingclaw" / "gbrain-home"
     environment = os.environ.copy()
     environment.pop("DATABASE_URL", None)
     environment.pop("GBRAIN_DATABASE_URL", None)
@@ -66,8 +67,7 @@ async def test_raw_to_wiki_to_postgres_to_filtered_mcp(
     )
     assert initialized.returncode == 0, initialized.stderr[-4000:]
 
-    monkeypatch.setenv("PUDDINGCLAW_KNOWLEDGE_DIR", str(tmp_path / "knowledge"))
-    monkeypatch.setenv("PUDDINGCLAW_GBRAIN_HOME", str(runtime_home))
+    monkeypatch.setenv("PUDDINGCLAW_KNOWLEDGE_DIR", str(knowledge_root))
     monkeypatch.setenv("PUDDINGCLAW_GBRAIN_BIN", binary)
 
     base_dir = Path(__file__).resolve().parents[2]

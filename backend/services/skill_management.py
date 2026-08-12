@@ -70,8 +70,13 @@ def _json_digest(payload: dict[str, Any]) -> str:
 class SkillManagementService:
     """Prepare immutable plans and atomically commit them to ``skills/``."""
 
-    def __init__(self, base_dir: Path) -> None:
+    def __init__(self, base_dir: Path, *, package_root: Path | None = None) -> None:
         self.base_dir = base_dir.expanduser().resolve()
+        if self.base_dir.name == "backend":
+            from runtime_identity.paths import PuddingClawPaths
+
+            self.base_dir = PuddingClawPaths.from_environment().root
+        self.package_root = (package_root or self.base_dir).expanduser().resolve()
         self.skills_dir = self.base_dir / "skills"
         self.state_dir = self.base_dir / "data" / "skill-management"
         self.plans_dir = self.state_dir / "plans"
@@ -1203,7 +1208,11 @@ class SkillManagementService:
         try:
             from tools.skills_scanner import scan_skills
 
-            scan_skills(self.base_dir)
+            scan_skills(
+                self.package_root,
+                user_root=self.skills_dir,
+                snapshot_path=self.state_dir / "SKILLS_SNAPSHOT.md",
+            )
         except Exception:
             # The installed directory is authoritative; catalogue refresh can
             # recover on process startup and must not roll back a valid commit.
@@ -1214,11 +1223,17 @@ _SERVICES: dict[str, SkillManagementService] = {}
 _SERVICES_LOCK = threading.Lock()
 
 
-def get_skill_management_service(base_dir: Path) -> SkillManagementService:
-    key = str(base_dir.expanduser().resolve())
+def get_skill_management_service(base_dir: Path, *, user_root: Path | None = None) -> SkillManagementService:
+    package_root = base_dir.expanduser().resolve()
+    if user_root is None and package_root.name == "backend" and (package_root / "skills").is_dir():
+        from runtime_identity.paths import PuddingClawPaths
+
+        user_root = PuddingClawPaths.from_environment().root
+    write_root = (user_root or package_root).expanduser().resolve()
+    key = f"{package_root}\0{write_root}"
     with _SERVICES_LOCK:
         service = _SERVICES.get(key)
         if service is None:
-            service = SkillManagementService(Path(key))
+            service = SkillManagementService(write_root, package_root=package_root)
             _SERVICES[key] = service
         return service

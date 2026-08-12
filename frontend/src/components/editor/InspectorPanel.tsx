@@ -11,7 +11,6 @@ import {
   AlertCircle,
   Brain,
   Zap,
-  Sparkles,
   Maximize2,
   Minimize2,
   Settings2,
@@ -32,12 +31,7 @@ const MonacoEditor = dynamic(() => import("@monaco-editor/react"), {
 
 // ── Memory files config ─────────────────────────────────
 const MEMORY_FILES = [
-  { label: "MEMORY.md", path: "memory/MEMORY.md", icon: Brain, color: "#7c3aed" },
-  { label: "SOUL.md", path: "workspace/SOUL.md", icon: Sparkles, color: "#f59e0b" },
-  { label: "IDENTITY.md", path: "workspace/IDENTITY.md", icon: FileText, color: "#6b7280" },
-  { label: "USER.md", path: "workspace/USER.md", icon: FileText, color: "#6b7280" },
-  { label: "AGENTS.md", path: "workspace/AGENTS.md", icon: FileText, color: "#10b981" },
-  { label: "SKILLS_SNAPSHOT.md", path: "SKILLS_SNAPSHOT.md", icon: Zap, color: "#f59e0b" },
+  { label: "全局 MEMORY.md", path: "memory/global/MEMORY.md", icon: Brain, color: "#7c3aed" },
 ];
 
 export default function InspectorPanel() {
@@ -61,6 +55,12 @@ export default function InspectorPanel() {
   const [activeSkills, setActiveSkills] = useState<Array<{ name: string; description: string }>>([]);
   const [tokenCounts, setTokenCounts] = useState<Record<string, number>>({});
   const editorRef = useRef<unknown>(null);
+
+  useEffect(() => {
+    if (rightTab === "memory" && !MEMORY_FILES.some((file) => file.path === inspectorFile)) {
+      setInspectorFile(MEMORY_FILES[0].path);
+    }
+  }, [inspectorFile, rightTab, setInspectorFile]);
 
   // Load skills on mount
   useEffect(() => {
@@ -301,7 +301,7 @@ function FileList({
   return (
     <div className="space-y-0.5">
       <p className="px-3 pt-1 pb-1 text-[10px] font-semibold text-gray-400 uppercase tracking-widest">
-        Workspace
+        Memory
       </p>
       {files.map((f) => {
         const Icon = f.icon;
@@ -349,7 +349,7 @@ function McpServerList({
       </p>
       {servers.length === 0 && (
         <p className="px-3 py-2 text-[11px] text-gray-400">
-          No MCP servers enabled. Add one in backend/config.json.
+          No MCP servers enabled. Add one in the Home MCP configuration.
         </p>
       )}
       {servers.map((s) => (

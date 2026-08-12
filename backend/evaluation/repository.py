@@ -52,7 +52,9 @@ class EvaluationRepository:
     """Small synchronous repository; each operation owns a short transaction."""
 
     def __init__(self, db_path: Path | str | None = None) -> None:
-        default = Path(__file__).resolve().parent.parent / "data" / "evaluation.db"
+        from runtime_identity.paths import PuddingClawPaths
+
+        default = PuddingClawPaths.from_environment().databases() / "evaluation.sqlite3"
         self.db_path = Path(db_path or os.getenv("PUDDINGCLAW_EVALUATION_DB") or default)
         self._lock = threading.RLock()
         self.initialize()

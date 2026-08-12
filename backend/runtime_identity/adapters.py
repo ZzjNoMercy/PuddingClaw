@@ -234,6 +234,36 @@ _LARK_TOOLCHAIN_PACKAGE = ToolchainPackageSpec(
     executable="lark-cli",
     compatibility=">=1.0.0 <2.0.0",
 )
+_LARK_OPAQUE_VALUE_OPTIONS = frozenset(
+    {
+        "--body",
+        "--content",
+        "--data",
+        "--description",
+        "--markdown",
+        "--text",
+        "--title",
+    }
+)
+
+
+def _lark_control_tokens(argv: tuple[str, ...] | list[str]) -> list[str]:
+    """Return command/option tokens while excluding opaque content values."""
+
+    values = [str(item).lower() for item in argv[1:]]
+    controls: list[str] = []
+    index = 0
+    while index < len(values):
+        value = values[index]
+        option = value.partition("=")[0]
+        if option in _LARK_OPAQUE_VALUE_OPTIONS:
+            # ``--markdown=<value>`` contains its opaque value in this token;
+            # the two-argv form consumes exactly the following value.
+            index += 1 if "=" in value else 2
+            continue
+        controls.append(value)
+        index += 1
+    return controls
 
 
 def is_lark_destructive_argv(argv: tuple[str, ...] | list[str]) -> bool:
@@ -244,7 +274,7 @@ def is_lark_destructive_argv(argv: tuple[str, ...] | list[str]) -> bool:
     caught from lark-cli's structured exit-10 action before ``--yes`` retry.
     """
 
-    values = [str(item).lower() for item in argv[1:]]
+    values = _lark_control_tokens(argv)
     if values[:2] in (["config", "remove"], ["auth", "logout"]):
         return True
     for value in values:
@@ -265,7 +295,7 @@ def is_lark_destructive_argv(argv: tuple[str, ...] | list[str]) -> bool:
 def _shell_surface_error(value: str) -> str | None:
     """Explain why raw text is not provably standalone argv, or return None.
 
-    The managed runner executes argv via ``docker exec`` with no shell
+    The managed runner executes normalized argv directly with no shell
     involved, so characters that are only dangerous under shell re-parsing
     (newlines, ``;``, ``|``, backticks, ``$( )`` inside quotes) are inert
     payload text and must round-trip byte-for-byte — Markdown messages
@@ -460,10 +490,11 @@ def _lark_command(tokens: list[str], env: dict[str, str]) -> ManagedCliMatch | N
         raise UnsupportedManagedCliCommand("managed lark-cli environment flags must use a fixed enabled value")
     argv = tuple(["lark-cli", *tokens[1:]])
     lowered = [item.lower() for item in tokens[1:]]
+    control_lowered = _lark_control_tokens(argv)
     requested_identity: str | None = None
-    for index, item in enumerate(lowered):
-        if item == "--as" and index + 1 < len(lowered):
-            requested_identity = lowered[index + 1]
+    for index, item in enumerate(control_lowered):
+        if item == "--as" and index + 1 < len(control_lowered):
+            requested_identity = control_lowered[index + 1]
         elif item.startswith("--as="):
             requested_identity = item.partition("=")[2]
     if requested_identity not in {None, "bot", "user", "auto"}:
@@ -594,7 +625,9 @@ def _lark_command(tokens: list[str], env: dict[str, str]) -> ManagedCliMatch | N
     else:
         action = ManagedCliAction.PROVIDER_OPERATION
     workspace_writable = any(
-        item in {"download", "export", "save", "output"} or item.startswith(("--output=", "--out=")) for item in lowered
+        item in {"download", "export", "save", "output"}
+        or item.startswith(("--output=", "--out="))
+        for item in control_lowered
     )
     return ManagedCliMatch(
         adapter_id="lark-cli",

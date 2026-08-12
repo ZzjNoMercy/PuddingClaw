@@ -24,8 +24,8 @@ def _configured_knowledge_root() -> tuple[str, str]:
 def get_knowledge_root(base_dir: Path) -> Path:
     """Return the physical root mapped to DeepAgents `/knowledge/`.
 
-    Default is `backend/knowledge` for a zero-config local checkout. Users can
-    move the actual knowledge store outside the project from Settings
+    Default is `$PUDDINGCLAW_HOME/knowledge`. Users can move the actual
+    knowledge store outside Home from Settings
     (`knowledge.root_dir`) or by setting `PUDDINGCLAW_KNOWLEDGE_DIR`, for example:
 
         PUDDINGCLAW_KNOWLEDGE_DIR=/Users/pet/Documents/PuddingClawKnowledge
@@ -37,18 +37,29 @@ def get_knowledge_root(base_dir: Path) -> Path:
     configured, _source = _configured_knowledge_root()
     if configured:
         return Path(configured).expanduser().resolve()
-    return base_dir / "knowledge"
+    from runtime_identity.paths import PuddingClawPaths
+
+    return PuddingClawPaths.from_environment().knowledge()
+
+
+def get_gbrain_runtime_home(base_dir: Path) -> Path:
+    """Return the gbrain runtime owned by the active knowledge base.
+
+    This path must never be independently redirected: schema state, compiled
+    packs, and the Wiki it serves form one portable knowledge-base unit.
+    """
+
+    return get_knowledge_root(base_dir) / "llm-wiki" / ".puddingclaw" / "gbrain-home"
 
 
 def get_knowledge_originals_dir(base_dir: Path, knowledge_root: Path | None = None) -> Path:
     """Return where original uploaded files are stored.
 
-    When the knowledge root is user-configured, keep originals inside that root
-    so the knowledge base is portable as one folder. Otherwise preserve the
-    previous project-local data location.
+    Originals always stay inside the effective knowledge root so the knowledge
+    base remains portable as one folder.
     """
 
     configured, _source = _configured_knowledge_root()
     if configured:
         return (knowledge_root or get_knowledge_root(base_dir)) / "originals"
-    return base_dir / "data" / "knowledge" / "originals"
+    return (knowledge_root or get_knowledge_root(base_dir)) / "originals"

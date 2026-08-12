@@ -335,7 +335,7 @@ export default function Sidebar() {
                   // completes, sessionId is the placeholder "default" and the
                   // project must not flash as selected (the saved session will
                   // highlight itself a moment later).
-                  const projectContextSelected = sessionsLoaded && sessionId === "default" && currentProjectId === project.project_id;
+                  const projectSelected = sessionsLoaded && sessionId === "default" && currentProjectId === project.project_id;
                   return (
                     <div key={project.project_id} className="relative">
                       <ProjectItem
@@ -346,7 +346,7 @@ export default function Sidebar() {
                         collapsed={projectCollapsed}
                         isActive={
                           isChatRoute &&
-                          (projectContextSelected || (projectCollapsed && containsSelectedSession))
+                          (projectSelected || (projectCollapsed && containsSelectedSession))
                         }
                         onSelect={() => {
                           setRuntimeMode("agent");

@@ -9,6 +9,8 @@ import yaml
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
+from runtime_identity.paths import PuddingClawPaths
+from tools.skills_scanner import scan_skill_registry
 
 router = APIRouter()
 
@@ -16,6 +18,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 
 # Whitelist of editable directories (relative to backend/)
 ALLOWED_PREFIXES = [
+    "profile/",
     "workspace/",
     "memory/",
     "skills/",
@@ -27,6 +30,9 @@ ALLOWED_PREFIXES = [
 
 # Whitelist of specific root-level files that can be accessed
 ALLOWED_ROOT_FILES = {"SKILLS_SNAPSHOT.md"}
+ALLOWED_PROFILE_FILES = {
+    "profile/AGENTS.md",
+}
 
 
 def _validate_path(rel_path: str) -> Path:
@@ -37,8 +43,34 @@ def _validate_path(rel_path: str) -> Path:
         or normalized in ALLOWED_ROOT_FILES
     ):
         raise HTTPException(status_code=403, detail=f"Access denied: {rel_path}")
-    full_path = (BASE_DIR / normalized).resolve()
-    if not str(full_path).startswith(str(BASE_DIR)):
+    user = PuddingClawPaths.from_environment()
+    if normalized.startswith("profile/") and normalized not in ALLOWED_PROFILE_FILES:
+        raise HTTPException(status_code=403, detail=f"Unsupported profile file: {rel_path}")
+    if normalized.startswith("skills/"):
+        # Generic file CRUD cannot mutate the Skill namespace. Reads are served
+        # by the typed Skill API; writes must go through SkillManagementService.
+        if normalized not in {"skills", "skills/"}:
+            raise HTTPException(status_code=409, detail="Use the typed Skill management API")
+    mappings = {
+        "SKILLS_SNAPSHOT.md": user.skill_management() / "SKILLS_SNAPSHOT.md",
+        "profile/": user.profile(),
+        "memory/": user.memory(),
+        "knowledge/": user.knowledge(),
+        "semantic-assets/": user.user_definitions() / "semantic-assets",
+        "sql-guardrails/": user.user_definitions() / "sql-guardrails",
+        "analytics-models/": user.user_definitions() / "analytics-models",
+        "workspace/": user.agent_workspaces() / "unscoped" / "default",
+    }
+    full_path = None
+    for prefix, root in mappings.items():
+        if normalized.startswith(prefix):
+            full_path = (root / normalized.removeprefix(prefix)).resolve()
+            if not full_path.is_relative_to(root.resolve()):
+                raise HTTPException(status_code=403, detail="Path traversal detected")
+            break
+    if full_path is None:
+        raise HTTPException(status_code=403, detail=f"Access denied: {rel_path}")
+    if not full_path.is_relative_to(user.root.resolve()):
         raise HTTPException(status_code=403, detail="Path traversal detected")
     return full_path
 
@@ -58,6 +90,8 @@ def _safe_read_text(file_path: Path) -> str:
 async def read_file(path: str):
     file_path = _validate_path(path)
     if not file_path.exists():
+        if path.replace("\\", "/").lstrip("./").startswith("profile/"):
+            return {"path": path, "content": ""}
         raise HTTPException(status_code=404, detail=f"File not found: {path}")
     content = _safe_read_text(file_path)
     return {"path": path, "content": content}
@@ -74,21 +108,12 @@ async def save_file(request: FileSaveRequest):
     file_path.parent.mkdir(parents=True, exist_ok=True)
     file_path.write_text(request.content, encoding="utf-8")
 
-    # Trigger memory index rebuild when MEMORY.md is saved
     normalized = request.path.replace("\\", "/").lstrip("./")
-    if normalized == "memory/MEMORY.md":
-        try:
-            from graph.memory_indexer import get_memory_indexer
-
-            indexer = get_memory_indexer(BASE_DIR)
-            indexer.rebuild_index()
-        except Exception:
-            pass
-    elif normalized.startswith("semantic-assets/"):
+    if normalized.startswith("semantic-assets/"):
         try:
             from analytics.semantic_assets import get_semantic_asset_registry
 
-            get_semantic_asset_registry(BASE_DIR).refresh()
+            get_semantic_asset_registry(PuddingClawPaths.from_environment().user_definitions()).refresh()
         except Exception:
             pass
     elif normalized.startswith("sql-guardrails/"):
@@ -102,7 +127,7 @@ async def save_file(request: FileSaveRequest):
         try:
             from analytics.models import get_analytics_model_registry
 
-            get_analytics_model_registry(BASE_DIR).refresh()
+            get_analytics_model_registry(PuddingClawPaths.from_environment().user_definitions()).refresh()
         except Exception:
             pass
 
@@ -112,19 +137,18 @@ async def save_file(request: FileSaveRequest):
 @router.get("/skills")
 async def list_skills():
     """Scan skills/ directory and return skill list with name, path, description."""
-    skills_dir = BASE_DIR / "skills"
-    if not skills_dir.exists():
+    records = scan_skill_registry(BASE_DIR, user_root=PuddingClawPaths.from_environment().user_skills())
+    if not records:
         return {"skills": []}
 
     skills: list[dict[str, str]] = []
-    for skill_dir in sorted(skills_dir.iterdir()):
-        if not skill_dir.is_dir():
+    for record in records:
+        if not record.get("effective"):
             continue
+        skill_dir = Path(str(record["physical_root"]))
         skill_md = skill_dir / "SKILL.md"
-        if not skill_md.exists():
-            continue
 
-        name = skill_dir.name
+        name = str(record["skill_id"])
         description = ""
         rel_path = f"skills/{name}/SKILL.md"
 
@@ -160,9 +184,9 @@ def _validate_skill_name(name: str) -> Path:
             status_code=400,
             detail="Invalid skill name. Only letters, digits, hyphens and underscores are allowed.",
         )
-    skill_dir = (BASE_DIR / "skills" / name).resolve()
+    skill_dir = (PuddingClawPaths.from_environment().user_skills() / name).resolve()
     # Path traversal guard
-    if not str(skill_dir).startswith(str(BASE_DIR / "skills")):
+    if not skill_dir.is_relative_to(PuddingClawPaths.from_environment().user_skills().resolve()):
         raise HTTPException(status_code=403, detail="Path traversal detected")
     return skill_dir
 

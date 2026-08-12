@@ -1,12 +1,14 @@
 # Spawn + Kernel 双执行模式重构方案
 
-状态：实施中（Phase 1 + Phase 5 迁移切片：spawn/kernel 产品契约、Linux/WSL2 Kernel runner、外部目录与 HTML E2E、显式 Kernel fallback）
+状态：规范基线 + 实施中（已合并 spawn/kernel 产品契约、Linux/WSL2 runner、外部目录与 HTML E2E、显式 Kernel fallback；仍需完成 runner-neutral runtime 收口和真实平台 E2E）
 
 本轮待审核决策：第 3.5、6、7.4、9、10 和 12 节提出 Spawn 低风险探索零干预、Spawn 下完整启用 smart、DeepAgents 虚拟目录降级为路径/路由抽象、文件工具与 Shell 统一 effect 判定、allow/ask/deny 模式规则、once/session/project 审批记忆、凭证与网络耦合审批，以及 Spawn 安装事务；审核通过后再作为后续权限实现和批量验收的规范基线。
 
 日期：2026-08-11
 
 范围：只移除 PuddingClaw 自己的 Docker 沙箱与 Docker 运行时选择；不移除项目、工具或第三方服务对 Docker 的正常依赖。
+
+本次合并了三个并行结论：DeepAgents 的 `execute` 能力属于执行 backend 协议，不属于 Docker；权限判断、运行时投影和 OS 隔离必须分层；Windows 首发 Kernel 路径采用 WSL2 复用 Linux runner。本文因此同时记录产品目标、Harness 权限不变量和当前代码差距；“目标/必须迁移”不能误读成“当前已全部上线”。
 
 平台承诺：macOS、原生 Linux，以及 Windows 通过 WSL2 使用 Linux Kernel runner，是完整 `kernel` 支持路径。原生 Windows 本地启动默认使用 `spawn`，当前不声明原生 Kernel 沙箱；原生 AppContainer Kernel runner 作为后续增强，不阻塞本轮 Docker 沙箱移除。WSL2 bootstrap 降级为部署文档和前置条件，不作为当前产品化向导或自动安装能力交付。
 
@@ -17,7 +19,7 @@ PuddingClaw 的 Shell 执行只保留两种用户可选模式：
 | 配置值 | 用户界面名称 | 默认值 | 隔离含义 |
 | --- | --- | --- | --- |
 | `spawn` | 宿主执行 | 是 | 直接创建宿主进程；低风险探索不干预，高风险副作用仍经过 Tool Gate；没有 OS 文件或网络边界 |
-| `kernel` | 内核沙箱 | 否 | 使用当前操作系统的进程级内核隔离；不可用时必须询问用户是否仅本次 Run 回退到 `spawn` |
+| `kernel` | 内核沙箱 | 否 | 使用当前操作系统的进程级内核隔离；不可用时必须询问用户是否切换项目或仅本次 Run 回退到 `spawn` |
 
 `spwan` 仅视为讨论中的拼写错误，配置、API、日志和代码统一使用 `spawn`。
 
@@ -118,7 +120,7 @@ cli    = executable_digest + adapter_revision + credential_profile_revision
 
 - `backend/config.py`、`backend/config.json.example` 和本地默认配置使用 `execution_mode=spawn|kernel`，默认值为 `spawn`；旧 `sandbox_mode`、`docker_enabled`、`on_unavailable` 不再迁移或解释。
 - `frontend/src/lib/settingsApi.ts` 与 `frontend/src/app/settings/page.tsx` 只暴露“宿主执行 / 内核沙箱”两种模式，不再提供 Docker 沙箱配置或 Docker 探测入口。
-- `backend/harness/workspace_backends.py::build_workspace_execution_backend` 只构造 `spawn` 或 `kernel`。Docker/Adaptive 类仍是 managed runtime 的内部兼容实现，不是新 Run 的产品模式。
+- `backend/harness/workspace_backends.py::build_workspace_execution_backend` 只构造 `spawn` 或 `kernel`。Docker/Adaptive 类尚未从源码删除，但新的 Managed CLI composition 已不再实例化它们。
 
 ### 3.2 DeepAgents 的 execute 不依赖 Docker，但依赖执行协议
 
@@ -138,7 +140,7 @@ cli    = executable_digest + adapter_revision + credential_profile_revision
 - 当前 runner mode 会绑定到 permit：macOS 为 `kernel_macos_seatbelt`，Linux/WSL2 为 `kernel_linux_bwrap_seccomp`；不能把一个平台的 permit 重放到另一个 runner。
 - 当前实现已将 `execute_external_directory` 的 Kernel/Adaptive 路径接入精确 external cwd/profile；HostFileBroker 仍负责外部目录 grant，writable draft 仍由 lease 控制。
 - 当前实现已将 workspace 内 HTML browser E2E 接入 typed Kernel validator；workspace 外的 HTML 仍先经过 HostFileBroker，再使用 Kernel external-directory runner。固定的 `/opt/puddingclaw/bin` 仅映射到受信任的仓库脚本目录，不向普通 shell 暴露。
-- Managed Provider CLI 与 browser authorization CLI 仍由 Adaptive 的显式 managed-runtime 兼容路径委托 Docker；Kernel 模式不提供该能力，下一步必须迁移到通用 ManagedCommandRunner 后才能删除这条 Docker 依赖。
+- macOS 的 Managed Provider CLI 与 browser authorization CLI 已迁到 Host Toolchain + Seatbelt：Toolchain 发布不可变 CLI，执行时创建私有 HOME/TMP，只挂载当前 workspace 和精确 Toolchain revision，Vault 密文状态只投影到该 HOME，结束后再做 CAS 回写；不再要求 Docker。Linux/WSL2 仍需把同一 typed contract 接到 bwrap/seccomp runner 后，才能宣称跨平台完成。
 - Docker 沙箱删除的完成条件必须包含 macOS、原生 Linux、Windows/WSL2 三条用户路径的真实越权 E2E；原生 Windows AppContainer runner 不作为首发门槛。
 
 ### 3.4 Docker 渗透面不只在 WorkspaceBackend
@@ -165,8 +167,8 @@ cli    = executable_digest + adapter_revision + credential_profile_revision
 - `backend/tools/request_skill_runtime_tool.py`
   - 用户显式选择 Docker Skill runtime
 - `backend/api/connectors.py`
-  - Connector catalog 和 Lark 等托管 CLI 通过 `ProjectSandboxManager` 获取 runtime contract
-  - 授权入口明确要求 Docker runtime
+  - Connector catalog、Lark 执行与授权已使用统一 Host managed-integration composition
+  - 仍需在 Linux/WSL2 上补同一 contract 的真实 E2E
 - `backend/tools/filesystem/leases.py`、`validation.py`
   - 独立外部目录执行和 Chromium 验证仍假定 Docker 能力
 
@@ -182,6 +184,21 @@ cli    = executable_digest + adapter_revision + credential_profile_revision
 4. `install_packages` 在 Spawn 下直接返回 `package_install_requires_host_runtime` DENY。这是 Docker/Kernel 时代残留，与“Spawn 是默认宿主 runtime、安装和执行共享同一 ABI binding”的新契约冲突。
 
 本轮方案将这些问题视为权限实现缺陷，而不是通过扩大“低风险”定义去掩盖。修复顺序固定为：先让 smart 与低风险确定性策略在 Spawn 生效，再引入可复用语义规则，最后迁移安装事务和删除旧分支。
+
+### 3.6 三个线程合并后的实现对照
+
+| 领域 | 当前已具备 | 仍需收口 |
+| --- | --- | --- |
+| DeepAgents `execute` | Spawn/Kernel backend 都实现 `SandboxBackendProtocol`，不会因关闭 Kernel 而移除 `execute` | 统一为 runner-neutral backend，避免文件路由和命令执行各自维护一套权限语义 |
+| 权限 handoff | `ExecutionPermit`、`AuthorizedExecution`、`SandboxGrantProfile` 已绑定 command/profile/revision/runner，并在 spawn 前复核 | 所有执行入口都必须走同一 handoff；禁止 legacy backend 直接执行或自行重建环境 |
+| Spawn | 宿主进程、独立 PuddingClaw HOME/TMP、超时、输出上限和进程组生命周期 | 明确 Spawn 是“无 OS 隔离的宿主模式”，把低风险 smart 路径从旧 Docker-only 条件中解耦 |
+| Kernel | macOS Seatbelt 与 Linux/WSL2 bwrap/seccomp runner、canonical roots、network/profile digest | 真实 Linux/WSL2 越权 E2E、helper 发行形态、symlink/nested deny 和进程树边界 |
+| Skill runtime / Secret | 受管宿主 runtime、Skill Secret 加密存储与临时环境注入链路已存在 | runtime owner 必须结构化传递；不能依赖命令字符串猜 Skill；Secret 不得进入 command、日志或模型上下文 |
+| Managed CLI | macOS 已使用 Host Toolchain + Seatbelt 运行 Provider CLI 与 browser authorization，Catalog/API/Agent 共用同一 composition | Linux/WSL2 接入 bwrap/seccomp；补 browser runner 跨进程恢复与平台 E2E |
+| Docker | 源码仍保留旧 Docker/Adaptive 实现，但新 Run、Skill runtime 和 macOS Managed CLI composition 均不实例化它们 | 删除未再引用的兼容 class、镜像与配置；用户项目显式 Docker 仍作为普通外部工具保留 |
+| Windows | 原生 Windows 的 `spawn` 与 WSL2 部署方向已定义 | 首发 Kernel 只承诺 Windows via WSL2；原生 AppContainer/DACL/Job Object 不是本轮发布门槛 |
+
+因此，代码中暂时存在的 `DockerWorkspaceBackend`、`AdaptiveWorkspaceBackend`、`request_skill_runtime` 或 `runtime_image_digest` 不能被解释为产品仍有第三种执行模式；它们是迁移期兼容面，必须在对应能力迁移后删除或降级为独立 typed managed runtime。
 
 ## 4. 目标领域模型
 
@@ -212,7 +229,7 @@ effective_runner: Literal[
     "spawn",
     "kernel_macos_seatbelt",
     "kernel_linux_bwrap_seccomp",
-    "kernel_windows_restricted_token",
+    "kernel_windows_wsl2_bwrap_seccomp",
 ]
 ```
 
@@ -233,6 +250,8 @@ class ResolvedExecution:
     cwd: Path
     environment: tuple[tuple[str, str], ...]
     secret_values: tuple[str, ...]
+    runtime_owner: str
+    environment_binding_digest: str
     runtime_binding: RuntimeBinding
     filesystem_profile: FilesystemAuthority
     network_allowed: bool
@@ -247,6 +266,29 @@ class ResolvedExecution:
 - `/workspace`、`/scratch`、`/skills` 等虚拟路径在解析阶段统一映射。
 - 环境快照和目录 profile 都参与 digest；spawn 前重新验证。
 - 命令、权限 revision、runtime binding、profile 和 runner 任一变化都使 permit 失效。
+
+`environment` 与 `secret_values` 只存在于当前执行 handoff 的内存投影中，不进入模型消息、Session JSON、Trace 文本或普通日志。`runtime_owner` 必须由 Skill/managed adapter 的结构化上下文提供；命令字符串、当前激活 Skill 列表和解释器名称只能作为诊断信息，不能成为权限或解释器选择的唯一依据。
+
+### 4.2.1 Harness 权限 handoff 不变量
+
+Tool Gate 到 runner 之间只允许传递一个不可变的 `AuthorizedExecution`：
+
+```text
+Tool call
+  -> normalized requirements
+  -> SandboxGrantProfile
+  -> ExecutionPermit(one tool call, one spawn)
+  -> AuthorizedExecution
+  -> SpawnRunner / KernelRunner
+```
+
+- `SandboxGrantProfile` 统一承载 canonical `read/write/delete/deny` roots、workspace/scratch、网络开关和资源上限；Spawn 使用它做审计与一致性校验，Kernel 还把它投影成 OS profile。
+- `ExecutionPermit` 绑定 command digest、requirements digest、permission revision、profile digest、selected runner 和 runner binding digest，并且只能消费一次；可复用的是声明作用域内的 Grant，不是进程创建凭证。
+- 真正创建进程前必须重新校验环境 revision、profile、权限 revision 和 runner binding；任一变化都 fail-closed。
+- Secret 通过环境映射注入，不能拼进 shell command；执行输出返回 Agent 前必须脱敏。
+- `spawn` 可以访问当前用户可达的宿主资源，但不能把 Tool Gate、`root_dir` 或 exact-directory grant 宣称成 OS 隔离；需要抗恶意脚本边界时必须选择 `kernel`。
+
+当前代码对应入口为 `backend/harness/execution_context.py`、`execution_permits.py`、`sandbox_profiles.py` 和 `tool_execution.py`。后续改动不得绕过这条 handoff，不能在 backend 内部重新猜 runner、环境或权限。
 
 ### 4.3 Runner 接口
 
@@ -848,6 +890,8 @@ PuddingClaw 在此基线上额外增加两项约束：凭证与网络的跨工�
 - 删除 `SkillRuntimeBindingStore` 中 `host | docker` 选择；如需保留 store，应改为保存明确的宿主 runtime binding id，而不是 runner 类型。
 - Skill 不再选择隔离技术。Skill 声明的是所需软件、网络、系统能力和 runtime owner，平台负责解析执行方式。
 
+迁移期间如果代码仍暴露 `request_skill_runtime`，它只能表示显式 managed runtime 能力，不得改变普通 Skill 的默认路径，也不得作为 Kernel 失败后的 fallback。它的审批、绑定和执行必须与普通 `install_packages`/Skill execution 分开记录；后续删除该工具时，不能删除 DeepAgents 的 `execute` 或宿主 runtime。
+
 ### 7.2 显式 Skill runtime owner
 
 不能继续通过正则搜索命令中的 `/skills/<id>` 或“当前激活的 Skill 列表”猜测解释器。
@@ -1069,7 +1113,7 @@ class RuntimeBinding:
 
 退出条件：上述能力均不实例化 `ProjectSandboxManager`，且 Docker 未安装时可工作。
 
-当前进度：`execute_external_directory` 与 HTML E2E 已在 Kernel/Adaptive 路径完成第一版迁移；托管 Provider CLI、browser authorization CLI 和 Connector catalog 仍未满足退出条件。
+当前进度：`execute_external_directory`、HTML E2E，以及 macOS 上的 Managed Provider CLI、browser authorization CLI、Connector catalog/API/Agent 注入已完成第一版迁移；真实飞书 Toolchain 安装、凭证读取、token refresh CAS 回写和第二次独立状态查询已通过。Phase 5 尚未满足跨平台退出条件：Linux/WSL2 managed runner、browser job 跨进程恢复及 Docker 未安装门禁仍需补齐。
 
 ### Phase 6：删除 Docker 沙箱实现和兼容代码
 

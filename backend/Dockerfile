@@ -12,7 +12,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # SkillHub CLI 是后端运行依赖：用于在容器内安装/管理 SkillHub 技能。
-# 只安装 CLI，不安装商店运行时；技能目录由 docker-compose volume 挂载到 /app/skills。
+# 只安装 CLI，不安装商店运行时；技能运行时视图由后端生成到 PUDDINGCLAW_HOME。
 RUN curl -fsSL https://skillhub-1388575217.cos.ap-guangzhou.myqcloud.com/install/install.sh \
     | bash -s -- --cli-only \
     && /root/.local/bin/skillhub --version
@@ -71,9 +71,9 @@ root:
   handlers: [console]
 EOF
 
-# 持久化目录：sessions、workspace、memory、logs 等
-# 运行时可通过 docker volume 挂载到宿主机
-RUN mkdir -p /app/sessions /app/workspace /app/memory /app/logs
+# Runtime state is mounted separately at PUDDINGCLAW_HOME; the package tree
+# remains immutable in production containers.
+RUN mkdir -p /app/.puddingclaw
 
 # 默认环境变量
 ENV PYTHONUNBUFFERED=1

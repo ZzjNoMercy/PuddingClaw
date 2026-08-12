@@ -129,3 +129,19 @@ def test_revoked_skill_secret_binding_stops_projection_without_deleting_value(tm
     assert store.status(
         skill_id="beta", skill_version="sha256-b", env_name="SHARED_TOKEN"
     ) == "reusable"
+
+
+def test_secret_request_resolves_user_home_skill_version(tmp_path, monkeypatch):
+    from api.skill_secret_requests import _current_skill_version
+    from runtime_identity.software_runtime import skill_content_version
+
+    home = tmp_path / ".puddingclaw"
+    skill = home / "skills" / "home-only"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text(
+        "---\nname: home-only\ndescription: test\n---\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("PUDDINGCLAW_HOME", str(home))
+
+    assert _current_skill_version("home-only") == skill_content_version(skill)

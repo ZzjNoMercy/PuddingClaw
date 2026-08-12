@@ -5,8 +5,9 @@ from typing import Any
 
 import pytest
 
-from graph.citations import parse_tool_result
+from graph.citations import format_sources_for_model, make_source_id, parse_tool_result
 from web_search.adapters.base import normalized_response_sources
+from web_search.adapters.grok import GrokSearchAdapter
 from web_search.models import AdapterResponse, SearchRequest, SearchResult, WebSearchError
 from web_search.registry import WebSearchRegistry
 from web_search.service import WebSearchService
@@ -205,6 +206,68 @@ def test_search_request_rejects_conflicting_filters() -> None:
         SearchRequest(query="test", source="x", allowed_x_handles=["xai"], excluded_x_handles=["spam"])
 
 
+def test_grok_web_search_builds_domain_and_image_parameters() -> None:
+    tools = GrokSearchAdapter._build_tools(
+        SearchRequest(
+            query="show official launch images",
+            source="web",
+            include_domains=["x.ai", "spacex.com"],
+            enable_image_understanding=True,
+            enable_image_search=True,
+        ),
+        {"web_search_enabled": True, "x_search_enabled": True},
+    )
+
+    assert tools == [
+        {
+            "type": "web_search",
+            "filters": {"allowed_domains": ["x.ai", "spacex.com"]},
+            "enable_image_understanding": True,
+            "enable_image_search": True,
+        }
+    ]
+
+
+def test_grok_x_search_builds_media_understanding_parameters() -> None:
+    tools = GrokSearchAdapter._build_tools(
+        SearchRequest(
+            query="analyze recent media posts",
+            source="x",
+            allowed_x_handles=["xai"],
+            enable_image_understanding=True,
+            enable_video_understanding=True,
+        ),
+        {"web_search_enabled": True, "x_search_enabled": True},
+    )
+
+    assert tools == [
+        {
+            "type": "x_search",
+            "allowed_x_handles": ["xai"],
+            "enable_image_understanding": True,
+            "enable_video_understanding": True,
+        }
+    ]
+
+
+def test_grok_media_capabilities_do_not_fall_back_to_other_providers(tmp_path) -> None:
+    registry = _ready_registry(tmp_path, "tavily", "grok")
+    grok = FakeAdapter("grok")
+    tavily = FakeAdapter("tavily")
+    service = WebSearchService(
+        registry,
+        {"grok": grok, "tavily": tavily, "deepseek": FakeAdapter("deepseek")},
+    )
+
+    response = service.search(
+        SearchRequest(query="show launch images", scope="domestic", enable_image_search=True)
+    )
+
+    assert response.selected_provider == "grok"
+    assert grok.calls[0].enable_image_search is True
+    assert tavily.calls == []
+
+
 def test_unicode_punctuation_between_urls_does_not_corrupt_netloc() -> None:
     text = (
         "官方入口（`https://api.deepseek.com`）："
@@ -223,6 +286,58 @@ def test_unicode_punctuation_between_urls_does_not_corrupt_netloc() -> None:
         "https://api.deepseek.com",
         "https://api-docs.deepseek.com/zh-cn/guides/responses_api/",
     ]
+
+
+def test_xai_top_level_citations_are_kept_without_inline_links() -> None:
+    sources = normalized_response_sources(
+        {},
+        {"citations": ["https://x.com/thsottiaux/status/2086972933566857393"]},
+        "Grok found a recent Codex usage reset announcement.",
+        provider="grok",
+        query="codex reset",
+    )
+
+    assert len(sources) == 1
+    assert sources[0].uri == "https://x.com/thsottiaux/status/2086972933566857393"
+    assert sources[0].title == "@thsottiaux 的 X 帖子"
+
+
+def test_numeric_xai_inline_citation_title_is_replaced_and_quote_is_extracted() -> None:
+    text = (
+        "Latest official reset: @thsottiaux reset paid Codex usage limits."
+        "[[1]](https://x.com/thsottiaux/status/2086972933566857393)"
+    )
+    sources = normalized_response_sources({}, {}, text, provider="grok", query="codex reset")
+
+    assert sources[0].title == "@thsottiaux 的 X 帖子"
+    assert "reset paid Codex usage limits" in sources[0].quote
+
+
+def test_numeric_xai_web_citation_title_uses_page_slug_and_host() -> None:
+    text = "See the current API guide.[[1]](https://docs.x.ai/developers/tools/web-search)"
+    sources = normalized_response_sources({}, {}, text, provider="grok", query="xAI web search")
+
+    assert sources[0].source_type == "web"
+    assert sources[0].title == "web search · docs.x.ai"
+
+
+def test_web_source_id_is_stable_across_provider_labels_and_catalog_shows_uri() -> None:
+    first = {
+        "title": "1",
+        "uri": "https://x.com/thsottiaux",
+        "source_type": "x",
+        "quote": "first excerpt",
+    }
+    second = {
+        "title": "@thsottiaux 的 X 主页",
+        "uri": "https://x.com/thsottiaux",
+        "source_type": "x",
+        "quote": "another excerpt",
+    }
+
+    assert make_source_id(first) == make_source_id(second)
+    rendered = format_sources_for_model("answer", [{**second, "source_id": make_source_id(second)}])
+    assert "链接：https://x.com/thsottiaux" in rendered
 
 
 def test_managed_tool_returns_structured_citations(tmp_path, monkeypatch) -> None:

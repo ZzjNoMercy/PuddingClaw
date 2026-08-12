@@ -55,23 +55,24 @@ services:
       # is intentionally ignored so inherited shell variables cannot silently
       # disagree with Settings.
       - PUDDINGCLAW_DATABASE_URL=${PUDDINGCLAW_DATABASE_URL:-postgresql+asyncpg://${POSTGRES_USER:-puddingclaw}:${POSTGRES_PASSWORD:-puddingclaw}@postgres:5432/${POSTGRES_DB:-puddingclaw}}
+      - PUDDINGCLAW_HOME=/app/.puddingclaw
       # 其他环境变量在 backend/.env 中配置（如 MINERU_URL）
+    read_only: true
+    tmpfs:
+      - /tmp
     volumes:
-      # 持久化会话、workspace、memory、日志到宿主机
-      - ./backend/sessions:/app/sessions
-      - ./backend/workspace:/app/workspace
-      - ./backend/memory:/app/memory
-      - ./backend/data:/app/data
-      - ./backend/knowledge:/app/knowledge
-      - ./backend/logs:/app/logs
-      # 挂载 skills，允许容器内 API/工具写入（import/save/rename/version）
-      - ./backend/skills:/app/skills
-      # 挂载静态系统提示词文件，便于在容器外修改后无需重建镜像
-      - ./backend/prompts:/app/prompts:ro
-      # 挂载 .env 与 config.json，便于在容器外修改配置
-      - ./backend/.env:/app/.env:ro
-      - ./backend/config.json:/app/config.json
-      - ./logging.yaml:/app/logging.yaml:ro
+      # User-visible Home is a host bind mount. SQLite stays on a Docker-managed
+      # filesystem so WAL/locking semantics do not depend on Desktop sharing.
+      - type: bind
+        source: ${PUDDINGCLAW_HOST_HOME:-${HOME}/.puddingclaw}
+        target: /app/.puddingclaw
+      - type: volume
+        source: puddingclaw_db
+        target: /app/.puddingclaw/db
+      - type: bind
+        source: ./logging.yaml
+        target: /app/logging.yaml
+        read_only: true
     restart: unless-stopped
     depends_on:
       postgres:
@@ -106,3 +107,4 @@ services:
 
 volumes:
   postgres_data:
+  puddingclaw_db:

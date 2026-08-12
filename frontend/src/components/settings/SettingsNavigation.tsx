@@ -7,24 +7,20 @@ import {
   Bot,
   Brain,
   Database,
-  FileText,
   FolderOpen,
   Globe2,
   KeyRound,
   Network,
-  Sliders,
 } from "lucide-react";
 
 export type SettingsCategory =
   | "ai"
-  | "project"
   | "databaseQa"
   | "rag"
   | "knowledge"
   | "memory"
   | "harness"
   | "worker"
-  | "advanced"
   | "system";
 
 export const SETTINGS_CATEGORIES: Array<{
@@ -34,14 +30,12 @@ export const SETTINGS_CATEGORIES: Array<{
   color: string;
 }> = [
   { key: "ai", label: "模型服务", icon: Network, color: "#002fa7" },
-  { key: "project", label: "项目上下文", icon: FileText, color: "#002fa7" },
   { key: "databaseQa", label: "智能问数设置", icon: Database, color: "#002fa7" },
   { key: "rag", label: "RAG 设置", icon: Database, color: "#002fa7" },
   { key: "knowledge", label: "知识库", icon: FolderOpen, color: "#002fa7" },
   { key: "memory", label: "记忆管理", icon: Brain, color: "#002fa7" },
   { key: "harness", label: "Harness 配置", icon: Bot, color: "#002fa7" },
   { key: "worker", label: "Worker 接入", icon: KeyRound, color: "#002fa7" },
-  { key: "advanced", label: "高级设置", icon: Sliders, color: "#6b7280" },
   { key: "system", label: "系统状态", icon: Activity, color: "#002fa7" },
 ];
 

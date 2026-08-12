@@ -26,8 +26,12 @@ class EvaluationWorkerManager:
                 return
         except Exception:
             return
-        backend_dir = Path(__file__).resolve().parent.parent
-        shutil.rmtree(backend_dir / "data" / "evaluation-runs" / experiment_id, ignore_errors=True)
+        from runtime_identity.paths import PuddingClawPaths
+
+        shutil.rmtree(
+            PuddingClawPaths.from_environment().data() / "evaluation-runs" / experiment_id,
+            ignore_errors=True,
+        )
 
     async def start(self, experiment_id: str) -> None:
         async with self._lock:
@@ -42,6 +46,9 @@ class EvaluationWorkerManager:
                 # when the current worker is reaped.
                 return
             backend_dir = Path(__file__).resolve().parent.parent
+            from runtime_identity.paths import PuddingClawPaths
+
+            runtime_root = PuddingClawPaths.from_environment().root
             allowed_keys = {
                 "PATH",
                 "PYTHONPATH",
@@ -60,11 +67,10 @@ class EvaluationWorkerManager:
                 "LANGSMITH_PROJECT",
                 "PUDDINGCLAW_EVALUATION_DB",
                 "PUDDINGCLAW_EVALUATION_SETTINGS",
-                "PUDDINGDATA_USER_DATA_DIR",
-                "PUDDINGCLAW_USER_DATA_DIR",
             }
             environment = {key: value for key, value in os.environ.items() if key in allowed_keys}
             environment["PYTHONPATH"] = str(backend_dir)
+            environment["PUDDINGCLAW_HOME"] = str(runtime_root)
             process = await asyncio.create_subprocess_exec(
                 sys.executable,
                 "-m",

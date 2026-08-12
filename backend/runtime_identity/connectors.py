@@ -13,6 +13,7 @@ from runtime_identity.authorization_drivers import AuthorizationDriverRegistry
 from runtime_identity.paths import PuddingClawPaths, trusted_owner_user_id
 from runtime_identity.profiles import CredentialProfileStore
 from runtime_identity.toolchains import ToolchainManager
+from tools.skills_scanner import scan_skill_registry
 
 
 @dataclass(frozen=True)
@@ -291,12 +292,14 @@ class ConnectorRegistry:
         prefix = str(getattr(metadata, "skill_prefix", "") or "")
         if not prefix:
             return 0
-        skills_root = Path(__file__).resolve().parents[1] / "skills"
         try:
             return sum(
                 1
-                for child in skills_root.iterdir()
-                if child.is_dir() and child.name.startswith(prefix) and (child / "SKILL.md").is_file()
+                for item in scan_skill_registry(
+                    Path(__file__).resolve().parents[1],
+                    user_root=self.paths.user_skills(),
+                )
+                if item.get("effective") and str(item["skill_id"]).startswith(prefix)
             )
         except OSError:
             return 0

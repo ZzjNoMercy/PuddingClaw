@@ -93,7 +93,7 @@ def test_mineru_client_uses_configured_long_read_timeout(tmp_path: Path):
 
 
 def test_preview_markdown_keeps_utf8_when_chunk_ends_mid_character(tmp_path: Path):
-    knowledge_dir = tmp_path / "knowledge" / "imported" / "20260702"
+    knowledge_dir = get_knowledge_root(tmp_path) / "imported" / "20260702"
     knowledge_dir.mkdir(parents=True)
     markdown = knowledge_dir / "中文.md"
     markdown.write_text("## 中文标题\n" + "内容" * 100, encoding="utf-8")
@@ -138,7 +138,7 @@ def test_import_job_processes_markdown_upload(tmp_path: Path):
         assert processed.status == "succeeded"
         assert processed.progress == 100
         assert processed.document_id
-        imported_files = list((backend_dir / "knowledge" / "imported").rglob("*.md"))
+        imported_files = list((get_knowledge_root(backend_dir) / "imported").rglob("*.md"))
         assert len(imported_files) == 1
         assert imported_files[0].name == "中文笔记.md"
         assert imported_files[0].read_text(encoding="utf-8") == content.decode()
@@ -265,7 +265,7 @@ def test_document_rebuild_deletes_only_stale_milvus_nodes():
     assert image_store.client.deletes == ['id in ["image-stale"]']
 
 
-def test_import_local_markdown_copies_into_deepagents_knowledge_backend(tmp_path: Path):
+def test_import_local_markdown_copies_into_puddingclaw_home(tmp_path: Path):
     async def run() -> None:
         engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'test.db'}")
         async with engine.begin() as conn:
@@ -282,7 +282,7 @@ def test_import_local_markdown_copies_into_deepagents_knowledge_backend(tmp_path
             documents = await service.list_documents(session)
 
         assert document.virtual_path.startswith("/knowledge/imported/")
-        assert document.storage_path.startswith(str(backend_dir / "knowledge" / "imported"))
+        assert document.storage_path.startswith(str(get_knowledge_root(backend_dir) / "imported"))
         assert Path(document.storage_path).read_text(encoding="utf-8") == source.read_text(encoding="utf-8")
         assert documents[0].id == document.id
 
@@ -1037,7 +1037,7 @@ def test_uploaded_markdown_filename_uses_title_and_deduplicates(tmp_path: Path):
 
 
 def test_markdown_glob_and_grep_include_imported_pdf_markdown(tmp_path: Path):
-    knowledge_dir = tmp_path / "knowledge" / "imported" / "20260702"
+    knowledge_dir = get_knowledge_root(tmp_path) / "imported" / "20260702"
     knowledge_dir.mkdir(parents=True)
     (knowledge_dir / "pdf-report.md").write_text("# Report\n\nMinerU conclusion\n", encoding="utf-8")
     (knowledge_dir / "notes.markdown").write_text("other content\n", encoding="utf-8")
@@ -1064,8 +1064,8 @@ def test_knowledge_root_can_be_configured_by_user_directory(tmp_path: Path, monk
 
 
 def test_directory_listing_reports_unreadable_root(tmp_path: Path, monkeypatch):
-    knowledge_dir = tmp_path / "knowledge"
-    knowledge_dir.mkdir()
+    knowledge_dir = get_knowledge_root(tmp_path)
+    knowledge_dir.mkdir(parents=True)
     service = KnowledgeService(tmp_path)
     original_iterdir = Path.iterdir
 
