@@ -26,7 +26,7 @@ from api.headless import (
     list_worker_access_logs,
     resume_headless_run,
 )
-from graph.headless_resolver import HeadlessInterruptResolver
+from graph.headless_resolver import HeadlessInterruptResolver, headless_authority_from_environment
 from graph.permission_resume import permission_resume_registry
 from graph.session_manager import session_manager
 from headless_session_lifecycle import cleanup_stale_headless_sessions
@@ -60,6 +60,12 @@ def _register_test_worker_project(tmp_path: Path) -> str:
 def test_headless_request_rejects_caller_selected_model():
     with pytest.raises(ValidationError):
         HeadlessRunRequest(message="分析销售", analytics_model_id="sales")
+
+
+def test_headless_authority_defaults_to_smart(monkeypatch):
+    monkeypatch.delenv("PUDDINGCLAW_HEADLESS_AUTHORITY_PROFILE", raising=False)
+
+    assert headless_authority_from_environment()["profile"] == "smart"
 
 
 def test_model_routing_candidates_are_limited_by_worker_key(monkeypatch):

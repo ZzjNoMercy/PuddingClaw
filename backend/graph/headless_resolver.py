@@ -150,7 +150,7 @@ class HeadlessInterruptResolver:
     def _within_authority_scope(self, request: dict[str, Any]) -> bool:
         """Allow only server-configured workspace/network/package sub-scopes."""
 
-        profile = str(self.context.get("authority_profile") or "workspace").strip().lower()
+        profile = str(self.context.get("authority_profile") or "smart").strip().lower()
         if profile in {"", "smart", "none", "restricted"}:
             return False
         target_kind = str(request.get("session_target_kind") or request.get("target_kind") or "")
@@ -194,7 +194,7 @@ def headless_authority_from_environment() -> dict[str, Any]:
     raw_dirs = os.getenv("PUDDINGCLAW_HEADLESS_ALLOWED_DIRECTORIES", "")
     raw_origins = os.getenv("PUDDINGCLAW_HEADLESS_ALLOWED_NETWORK_ORIGINS", "")
     return {
-        "profile": os.getenv("PUDDINGCLAW_HEADLESS_AUTHORITY_PROFILE", "workspace").strip().lower(),
+        "profile": os.getenv("PUDDINGCLAW_HEADLESS_AUTHORITY_PROFILE", "smart").strip().lower(),
         "directories": [item.strip() for item in raw_dirs.split(",") if item.strip()],
         "network_origins": [item.strip() for item in raw_origins.split(",") if item.strip()],
     }

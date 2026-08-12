@@ -826,7 +826,7 @@ async def _consume_run(
         # consumer keeps the original graph invocation alive while the HTTP
         # caller is released with a structured ``needs_input`` response.
         interaction_mode="external",
-        authority_profile=str(authority.get("profile") or "workspace"),
+        authority_profile=str(authority.get("profile") or "smart"),
         authority_directories=list(authority.get("directories") or []),
         authority_network_origins=list(authority.get("network_origins") or []),
         query_created_at=request_received_at,
