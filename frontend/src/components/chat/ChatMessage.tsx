@@ -5,7 +5,7 @@ import ReactMarkdown from "react-markdown";
 import type { Components } from "react-markdown";
 import { AlertTriangle, CheckCircle2, ChevronDown, ChevronRight, Database, Download, FileSpreadsheet, FileText, FolderOpen, Globe2, HelpCircle, ImageIcon, Key, KeyRound, Layers3, Loader2, Maximize2, PauseCircle, Plus, Sparkles, SquareTerminal, Trash2, XCircle } from "lucide-react";
 import { denyPermissionRequest, grantExternalFilePermission, grantShellDirectoryPermission, grantToolActionPermission, resolveDatabaseSqlRevisionRequest, resolveDimensionBuildRuleRequest, resolveKernelFallbackRequest, resolveLogicalDatasetRuleRequest, resolveSkillSecretRequest, resolveUserInputRequest, type AgentAttachment, type DatabaseSqlRevisionRequest, type DimensionBuildRuleRequest, type KernelFallbackRequest, type LogicalDatasetRuleRequest, type PermissionRequest, type SkillSecretRequest, type UserInputAnswer, type UserInputRequest } from "@/lib/api";
-import { markdownRemarkPlugins, markdownUrlTransform } from "@/lib/markdown";
+import { markdownRemarkPlugins, markdownUrlTransform, normalizeLooseStrongMarkdown } from "@/lib/markdown";
 import { useApp, type ChatMessage as ChatMessageType, type SourceRecord, type TimelineItem, type ToolCall } from "@/lib/store";
 import { isPreviewableImageAttachment, isQrImageAttachment } from "@/lib/imageAttachments";
 import { placeOutputAttachments } from "@/lib/artifactPlacement";
@@ -2008,7 +2008,7 @@ function renderCitationMarkers(message: ChatMessageType, sessionSources: SourceR
 }
 
 function sanitizeCitationMarkdown(content: string): string {
-  return content
+  return normalizeLooseStrongMarkdown(content)
     // Citation metadata belongs to the structured source cards, never a GFM
     // Footnotes appendix rendered inside the assistant answer.
     .replace(/^[ \t]*\[\^[^\]\n]+\]:[^\n]*(?:\n(?:(?: {2,}|\t)[^\n]*))*(?:\n|$)/gm, "")

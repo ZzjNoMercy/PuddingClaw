@@ -37,6 +37,12 @@ import SessionSearchDialog from "./SessionSearchDialog";
 const PROJECT_EXPANSION_STORAGE_KEY = "puddingclaw_sidebar_project_expansion";
 const useBrowserLayoutEffect = typeof window === "undefined" ? useEffect : useLayoutEffect;
 
+type RuntimeExtensions = {
+  knowledge: boolean;
+  analytics: boolean;
+  headless_worker: boolean;
+};
+
 export default function Sidebar() {
   const {
     sessionId,
@@ -66,7 +72,35 @@ export default function Sidebar() {
   const [expandedProjects, setExpandedProjects] = useState<Set<string>>(() => new Set());
   const [projectExpansionRestored, setProjectExpansionRestored] = useState(false);
   const [searchOpen, setSearchOpen] = useState(false);
+  const [runtimeExtensions, setRuntimeExtensions] = useState<RuntimeExtensions>({
+    knowledge: false,
+    analytics: false,
+    headless_worker: false,
+  });
   const hasSavedProjectExpansionRef = useRef(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    fetch("/api/runtime-profile")
+      .then(async (response) => {
+        if (!response.ok) throw new Error(`runtime profile returned ${response.status}`);
+        return response.json() as Promise<{ extensions?: Partial<RuntimeExtensions> }>;
+      })
+      .then((payload) => {
+        if (cancelled || !payload.extensions) return;
+        setRuntimeExtensions((current) => ({ ...current, ...payload.extensions }));
+      })
+      .catch(() => {
+        // A source checkout without the profile endpoint keeps the historical
+        // full navigation surface. CLI-managed runtimes always expose it.
+        if (!cancelled) {
+          setRuntimeExtensions({ knowledge: true, analytics: true, headless_worker: true });
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   useEffect(() => {
     const handleSearchShortcut = (event: KeyboardEvent) => {
@@ -253,28 +287,32 @@ export default function Sidebar() {
           muted
           onClick={() => setSearchOpen(true)}
         />
-        <Link
-          href="/knowledge"
-          className={`w-full flex items-center gap-2 px-3 py-2 text-[13px] rounded-xl transition-all ${
-            runtimeReady && pathname.startsWith("/knowledge")
-              ? "bg-[#002fa7] text-white font-medium shadow-sm shadow-[#002fa7]/20"
-              : "text-gray-600 hover:text-gray-900 hover:bg-white/50"
-          }`}
-        >
-          <Database className="w-4 h-4" />
-          知识库
-        </Link>
-        <Link
-          href="/analytics"
-          className={`w-full flex items-center gap-2 px-3 py-2 text-[13px] rounded-xl transition-all ${
-            runtimeReady && pathname.startsWith("/analytics")
-              ? "bg-[#002fa7] text-white font-medium shadow-sm shadow-[#002fa7]/20"
-              : "text-gray-600 hover:text-gray-900 hover:bg-white/50"
-          }`}
-        >
-          <BarChart3 className="w-4 h-4" />
-          智能问数
-        </Link>
+        {runtimeExtensions.knowledge && (
+          <Link
+            href="/knowledge"
+            className={`w-full flex items-center gap-2 px-3 py-2 text-[13px] rounded-xl transition-all ${
+              runtimeReady && pathname.startsWith("/knowledge")
+                ? "bg-[#002fa7] text-white font-medium shadow-sm shadow-[#002fa7]/20"
+                : "text-gray-600 hover:text-gray-900 hover:bg-white/50"
+            }`}
+          >
+            <Database className="w-4 h-4" />
+            知识库
+          </Link>
+        )}
+        {runtimeExtensions.analytics && (
+          <Link
+            href="/analytics"
+            className={`w-full flex items-center gap-2 px-3 py-2 text-[13px] rounded-xl transition-all ${
+              runtimeReady && pathname.startsWith("/analytics")
+                ? "bg-[#002fa7] text-white font-medium shadow-sm shadow-[#002fa7]/20"
+                : "text-gray-600 hover:text-gray-900 hover:bg-white/50"
+            }`}
+          >
+            <BarChart3 className="w-4 h-4" />
+            智能问数
+          </Link>
+        )}
         <Link
           href="/extension/connectors"
           className={`w-full flex items-center gap-2 px-3 py-2 text-[13px] rounded-xl transition-all ${

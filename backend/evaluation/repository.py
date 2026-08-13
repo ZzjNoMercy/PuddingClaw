@@ -244,9 +244,7 @@ class EvaluationRepository:
 
     def list_dataset_versions(self, dataset_id: str) -> list[EvalDataset]:
         with self._connect() as connection:
-            exists = connection.execute(
-                "SELECT 1 FROM eval_datasets WHERE dataset_id=?", (dataset_id,)
-            ).fetchone()
+            exists = connection.execute("SELECT 1 FROM eval_datasets WHERE dataset_id=?", (dataset_id,)).fetchone()
             if exists is None:
                 raise NotFoundError(f"Dataset not found: {dataset_id}")
             rows = connection.execute(
@@ -320,14 +318,10 @@ class EvaluationRepository:
         if row["status"] != DatasetStatus.DRAFT:
             raise ConflictError("Cases may only be edited in a draft Dataset")
         if expected_revision is not None and row["revision"] != expected_revision:
-            raise ConflictError(
-                f"Dataset revision changed: expected {expected_revision}, got {row['revision']}"
-            )
+            raise ConflictError(f"Dataset revision changed: expected {expected_revision}, got {row['revision']}")
         return row
 
-    def add_case(
-        self, dataset_id: str, case: EvalCase, expected_revision: int | None = None
-    ) -> EvalCase:
+    def add_case(self, dataset_id: str, case: EvalCase, expected_revision: int | None = None) -> EvalCase:
         with self._lock, self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             row = self._assert_draft(connection, dataset_id, expected_revision)
@@ -366,9 +360,7 @@ class EvaluationRepository:
             self._bump_revision(connection, dataset_id, row["revision"])
         return case
 
-    def delete_case(
-        self, dataset_id: str, case_id: str, expected_revision: int | None = None
-    ) -> None:
+    def delete_case(self, dataset_id: str, case_id: str, expected_revision: int | None = None) -> None:
         with self._lock, self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             row = self._assert_draft(connection, dataset_id, expected_revision)
@@ -386,8 +378,7 @@ class EvaluationRepository:
         ]
         dataset = EvalDataset.model_validate_json(raw).model_copy(update={"revision": revision + 1, "updated_at": now})
         cursor = connection.execute(
-            "UPDATE eval_datasets SET payload_json=?, revision=?, updated_at=? "
-            "WHERE dataset_id=? AND revision=?",
+            "UPDATE eval_datasets SET payload_json=?, revision=?, updated_at=? WHERE dataset_id=? AND revision=?",
             (
                 _json(self._dataset_payload(dataset)),
                 dataset.revision,
@@ -445,9 +436,7 @@ class EvaluationRepository:
                     if spec is None or str(spec.version) != str(binding.version):
                         raise ValidationError(f"Unknown evaluator binding: {binding.evaluator_id}@{binding.version}")
                     if case.dimensions and spec.dimension not in case.dimensions:
-                        raise ValidationError(
-                            f"Evaluator {binding.evaluator_id} is outside Case dimensions"
-                        )
+                        raise ValidationError(f"Evaluator {binding.evaluator_id} is outside Case dimensions")
                     registered = evaluator_registry.get_registered(binding.evaluator_id)
                     assert registered is not None
                     code_hash = evaluator_code_hash(spec, registered[1])
@@ -622,7 +611,8 @@ class EvaluationRepository:
     def finish_attempt(self, attempt_id: str, *, status: str, run: Any = None, error: Any = None) -> None:
         with self._lock, self._connect() as connection:
             connection.execute(
-                "UPDATE eval_case_attempts SET status=?, run_envelope_json=?, error_json=?, updated_at=? WHERE attempt_id=?",
+                "UPDATE eval_case_attempts SET status=?, run_envelope_json=?, error_json=?, "
+                "updated_at=? WHERE attempt_id=?",
                 (
                     status,
                     _json(run) if run is not None else None,
@@ -669,6 +659,31 @@ class EvaluationRepository:
             }
             for row in rows
         ]
+
+    def load_run_envelopes(self, experiment_id: str) -> dict[str, list[dict[str, Any]]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT attempt_id, status, case_id, run_envelope_json FROM eval_case_attempts "
+                "WHERE experiment_id=? AND run_envelope_json IS NOT NULL "
+                "ORDER BY repetition, created_at",
+                (experiment_id,),
+            ).fetchall()
+        envelopes: dict[str, list[dict[str, Any]]] = {}
+        for row in rows:
+            envelope = json.loads(row["run_envelope_json"])
+            envelope["_attempt_id"] = str(row["attempt_id"])
+            envelope["_attempt_status"] = str(row["status"])
+            envelopes.setdefault(str(row["case_id"]), []).append(envelope)
+        return envelopes
+
+    def update_attempt_run(self, attempt_id: str, run: Any) -> None:
+        with self._lock, self._connect() as connection:
+            cursor = connection.execute(
+                "UPDATE eval_case_attempts SET run_envelope_json=?, updated_at=? WHERE attempt_id=?",
+                (_json(run), utc_now().isoformat(), attempt_id),
+            )
+            if cursor.rowcount != 1:
+                raise NotFoundError(f"Attempt not found: {attempt_id}")
 
     def load_projection_outputs(self, experiment_id: str) -> dict[str, list[dict[str, Any]]]:
         with self._connect() as connection:
@@ -732,14 +747,11 @@ class EvaluationRepository:
     def mark_outbox_delivered(self, outbox_id: str) -> None:
         with self._lock, self._connect() as connection:
             connection.execute(
-                "UPDATE eval_outbox SET status='delivered', updated_at=? "
-                "WHERE outbox_id=? AND status='processing'",
+                "UPDATE eval_outbox SET status='delivered', updated_at=? WHERE outbox_id=? AND status='processing'",
                 (utc_now().isoformat(), outbox_id),
             )
 
-    def complete_experiment_projection(
-        self, experiment: EvalExperiment, outbox_id: str
-    ) -> EvalExperiment:
+    def complete_experiment_projection(self, experiment: EvalExperiment, outbox_id: str) -> EvalExperiment:
         """Atomically persist the remote identity and acknowledge its outbox claim."""
 
         now = utc_now().isoformat()
@@ -751,12 +763,9 @@ class EvaluationRepository:
                 (_json(experiment), experiment.status, now, experiment.experiment_id),
             )
             if updated.rowcount != 1:
-                raise ConflictError(
-                    f"Experiment {experiment.experiment_id} is no longer completed"
-                )
+                raise ConflictError(f"Experiment {experiment.experiment_id} is no longer completed")
             acknowledged = connection.execute(
-                "UPDATE eval_outbox SET status='delivered', updated_at=? "
-                "WHERE outbox_id=? AND status='processing'",
+                "UPDATE eval_outbox SET status='delivered', updated_at=? WHERE outbox_id=? AND status='processing'",
                 (now, outbox_id),
             )
             if acknowledged.rowcount != 1:
@@ -767,7 +776,8 @@ class EvaluationRepository:
         with self._lock, self._connect() as connection:
             connection.execute(
                 "INSERT INTO eval_results VALUES (?, ?, ?, ?, ?, ?, ?) "
-                "ON CONFLICT(attempt_id, evaluator_id, evaluator_version) DO UPDATE SET payload_json=excluded.payload_json",
+                "ON CONFLICT(attempt_id, evaluator_id, evaluator_version) "
+                "DO UPDATE SET payload_json=excluded.payload_json",
                 (
                     new_id("result"),
                     experiment_id,

@@ -91,7 +91,7 @@ const SERVICE_META: Record<
     icon: Terminal,
     color: "#002fa7",
     details: [
-      { label: "用途", value: "puddingclaw run / doctor / models list" },
+      { label: "用途", value: "puddingclaw agent run / doctor / agent models list" },
       { label: "安装方式", value: "后端启动时按安装策略检测或后台安装" },
     ],
   },

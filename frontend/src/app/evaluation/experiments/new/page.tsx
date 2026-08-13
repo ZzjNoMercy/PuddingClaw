@@ -42,6 +42,10 @@ export default function NewExperimentPage() {
     () => datasets.find((item) => `${item.dataset_id}@${item.current_version}` === datasetKey),
     [datasets, datasetKey],
   );
+  const isSWEbench = Boolean(selected?.tags.includes("swebench"));
+  useEffect(() => {
+    if (isSWEbench) setRepetitions(1);
+  }, [isSWEbench]);
   const models = useMemo(() => providerRegistry?.providers.flatMap((provider) => (
     provider.models
       .filter((item) => item.capability === "llm"
@@ -98,7 +102,7 @@ export default function NewExperimentPage() {
   return (
     <div className="mx-auto max-w-2xl p-6">
       <h1 className="mb-1 text-xl font-semibold">发起 Experiment</h1>
-      <p className="mb-6 text-sm text-gray-500">第一阶段固定串行执行；Worker 使用独立 session、workspace、memory，并禁用 MCP。</p>
+      <p className="mb-6 text-sm text-gray-500">固定串行执行；Worker 使用独立 session、workspace、memory，并禁用 MCP。Coding Profile 额外开放 kernel 隔离的 execute。</p>
       {error && <div className="mb-4 rounded-lg bg-red-50 p-3 text-sm text-red-700">{error}</div>}
       <div className="space-y-4 rounded-xl border bg-white p-5">
         <label className="block text-xs text-gray-500">Experiment 名称<input value={name} onChange={(event) => setName(event.target.value)} className={inputClass} /></label>
@@ -107,10 +111,10 @@ export default function NewExperimentPage() {
         <label className="block text-xs text-gray-500">LLM 模型（留空使用当前默认）<select value={model} onChange={(event) => { setModel(event.target.value); setCredentialName(""); }} className={inputClass}><option value="">当前默认模型</option>{models.map(({ provider, model: item }) => <option key={item.id} value={item.id}>{provider.name} · {item.name}</option>)}</select></label>
         {selectableKeys.length > 1 && <label className="block text-xs text-gray-500">评测 API Key（不选使用 default）<select value={credentialName} onChange={(event) => setCredentialName(event.target.value)} className={inputClass}><option value="">default</option>{selectableKeys.filter((item) => !item.is_default).map((item) => <option key={item.name} value={item.name}>{item.name}</option>)}</select></label>}
         <div className="grid grid-cols-2 gap-4">
-          <label className="text-xs text-gray-500">重复次数<input type="number" min={1} max={20} value={repetitions} onChange={(event) => setRepetitions(Number(event.target.value))} className={inputClass} /></label>
+          <label className="text-xs text-gray-500">重复次数<input disabled={isSWEbench} type="number" min={1} max={20} value={repetitions} onChange={(event) => setRepetitions(Number(event.target.value))} className={`${inputClass} disabled:bg-gray-50`} /></label>
           <label className="text-xs text-gray-500">单 Case 超时（秒）<input type="number" min={1} max={3600} value={timeout} onChange={(event) => setTimeoutSeconds(Number(event.target.value))} className={inputClass} /></label>
         </div>
-        <div className="rounded-lg bg-amber-50 p-3 text-xs text-amber-800">预计执行 {estimateCaseRuns(selected?.cases.length || 0, repetitions)} 个 Case Run。自定义生产 Tool 与 MCP 默认禁用；workspace 内建文件工具仍可用于 fixture 场景。</div>
+        <div className="rounded-lg bg-amber-50 p-3 text-xs text-amber-800">预计执行 {estimateCaseRuns(selected?.cases.length || 0, repetitions)} 个 Case Run。自定义生产 Tool 与 MCP 默认禁用；{isSWEbench ? "Agent 完成后平台会自动启动官方 SWE-bench Docker Harness。首次运行需要拉取/构建镜像，耗时和磁盘占用明显高于普通评测。" : selected?.default_profile === "coding_agent@1" ? "代码题可使用隔离 execute，评分以可信隐藏验证结果为准。" : "workspace 内建文件工具仍可用于 fixture 场景。"}</div>
         <button disabled={busy || !selected} onClick={submit} className="w-full rounded-lg bg-[#002fa7] py-2.5 text-sm text-white disabled:opacity-40">{busy ? "正在创建…" : "创建并运行"}</button>
       </div>
     </div>

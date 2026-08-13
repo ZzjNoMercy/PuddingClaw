@@ -1084,8 +1084,9 @@ def get_knowledge_mineru_config() -> dict[str, Any]:
     config = load_config()
     mineru = config.get("knowledge", {}).get("mineru", {})
     output_dir = str(mineru.get("runtime_output_dir") or "").strip()
+    env_base_url = os.getenv("PUDDINGCLAW_MINERU_URL", "").strip()
     return {
-        "base_url": str(mineru.get("base_url") or "http://localhost:8002").strip(),
+        "base_url": env_base_url or str(mineru.get("base_url") or "http://localhost:8002").strip(),
         "runtime_output_dir": output_dir,
         "keep_runtime_output": bool(mineru.get("keep_runtime_output", False)),
         "connect_timeout_seconds": int(mineru.get("connect_timeout_seconds") or 10),

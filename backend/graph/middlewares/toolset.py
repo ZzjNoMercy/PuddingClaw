@@ -163,10 +163,12 @@ class ToolsetMiddleware(AgentMiddleware):
     """Expose business toolsets only after a hash-bound Skill activation.
 
     A successful ``read_file`` caches canonical Skill instructions in the
-    Session and creates a structured Run activation. A later Run may fast
-    activate that cache only when its current task route selects the Skill, or
-    when the model explicitly attempts a tool uniquely provided by that Skill.
-    Cache, capability activation, and permission authority remain separate.
+    Session and creates a structured Run activation. Standard interactive
+    conversations restore hash-valid Session capabilities on later Runs, while
+    cached instructions remain stubbed until the current task recommends the
+    Skill or a Skill tool is actually used. Subagents and headless workers keep
+    their narrower Run-local surface. Cache, instruction context, capability
+    activation, and permission authority remain separate.
     """
 
     state_schema = ToolsetState
@@ -177,6 +179,7 @@ class ToolsetMiddleware(AgentMiddleware):
         skills_dir: Path,
         toolsets_by_skill: dict[str, set[str]],
         mcp_tool_names: set[str] | None = None,
+        restore_session_skills: bool = False,
     ) -> None:
         super().__init__()
         self.skills_dir = skills_dir.resolve()
@@ -185,6 +188,7 @@ class ToolsetMiddleware(AgentMiddleware):
         # servers. They are not Skill capabilities and do not wait for a
         # Skill activation before becoming visible to the Agent.
         self.mcp_tool_names = frozenset(str(name) for name in (mcp_tool_names or ()) if str(name))
+        self.restore_session_skills = bool(restore_session_skills)
         self._observed_recommendations: set[tuple[str, str]] = set()
         self._observed_activations: set[tuple[str, str]] = set()
         for item in discover_skill_catalog(self.skills_dir):
@@ -363,6 +367,31 @@ class ToolsetMiddleware(AgentMiddleware):
             return None
         return entry
 
+    def _valid_session_cache_entries(
+        self,
+        session_id: str,
+        *,
+        policy_epoch: int,
+    ) -> list[SkillCacheEntry]:
+        """Return only hash- and policy-valid cached Skills, oldest first."""
+
+        if not session_id:
+            return []
+        result: list[SkillCacheEntry] = []
+        for raw in session_manager.list_skill_cache_entries(session_id):
+            try:
+                candidate = SkillCacheEntry.model_validate(raw)
+            except ValueError:
+                continue
+            entry = self._cached_skill_entry(
+                session_id,
+                candidate.skill_id,
+                policy_epoch=policy_epoch,
+            )
+            if entry is not None:
+                result.append(entry)
+        return sorted(result, key=lambda item: (item.created_at, item.skill_id))
+
     @staticmethod
     def _profile_skill_ids(
         state: dict[str, Any],
@@ -394,12 +423,14 @@ class ToolsetMiddleware(AgentMiddleware):
         run_id: str,
         activation: SkillActivation,
         source: str,
+        record_selection: bool = True,
     ) -> None:
-        session_manager.record_run_skill_selection(
-            session_id,
-            run_id,
-            activation.skill_id,
-        )
+        if record_selection:
+            session_manager.record_run_skill_selection(
+                session_id,
+                run_id,
+                activation.skill_id,
+            )
         session_manager.record_run_skill_activation(
             session_id,
             run_id,
@@ -490,6 +521,65 @@ class ToolsetMiddleware(AgentMiddleware):
             already_active.add(skill_id)
         return result
 
+    def _restore_cached_session_skills(
+        self,
+        *,
+        session_id: str,
+        run_id: str,
+        goal_id: str | None,
+        goal_revision: int | None,
+        policy_epoch: int,
+        already_active: set[str],
+        run_kind: str = "",
+    ) -> list[dict[str, Any]]:
+        """Restore capability schemas without eagerly injecting Skill text."""
+
+        if (
+            not self.restore_session_skills
+            or run_kind != "standalone"
+            or not session_id
+            or not run_id
+        ):
+            return []
+        restored: list[dict[str, Any]] = []
+        for entry in self._valid_session_cache_entries(
+            session_id,
+            policy_epoch=policy_epoch,
+        ):
+            if entry.skill_id in already_active:
+                continue
+            activation = self._activation_for_skill(
+                entry.skill_id,
+                run_id=run_id,
+                goal_id=goal_id,
+                goal_revision=goal_revision,
+                tool_call_id=f"skill-cache:session-available:{entry.skill_content_sha256}",
+                policy_epoch=policy_epoch,
+            )
+            if activation is None:
+                continue
+            try:
+                self._record_skill_activation(
+                    session_id=session_id,
+                    run_id=run_id,
+                    activation=activation,
+                    source="session_cache_capability_restore",
+                    record_selection=False,
+                )
+            except ValueError:
+                continue
+            emit_harness_metric(
+                logger,
+                "skill_cache_hit_total",
+                session_id=session_id,
+                run_id=run_id,
+                skill_id=entry.skill_id,
+                source="session_capability_restore",
+            )
+            restored.append(activation.model_dump(mode="json"))
+            already_active.add(entry.skill_id)
+        return restored
+
     def before_agent(self, state: dict[str, Any], runtime: Any) -> dict[str, Any] | None:
         context = runtime.context if runtime is not None and isinstance(runtime.context, dict) else {}
         session_id = str(context.get("session_id") or "")
@@ -512,17 +602,34 @@ class ToolsetMiddleware(AgentMiddleware):
             policy_epoch=policy_epoch,
         )
         active_ids = {str(item.get("skill_id")) for item in activations if item.get("skill_id")}
-        cached = self._activate_cached_profile_skills(
-            state,
+        standard_session = (
+            self.restore_session_skills
+            and str(context.get("run_kind") or "") == "standalone"
+        )
+        cached = (
+            []
+            if standard_session
+            else self._activate_cached_profile_skills(
+                state,
+                session_id=session_id,
+                run_id=run_id,
+                goal_id=goal_id,
+                goal_revision=goal_revision,
+                policy_epoch=policy_epoch,
+                already_active=active_ids,
+            )
+        )
+        restored = self._restore_cached_session_skills(
             session_id=session_id,
             run_id=run_id,
             goal_id=goal_id,
             goal_revision=goal_revision,
             policy_epoch=policy_epoch,
             already_active=active_ids,
+            run_kind=str(context.get("run_kind") or ""),
         )
         activations = self._valid_activations(
-            [*activations, *cached],
+            [*activations, *cached, *restored],
             policy_epoch=policy_epoch,
         )
         active = sorted({str(item.get("skill_id")) for item in activations if item.get("skill_id")})
@@ -557,17 +664,34 @@ class ToolsetMiddleware(AgentMiddleware):
             policy_epoch=policy_epoch,
         )
         active_ids = {str(item.get("skill_id")) for item in activations if item.get("skill_id")}
-        cached = self._activate_cached_profile_skills(
-            state,
+        standard_session = (
+            self.restore_session_skills
+            and str(context.get("run_kind") or "") == "standalone"
+        )
+        cached = (
+            []
+            if standard_session
+            else self._activate_cached_profile_skills(
+                state,
+                session_id=session_id,
+                run_id="" if run_id == "unscoped" else run_id,
+                goal_id=str(context.get("goal_id") or "") or None,
+                goal_revision=context.get("goal_revision"),
+                policy_epoch=policy_epoch,
+                already_active=active_ids,
+            )
+        )
+        restored = self._restore_cached_session_skills(
             session_id=session_id,
             run_id="" if run_id == "unscoped" else run_id,
             goal_id=str(context.get("goal_id") or "") or None,
             goal_revision=context.get("goal_revision"),
             policy_epoch=policy_epoch,
             already_active=active_ids,
+            run_kind=str(context.get("run_kind") or ""),
         )
         activations = self._valid_activations(
-            [*activations, *cached],
+            [*activations, *cached, *restored],
             policy_epoch=policy_epoch,
         )
         active = sorted({str(item.get("skill_id")) for item in activations if item.get("skill_id")})
@@ -746,9 +870,34 @@ class ToolsetMiddleware(AgentMiddleware):
         )
         routed_cached = [item for item in cached if item[0] in routed]
         candidates = routed_cached or cached
-        if len(candidates) != 1:
+        if not candidates:
             return None
-        skill_id, entry = candidates[0]
+        skill_id, entry = min(
+            candidates,
+            key=lambda item: (item[1].created_at, item[0]),
+        )
+        provider_reason = (
+            "task_router_advice_then_first_activation"
+            if routed_cached
+            else "first_activation_then_skill_id"
+            if len(cached) > 1
+            else "unique_cached_provider"
+        )
+        provider_payload = {
+            "tool": tool_name,
+            "selected_skill_id": skill_id,
+            "candidate_skill_ids": [item[0] for item in cached],
+            "reason": provider_reason,
+            "source_precedence": "effective_runtime_view_then_task_advice_then_first_activation",
+        }
+        collector = get_current_trace_collector()
+        if collector is not None:
+            collector.add_custom_span(
+                "skill_tool_provider_resolved",
+                provider_payload,
+                span_type="capability",
+                metadata={"provider_resolution": provider_payload},
+            )
         try:
             get_stream_writer()(
                 {
@@ -794,6 +943,195 @@ class ToolsetMiddleware(AgentMiddleware):
             requested_tool=tool_name,
         )
         return entry, activation
+
+    def _resolve_active_tool_provider(
+        self,
+        request: ToolCallRequest,
+        *,
+        tool_name: str,
+        policy_epoch: int,
+    ) -> tuple[str, str, list[str]] | None:
+        """Choose one active Skill provider with a stable, traceable order."""
+
+        active = set(self._active_skill_ids(request.state, policy_epoch=policy_epoch))
+        providers = sorted(
+            skill_id
+            for skill_id, toolsets in self.toolsets_by_skill.items()
+            if skill_id in active
+            and tool_name in tools_for_toolsets(set(toolsets))
+            and self._refresh_installed_skill(skill_id)
+        )
+        if not providers:
+            return None
+        context = (
+            request.runtime.context
+            if request.runtime is not None and isinstance(request.runtime.context, dict)
+            else {}
+        )
+        session_id = str(context.get("session_id") or "")
+        run_id = str(context.get("run_id") or "")
+        routed = self._profile_skill_ids(
+            request.state,
+            session_id=session_id,
+            run_id=run_id,
+        )
+        routed_order = {skill_id: index for index, skill_id in enumerate(routed)}
+        cache_order = {
+            entry.skill_id: index
+            for index, entry in enumerate(
+                self._valid_session_cache_entries(session_id, policy_epoch=policy_epoch)
+            )
+        }
+        selected = min(
+            providers,
+            key=lambda skill_id: (
+                0 if skill_id in routed_order else 1,
+                routed_order.get(skill_id, len(routed_order)),
+                cache_order.get(skill_id, len(cache_order)),
+                skill_id,
+            ),
+        )
+        if len(providers) == 1:
+            reason = "unique_active_provider"
+        elif selected in routed_order:
+            reason = "task_router_advice_then_first_activation"
+        else:
+            reason = "first_activation_then_skill_id"
+        payload = {
+            "tool": tool_name,
+            "selected_skill_id": selected,
+            "candidate_skill_ids": providers,
+            "reason": reason,
+            "source_precedence": "effective_runtime_view_then_task_advice_then_first_activation",
+        }
+        collector = get_current_trace_collector()
+        if collector is not None:
+            collector.add_custom_span(
+                "skill_tool_provider_resolved",
+                payload,
+                span_type="capability",
+                metadata={"provider_resolution": payload},
+            )
+        try:
+            get_stream_writer()({"type": "skill_tool_provider_resolved", **payload})
+        except (KeyError, RuntimeError):
+            pass
+        return selected, reason, providers
+
+    def _skill_instructions_loaded_for_run(
+        self,
+        request: ToolCallRequest,
+        *,
+        skill_id: str,
+        policy_epoch: int,
+    ) -> bool:
+        if skill_id in set(self._loaded_skill_ids(list(request.state.get("messages") or []))):
+            return True
+        context = (
+            request.runtime.context
+            if request.runtime is not None and isinstance(request.runtime.context, dict)
+            else {}
+        )
+        session_id = str(context.get("session_id") or "")
+        run_id = str(context.get("run_id") or "")
+        if skill_id in set(
+            self._profile_skill_ids(
+                request.state,
+                session_id=session_id,
+                run_id=run_id,
+            )
+        ):
+            return True
+        for raw in self._valid_activations(
+            list(request.state.get("skill_activations") or []),
+            policy_epoch=policy_epoch,
+        ):
+            activation = SkillActivation.model_validate(raw)
+            if (
+                activation.skill_id == skill_id
+                and activation.run_id == run_id
+                and not activation.source_tool_call_id.startswith("skill-cache:session-available:")
+            ):
+                return True
+        return False
+
+    def _load_cached_context_for_tool(
+        self,
+        request: ToolCallRequest,
+        *,
+        tool_name: str,
+        policy_epoch: int,
+    ) -> ToolMessage | None:
+        """Inject cached instructions on first use without executing the call."""
+
+        resolved = self._resolve_active_tool_provider(
+            request,
+            tool_name=tool_name,
+            policy_epoch=policy_epoch,
+        )
+        if resolved is None:
+            return None
+        skill_id, reason, providers = resolved
+        if self._skill_instructions_loaded_for_run(
+            request,
+            skill_id=skill_id,
+            policy_epoch=policy_epoch,
+        ):
+            return None
+        context = (
+            request.runtime.context
+            if request.runtime is not None and isinstance(request.runtime.context, dict)
+            else {}
+        )
+        session_id = str(context.get("session_id") or "")
+        run_id = str(context.get("run_id") or "")
+        entry = self._cached_skill_entry(session_id, skill_id, policy_epoch=policy_epoch)
+        if entry is None or not run_id:
+            return None
+        activation = self._activation_for_skill(
+            skill_id,
+            run_id=run_id,
+            goal_id=str(context.get("goal_id") or "") or None,
+            goal_revision=context.get("goal_revision"),
+            tool_call_id=f"skill-cache:tool-context:{request.tool_call.get('id') or tool_name}",
+            policy_epoch=policy_epoch,
+        )
+        if activation is None:
+            return None
+        try:
+            self._record_skill_activation(
+                session_id=session_id,
+                run_id=run_id,
+                activation=activation,
+                source="session_cache_tool_context",
+            )
+            session_manager.record_skill_cache_entry(
+                session_id,
+                entry.model_copy(update={"last_used_at": time.time()}).model_dump(mode="json"),
+            )
+        except (FileNotFoundError, ValueError):
+            return None
+        return ToolMessage(
+            content=(
+                f"已为工具 `{tool_name}` 按需加载 Skill `{skill_id}` 的哈希绑定指令 "
+                f"({entry.skill_content_sha256})。本次原始调用没有执行；请结合刚加载的指令重新判断"
+                "它是否仍与当前任务相关，仅在相关时重新调用。"
+            ),
+            tool_call_id=str(request.tool_call.get("id") or ""),
+            name="load_skill_context",
+            status="error",
+            additional_kwargs={
+                "puddingclaw_control_plane": {
+                    "type": "skill_context_loaded_on_demand",
+                    "skill_id": skill_id,
+                    "requested_tool": tool_name,
+                    "provider_candidates": providers,
+                    "provider_reason": reason,
+                    "original_tool_executed": False,
+                    "activation_id": activation.activation_id,
+                }
+            },
+        )
 
     def _denied_tool_message(self, request: ToolCallRequest) -> ToolMessage | None:
         tool_name = str(request.tool_call.get("name") or "")
@@ -875,6 +1213,13 @@ class ToolsetMiddleware(AgentMiddleware):
             )
             and not legacy_lease_denied
         ):
+            context_load = self._load_cached_context_for_tool(
+                request,
+                tool_name=tool_name,
+                policy_epoch=policy_epoch,
+            )
+            if context_load is not None:
+                return context_load
             return None
         if not legacy_lease_denied:
             cached_activation = self._activate_cached_tool_provider(
@@ -950,13 +1295,16 @@ class ToolsetMiddleware(AgentMiddleware):
             and (not inspection or self._inspection_tool_allowed(self._tool_name(tool)))
             and (legacy_enabled or self._tool_name(tool) not in _LEGACY_EXTERNAL_LEASE_TOOLS)
         ]
-        stable_schema = bool(
+        stable_schema = self.restore_session_skills or bool(
             config.load_config().get("harness", {}).get("prompt_cache", {}).get("stable_tool_schema", False)
         )
         if stable_schema:
             # The schema cohort is a bounded superset of the tools already
-            # mounted for this Agent.  It never invents tools and never bypasses
-            # the per-call Skill/permission gate below.
+            # mounted for this Agent. Standard conversations keep this cohort
+            # stable across Session Skill activations; subagents and headless
+            # workers retain their configured narrower behavior. It never
+            # invents tools and never bypasses the per-call Skill/permission
+            # gate below.
             mounted_names = {self._tool_name(tool) for tool in request.tools}
             installed_skill_tools = {
                 tool_name
@@ -1344,19 +1692,28 @@ class ToolsetMiddleware(AgentMiddleware):
         run_id = str(context.get("run_id") or "")
         policy_epoch = self._context_policy_epoch(session_id)
         sections: list[str] = []
+        stubs: list[str] = []
         seen: set[str] = set()
         currently_loaded = set(self._loaded_skill_ids(list(request.messages or [])))
+        task_relevant = set(
+            self._profile_skill_ids(
+                request.state,
+                session_id=session_id,
+                run_id=run_id,
+            )
+        )
         activations = self._valid_activations(
             list(request.state.get("skill_activations") or []),
             policy_epoch=policy_epoch,
         )
-        for raw in sorted(activations, key=lambda item: (str(item.get("skill_id") or ""), str(item.get("activation_id") or ""))):
+        for raw in sorted(
+            activations,
+            key=lambda item: (str(item.get("skill_id") or ""), str(item.get("activation_id") or "")),
+        ):
             activation = SkillActivation.model_validate(raw)
             cache_bound = activation.source_tool_call_id.startswith("skill-cache:")
             inherited = bool(run_id and activation.run_id != run_id)
-            if activation.skill_id in seen or not (
-                cache_bound or inherited or activation.skill_id not in currently_loaded
-            ):
+            if activation.skill_id in seen:
                 continue
             entry = self._cached_skill_entry(
                 session_id,
@@ -1366,14 +1723,38 @@ class ToolsetMiddleware(AgentMiddleware):
             if entry is None:
                 continue
             seen.add(activation.skill_id)
-            sections.append(f"### {activation.skill_id} ({entry.skill_content_sha256})\n\n{entry.content.rstrip()}")
-        if not sections:
+            if self.restore_session_skills:
+                full_context = (
+                    activation.skill_id in currently_loaded
+                    or activation.skill_id in task_relevant
+                    or (
+                        activation.run_id == run_id
+                        and not activation.source_tool_call_id.startswith("skill-cache:session-available:")
+                    )
+                )
+                if not full_context:
+                    stubs.append(
+                        f"- `{activation.skill_id}` ({entry.skill_content_sha256}): "
+                        "工具 schema 已恢复；完整指令仅在当前任务相关或首次调用对应工具时按需加载。"
+                    )
+                    continue
+            elif not (cache_bound or inherited or activation.skill_id not in currently_loaded):
+                continue
+            sections.append(
+                f"### {activation.skill_id} ({entry.skill_content_sha256})\n\n{entry.content.rstrip()}"
+            )
+        if not sections and not stubs:
             return ""
-        return (
+        full_section = (
             "## Active Skill Instructions (authoritative cached copy)\n\n"
-            "These Skills were selected for the current Run. Their cached "
-            "content is hash-bound and grants no permissions by itself.\n\n" + "\n\n".join(sections)
+            "Only task-relevant or just-in-time loaded Skills include full instructions. "
+            "Their cached content is hash-bound and grants no permissions by itself."
         )
+        if sections:
+            full_section += "\n\n" + "\n\n".join(sections)
+        if stubs:
+            full_section += "\n\n### Session capability stubs\n\n" + "\n".join(stubs)
+        return full_section
 
     def _request_with_capability_manifest(self, request: ModelRequest) -> ModelRequest:
         visible_tools = self._visible_tools(request)

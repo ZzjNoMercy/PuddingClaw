@@ -1,0 +1,41 @@
+{
+  "name": "@puddingai/puddingclaw",
+  "version": "0.1.2",
+  "private": false,
+  "description": "CLI-first installer, runtime manager, and Agent Harness client for PuddingClaw",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ZzjNoMercy/PuddingClaw.git",
+    "directory": "packages/puddingclaw-deploy-cli"
+  },
+  "homepage": "https://github.com/ZzjNoMercy/PuddingClaw#readme",
+  "bugs": {
+    "url": "https://github.com/ZzjNoMercy/PuddingClaw/issues"
+  },
+  "type": "module",
+  "bin": {
+    "puddingclaw": "src/cli.js"
+  },
+  "files": [
+    "src",
+    "runtime-bundle",
+    "worker.manifest.json",
+    "README.md",
+    "LICENSE",
+    "PUBLISHING.md"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
+  "scripts": {
+    "build:runtime": "node scripts/build-embedded-runtime.mjs",
+    "test": "node --test test/*.test.js",
+    "verify:publish": "node scripts/verify-publish.mjs",
+    "prepublishOnly": "npm test && npm run verify:publish"
+  }
+}

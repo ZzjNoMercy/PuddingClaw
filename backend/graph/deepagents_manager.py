@@ -65,6 +65,7 @@ from typing_extensions import NotRequired
 
 import config
 from analytics.models import get_analytics_model_registry
+from extensions import extension_enabled
 from graph.attachment_store import attachment_store
 from graph.citations import (
     dedupe_sources,
@@ -93,7 +94,10 @@ from graph.middlewares.goal_completion import (
 )
 from graph.middlewares.harness_todos import HarnessTodoMiddleware
 from graph.middlewares.semantic_assets import SemanticAssetsMiddleware
-from graph.middlewares.skill_intent_router import SkillIntentRouterMiddleware
+from graph.middlewares.skill_intent_router import (
+    RequiredSkillBoundaryMiddleware,
+    SkillIntentRouterMiddleware,
+)
 from graph.middlewares.tool_context_compaction import (
     CONTEXT_METHOD_ARTIFACT_KEY,
     CONTEXT_OUTPUT_ARTIFACT_KEY,
@@ -3224,6 +3228,7 @@ class DeepAgentsAgentManager:
         workspace_path: str | Path | None = None,
         session_id: str = "",
         query_id: str = "",
+        restore_session_skills: bool = False,
     ) -> list[Any]:
         """Build user-provided DeepAgents middlewares.
 
@@ -3250,8 +3255,14 @@ class DeepAgentsAgentManager:
             MemoryMiddleware(backend=memory_store_backend, sources=["/MEMORY.md"]),
             RunScopeMiddleware(),
             *([AttachmentAuthorityBoundaryMiddleware()] if attachment_observation_only else []),
-            AnalysisTemplateMiddleware(base_dir=self._definitions_root()),
-            SemanticAssetsMiddleware(base_dir=self._definitions_root()),
+            *(
+                [
+                    AnalysisTemplateMiddleware(base_dir=self._definitions_root()),
+                    SemanticAssetsMiddleware(base_dir=self._definitions_root()),
+                ]
+                if extension_enabled("analytics")
+                else []
+            ),
             ExternalFilePermissionMiddleware(
                 backend_mode=backend_mode,
                 approval_mode=(
@@ -3279,10 +3290,12 @@ class DeepAgentsAgentManager:
             GoalCompletionMiddleware(),
             UserInputBoundaryMiddleware(),
             SkillIntentRouterMiddleware(),
+            RequiredSkillBoundaryMiddleware(),
             ToolsetMiddleware(
                 skills_dir=self._skills_runtime_root(),
                 toolsets_by_skill=toolset_mapping,
                 mcp_tool_names=mcp_tool_names,
+                restore_session_skills=restore_session_skills,
             ),
             ToolGuideMiddleware(base_dir=self._base_dir),
             # Keep execution policy in the Agent middleware chain: its
@@ -3422,6 +3435,7 @@ class DeepAgentsAgentManager:
         query_id: str = "",
         run_id: str = "",
         current_message: str = "",
+        current_conversation: str = "",
         current_attachments: list[dict[str, Any]] | None = None,
         goal_id: str = "",
         goal_revision: int | None = None,
@@ -3519,6 +3533,8 @@ class DeepAgentsAgentManager:
                 "request_dimension_build_rule",
                 "inspect_dimension_build_input",
                 "enqueue_semantic_dimension_build",
+                "prepare_semantic_markdown",
+                "publish_semantic_markdown",
                 "request_logical_dataset_rule",
                 "ensure_attachment_table_asset",
             }:
@@ -3548,6 +3564,7 @@ class DeepAgentsAgentManager:
                     "session_id": session_id,
                     "query_id": query_id,
                     "current_message": current_message,
+                    "current_conversation": current_conversation,
                     "current_attachments": list(current_attachments or []),
                 }
                 try:
@@ -4780,9 +4797,14 @@ class DeepAgentsAgentManager:
         analytics_model_id: str | None,
         internal_continuation: bool,
     ) -> RunTaskProfile | None:
-        """Reuse the latest task understanding for explicit continuations."""
+        """Reuse a profile only for a server-owned Goal continuation.
 
-        if not internal_continuation and not _TASK_PROFILE_CONTINUATION_RE.fullmatch(message.strip()):
+        Natural conversation continuity is intentionally left to the main
+        Agent that sees the full transcript. Phrase matching must not decide
+        capability state or silently reinterpret a user turn.
+        """
+
+        if not internal_continuation:
             return None
         previous = session_manager.get_run_state(session_id)
         profile_payload = previous.get("task_profile") if isinstance(previous, dict) else None
@@ -4797,6 +4819,42 @@ class DeepAgentsAgentManager:
             profile.reasons.append("reused_for_continuation")
         profile.classifier = "session_continuation"
         return profile
+
+    @staticmethod
+    def _llm_wiki_conversation_source(session_id: str, *, limit: int = 16) -> str:
+        """Project recent user-visible conversation into one traceable Raw source.
+
+        This deliberately excludes hidden reasoning and nested Tool payloads.
+        URLs and citations already shown in user/assistant messages remain in
+        the snapshot, so the background compiler receives the same material the
+        user referred to with phrases such as “把刚才这些编译到 Wiki”.
+        """
+
+        if not session_id:
+            return ""
+        messages = session_manager.load_session(session_id)
+        sections: list[str] = []
+        total_chars = 0
+        for item in messages[-max(1, limit) :]:
+            if not isinstance(item, dict):
+                continue
+            role = str(item.get("role") or "")
+            if role not in {"user", "assistant"}:
+                continue
+            content = str(item.get("content") or "").strip()
+            if not content:
+                continue
+            # Keep the projection bounded without silently changing the most
+            # recent turns. Older long answers are clipped first by this
+            # per-message ceiling and the global ceiling below.
+            content = content[:16_000]
+            label = "用户" if role == "user" else "Agent"
+            section = f"## {label}\n\n{content}"
+            if total_chars + len(section) > 64_000:
+                break
+            sections.append(section)
+            total_chars += len(section)
+        return "\n\n".join(sections)
 
     @staticmethod
     def _frozen_goal_rubric_config(
@@ -7699,6 +7757,7 @@ class DeepAgentsAgentManager:
                 query_id=query_id,
                 run_id=run_record.run_id,
                 current_message=message,
+                current_conversation=self._llm_wiki_conversation_source(session_id),
                 current_attachments=attachments,
                 goal_id=str(run_record.goal_id or ""),
                 goal_revision=run_record.goal_revision,
@@ -7758,7 +7817,11 @@ class DeepAgentsAgentManager:
             # project Spawn/Kernel runner.  The lazy handle preserves that
             # boundary while the control plane itself uses Host Toolchain +
             # kernel sandboxing rather than Docker.
-            managed_cli_service = lazy_managed_cli_service(workspace_path)
+            managed_cli_service = (
+                None
+                if evaluation_builtin_tool_allowlist is not None
+                else lazy_managed_cli_service(workspace_path)
+            )
             agent_middlewares = self._build_middlewares(
                 project_id,
                 rubric_model=rubric_model,
@@ -7783,6 +7846,10 @@ class DeepAgentsAgentManager:
                 workspace_path=workspace_path,
                 session_id=session_id,
                 query_id=query_id,
+                restore_session_skills=(
+                    interaction_mode == "interactive"
+                    and evaluation_builtin_tool_allowlist is None
+                ),
             )
             main_summarization = _build_deepagents_summarization(model, agent_backend)
             if main_summarization is not None:
@@ -7812,9 +7879,10 @@ class DeepAgentsAgentManager:
                 execution_backend=agent_backend,
             )
             trace_collector.runtime_inventory = runtime_inventory
-            analytics_model_prompt, analytics_model_payload = self._analytics_model_context(
-                analytics_model_id,
-                query=run_record.objective,
+            analytics_model_prompt, analytics_model_payload = (
+                self._analytics_model_context(analytics_model_id, query=run_record.objective)
+                if extension_enabled("analytics")
+                else ("", None)
             )
             if analytics_model_payload:
                 runtime_inventory["analytics_model"] = analytics_model_payload
@@ -7836,13 +7904,20 @@ class DeepAgentsAgentManager:
                     ),
                     SubagentProgressMiddleware(),
                     RunScopeMiddleware(),
-                    AnalysisTemplateMiddleware(base_dir=self._definitions_root()),
-                    SemanticAssetsMiddleware(base_dir=self._definitions_root()),
+                    *(
+                        [
+                            AnalysisTemplateMiddleware(base_dir=self._definitions_root()),
+                            SemanticAssetsMiddleware(base_dir=self._definitions_root()),
+                        ]
+                        if extension_enabled("analytics")
+                        else []
+                    ),
                     ExternalFilePermissionMiddleware(backend_mode=backend_mode),
                     WorkspacePathRouterMiddleware(agent_backend),
                     VerificationActivationMiddleware(),
                     VersionedPatchMiddleware(agent_backend, compact_model_surface=True),
                     SkillIntentRouterMiddleware(),
+                    RequiredSkillBoundaryMiddleware(),
                     ToolsetMiddleware(
                         skills_dir=self._skills_runtime_root(),
                         toolsets_by_skill=skill_toolsets,
@@ -8108,6 +8183,7 @@ class DeepAgentsAgentManager:
                 "session_id": session_id,
                 "query_id": query_id,
                 "run_id": run_record.run_id,
+                "run_kind": run_record.run_kind.value,
                 "goal_id": run_record.goal_id or "",
                 "goal_revision": run_record.goal_revision,
                 "user_id": user_id,

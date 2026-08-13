@@ -2,11 +2,19 @@
 
 from __future__ import annotations
 
+from pathlib import PurePosixPath
+
 from .contracts import DatasetValidation, EvalDataset, ValidationIssue
 from .privacy import find_plaintext_secrets
 
 
 def _has_executable_expectation(case: object) -> bool:
+    if case.code is not None:
+        explicit_evaluators = {binding.evaluator_id for binding in case.evaluator_bindings}
+        available_dimensions = set(case.dimensions)
+        return (not explicit_evaluators or "code_verification.v1" in explicit_evaluators) and (
+            not available_dimensions or "task_completion" in available_dimensions
+        )
     expectations = case.expectations
     available_dimensions = set(case.dimensions)
     explicit_evaluators = {binding.evaluator_id for binding in case.evaluator_bindings}
@@ -87,6 +95,90 @@ def validate_dataset(dataset: EvalDataset) -> DatasetValidation:
                 )
             )
         seen_names.add(case.name)
+        if case.code is not None and dataset.default_profile != "coding_agent@1":
+            issues.append(
+                ValidationIssue(
+                    severity="error",
+                    code="coding_profile_required",
+                    message="Code Case 必须使用 coding_agent@1，普通评测不会开放 execute",
+                    case_id=case.case_id,
+                    path="default_profile",
+                )
+            )
+        if case.enabled and dataset.default_profile == "coding_agent@1" and case.code is None:
+            issues.append(
+                ValidationIssue(
+                    severity="error",
+                    code="code_contract_missing",
+                    message="coding_agent@1 中的启用 Case 必须声明 code contract",
+                    case_id=case.case_id,
+                    path="code",
+                )
+            )
+        if case.code is not None:
+            file_maps = [case.code.repository.files, case.code.verification.hidden_files]
+            total_code_bytes = sum(
+                len(content.encode("utf-8")) for file_map in file_maps for content in file_map.values()
+            )
+            if total_code_bytes > 2 * 1024 * 1024:
+                issues.append(
+                    ValidationIssue(
+                        severity="error",
+                        code="code_fixture_too_large",
+                        message="单个 Code Case 的源码与隐藏验证文件合计不能超过 2 MiB",
+                        case_id=case.case_id,
+                        path="code",
+                    )
+                )
+            for file_map_name, file_map in (
+                ("repository.files", case.code.repository.files),
+                ("verification.hidden_files", case.code.verification.hidden_files),
+            ):
+                for raw_path in file_map:
+                    path = PurePosixPath(raw_path.replace("\\", "/"))
+                    if path.is_absolute() or not path.parts or ".." in path.parts or path.parts[0] in {"", ".git"}:
+                        issues.append(
+                            ValidationIssue(
+                                severity="error",
+                                code="unsafe_code_fixture_path",
+                                message=f"Code fixture 路径不安全：{raw_path}",
+                                case_id=case.case_id,
+                                path=f"code.{file_map_name}",
+                            )
+                        )
+            if case.code.repository.kind == "swebench" and case.code.verification.mode != "swebench":
+                issues.append(
+                    ValidationIssue(
+                        severity="error",
+                        code="swebench_verifier_required",
+                        message="SWE-bench Case 必须由官方 SWE-bench Harness 判定",
+                        case_id=case.case_id,
+                        path="code.verification.mode",
+                    )
+                )
+            if case.code.repository.kind == "inline" and case.code.verification.mode != "commands":
+                issues.append(
+                    ValidationIssue(
+                        severity="error",
+                        code="inline_code_verifier_required",
+                        message="Inline Code Case 必须配置隐藏命令验证",
+                        case_id=case.case_id,
+                        path="code.verification.mode",
+                    )
+                )
+            if case.code.verification.mode == "commands":
+                hidden_paths = set(case.code.verification.hidden_files)
+                for command in case.code.verification.commands:
+                    if command.command not in hidden_paths:
+                        issues.append(
+                            ValidationIssue(
+                                severity="error",
+                                code="hidden_verifier_missing",
+                                message=f"隐藏测试入口不存在：{command.command}",
+                                case_id=case.case_id,
+                                path="code.verification.commands",
+                            )
+                        )
         if not case.setup.reproducible:
             issues.append(
                 ValidationIssue(
@@ -107,9 +199,7 @@ def validate_dataset(dataset: EvalDataset) -> DatasetValidation:
                     path="repetitions",
                 )
             )
-        unsupported_turn = next(
-            (turn for turn in case.input.turns if turn.role not in {"user", "assistant"}), None
-        )
+        unsupported_turn = next((turn for turn in case.input.turns if turn.role not in {"user", "assistant"}), None)
         if unsupported_turn is not None:
             issues.append(
                 ValidationIssue(

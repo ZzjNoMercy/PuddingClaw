@@ -1,6 +1,6 @@
 [project]
 name = "puddingclaw-backend"
-version = "0.1.0"
+version = "0.1.2"
 description = "PuddingClaw backend API, agent, and knowledge base services"
 requires-python = ">=3.11,<3.13"
 license = { text = "MIT" }
@@ -22,9 +22,7 @@ dependencies = [
     "python-dotenv>=1.0.0",
     # Database
     "sqlalchemy[asyncio]>=2.0.48",
-    "asyncpg>=0.29.0",
     "aiosqlite>=0.22.0",
-    "pymilvus==2.6.15",
     # LangChain / LangGraph
     "deepagents>=0.6.12",
     "langchain>=1.3.11",
@@ -38,25 +36,7 @@ dependencies = [
     "urllib3>=2.0",
     # LLM provider SDKs
     "openai>=2.28.0",
-    # LlamaIndex (knowledge base & memory indexing)
-    "llama-index-core>=0.14.17",
-    "llama-index-embeddings-openai>=0.6.0",
-    "llama-index-retrievers-bm25>=0.7.0",
-    "rank-bm25>=0.2.2",
-    "jieba>=0.42.1",
-    # Table question answering
-    "pandas>=2.3.0",
-    "pyarrow>=18.0.0",
-    "openpyxl>=3.1.0",
-    "xlrd>=2.0.1",
-    "sqlparse>=0.5.0",
-    "tabulate>=0.9.0",
-    "plotly>=6.0.0",
     # Context engineering / token counting
-    # 注意：transformers 必须保持与 MinerU 兼容（MinerU 目前要求 <5.0.0）
-    "transformers>=4.57.3,<5.0.0",
-    "tokenizers>=0.22.0",
-    "safetensors>=0.7.0",
     "tiktoken>=0.12.0",
     # Document / media processing
     "pillow>=12.0.0",
@@ -76,10 +56,45 @@ dependencies = [
     "cryptography>=49.0.0",
     "filelock>=3.29.0",
     "langchain-experimental>=0.4.1",
-    "sqlglot>=30.0",
 ]
 
 [project.optional-dependencies]
+evaluation = [
+    # Official SWE-bench Docker verifier. Keep this exact and resolved through
+    # uv.lock; evaluation workers never download Python code at run time.
+    "swebench==4.1.0",
+]
+
+knowledge = [
+    "asyncpg>=0.29.0",
+    "pymilvus==2.6.15",
+    "llama-index-core>=0.14.17",
+    "llama-index-embeddings-openai>=0.6.0",
+    "llama-index-retrievers-bm25>=0.7.0",
+    "rank-bm25>=0.2.2",
+    "jieba>=0.42.1",
+    "pandas>=2.3.0",
+    "pyarrow>=18.0.0",
+    "openpyxl>=3.1.0",
+    "xlrd>=2.0.1",
+    "transformers>=4.57.3,<5.0.0",
+    "tokenizers>=0.22.0",
+    "safetensors>=0.7.0",
+]
+
+analytics = [
+    "asyncpg>=0.29.0",
+    "pymilvus==2.6.15",
+    "pandas>=2.3.0",
+    "pyarrow>=18.0.0",
+    "openpyxl>=3.1.0",
+    "xlrd>=2.0.1",
+    "sqlparse>=0.5.0",
+    "tabulate>=0.9.0",
+    "plotly>=6.0.0",
+    "sqlglot>=30.0",
+]
+
 # PDF rich parsing via MinerU (base package, no vllm/lmdeploy GPU backends).
 # Recommended for macOS/CPU. For Linux/Windows GPU acceleration, install
 # `mineru[all]` separately; it currently conflicts with this project's
@@ -118,18 +133,30 @@ build-backend = "hatchling.build"
 only-include = [
     "app.py",
     "capabilities.py",
+    "cli_runtime.py",
     "config.py",
+    "db.py",
+    "gbrain_runtime.py",
+    "headless_session_lifecycle.py",
+    "observability.py",
+    "postgres_dependencies.py",
     "provider_registry.py",
     "higress_config_reader.py",
+    "worker_access.py",
+    "extensions.py",
     "api",
     "analytics",
+    "connectors",
     "evaluation",
     "graph",
+    "harness",
     "knowledge",
     "llm",
     "mcp_clients",
     "prompts",
+    "projects",
     "runtime_identity",
+    "services",
     "skills",
     "tools",
     "utils",

@@ -7,10 +7,39 @@ from typing import List
 
 from langchain_core.tools import BaseTool
 
+from extensions import extension_enabled
+
 # 模块级工具实例缓存：避免动态加载路径每次请求重建工具对象
 # key = (module_name, base_dir)，value = List[BaseTool]
 # 保证 SearchKnowledgeBaseTool._index 等有状态缓存不丢失
 _tool_instance_cache: dict[tuple[str, str], List[BaseTool]] = {}
+
+KNOWLEDGE_TOOL_MODULES = {
+    "llm_wiki_tools",
+    "mineru_tool",
+    "read_later_tool",
+    "search_knowledge_tool",
+}
+ANALYTICS_TOOL_MODULES = {
+    "database_knowledge_tool",
+    "inspect_dimension_build_input_tool",
+    "logical_dataset_tools",
+    "request_dimension_build_rule_tool",
+    "request_logical_dataset_rule_tool",
+    "semantic_dimension_build_tool",
+    "semantic_steward_tool",
+}
+SHARED_DATA_TOOL_MODULES = {"pandas_knowledge_tool"}
+
+
+def _extension_module_enabled(module_name: str) -> bool:
+    if module_name in KNOWLEDGE_TOOL_MODULES:
+        return extension_enabled("knowledge")
+    if module_name in ANALYTICS_TOOL_MODULES:
+        return extension_enabled("analytics")
+    if module_name in SHARED_DATA_TOOL_MODULES:
+        return extension_enabled("knowledge") or extension_enabled("analytics")
+    return True
 
 # 动态工具加载注册表：按意图类别分组，用于按需加载工具子集
 # core 类别始终加载；其他类别根据用户消息意图检测按需激活
@@ -70,6 +99,8 @@ def get_all_tools(base_dir: Path) -> List[BaseTool]:
     for tool_file in tool_files:
         module_name = tool_file.stem
         if module_name in ("__init__", "skills_scanner", "tavily_search_tool"):
+            continue
+        if not _extension_module_enabled(module_name):
             continue
         tools.extend(_load_tool_module(module_name, base_dir))
 

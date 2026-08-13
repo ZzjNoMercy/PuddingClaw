@@ -77,6 +77,27 @@ def test_filesystem_discovery_tool_descriptions_prefer_known_exact_paths():
     assert "Do not use glob to confirm a known path" in glob_description
 
 
+def test_llm_wiki_conversation_source_uses_visible_messages_only(monkeypatch):
+    import graph.deepagents_manager as manager_module
+
+    monkeypatch.setattr(
+        manager_module.session_manager,
+        "load_session",
+        lambda _session_id: [
+            {"role": "user", "content": "介绍浏览器功能"},
+            {"role": "tool", "content": "隐藏的大段工具结果"},
+            {"role": "assistant", "content": "Browser Use 是独立框架。"},
+            {"role": "user", "content": "把刚才这些编译到 Wiki"},
+        ],
+    )
+
+    source = manager_module.DeepAgentsAgentManager._llm_wiki_conversation_source("session-1")
+
+    assert "## 用户\n\n介绍浏览器功能" in source
+    assert "## Agent\n\nBrowser Use 是独立框架。" in source
+    assert "隐藏的大段工具结果" not in source
+
+
 def test_effective_agent_messages_uses_summary_and_preserved_tail():
     from graph.deepagents_manager import _effective_agent_messages
 
@@ -437,6 +458,23 @@ def test_build_middlewares_injects_explicit_managed_cli_control_plane(tmp_path):
 
     pipeline = next(item for item in middlewares if isinstance(item, ToolExecutionPipeline))
     assert pipeline.managed_cli_service is managed_service
+
+
+def test_session_skill_restore_is_opt_in_for_standard_main_agent_only(tmp_path):
+    from graph.deepagents_manager import DeepAgentsAgentManager
+    from graph.middlewares.toolset import ToolsetMiddleware
+
+    manager = DeepAgentsAgentManager()
+    manager.initialize(tmp_path, user_root=tmp_path)
+
+    narrow = manager._build_middlewares(project_id=None)  # noqa: SLF001
+    standard = manager._build_middlewares(  # noqa: SLF001
+        project_id=None,
+        restore_session_skills=True,
+    )
+
+    assert next(item for item in narrow if isinstance(item, ToolsetMiddleware)).restore_session_skills is False
+    assert next(item for item in standard if isinstance(item, ToolsetMiddleware)).restore_session_skills is True
 
 
 def test_completion_gate_loops_before_rubric_grader(tmp_path):
@@ -5458,6 +5496,7 @@ def test_deepagents_manager_uses_backend_execute_instead_of_custom_terminal(tmp_
         session_id="session-1",
         query_id="query-1",
         current_message="# pasted markdown",
+        current_conversation="## 用户\n\n前文\n\n## Agent\n\n结论",
         current_attachments=[{"id": "attachment-1", "name": "source.md"}],
     )
     by_name = {tool.name: tool for tool in tools}
@@ -5483,6 +5522,7 @@ def test_deepagents_manager_uses_backend_execute_instead_of_custom_terminal(tmp_
     assert by_name["llm_wiki_create_raw"].session_id == "session-1"
     assert by_name["llm_wiki_create_raw"].query_id == "query-1"
     assert by_name["llm_wiki_create_raw"].current_message == "# pasted markdown"
+    assert by_name["llm_wiki_create_raw"].current_conversation == "## 用户\n\n前文\n\n## Agent\n\n结论"
     assert by_name["llm_wiki_create_raw"].current_attachments == [{"id": "attachment-1", "name": "source.md"}]
     assert by_name["llm_wiki_start_ingest"].session_id == "session-1"
     assert by_name["llm_wiki_start_ingest"].query_id == "query-1"

@@ -14,9 +14,9 @@ from zoneinfo import ZoneInfo
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from knowledge.semantic_dimension_jobs import get_semantic_dimension_build_job, mark_semantic_dimension_build_published
+from analytics.semantic_authoring.documents import parse_markdown_document, render_markdown_document
 from knowledge.semantic_dimension_crosswalk import ACTIVE_FILE, list_registered_sources, publish_generated_crosswalk
-
+from knowledge.semantic_dimension_jobs import get_semantic_dimension_build_job, mark_semantic_dimension_build_published
 
 DISPLAY_TIMEZONE = ZoneInfo("Asia/Shanghai")
 _DIMENSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
@@ -77,21 +77,25 @@ def _atomic_write(path: Path, content: str) -> None:
 
 
 def _update_dimension_frontmatter(path: Path, *, dimension_id: str, reference_path: str, adapter: str) -> str:
-    content = path.read_text(encoding="utf-8")
-    if not content.startswith("---") or f"id: {dimension_id}" not in content:
-        raise ValueError("目标 dimension.md 无法确认对应当前 Job")
+    if path.parent.name != dimension_id:
+        raise ValueError("目标 dimension.md 与当前 Job 的维度目录不一致")
+    document = parse_markdown_document(path.read_text(encoding="utf-8"))
+    metadata = dict(document.frontmatter)
+    existing_id = str(metadata.get("id") or "").strip()
+    if existing_id and existing_id != dimension_id:
+        raise ValueError("目标 dimension.md 的 id 与当前 Job 不一致")
+    resolution = metadata.get("resolution")
+    if not isinstance(resolution, dict):
+        raise ValueError("目标 dimension.md 缺少结构化 resolution")
+    build_skill = metadata.get("build_skill")
+    if build_skill is not None and not isinstance(build_skill, dict):
+        raise ValueError("目标 dimension.md 的 build_skill 必须是对象")
     beijing_now = datetime.now(DISPLAY_TIMEZONE).strftime("%Y-%m-%d %H:%M:%S")
-    replacements = (
-        (r"(?m)^  reference_path:.*$", f"  reference_path: {reference_path}"),
-        (r"(?m)^  adapter:.*$", f"  adapter: {adapter}"),
-        (r"(?m)^updated_at:.*$", f"updated_at: {beijing_now}"),
-    )
-    for pattern, replacement in replacements:
-        updated, count = re.subn(pattern, replacement, content, count=1)
-        if count != 1:
-            raise ValueError(f"目标 dimension.md 缺少发布字段：{replacement.split(':', 1)[0]}")
-        content = updated
-    return content
+    metadata["id"] = dimension_id
+    metadata["resolution"] = {**resolution, "reference_path": reference_path}
+    metadata["build_skill"] = {**(build_skill or {}), "adapter": adapter}
+    metadata["updated_at"] = beijing_now
+    return render_markdown_document(type(document)(frontmatter=metadata, body=document.body))
 
 
 def _validate_registered_source_modes(base_dir: Path, dimension_id: str, payload: dict[str, Any]) -> None:

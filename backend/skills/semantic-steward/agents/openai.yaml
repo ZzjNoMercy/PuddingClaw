@@ -1,0 +1,4 @@
+interface:
+  display_name: "Semantic Steward"
+  short_description: "通过对话共创并安全发布语义 Markdown 资产"
+  default_prompt: "Use $semantic-steward to help me create or improve a semantic asset through guided dialogue."

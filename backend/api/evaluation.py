@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from pathlib import Path
 from typing import Any, Literal
 
@@ -10,11 +12,16 @@ from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, ConfigDict, Field
 from starlette.concurrency import run_in_threadpool
 
-from evaluation.candidate import CandidateRequest, resolve_candidate
+from evaluation.candidate import CandidateRequest, bind_candidate_capability, resolve_candidate
 from evaluation.contracts import (
+    AgentRunEnvelope,
     EvalCase,
     EvalDataset,
     EvalExperiment,
+    EvaluationDimension,
+    EvaluationOutcome,
+    EvaluationResult,
+    EvidenceReference,
     ExecutionPolicy,
     new_id,
     protocol_json_schemas,
@@ -23,6 +30,7 @@ from evaluation.contracts import (
 from evaluation.dataset_io import export_dataset, import_dataset
 from evaluation.evaluators import evaluator_registry
 from evaluation.langsmith_backend import LangSmithDatasetAdapter, _redact
+from evaluation.official_swebench import probe_official_swebench_runtime
 from evaluation.repository import (
     ConflictError,
     EvaluationRepositoryError,
@@ -32,6 +40,19 @@ from evaluation.repository import (
 )
 from evaluation.runner import EvaluationRunner
 from evaluation.settings import get_evaluation_settings_store
+from evaluation.swebench_adapter import (
+    DEFAULT_DATASET as DEFAULT_SWEBENCH_DATASET,
+)
+from evaluation.swebench_adapter import (
+    fetch_swebench_rows,
+    frozen_swebench_dataset_json,
+    parse_official_swebench_results,
+    parse_swebench_content,
+    prediction_jsonl,
+    swebench_dataset_from_rows,
+    swebench_prediction_manifest,
+    swebench_run_manifest,
+)
 from evaluation.validation import validate_dataset
 from evaluation.worker_manager import evaluation_worker_manager
 
@@ -73,6 +94,20 @@ class ImportRequest(StrictRequest):
     format: Literal["bundle", "jsonl", "csv"]
     content: str
     name: str | None = None
+
+
+class SWEbenchImportRequest(StrictRequest):
+    dataset_name: str = Field(default=DEFAULT_SWEBENCH_DATASET, min_length=1, max_length=200)
+    split: str = Field(default="test", min_length=1, max_length=64)
+    offset: int = Field(default=0, ge=0)
+    limit: int = Field(default=10, ge=1, le=500)
+    name: str | None = Field(default=None, max_length=200)
+    content: str | None = None
+
+
+class SWEbenchResultImportRequest(StrictRequest):
+    content: str = Field(min_length=1)
+    manifest: dict[str, Any]
 
 
 class LangSmithSettingsRequest(StrictRequest):
@@ -148,6 +183,43 @@ async def import_new_dataset(body: ImportRequest) -> dict[str, Any]:
     return _dataset_response(created)
 
 
+@router.post("/datasets/import/swebench", status_code=201)
+async def import_swebench_dataset(body: SWEbenchImportRequest) -> dict[str, Any]:
+    try:
+        rows = (
+            await run_in_threadpool(
+                parse_swebench_content,
+                body.content,
+            )
+            if body.content is not None
+            else await run_in_threadpool(
+                fetch_swebench_rows,
+                dataset_name=body.dataset_name,
+                split=body.split,
+                offset=body.offset,
+                limit=body.limit,
+            )
+        )
+        dataset = await run_in_threadpool(
+            swebench_dataset_from_rows,
+            rows,
+            dataset_name=body.dataset_name,
+            split=body.split,
+            name=body.name,
+        )
+        created = await run_in_threadpool(get_evaluation_repository().create_dataset, dataset)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except EvaluationRepositoryError as exc:
+        _raise_repository_error(exc)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"SWE-bench Dataset import failed: {type(exc).__name__}: {str(exc)[:500]}",
+        ) from exc
+    return _dataset_response(created)
+
+
 @router.get("/datasets/{dataset_id}")
 async def get_dataset(
     dataset_id: str, response: Response, version: int | None = Query(default=None, ge=1)
@@ -163,9 +235,7 @@ async def get_dataset(
 @router.get("/datasets/{dataset_id}/versions")
 async def list_dataset_versions(dataset_id: str) -> dict[str, Any]:
     try:
-        versions = await run_in_threadpool(
-            get_evaluation_repository().list_dataset_versions, dataset_id
-        )
+        versions = await run_in_threadpool(get_evaluation_repository().list_dataset_versions, dataset_id)
     except EvaluationRepositoryError as exc:
         _raise_repository_error(exc)
     return {"items": [_dataset_response(item) for item in versions], "total": len(versions)}
@@ -293,7 +363,28 @@ async def export_dataset_endpoint(
     )
     extension = "json" if format == "bundle" else format
     return PlainTextResponse(
-        content, media_type=media_type, headers={"Content-Disposition": f'attachment; filename="{dataset_id}.{extension}"'}
+        content,
+        media_type=media_type,
+        headers={"Content-Disposition": f'attachment; filename="{dataset_id}.{extension}"'},
+    )
+
+
+@router.get("/datasets/{dataset_id}/export/swebench", response_class=PlainTextResponse)
+async def export_frozen_swebench_dataset(
+    dataset_id: str,
+    version: int | None = Query(default=None, ge=1),
+) -> PlainTextResponse:
+    try:
+        bundle = await run_in_threadpool(get_evaluation_repository().export_bundle, dataset_id, version)
+        content = await run_in_threadpool(frozen_swebench_dataset_json, bundle.dataset)
+    except EvaluationRepositoryError as exc:
+        _raise_repository_error(exc)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return PlainTextResponse(
+        content,
+        media_type="application/json",
+        headers={"Content-Disposition": f'attachment; filename="{dataset_id}-swebench-frozen.json"'},
     )
 
 
@@ -355,16 +446,12 @@ async def test_langsmith_settings() -> dict[str, Any]:
     if not settings.api_key:
         raise HTTPException(status_code=409, detail="LangSmith API Key is not configured")
     try:
-        result = await run_in_threadpool(
-            LangSmithDatasetAdapter(get_evaluation_repository(), settings).test_connection
-        )
+        result = await run_in_threadpool(LangSmithDatasetAdapter(get_evaluation_repository(), settings).test_connection)
         return {**result, "projection_enabled": settings.enabled}
     except Exception as exc:
         raise HTTPException(
             status_code=502,
-            detail=str(
-                _redact(f"LangSmith connection failed: {type(exc).__name__}: {str(exc)[:500]}")
-            ),
+            detail=str(_redact(f"LangSmith connection failed: {type(exc).__name__}: {str(exc)[:500]}")),
         ) from exc
 
 
@@ -382,10 +469,21 @@ async def create_experiment(body: CreateExperimentRequest) -> dict[str, Any]:
         if not bundle.version_id or not bundle.checksum:
             raise ConflictError("Experiment requires an immutable published Dataset version")
         if body.profile_id != bundle.dataset.default_profile:
-            raise ConflictError(
-                "Phase 1 Experiments must use the evaluator profile frozen with the Dataset version"
-            )
+            raise ConflictError("Phase 1 Experiments must use the evaluator profile frozen with the Dataset version")
+        is_swebench = any(
+            case.enabled and case.code is not None and case.code.repository.kind == "swebench"
+            for case in bundle.dataset.cases
+        )
+        if is_swebench:
+            if body.execution.repetitions != 1:
+                raise ConflictError("SWE-bench Phase 1 requires repetitions=1 for unambiguous official scoring")
+            verifier_status = await probe_official_swebench_runtime()
+            if not verifier_status["available"]:
+                raise ConflictError(
+                    "SWE-bench Docker Verifier is unavailable: " + str(verifier_status.get("reason") or "unknown")
+                )
         candidate = await run_in_threadpool(resolve_candidate, BASE_DIR, body.candidate_request)
+        candidate = bind_candidate_capability(candidate, body.profile_id)
         experiment = EvalExperiment(
             name=body.name,
             dataset_id=body.dataset_id,
@@ -425,6 +523,287 @@ async def get_experiment_results(experiment_id: str) -> dict[str, Any]:
     return {"items": items, "total": len(items)}
 
 
+@router.get("/experiments/{experiment_id}/export/swebench", response_class=PlainTextResponse)
+async def export_swebench_predictions(experiment_id: str) -> PlainTextResponse:
+    repository = get_evaluation_repository()
+    try:
+        experiment = await run_in_threadpool(repository.get_experiment, experiment_id)
+        dataset = (
+            await run_in_threadpool(
+                repository.export_bundle,
+                experiment.dataset_id,
+                experiment.dataset_version,
+            )
+        ).dataset
+        envelopes = await run_in_threadpool(repository.load_run_envelopes, experiment_id)
+        content = await run_in_threadpool(
+            prediction_jsonl,
+            dataset,
+            envelopes,
+            model_name_or_path=(experiment.candidate.llm_model_id or experiment.candidate.name),
+        )
+    except EvaluationRepositoryError as exc:
+        _raise_repository_error(exc)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return PlainTextResponse(
+        content,
+        media_type="application/x-ndjson",
+        headers={"Content-Disposition": (f'attachment; filename="{experiment_id}-swebench-predictions.jsonl"')},
+    )
+
+
+@router.get("/experiments/{experiment_id}/swebench/manifest")
+async def get_swebench_run_manifest(experiment_id: str) -> dict[str, Any]:
+    repository = get_evaluation_repository()
+    try:
+        experiment = await run_in_threadpool(repository.get_experiment, experiment_id)
+        dataset = (
+            await run_in_threadpool(repository.export_bundle, experiment.dataset_id, experiment.dataset_version)
+        ).dataset
+        envelopes = await run_in_threadpool(repository.load_run_envelopes, experiment_id)
+        return await run_in_threadpool(
+            swebench_run_manifest,
+            dataset,
+            envelopes,
+            model_name_or_path=(experiment.candidate.llm_model_id or experiment.candidate.name),
+            experiment_id=experiment.experiment_id,
+            dataset_version_id=experiment.dataset_version_id,
+            dataset_content_hash=experiment.dataset_content_hash,
+        )
+    except EvaluationRepositoryError as exc:
+        _raise_repository_error(exc)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+def _recompute_official_summary(
+    dataset: EvalDataset,
+    result_rows: list[dict[str, Any]],
+    previous: dict[str, Any],
+) -> tuple[dict[str, Any], str]:
+    attempts: dict[str, dict[str, Any]] = {}
+    cases = {case.case_id: case for case in dataset.cases}
+    for row in result_rows:
+        attempt = attempts.setdefault(
+            row["attempt_id"],
+            {"case_id": row["case_id"], "status": row["attempt_status"], "results": []},
+        )
+        if row["result"] is not None:
+            attempt["results"].append(EvaluationResult.model_validate(row["result"]))
+    summaries = []
+    for attempt in attempts.values():
+        case = cases[attempt["case_id"]]
+        item = evaluator_registry.summarize(case, attempt["results"])
+        if attempt["status"] != "completed":
+            item["verdict"] = "fail"
+        summaries.append({**item, "status": attempt["status"], "results": attempt["results"]})
+    dimensions: dict[str, dict[str, Any]] = {}
+    for attempt in summaries:
+        for result in attempt["results"]:
+            bucket = dimensions.setdefault(
+                str(result.dimension),
+                {
+                    "sample_count": 0,
+                    "applicable_count": 0,
+                    "pass_count": 0,
+                    "fail_count": 0,
+                    "not_applicable_count": 0,
+                    "not_evaluated_count": 0,
+                    "error_count": 0,
+                    "scores": [],
+                    "evaluator_versions": set(),
+                },
+            )
+            outcome = str(result.outcome)
+            bucket["sample_count"] += 1
+            bucket[f"{outcome}_count"] += 1
+            if outcome in {"pass", "fail"}:
+                bucket["applicable_count"] += 1
+            if result.score is not None:
+                bucket["scores"].append(result.score)
+            bucket["evaluator_versions"].add(f"{result.evaluator_id}@{result.evaluator_version}")
+    dimension_summary: dict[str, Any] = {}
+    for dimension, bucket in dimensions.items():
+        scores = bucket.pop("scores")
+        versions = sorted(bucket.pop("evaluator_versions"))
+        expected = bucket["sample_count"] - bucket["not_applicable_count"]
+        dimension_summary[dimension] = {
+            **bucket,
+            "score": sum(scores) / len(scores) if scores else None,
+            "coverage": bucket["applicable_count"] / expected if expected else None,
+            "evaluator_versions": versions,
+        }
+    failed_attempts = sum(item["status"] != "completed" for item in summaries)
+    summary = {
+        **previous,
+        "case_attempts": len(summaries),
+        "completed_attempts": sum(item["status"] == "completed" for item in summaries),
+        "failed_attempts": failed_attempts,
+        "determinate": sum(item["verdict"] != "indeterminate" for item in summaries),
+        "passed": sum(item["verdict"] == "pass" for item in summaries),
+        "failed": sum(item["verdict"] == "fail" for item in summaries),
+        "critical_failures": sum(bool(item["critical_failure"]) for item in summaries),
+        "indeterminate": sum(item["verdict"] == "indeterminate" for item in summaries),
+        "dimensions": dimension_summary,
+    }
+    summary["applicable_count"] = sum(item["applicable_count"] for item in dimension_summary.values())
+    expected_metrics = sum(
+        item["sample_count"] - item["not_applicable_count"] for item in dimension_summary.values()
+    )
+    summary["coverage"] = summary["applicable_count"] / expected_metrics if expected_metrics else None
+    verdict = (
+        "fail"
+        if summary["failed"] or summary["critical_failures"] or failed_attempts
+        else "indeterminate"
+        if summary["indeterminate"]
+        else "pass"
+    )
+    return summary, verdict
+
+
+@router.post("/experiments/{experiment_id}/results/swebench")
+async def import_official_swebench_results(
+    experiment_id: str,
+    body: SWEbenchResultImportRequest,
+) -> dict[str, Any]:
+    raise HTTPException(
+        status_code=410,
+        detail="Manual SWE-bench report import is retired; the Evaluation Worker now runs the official Docker Harness",
+    )
+
+    # Compatibility code below is intentionally unreachable for one release;
+    # it can be deleted after old clients have migrated to managed verification.
+    repository = get_evaluation_repository()
+    try:
+        experiment = await run_in_threadpool(repository.get_experiment, experiment_id)
+        if experiment.status != "completed":
+            raise ConflictError("Official SWE-bench results require a completed Experiment")
+        dataset = (
+            await run_in_threadpool(
+                repository.export_bundle,
+                experiment.dataset_id,
+                experiment.dataset_version,
+            )
+        ).dataset
+        envelopes = await run_in_threadpool(repository.load_run_envelopes, experiment_id)
+        manifest = swebench_prediction_manifest(
+            dataset,
+            envelopes,
+            model_name_or_path=(experiment.candidate.llm_model_id or experiment.candidate.name),
+        )
+        if manifest["missing_instance_ids"]:
+            raise ConflictError(
+                "Cannot score an incomplete SWE-bench prediction set: "
+                + ", ".join(manifest["missing_instance_ids"][:20])
+            )
+        expected_manifest = swebench_run_manifest(
+            dataset,
+            envelopes,
+            model_name_or_path=(experiment.candidate.llm_model_id or experiment.candidate.name),
+            experiment_id=experiment.experiment_id,
+            dataset_version_id=experiment.dataset_version_id,
+            dataset_content_hash=experiment.dataset_content_hash,
+        )
+        if body.manifest != expected_manifest:
+            raise ValueError("SWE-bench report manifest does not match this frozen Dataset and prediction set")
+        official = parse_official_swebench_results(body.content)
+        expected_ids = {item["instance_id"] for item in manifest["predictions"]}
+        if set(official) != expected_ids:
+            missing = sorted(expected_ids - set(official))
+            unknown = sorted(set(official) - expected_ids)
+            raise ValueError(f"Official report coverage mismatch; missing={missing[:20]}, unknown={unknown[:20]}")
+        report_sha256 = hashlib.sha256(body.content.encode("utf-8")).hexdigest()
+        manifest_sha256 = hashlib.sha256(
+            json.dumps(expected_manifest, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        prior_import = experiment.summary.get("swebench_manual_report")
+        if isinstance(prior_import, dict) and prior_import.get("report_sha256") != report_sha256:
+            raise ConflictError("A different manual SWE-bench report is already attached to this Experiment")
+        resolved_count = 0
+        for prediction in manifest["predictions"]:
+            instance_id = prediction["instance_id"]
+            attempt_id = prediction["attempt_id"]
+            envelope = next(item for item in envelopes[instance_id] if str(item.get("_attempt_id") or "") == attempt_id)
+            checked_run = AgentRunEnvelope.model_validate(
+                {key: value for key, value in envelope.items() if not key.startswith("_")}
+            )
+            official_result = official[instance_id]
+            resolved = bool(official_result["resolved"])
+            resolved_count += int(resolved)
+            verification = dict(checked_run.metadata.get("code_verification") or {})
+            verification.update(
+                {
+                    "status": "not_evaluated",
+                    "passed": None,
+                    "reason": "Manual SWE-bench report attached; provenance is not platform-verified",
+                    "manual_unverified_result": official_result,
+                }
+            )
+            checked_run = checked_run.model_copy(
+                update={
+                    "metadata": {
+                        **checked_run.metadata,
+                        "code_verification": verification,
+                    }
+                }
+            )
+            result = EvaluationResult(
+                evaluator_id="code_verification.v1",
+                evaluator_version="1",
+                dimension=EvaluationDimension.TASK_COMPLETION,
+                outcome=EvaluationOutcome.NOT_EVALUATED,
+                score=None,
+                passed=None,
+                reason=verification["reason"],
+                evidence=[
+                    EvidenceReference(
+                        kind="swebench_manual_unverified_result",
+                        summary=f"instance_id={instance_id}; reported_resolved={resolved}; provenance=manual_unverified",
+                    )
+                ],
+                metadata={
+                    "provenance": "manual_unverified",
+                    "reported_result": official_result,
+                    "report_sha256": report_sha256,
+                    "manifest_sha256": manifest_sha256,
+                },
+            )
+            await run_in_threadpool(repository.update_attempt_run, attempt_id, checked_run)
+            await run_in_threadpool(repository.save_result, experiment_id, attempt_id, result)
+        total = len(manifest["predictions"])
+        summary, verdict = _recompute_official_summary(
+            dataset,
+            await run_in_threadpool(repository.list_results, experiment_id),
+            experiment.summary,
+        )
+        summary.update({
+            "swebench_manual_report": {
+                "status": "manual_unverified",
+                "reported_resolved": resolved_count,
+                "reported_unresolved": total - resolved_count,
+                "total": total,
+                "reported_resolve_rate": resolved_count / total,
+                "source_snapshot_sha256": dataset.metadata.get("source_snapshot_sha256"),
+                "manifest": expected_manifest,
+                "manifest_sha256": manifest_sha256,
+                "report_sha256": report_sha256,
+            },
+        })
+        updated = experiment.model_copy(
+            update={
+                "verdict": verdict,
+                "summary": summary,
+            }
+        )
+        updated = await run_in_threadpool(repository.update_experiment, updated)
+    except EvaluationRepositoryError as exc:
+        _raise_repository_error(exc)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return updated.model_dump(mode="json")
+
+
 @router.post("/experiments/{experiment_id}/cancel")
 async def cancel_experiment(experiment_id: str) -> dict[str, Any]:
     repository = get_evaluation_repository()
@@ -433,9 +812,7 @@ async def cancel_experiment(experiment_id: str) -> dict[str, Any]:
         if experiment.status in {"completed", "failed", "cancelled"}:
             raise ConflictError("Experiment is already terminal")
         updated = experiment.model_copy(update={"status": "cancel_requested"})
-        updated = await run_in_threadpool(
-            repository.update_experiment, updated, expected_status=experiment.status
-        )
+        updated = await run_in_threadpool(repository.update_experiment, updated, expected_status=experiment.status)
     except EvaluationRepositoryError as exc:
         _raise_repository_error(exc)
     terminated = await evaluation_worker_manager.cancel(experiment_id)
@@ -475,9 +852,7 @@ async def retry_experiment_projection(experiment_id: str) -> dict[str, Any]:
     except Exception as exc:
         raise HTTPException(
             status_code=502,
-            detail=str(
-                _redact(f"LangSmith projection failed: {type(exc).__name__}: {str(exc)[:500]}")
-            ),
+            detail=str(_redact(f"LangSmith projection failed: {type(exc).__name__}: {str(exc)[:500]}")),
         ) from exc
     return experiment.model_dump(mode="json")
 

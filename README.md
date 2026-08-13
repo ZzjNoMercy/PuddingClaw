@@ -14,6 +14,8 @@ PuddingClaw 目前主打两条产品主线：
 
 > 当前产品边界：优先服务知识管理和智能问数场景；通用 Agent、Skill、MCP、Goal 和沙箱能力作为底层 Harness 提供支撑。
 
+> **智能问数方向当前首要 P0（2026-08-12）：** 先完成用户与 Agent 对话共创全部语义资产和分析模型的闭环，再推进持久化 IR 与更复杂的自动治理。Agent 必须会基于数据证据逐步引导用户，不把 YAML、Markdown 或底层目录暴露为使用门槛。
+
 ## 为什么是 PuddingClaw
 
 传统 RAG 往往只返回一段答案，传统 ChatBI 又容易让模型直接根据字段名猜 SQL。PuddingClaw 在两者之间增加了一层可维护、可检查、可迁移的资产体系：
@@ -100,6 +102,8 @@ PuddingClaw 目前主打两条产品主线：
 - 后续再评估稳定知识 gbrain 与实时文档 Milvus RAG 的查询路由和结果融合，不在首期实现中提前耦合。
 
 ### 2. AI Native 智能问数
+
+> **P0 近期优先：语义资产与分析模型对话共创。** 用户将能够直接与 Agent 交互创建、修改、合并和废弃度量值、维度、颗粒度、资产关联及分析模型。Agent 先读取真实 Profile 和现有依赖，再逐步引导业务决策，通过临时 IR、持久 ChangeSet、验证、影响分析和显式确认发布到 `$PUDDINGCLAW_HOME/definitions/`；不要求用户手写 Markdown/YAML，也不允许 Agent 通过通用文件写入绕过发布协议。详见 [实施方案](docs/plans/2026-08-12-ai-native-semantic-steward-and-model-authoring.md)。
 
 智能问数工作台把结构化数据组织为五类对象：
 
@@ -466,7 +470,8 @@ npm run build
 - Brain 可移植打包稳定后的 OKF 导入/导出兼容层（低优先级，不改变内部 Schema、wikilink 或 gbrain 规范）；
 - 多用户 / 组织级 RBAC 与完整企业权限后台；
 - 更通用的外部 HTTP / MCP 副作用 receipt 与幂等执行层；
-- 语义资产的更强确定性编译、自动评估与版本治理；
+- **P0：用户与 Agent 对话共创全部语义资产和分析模型，并通过 ChangeSet 完成验证、确认、版本与安全发布；**
+- P0 完成后再推进持久化 IR、单向确定性编译和更自动化的评估治理；
 - 开源发行所需的根目录 License、CONTRIBUTING、SECURITY、CI 与完整脱敏检查。
 
 以上方向仍处于规划或持续演进阶段，不应被理解为当前稳定功能。

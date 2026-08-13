@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+
 from runtime_identity.paths import PuddingClawPaths
 
 from .contracts import ExperimentCandidate
@@ -24,6 +25,27 @@ ISOLATED_WORKSPACE_CORE_TOOLS = (
     "update_todos",
 )
 ISOLATED_CAPABILITY_PROFILE = "isolated_workspace_core@1"
+CODING_WORKSPACE_TOOLS = (*ISOLATED_WORKSPACE_CORE_TOOLS, "execute")
+CODING_CAPABILITY_PROFILE = "isolated_code_workspace@1"
+
+
+def capability_for_profile(profile_id: str) -> tuple[str, tuple[str, ...]]:
+    if profile_id == "coding_agent@1":
+        return CODING_CAPABILITY_PROFILE, CODING_WORKSPACE_TOOLS
+    return ISOLATED_CAPABILITY_PROFILE, ISOLATED_WORKSPACE_CORE_TOOLS
+
+
+def bind_candidate_capability(candidate: ExperimentCandidate, profile_id: str) -> ExperimentCandidate:
+    capability_profile, offered_tools = capability_for_profile(profile_id)
+    snapshots = {
+        **candidate.config,
+        "capability_profile": capability_profile,
+        "offered_tools": list(offered_tools),
+    }
+    fingerprint = hashlib.sha256(json.dumps(snapshots, sort_keys=True, separators=(",", ":")).encode()).hexdigest()[:20]
+    return candidate.model_copy(update={"config": snapshots, "fingerprint": fingerprint})
+
+
 _CANDIDATE_SOURCE_ROOTS = [
     "graph",
     "harness",
@@ -42,8 +64,7 @@ _SECRET_KEY = re.compile(r"(api[_-]?key|token|secret|password|authorization|cook
 def _without_secrets(value: Any) -> Any:
     if isinstance(value, dict):
         return {
-            key: "[REDACTED]" if _SECRET_KEY.search(str(key)) else _without_secrets(item)
-            for key, item in value.items()
+            key: "[REDACTED]" if _SECRET_KEY.search(str(key)) else _without_secrets(item) for key, item in value.items()
         }
     if isinstance(value, list):
         return [_without_secrets(item) for item in value]
@@ -137,9 +158,7 @@ def _skill_hashes(base_dir: Path) -> dict[str, str]:
     bundled = _skill_tree_hash(base_dir / "skills")
     user_root = PuddingClawPaths.from_environment().user_skills()
     user = _skill_tree_hash(user_root)
-    effective = hashlib.sha256(
-        f"bundled:{bundled}\nuser:{user}".encode("utf-8")
-    ).hexdigest()
+    effective = hashlib.sha256(f"bundled:{bundled}\nuser:{user}".encode()).hexdigest()
     return {
         "bundled_skill_hash": bundled,
         "user_skill_hash": user,

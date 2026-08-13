@@ -20,6 +20,24 @@ export interface EvalExpectations {
   expected_state: Record<string, unknown>;
   rubric?: string | null;
 }
+export interface CodeEvaluationSpec {
+  schema_version: "1";
+  repository: {
+    kind: "inline" | "swebench";
+    files: Record<string, string>;
+    swebench?: {
+      dataset_name: string; split: string; instance_id: string; repo: string;
+      base_commit: string; version?: string | null; environment_setup_commit?: string | null;
+      test_patch: string; fail_to_pass: string[]; pass_to_pass: string[];
+    } | null;
+  };
+  verification: {
+    mode: "commands" | "swebench";
+    commands: Array<{ command_id: string; command: string; runner: "python_callable_json"; timeout_seconds: number; expected_exit_code: number }>;
+    hidden_files: Record<string, string>;
+    require_patch: boolean;
+  };
+}
 export interface EvalCase {
   protocol_version: "1.0";
   case_id: string;
@@ -40,6 +58,7 @@ export interface EvalCase {
     reproducible: boolean;
   };
   expectations: EvalExpectations;
+  code?: CodeEvaluationSpec | null;
   evaluator_bindings: unknown[];
   resolved_evaluator_bindings: unknown[];
   criticality: "normal" | "high" | "critical";
@@ -129,8 +148,11 @@ export async function getEvaluationDataset(id: string, signal?: AbortSignal) {
 export async function listEvaluationDatasetVersions(id: string, signal?: AbortSignal) {
   return request<{ items: EvalDataset[]; total: number }>(`/datasets/${encodeURIComponent(id)}/versions`, undefined, signal);
 }
-export async function createEvaluationDataset(body: { name: string; description?: string }) {
+export async function createEvaluationDataset(body: { name: string; description?: string; default_profile?: string; tags?: string[] }) {
   return request<EvalDataset>("/datasets", json(body));
+}
+export async function importSWEbenchDataset(body: { dataset_name?: string; split?: string; offset?: number; limit?: number; name?: string; content?: string }) {
+  return request<EvalDataset>("/datasets/import/swebench", json(body));
 }
 export async function importEvaluationDataset(content: string, format: "bundle" | "jsonl" | "csv", name?: string) {
   return request<EvalDataset>("/datasets/import", json({ content, format, name }));
@@ -166,6 +188,9 @@ export async function syncEvaluationDataset(id: string, version?: number) {
 export function evaluationDatasetExportUrl(id: string, format: "bundle" | "jsonl" | "csv" = "bundle") {
   return `${API_BASE}/datasets/${encodeURIComponent(id)}/export?format=${format}`;
 }
+export function frozenSWEbenchDatasetExportUrl(id: string, version?: number) {
+  return `${API_BASE}/datasets/${encodeURIComponent(id)}/export/swebench${version ? `?version=${version}` : ""}`;
+}
 export async function getLangSmithSettings(signal?: AbortSignal) {
   return request<LangSmithSettings>("/settings/langsmith", undefined, signal);
 }
@@ -189,4 +214,7 @@ export async function retryEvaluationExperiment(id: string) {
 }
 export async function syncEvaluationExperiment(id: string) {
   return request<EvalExperiment>(`/experiments/${encodeURIComponent(id)}/sync/langsmith`, { method: "POST" });
+}
+export function swebenchPredictionExportUrl(id: string) {
+  return `${API_BASE}/experiments/${encodeURIComponent(id)}/export/swebench`;
 }

@@ -140,6 +140,87 @@ class EvalExpectations(ProtocolModel):
     rubric: str | None = None
 
 
+class CodeVerificationCommand(ProtocolModel):
+    command_id: str = Field(min_length=1, max_length=128)
+    command: str = Field(min_length=1, max_length=4_000)
+    runner: Literal["python_callable_json"] = "python_callable_json"
+    timeout_seconds: int = Field(default=120, ge=1, le=900)
+    expected_exit_code: int = Field(default=0, ge=0, le=255)
+
+    @model_validator(mode="after")
+    def reject_infrastructure_exit_codes(self) -> CodeVerificationCommand:
+        if self.expected_exit_code in {124, 125, 126, 127} or self.expected_exit_code >= 128:
+            raise ValueError("expected_exit_code cannot use timeout, runner, or signal exit codes")
+        normalized = self.command.replace("\\", "/")
+        parts = normalized.split("/")
+        if (
+            normalized.startswith("/")
+            or not normalized.endswith(".json")
+            or any(part in {"", ".", ".."} for part in parts)
+            or parts[0] == ".git"
+        ):
+            raise ValueError("python_callable_json command must be one hidden relative .json case path")
+        if self.expected_exit_code != 0:
+            raise ValueError("python_callable_json verification requires expected_exit_code=0")
+        return self
+
+
+class SWEbenchReference(ProtocolModel):
+    dataset_name: str = Field(min_length=1, max_length=200)
+    split: str = Field(default="test", min_length=1, max_length=64)
+    instance_id: str = Field(min_length=1, max_length=200)
+    repo: str = Field(pattern=r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+    base_commit: str = Field(pattern=r"^[0-9a-fA-F]{7,64}$")
+    version: str | None = Field(default=None, max_length=100)
+    environment_setup_commit: str | None = Field(default=None, max_length=64)
+    test_patch: str = Field(default="", max_length=2_000_000)
+    fail_to_pass: list[str] = Field(default_factory=list, max_length=10_000)
+    pass_to_pass: list[str] = Field(default_factory=list, max_length=10_000)
+
+    @model_validator(mode="after")
+    def validate_instance_path_identity(self) -> SWEbenchReference:
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", self.instance_id):
+            raise ValueError("SWE-bench instance_id must be one safe path/container identifier")
+        return self
+
+
+class CodeRepositorySpec(ProtocolModel):
+    kind: Literal["inline", "swebench"] = "inline"
+    files: dict[str, str] = Field(default_factory=dict)
+    swebench: SWEbenchReference | None = None
+
+    @model_validator(mode="after")
+    def validate_repository_shape(self) -> CodeRepositorySpec:
+        if self.kind == "inline" and not self.files:
+            raise ValueError("inline code repository requires at least one file")
+        if self.kind == "swebench" and self.swebench is None:
+            raise ValueError("swebench repository requires a SWE-bench reference")
+        if self.kind == "inline" and self.swebench is not None:
+            raise ValueError("inline code repository cannot include a SWE-bench reference")
+        return self
+
+
+class CodeVerificationSpec(ProtocolModel):
+    mode: Literal["commands", "swebench"] = "commands"
+    commands: list[CodeVerificationCommand] = Field(default_factory=list, max_length=20)
+    hidden_files: dict[str, str] = Field(default_factory=dict)
+    require_patch: bool = True
+
+    @model_validator(mode="after")
+    def validate_verification_shape(self) -> CodeVerificationSpec:
+        if self.mode == "commands" and not self.commands:
+            raise ValueError("command verification requires at least one command")
+        if self.mode == "swebench" and (self.commands or self.hidden_files):
+            raise ValueError("SWE-bench verification is delegated to the official Harness")
+        return self
+
+
+class CodeEvaluationSpec(ProtocolModel):
+    schema_version: Literal["1"] = "1"
+    repository: CodeRepositorySpec
+    verification: CodeVerificationSpec
+
+
 class EvaluatorBinding(ProtocolModel):
     evaluator_id: str
     version: str = "1"
@@ -163,6 +244,7 @@ class EvalCase(ProtocolModel):
     input: EvalInput
     setup: EvalSetup = Field(default_factory=EvalSetup)
     expectations: EvalExpectations = Field(default_factory=EvalExpectations)
+    code: CodeEvaluationSpec | None = None
     evaluator_bindings: list[EvaluatorBinding] = Field(default_factory=list)
     resolved_evaluator_bindings: list[ResolvedEvaluatorBinding] = Field(default_factory=list)
     criticality: Criticality = Criticality.NORMAL
@@ -357,7 +439,7 @@ class EvaluationResult(ProtocolModel):
     evaluator_version: str
     dimension: EvaluationDimension
     outcome: EvaluationOutcome
-    error_type: Literal["agent_error", "evaluator_error", "evidence_missing"] | None = None
+    error_type: Literal["agent_error", "evaluator_error", "evidence_missing", "verifier_error"] | None = None
     score: float | None = Field(default=None, ge=0, le=1)
     passed: bool | None = None
     reason: str

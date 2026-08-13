@@ -180,6 +180,7 @@ from graph.tool_result_adapter import tool_result_adapter
 from graph.llm_input_logger import current_session_id, current_user_id, log_llm_input
 from llm.model_client import ModelClient, ModelClientChatModel
 from tools import get_all_tools
+from tools.toolsets import BUSINESS_TOOLSETS
 
 
 class AgentManager:
@@ -202,17 +203,24 @@ class AgentManager:
         from runtime_identity.paths import PuddingClawPaths
 
         self._user_root = PuddingClawPaths.from_environment().root
-        self._tools = get_all_tools(base_dir)
+        self._tools = [
+            tool
+            for tool in get_all_tools(base_dir)
+            if tool.name not in BUSINESS_TOOLSETS["semantic_steward"]
+        ]
 
         self._llm = ModelClientChatModel(role="agent", streaming=True)
         self._config_sig, model = _agent_model_config_signature()
 
         from graph.middlewares.tool_intent_router import ToolIntentRouterMiddleware
-        _router = ToolIntentRouterMiddleware()
-        _tool_names = {t.name for t in self._tools}
-        _missing = _router.validate_preferred_tools(_tool_names)
-        if _missing:
-            logger.warning("[agent] ToolIntentRouter preferred_tools not in loaded tools: %s", _missing)
+        from extensions import extension_enabled
+
+        if extension_enabled("knowledge") or extension_enabled("analytics"):
+            _router = ToolIntentRouterMiddleware()
+            _tool_names = {t.name for t in self._tools}
+            _missing = _router.validate_preferred_tools(_tool_names)
+            if _missing:
+                logger.warning("[agent] ToolIntentRouter preferred_tools not in loaded tools: %s", _missing)
 
         if sessions_dir is not None:
             session_manager.initialize(sessions_dir=sessions_dir)

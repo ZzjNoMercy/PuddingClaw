@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any
 
 CLI_COMMAND = "puddingclaw"
-CLI_VERSION = "0.2.0"
+CLI_VERSION = "0.1.2"
 MIN_NODE_MAJOR = 20
 INSTALL_POLICIES = frozenset({"auto", "prompt", "never"})
 CommandRunner = Callable[..., subprocess.CompletedProcess[str]]
@@ -37,7 +37,7 @@ def cli_package_dir(base_dir: Path) -> Path:
     configured = str(os.getenv("PUDDINGCLAW_CLI_PACKAGE_DIR") or "").strip()
     if configured:
         return Path(configured).expanduser().resolve()
-    return (base_dir.parent / "packages" / "puddingclaw-cli").resolve()
+    return (base_dir.parent / "packages" / "puddingclaw-deploy-cli").resolve()
 
 
 def _parse_version(value: str) -> tuple[int, ...] | None:
@@ -202,15 +202,15 @@ def _validate_package_dir(package_dir: Path) -> str | None:
         return f"CLI package manifest is unavailable: {manifest_path}"
     if not isinstance(payload, dict):
         return "CLI package manifest is invalid"
-    if payload.get("name") != "@pudding/worker-puddingclaw":
-        return "CLI package name does not match @pudding/worker-puddingclaw"
+    if payload.get("name") != "@puddingai/puddingclaw":
+        return "CLI package name does not match @puddingai/puddingclaw"
     if payload.get("version") != CLI_VERSION:
         return f"CLI package version does not match {CLI_VERSION}"
     package_bin = payload.get("bin")
-    if not isinstance(package_bin, dict) or package_bin.get(CLI_COMMAND) != "dist/cli.js":
+    if not isinstance(package_bin, dict) or package_bin.get(CLI_COMMAND) != "src/cli.js":
         return "CLI package manifest does not expose the expected puddingclaw binary"
-    if not (package_dir / "dist" / "cli.js").is_file():
-        return "CLI package entrypoint dist/cli.js is missing"
+    if not (package_dir / "src" / "cli.js").is_file():
+        return "CLI package entrypoint src/cli.js is missing"
     return None
 
 
@@ -261,7 +261,7 @@ def ensure_cli_runtime(
     if not should_install:
         initial["install_message"] = (
             "CLI not installed; set PUDDINGCLAW_CLI_INSTALL_POLICY=auto or run "
-            "npm install -g ./packages/puddingclaw-cli"
+            "npm install -g ./packages/puddingclaw-deploy-cli"
         )
         _last_status = initial
         return initial

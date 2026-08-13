@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import subprocess
+import ast
+import tomllib
 from pathlib import Path
 
 import cli_runtime
@@ -32,14 +34,14 @@ def test_production_defaults_to_prompt(monkeypatch):
 
 def test_cli_runtime_auto_installs_local_package(monkeypatch, tmp_path: Path):
     monkeypatch.setenv("PUDDINGCLAW_CLI_INSTALL_POLICY", "auto")
-    package_dir = tmp_path / "packages" / "puddingclaw-cli"
-    (package_dir / "dist").mkdir(parents=True)
+    package_dir = tmp_path / "packages" / "puddingclaw-deploy-cli"
+    (package_dir / "src").mkdir(parents=True)
     (package_dir / "package.json").write_text(
-        '{"name":"@pudding/worker-puddingclaw","version":"0.2.0",'
-        '"bin":{"puddingclaw":"dist/cli.js"}}',
+        '{"name":"@puddingai/puddingclaw","version":"0.1.2",'
+        '"bin":{"puddingclaw":"src/cli.js"}}',
         encoding="utf-8",
     )
-    (package_dir / "dist" / "cli.js").write_text("#!/usr/bin/env node\n", encoding="utf-8")
+    (package_dir / "src" / "cli.js").write_text("#!/usr/bin/env node\n", encoding="utf-8")
     monkeypatch.setenv("PUDDINGCLAW_CLI_PACKAGE_DIR", str(package_dir))
     paths = {"node": "/fake/node", "npm": "/fake/npm", "puddingclaw": None}
     monkeypatch.setattr(cli_runtime.shutil, "which", paths.get)
@@ -76,7 +78,7 @@ def test_cli_version_json_is_reported_without_treating_schema_version_as_cli_ver
             return subprocess.CompletedProcess(
                 args,
                 0,
-                stdout='{"schema_version":"1","cli_version":"0.2.0"}',
+                stdout='{"schema_version":"1","cli_version":"0.1.2"}',
                 stderr="",
             )
         raise AssertionError(args)
@@ -84,5 +86,28 @@ def test_cli_version_json_is_reported_without_treating_schema_version_as_cli_ver
     status = cli_runtime.ensure_cli_runtime(tmp_path, runner=runner)
 
     assert status["installed"] is True
-    assert status["version"] == "0.2.0"
+    assert status["version"] == "0.1.2"
     assert status["version_mismatch"] is False
+
+
+def test_wheel_manifest_covers_backend_local_import_closure():
+    backend = Path(__file__).resolve().parent.parent
+    document = tomllib.loads((backend / "pyproject.toml").read_text(encoding="utf-8"))
+    included = {
+        Path(item).stem if str(item).endswith(".py") else str(item).split("/", 1)[0]
+        for item in document["tool"]["hatch"]["build"]["targets"]["wheel"]["only-include"]
+    }
+    local = {path.stem for path in backend.glob("*.py")}
+    local.update(path.name for path in backend.iterdir() if path.is_dir() and (path / "__init__.py").is_file())
+    imported = {"app"}
+    for source in backend.rglob("*.py"):
+        if any(part in {".venv", "tests", "__pycache__"} for part in source.parts):
+            continue
+        tree = ast.parse(source.read_text(encoding="utf-8"), filename=str(source))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imported.update(alias.name.split(".", 1)[0] for alias in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                imported.add(node.module.split(".", 1)[0])
+    missing = (imported & local) - included
+    assert missing == set(), f"Backend wheel only-include is missing local imports: {sorted(missing)}"

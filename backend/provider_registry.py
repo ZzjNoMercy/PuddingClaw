@@ -303,7 +303,7 @@ def _provider_presets() -> list[dict[str, Any]]:
 
 
 def _default_registry() -> dict[str, Any]:
-    return {
+    payload = {
         "version": REGISTRY_VERSION,
         "providers": _provider_presets(),
         "bindings": {
@@ -316,6 +316,53 @@ def _default_registry() -> dict[str, Any]:
             "vanna_embedding": "dashscope:dashscope-compatible:text-embedding-v4:text_embedding",
         },
     }
+    raw = os.getenv("PUDDINGCLAW_INITIAL_PROVIDER", "").strip()
+    if not raw:
+        return payload
+    try:
+        initial = json.loads(raw)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return payload
+    if not isinstance(initial, dict) or initial.get("status") not in {"configured", "needs_action"}:
+        return payload
+    provider_id = f"initial-{_slug(str(initial.get('id') or initial.get('name') or 'provider'))}"
+    provider_name = str(initial.get("name") or provider_id)
+    base_url = str(initial.get("base_url") or "").rstrip("/")
+    model_name = str(initial.get("model") or "").strip()
+    if not base_url or not model_name:
+        return payload
+    endpoint_id = f"{provider_id}-initial"
+    model_id = f"{provider_id}:{endpoint_id}:{model_name}:llm"
+    credential_ref = "env://PUDDINGCLAW_INITIAL_PROVIDER_API_KEY"
+    configured_provider = {
+        "id": provider_id,
+        "name": provider_name,
+        "enabled": True,
+        "website": base_url,
+        "credentials": {DEFAULT_CREDENTIAL_NAME: credential_ref},
+        "endpoints": [{
+            "id": endpoint_id,
+            "protocol": str(initial.get("protocol") or "openai_compatible"),
+            "base_url": base_url,
+            "credential_ref": credential_ref,
+            "capabilities": ["llm"],
+        }],
+        "models": [{
+            "id": model_id,
+            "name": model_name,
+            "endpoint_id": endpoint_id,
+            "capability": "llm",
+            "categories": ["llm"],
+            "temperature": 0.7,
+            "max_tokens": 4096,
+        }],
+    }
+    payload["providers"] = [
+        provider for provider in payload["providers"] if provider.get("id") != provider_id
+    ]
+    payload["providers"].insert(0, configured_provider)
+    payload["bindings"]["agent"] = model_id
+    return payload
 
 
 class ProviderRegistry:

@@ -8,6 +8,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 load_dotenv()
@@ -42,9 +43,12 @@ async def _warm_mcp_discovery(
         import config
         from mcp_clients import load_filtered_mcp_tools
         from mcp_clients.servers import effective_mcp_server_names
+        from extensions import extension_enabled
 
         mcp_config = config.load_config().get("mcp", {})
         enabled_mcp = effective_mcp_server_names(mcp_config.get("enabled", []))
+        if not extension_enabled("knowledge"):
+            enabled_mcp = [name for name in enabled_mcp if name != "gbrain"]
         if not enabled_mcp:
             return
         attempts = max(1, max_attempts)
@@ -84,7 +88,6 @@ async def _warm_mcp_discovery(
                 )
 
 
-@asynccontextmanager
 async def _install_cli_runtime_in_background() -> None:
     """Install the optional CLI after the backend has become ready."""
 
@@ -112,8 +115,6 @@ async def lifespan(app: FastAPI):
     print("🚀 Initializing PuddingClaw backend...")
 
     import capabilities
-    from analytics.nl2sql.result_cleanup import query_result_cleanup_manager
-    from analytics.semantic_assets import get_semantic_asset_registry
     from cli_runtime import detect_cli_runtime
     from db import init_database
     from evaluation.worker_manager import evaluation_worker_manager
@@ -121,9 +122,7 @@ async def lifespan(app: FastAPI):
     from graph.attachment_store import attachment_store
     from graph.deepagents_manager import deepagents_agent_manager
     from graph.session_manager import session_manager
-    from knowledge.import_worker import knowledge_import_worker_manager
-    from knowledge.portal_search import knowledge_catalog_watcher
-    from knowledge.semantic_dimension_worker import semantic_dimension_build_worker_manager
+    from extensions import extension_enabled
     from projects.registry import project_registry
     from runtime_identity.migration import (
         migrate_definitions_and_data,
@@ -184,16 +183,34 @@ async def lifespan(app: FastAPI):
         user_root=user_paths.user_skills(),
         snapshot_path=user_paths.skill_management() / "SKILLS_SNAPSHOT.md",
     )
-    semantic_assets = get_semantic_asset_registry(user_paths.user_definitions()).refresh()
-    print(f"🧭 Semantic assets loaded: {semantic_assets.get('count', 0)}")
+    knowledge_enabled = extension_enabled("knowledge")
+    analytics_enabled = extension_enabled("analytics")
+    headless_worker_enabled = extension_enabled("headless_worker")
+    query_result_cleanup_manager = None
+    knowledge_import_worker_manager = None
+    semantic_dimension_build_worker_manager = None
+    knowledge_catalog_watcher = None
+    if analytics_enabled:
+        from analytics.nl2sql.result_cleanup import query_result_cleanup_manager
+        from analytics.semantic_assets import get_semantic_asset_registry
+
+        semantic_assets = get_semantic_asset_registry(user_paths.user_definitions()).refresh()
+        print(f"🧭 Semantic assets loaded: {semantic_assets.get('count', 0)}")
+    if knowledge_enabled:
+        from knowledge.import_worker import knowledge_import_worker_manager
+        from knowledge.portal_search import knowledge_catalog_watcher
+
+        knowledge_catalog_watcher.start(user_paths.root)
+    if knowledge_enabled or analytics_enabled:
+        from knowledge.semantic_dimension_worker import semantic_dimension_build_worker_manager
     project_registry.initialize(user_paths.root)
     attachment_store.initialize(
         user_paths.root,
     )
-    knowledge_catalog_watcher.start(user_paths.root)
     # SQL Evidence catalog backfill needs the durable Session owner index.
     session_manager.initialize(sessions_dir=user_paths.sessions())
-    worker_access_store.initialize(user_paths.root)
+    if headless_worker_enabled:
+        worker_access_store.initialize(user_paths.root)
     cli_status = detect_cli_runtime(BASE_DIR)
     if not cli_status.get("installed"):
         print(
@@ -206,11 +223,12 @@ async def lifespan(app: FastAPI):
                 _install_cli_runtime_in_background(),
                 name="puddingclaw-cli-runtime-setup",
             )
-    db_ready = await init_database()
+    db_ready = await init_database() if knowledge_enabled or analytics_enabled else False
     if db_ready:
         print("🗄️ Knowledge catalog database ready")
-        query_result_cleanup_manager.start()
-    else:
+        if query_result_cleanup_manager is not None:
+            query_result_cleanup_manager.start()
+    elif knowledge_enabled or analytics_enabled:
         print("⚠️ Knowledge catalog database unavailable; knowledge management API will report degraded status")
     # Confirm database startup before spawning database-backed stdio MCP
     # servers. Keep discovery ahead of capability detection because Milvus can
@@ -218,8 +236,9 @@ async def lifespan(app: FastAPI):
     # warnings. Awaiting discovery here also keeps first-use latency out of the
     # first Agent request whenever warm-up succeeds.
     await _warm_mcp_discovery()
-    caps = await capabilities.detect_capabilities(force=True)
-    print(f"🔌 Capabilities: {caps.to_dict()}")
+    if knowledge_enabled or analytics_enabled:
+        caps = await capabilities.detect_capabilities(force=True)
+        print(f"🔌 Capabilities: {caps.to_dict()}")
     # LEGACY compatibility bootstrap. /api/chat and one deep-research helper
     # still depend on it while they await migration; new flows must not do so.
     try:
@@ -238,8 +257,10 @@ async def lifespan(app: FastAPI):
         # LLM Wiki jobs use the Agent harness without creating a user-visible
         # conversation, so workers may only claim jobs after the harness owner
         # has been initialized.
-        knowledge_import_worker_manager.start(user_paths.root)
-        semantic_dimension_build_worker_manager.start(user_paths.root)
+        if knowledge_import_worker_manager is not None:
+            knowledge_import_worker_manager.start(user_paths.root)
+        if semantic_dimension_build_worker_manager is not None:
+            semantic_dimension_build_worker_manager.start(user_paths.root)
 
     print("✅ PuddingClaw backend ready")
     await evaluation_worker_manager.start_pending()
@@ -251,13 +272,17 @@ async def lifespan(app: FastAPI):
             cli_task.cancel()
             await asyncio.gather(cli_task, return_exceptions=True)
         await evaluation_worker_manager.stop()
-        await query_result_cleanup_manager.stop()
-        await semantic_dimension_build_worker_manager.stop()
-        await knowledge_import_worker_manager.stop()
-        await knowledge_catalog_watcher.stop()
+        if query_result_cleanup_manager is not None:
+            await query_result_cleanup_manager.stop()
+        if semantic_dimension_build_worker_manager is not None:
+            await semantic_dimension_build_worker_manager.stop()
+        if knowledge_import_worker_manager is not None:
+            await knowledge_import_worker_manager.stop()
+        if knowledge_catalog_watcher is not None:
+            await knowledge_catalog_watcher.stop()
 
 
-app = FastAPI(title="PuddingClaw", version="0.1.0", lifespan=lifespan)
+app = FastAPI(title="PuddingClaw", version="0.1.2", lifespan=lifespan)
 
 cors_origins = [
     origin.strip()
@@ -276,29 +301,33 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+@app.middleware("http")
+async def extension_route_boundary(request, call_next):
+    from extensions import disabled_extension_for_api_path, extension_disabled_payload
+
+    disabled = disabled_extension_for_api_path(request.url.path)
+    if disabled:
+        return JSONResponse(
+            status_code=404,
+            content=extension_disabled_payload(disabled),
+        )
+    return await call_next(request)
+
 from api.agent import router as agent_router
-from api.analytics import router as analytics_router
 from api.attachments import router as attachments_router
-from api.brain_schema import router as brain_schema_router
 from api.capabilities import router as capabilities_router
 from api.chat import router as chat_router  # LEGACY: compatibility only; no longer maintained.
 from api.compress import router as compress_router
 from api.config_api import router as config_router
 from api.connectors import router as connectors_router
-from api.database_sql_revisions import router as database_sql_revisions_router
-from api.dimension_build_rules import router as dimension_build_rules_router
 from api.eval_api import router as eval_router
 from api.evaluation import router as evaluation_router
 from api.files import router as files_router
-from api.headless import router as headless_router
-from api.headless import worker_access_router
-from api.knowledge import router as knowledge_router
-from api.llm_wiki import router as llm_wiki_router
-from api.logical_dataset_rules import router as logical_dataset_rules_router
 from api.mcp import router as mcp_router
 from api.permissions import router as permissions_router
 from api.projects import router as projects_router
-from api.read_later import router as read_later_router
+from api.runtime_profile import router as runtime_profile_router
 from api.sessions import router as sessions_router
 from api.skill_plans import router as skill_plans_router
 from api.skill_secret_requests import router as skill_secret_requests_router
@@ -323,28 +352,50 @@ app.include_router(evaluation_router, prefix="/api")
 app.include_router(stats_router, prefix="/api")
 app.include_router(mcp_router, prefix="/api")
 app.include_router(capabilities_router, prefix="/api")
+app.include_router(runtime_profile_router, prefix="/api")
 app.include_router(projects_router, prefix="/api")
 app.include_router(permissions_router, prefix="/api")
 app.include_router(skill_plans_router, prefix="/api")
 app.include_router(skill_secret_requests_router, prefix="/api")
 app.include_router(attachments_router, prefix="/api")
-app.include_router(knowledge_router, prefix="/api")
-app.include_router(analytics_router, prefix="/api")
-app.include_router(dimension_build_rules_router, prefix="/api")
-app.include_router(logical_dataset_rules_router, prefix="/api")
-app.include_router(database_sql_revisions_router, prefix="/api")
 app.include_router(user_input_requests_router, prefix="/api")
 app.include_router(kernel_fallback_requests_router, prefix="/api")
 app.include_router(connectors_router, prefix="/api")
 app.include_router(toolchains_router, prefix="/api")
-app.include_router(brain_schema_router, prefix="/api")
-app.include_router(llm_wiki_router, prefix="/api")
-app.include_router(read_later_router, prefix="/api")
-app.include_router(headless_router, prefix="/api")
-app.include_router(worker_access_router, prefix="/api")
 app.include_router(web_search_config_router, prefix="/api")
+
+from extensions import extension_enabled
+
+if extension_enabled("knowledge"):
+    from api.brain_schema import router as brain_schema_router
+    from api.knowledge import router as knowledge_router
+    from api.llm_wiki import router as llm_wiki_router
+    from api.read_later import router as read_later_router
+
+    app.include_router(knowledge_router, prefix="/api")
+    app.include_router(brain_schema_router, prefix="/api")
+    app.include_router(llm_wiki_router, prefix="/api")
+    app.include_router(read_later_router, prefix="/api")
+
+if extension_enabled("analytics"):
+    from api.analytics import router as analytics_router
+    from api.database_sql_revisions import router as database_sql_revisions_router
+    from api.dimension_build_rules import router as dimension_build_rules_router
+    from api.logical_dataset_rules import router as logical_dataset_rules_router
+
+    app.include_router(analytics_router, prefix="/api")
+    app.include_router(dimension_build_rules_router, prefix="/api")
+    app.include_router(logical_dataset_rules_router, prefix="/api")
+    app.include_router(database_sql_revisions_router, prefix="/api")
+
+if extension_enabled("headless_worker"):
+    from api.headless import router as headless_router
+    from api.headless import worker_access_router
+
+    app.include_router(headless_router, prefix="/api")
+    app.include_router(worker_access_router, prefix="/api")
 
 
 @app.get("/")
 async def root():
-    return {"name": "PuddingClaw", "version": "0.1.0", "status": "running"}
+    return {"name": "PuddingClaw", "version": "0.1.2", "status": "running"}

@@ -11,6 +11,8 @@ from __future__ import annotations
 from collections.abc import Iterable
 from dataclasses import dataclass
 
+from extensions import extension_enabled
+
 # DeepAgents injects the native tools itself.  They are recorded here for a
 # complete, inspectable runtime inventory, but are not created by tools/.
 NATIVE_TOOLSETS: dict[str, frozenset[str]] = {
@@ -118,6 +120,10 @@ BUSINESS_TOOLSETS: dict[str, frozenset[str]] = {
         "enqueue_semantic_dimension_build",
         "get_semantic_dimension_build_job",
         "publish_semantic_dimension_build",
+    }),
+    "semantic_steward": frozenset({
+        "prepare_semantic_markdown",
+        "publish_semantic_markdown",
     }),
     "logical_dataset": frozenset({
         "ensure_attachment_table_asset",
@@ -348,6 +354,13 @@ TOOL_CONTROL_DESCRIPTORS: dict[str, ToolControlDescriptor] = {
     "request_dimension_build_rule": _INTERNAL_MUTATION,
     "enqueue_semantic_dimension_build": _INTERNAL_MUTATION,
     "publish_semantic_dimension_build": _INTERNAL_MUTATION,
+    "prepare_semantic_markdown": _INTERNAL_MUTATION,
+    "publish_semantic_markdown": ToolControlDescriptor(
+        side_effect="managed_definition_write",
+        idempotency="required",
+        approval_scope="call",
+        policy="digest_bound_user_confirmation",
+    ),
     "ensure_attachment_table_asset": _INTERNAL_MUTATION,
     "request_logical_dataset_rule": _INTERNAL_MUTATION,
     "apply_logical_dataset_rule": _INTERNAL_MUTATION,
@@ -376,7 +389,23 @@ def business_tool_names() -> frozenset[str]:
 
 def agent_custom_tool_names() -> frozenset[str]:
     """Return the single-source registration set for PuddingClaw Agent tools."""
-    return business_tool_names() | DEFAULT_CUSTOM_TOOL_NAMES
+    enabled_business = {"skill_management"}
+    if extension_enabled("knowledge"):
+        enabled_business.update({"knowledge_analysis", "llm_wiki", "gbrain_query"})
+    if extension_enabled("analytics"):
+        enabled_business.update(
+            {
+                "database_analysis",
+                "semantic_lookup",
+                "semantic_dimension_build",
+                "semantic_steward",
+                "logical_dataset",
+            }
+        )
+    defaults = DEFAULT_CUSTOM_TOOL_NAMES
+    if not extension_enabled("knowledge"):
+        defaults = defaults - UNCONDITIONAL_EXTENSION_TOOLSETS["read_later_capture"]
+    return tools_for_toolsets(enabled_business) | defaults
 
 
 def validate_toolset_names(toolsets: Iterable[str]) -> list[str]:

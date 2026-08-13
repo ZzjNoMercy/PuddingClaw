@@ -12,15 +12,16 @@ from pathlib import Path
 from typing import Any
 
 from .candidate import (
-    ISOLATED_CAPABILITY_PROFILE,
-    ISOLATED_WORKSPACE_CORE_TOOLS,
+    capability_for_profile,
     verify_candidate_snapshot,
 )
+from .code_eval import prepare_code_repository, verify_code_case
 from .contracts import (
     AgentRunEnvelope,
     EvalCase,
     EvalError,
     EvalExperiment,
+    EvaluationResult,
     ExperimentStatus,
     ToolCallEvidence,
     TraceEvidence,
@@ -35,8 +36,10 @@ from .langsmith_backend import (
     _redact,
     langsmith_client_kwargs,
 )
+from .official_swebench import run_official_swebench_harness
 from .repository import EvaluationRepository
 from .settings import LangSmithSettings
+from .swebench_adapter import swebench_prediction_manifest
 
 
 class EvaluationRunner:
@@ -147,11 +150,17 @@ class EvaluationRunner:
                 raise ValueError(
                     f"Fixture {fixture.fixture_id} is not materialized in the safe evaluation fixture store"
                 )
+        if case.code is not None:
+            prepare_code_repository(workspace, case.code)
         record = project_registry.register(
             str(workspace),
             name=f"Eval {case.name}",
             trusted=True,
         )
+        if case.code is not None:
+            # Code execution is never allowed to inherit the production host-spawn mode.
+            # A missing kernel runner fails closed in DeferredKernelWorkspaceBackend.
+            project_registry.set_execution_mode(record.project_id, "kernel")
         return workspace, record.project_id
 
     async def _run_case(
@@ -187,8 +196,13 @@ class EvaluationRunner:
             or case.data_classification in {"sensitive", "restricted"}
             else "not_started"
         )
+        capability_profile, offered_tools = capability_for_profile(experiment.profile_id)
+        deadline = asyncio.get_running_loop().time() + experiment.execution.timeout_seconds
         try:
-            _, project_id = self._prepare_workspace(runtime_root, case, repetition)
+            async with asyncio.timeout(experiment.execution.timeout_seconds):
+                workspace, project_id = await self._daemon_call(
+                    lambda: self._prepare_workspace(runtime_root, case, repetition)
+                )
             session_manager.create_session(
                 session_id,
                 metadata={
@@ -211,49 +225,38 @@ class EvaluationRunner:
 
                     trace_client = Client(
                         **langsmith_client_kwargs(self.settings),
-                        anonymizer=lambda value: _redact(
-                            value, profile=self.settings.redaction_profile
-                        ),
-                        hide_inputs=lambda value: _redact(
-                            value, profile=self.settings.redaction_profile
-                        ),
-                        hide_outputs=lambda value: _redact(
-                            value, profile=self.settings.redaction_profile
-                        ),
-                        hide_metadata=lambda value: _redact(
-                            value, profile=self.settings.redaction_profile
-                        ),
+                        anonymizer=lambda value: _redact(value, profile=self.settings.redaction_profile),
+                        hide_inputs=lambda value: _redact(value, profile=self.settings.redaction_profile),
+                        hide_outputs=lambda value: _redact(value, profile=self.settings.redaction_profile),
+                        hide_metadata=lambda value: _redact(value, profile=self.settings.redaction_profile),
                         tracing_error_callback=lambda error: trace_errors.append(
                             str(_redact(f"{type(error).__name__}: {str(error)[:500]}"))
                         ),
                     )
                     langsmith_tracer = LangChainTracer(
-                            client=trace_client,
-                            project_name=f"{self.settings.project}-agent-runs",
-                            tags=["puddingclaw-evaluation", case.case_id],
-                            metadata={
-                                "experiment_id": experiment.experiment_id,
-                                "case_id": case.case_id,
-                                "attempt_id": attempt_id,
-                                "eval_run_id": eval_run_id,
-                                "session_id": session_id,
-                                "candidate_id": experiment.candidate.candidate_id,
-                                "candidate_fingerprint": str(experiment.candidate.fingerprint or ""),
-                                "dataset_version_id": experiment.dataset_version_id,
-                            },
-                        )
+                        client=trace_client,
+                        project_name=f"{self.settings.project}-agent-runs",
+                        tags=["puddingclaw-evaluation", case.case_id],
+                        metadata={
+                            "experiment_id": experiment.experiment_id,
+                            "case_id": case.case_id,
+                            "attempt_id": attempt_id,
+                            "eval_run_id": eval_run_id,
+                            "session_id": session_id,
+                            "candidate_id": experiment.candidate.candidate_id,
+                            "candidate_fingerprint": str(experiment.candidate.fingerprint or ""),
+                            "dataset_version_id": experiment.dataset_version_id,
+                        },
+                    )
                     callbacks.append(langsmith_tracer)
                 except Exception as exc:
                     trace_export_status = "failed"
-                    trace_errors.append(
-                        str(_redact(f"{type(exc).__name__}: {str(exc)[:500]}"))
-                    )
+                    trace_errors.append(str(_redact(f"{type(exc).__name__}: {str(exc)[:500]}")))
             actions: list[tuple[str, str]] = []
             if case.input.message:
                 actions.append(("user", case.input.message))
             else:
                 actions.extend((turn.role, turn.content) for turn in case.input.turns)
-            deadline = asyncio.get_running_loop().time() + experiment.execution.timeout_seconds
             for role, message in actions:
                 if role == "assistant":
                     session_manager.save_message(session_id, "assistant", message)
@@ -264,8 +267,7 @@ class EvaluationRunner:
                     message = (
                         "[Evaluation deterministic clock] "
                         f"Current time is {case.setup.clock.isoformat()} ({case.setup.timezone}). "
-                        "Use this value instead of wall-clock time.\n\n"
-                        + message
+                        "Use this value instead of wall-clock time.\n\n" + message
                     )
                 response = ""
                 done_seen = False
@@ -284,10 +286,11 @@ class EvaluationRunner:
                         thinking_level=experiment.candidate.thinking_level,
                         credential_name=experiment.candidate.credential_name,
                         user_id="evaluation_worker",
+                        interaction_mode="auto",
                         callbacks_override=callbacks,
                         evaluation_tool_allowlist=set(experiment.candidate.config.get("tool_allowlist") or []),
                         disable_mcp=True,
-                        evaluation_builtin_tool_allowlist=set(ISOLATED_WORKSPACE_CORE_TOOLS),
+                        evaluation_builtin_tool_allowlist=set(offered_tools),
                     ):
                         payload = self._event_payload(event)
                         if event.get("event") == "tool_start":
@@ -307,9 +310,7 @@ class EvaluationRunner:
                             query_id = str(payload.get("query_id") or query_id or "") or None
                             turn_outcome = str(payload.get("outcome") or "") or None
                         elif event.get("event") == "error":
-                            stream_error = str(
-                                payload.get("message") or payload.get("error") or "Agent stream error"
-                            )
+                            stream_error = str(payload.get("message") or payload.get("error") or "Agent stream error")
                         elif event.get("event") == "done":
                             response = str(payload.get("content") or "")
                             done_seen = True
@@ -337,21 +338,32 @@ class EvaluationRunner:
             remaining_event_calls = list(event_calls)
             for callback_call in callback_evidence.tool_calls:
                 match = next(
-                    (
-                        index
-                        for index, item in enumerate(remaining_event_calls)
-                        if item.name == callback_call.name
-                    ),
+                    (index for index, item in enumerate(remaining_event_calls) if item.name == callback_call.name),
                     None,
                 )
                 if match is not None:
                     remaining_event_calls.pop(match)
             tool_calls.extend(remaining_event_calls)
-            tool_calls = [
-                call.model_copy(update={"sequence": index})
-                for index, call in enumerate(tool_calls)
-            ]
+            tool_calls = [call.model_copy(update={"sequence": index}) for index, call in enumerate(tool_calls)]
             using_sse_tool_fallback = bool(remaining_event_calls)
+            code_verification: dict[str, Any] | None = None
+            if case.code is not None:
+                verification_root = runtime_root / "verification" / case.case_id / f"attempt-{repetition}"
+                verification_root.mkdir(parents=True, exist_ok=True)
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    raise TimeoutError("Case timeout exhausted before code verification")
+                async with asyncio.timeout(remaining):
+                    code_verification = await self._daemon_call(
+                        lambda: verify_code_case(
+                            workspace,
+                            verification_root,
+                            case.code,
+                        )
+                    )
+            run_metadata: dict[str, Any] = {"query_id": query_id} if query_id else {}
+            if code_verification is not None:
+                run_metadata["code_verification"] = code_verification
             run = AgentRunEnvelope(
                 eval_run_id=eval_run_id,
                 case_id=case.case_id,
@@ -367,17 +379,24 @@ class EvaluationRunner:
                 finished_at=utc_now(),
                 timing={"latency_ms": (utc_now() - started).total_seconds() * 1000},
                 trace_refs=trace_refs,
-                metadata={"query_id": query_id} if query_id else {},
+                artifacts=(
+                    [
+                        {
+                            "kind": "code_patch",
+                            "sha256": code_verification.get("patch_sha256"),
+                            "changed_paths": code_verification.get("changed_paths") or [],
+                        }
+                    ]
+                    if code_verification is not None
+                    else []
+                ),
+                metadata=run_metadata,
             )
             evidence = callback_evidence.model_copy(
                 update={
                     "available_kinds": set(callback_evidence.available_kinds)
                     | {"final_output"}
-                    | (
-                        {"tool_name", "tool_order", "tool_status"}
-                        if using_sse_tool_fallback
-                        else set()
-                    ),
+                    | ({"tool_name", "tool_order", "tool_status"} if using_sse_tool_fallback else set()),
                     "tool_calls": tool_calls,
                     "trajectory": [call.name for call in tool_calls],
                     "metadata": {
@@ -386,14 +405,28 @@ class EvaluationRunner:
                         if using_sse_tool_fallback
                         else callback_evidence.metadata.get("capture_complete", True),
                         "tool_sequence_complete": tool_sequence_complete,
-                        "tool_evidence_source": "sse_fallback"
-                        if using_sse_tool_fallback
-                        else "callback",
-                        "offered_tools": list(ISOLATED_WORKSPACE_CORE_TOOLS),
-                        "capability_profile": ISOLATED_CAPABILITY_PROFILE,
+                        "tool_evidence_source": "sse_fallback" if using_sse_tool_fallback else "callback",
+                        "offered_tools": list(offered_tools),
+                        "capability_profile": capability_profile,
                     },
                 }
             )
+            if code_verification is not None:
+                evidence = evidence.model_copy(
+                    update={
+                        "available_kinds": set(evidence.available_kinds) | {"code_patch", "code_verification"},
+                        "artifacts": [
+                            *evidence.artifacts,
+                            {
+                                "kind": "code_patch",
+                                "summary": (
+                                    f"sha256={code_verification.get('patch_sha256')}; "
+                                    f"changed={code_verification.get('changed_paths') or []}"
+                                )[:500],
+                            },
+                        ],
+                    }
+                )
             results = evaluator_registry.run_profile(experiment.profile_id, case, run, evidence)
             for result in results:
                 self.repository.save_result(experiment.experiment_id, attempt_id, result)
@@ -453,8 +486,8 @@ class EvaluationRunner:
                 metadata={
                     "capture_complete": False,
                     "tool_sequence_complete": False,
-                    "offered_tools": list(ISOLATED_WORKSPACE_CORE_TOOLS),
-                    "capability_profile": ISOLATED_CAPABILITY_PROFILE,
+                    "offered_tools": list(offered_tools),
+                    "capability_profile": capability_profile,
                 },
             )
             results = evaluator_registry.run_profile(experiment.profile_id, case, run, evidence)
@@ -551,13 +584,134 @@ class EvaluationRunner:
             await async_results.wait()
         return str(async_results.experiment_id), str(async_results.url)
 
+    async def _run_and_apply_official_swebench(
+        self,
+        experiment: EvalExperiment,
+        dataset: Any,
+        runtime_root: Path,
+        all_attempts: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        envelopes = self.repository.load_run_envelopes(experiment.experiment_id)
+        prediction_manifest = swebench_prediction_manifest(
+            dataset,
+            envelopes,
+            model_name_or_path=(experiment.candidate.llm_model_id or experiment.candidate.name),
+        )
+        if prediction_manifest["missing_instance_ids"]:
+            return {
+                "status": "not_started",
+                "reason": "Agent did not produce a valid patch for every enabled SWE-bench Case",
+                "missing_instance_ids": prediction_manifest["missing_instance_ids"],
+            }
+        latest = self.repository.get_experiment(experiment.experiment_id)
+        self.repository.update_experiment(
+            latest.model_copy(
+                update={
+                    "summary": {
+                        **latest.summary,
+                        "swebench_official_harness": {
+                            "status": "running",
+                            "total": len(prediction_manifest["predictions"]),
+                        },
+                    }
+                }
+            ),
+            expected_status=ExperimentStatus.RUNNING,
+        )
+        official = await run_official_swebench_harness(
+            experiment,
+            dataset,
+            envelopes,
+            runtime_root,
+        )
+        case_by_instance = {
+            case.code.repository.swebench.instance_id: case
+            for case in dataset.cases
+            if case.enabled and case.code is not None and case.code.repository.swebench is not None
+        }
+        attempt_by_instance = {
+            item["instance_id"]: item["attempt_id"] for item in prediction_manifest["predictions"]
+        }
+        code_evaluator = evaluator_registry.get_registered("code_verification.v1")
+        assert code_evaluator is not None
+        for instance_id, instance_result in official["results"].items():
+            attempt_id = attempt_by_instance[instance_id]
+            case = case_by_instance[instance_id]
+            envelope = next(
+                item
+                for item in envelopes[case.case_id]
+                if str(item.get("_attempt_id") or "") == attempt_id
+            )
+            run = AgentRunEnvelope.model_validate(
+                {key: value for key, value in envelope.items() if not key.startswith("_")}
+            )
+            verification = dict(run.metadata.get("code_verification") or {})
+            verification.update(
+                {
+                    "status": instance_result["status"],
+                    "passed": instance_result.get("resolved"),
+                    "reason": instance_result["reason"],
+                    "official_harness": {
+                        "provenance": "platform_managed_official_harness",
+                        "package": official["receipt"].get("package"),
+                        "run_id": official["receipt"].get("run_id"),
+                        "report_sha256": official["receipt"].get("report_sha256"),
+                        "predictions_sha256": official["receipt"].get("predictions_sha256"),
+                        "patch_sha256": official["receipt"].get("patch_sha256", {}).get(instance_id),
+                        "result": instance_result,
+                    },
+                }
+            )
+            run = run.model_copy(
+                update={"metadata": {**run.metadata, "code_verification": verification}}
+            )
+            result = code_evaluator[1](
+                case,
+                run,
+                TraceEvidence(available_kinds={"code_patch", "code_verification"}),
+            )
+            self.repository.update_attempt_run(attempt_id, run)
+            self.repository.save_result(experiment.experiment_id, attempt_id, result)
+            attempt = next(item for item in all_attempts if item["attempt_id"] == attempt_id)
+            attempt["results"] = [
+                result.model_dump(mode="json")
+                if item.get("evaluator_id") == "code_verification.v1"
+                else item
+                for item in attempt["results"]
+            ]
+            typed_results = [EvaluationResult.model_validate(item) for item in attempt["results"]]
+            attempt["summary"] = evaluator_registry.summarize(case, typed_results)
+        receipt = dict(official["receipt"])
+        aggregate = receipt.get("aggregate") or {}
+        return {
+            "status": official["status"],
+            "reason": official["reason"],
+            "package": receipt.get("package"),
+            "provenance": receipt.get("provenance"),
+            "run_id": receipt.get("run_id"),
+            "total": len(official["results"]),
+            "resolved": len(aggregate.get("resolved_ids") or []),
+            "unresolved": len(aggregate.get("unresolved_ids") or []),
+            "errors": sum(item["status"] == "error" for item in official["results"].values()),
+            "resolve_rate": (
+                len(aggregate.get("resolved_ids") or []) / len(official["results"])
+                if official["results"]
+                else None
+            ),
+            "duration_seconds": receipt.get("duration_seconds"),
+            "report_sha256": receipt.get("report_sha256"),
+            "predictions_sha256": receipt.get("predictions_sha256"),
+            "source_snapshot_sha256": receipt.get("source_snapshot_sha256"),
+            "docker_server_version": receipt.get("docker_server_version"),
+            "container_policy": receipt.get("container_policy"),
+            "output_tail": str(receipt.get("output_tail") or "")[-4_000:],
+        }
+
     async def retry_projection(self, experiment_id: str) -> EvalExperiment:
         experiment = self.repository.get_experiment(experiment_id)
         if experiment.status != ExperimentStatus.COMPLETED:
             raise ValueError("Only a completed local Experiment can be projected")
-        outbox = self.repository.claim_outbox(
-            "langsmith", "experiment_projection", experiment_id
-        )
+        outbox = self.repository.claim_outbox("langsmith", "experiment_projection", experiment_id)
         if outbox is None:
             raise ValueError("No pending LangSmith projection is available to claim")
         outbox_id = str(outbox["outbox_id"])
@@ -569,13 +723,9 @@ class EvaluationRunner:
                     attempt["results"] = _redact(attempt.get("results", []))
             if not outputs:
                 raise ValueError("Experiment has no local Attempt results")
-            bundle = self.repository.export_bundle(
-                experiment.dataset_id, experiment.dataset_version
-            )
+            bundle = self.repository.export_bundle(experiment.dataset_id, experiment.dataset_version)
             mapping = LangSmithDatasetAdapter(self.repository, self.settings).sync_dataset(bundle)
-            remote_id, remote_url = await self._project_langsmith(
-                experiment, mapping["remote_name"], outputs
-            )
+            remote_id, remote_url = await self._project_langsmith(experiment, mapping["remote_name"], outputs)
         except Exception as exc:
             self.repository.release_outbox(
                 outbox_id,
@@ -611,9 +761,7 @@ class EvaluationRunner:
             if drifted:
                 raise ValueError(f"Candidate snapshot changed before execution: {', '.join(drifted)}")
             self._initialize_isolated_runtime(runtime_root)
-            dataset_data_classification = str(
-                dataset.metadata.get("data_classification") or "internal"
-            ).lower()
+            dataset_data_classification = str(dataset.metadata.get("data_classification") or "internal").lower()
             if dataset_data_classification not in {
                 "public",
                 "internal",
@@ -650,17 +798,29 @@ class EvaluationRunner:
                     # retain the last public output and keep aggregate locally.
                     outputs[case.case_id].append(result)
 
+            swebench_official_harness: dict[str, Any] | None = None
+            if any(
+                case.enabled and case.code is not None and case.code.repository.kind == "swebench"
+                for case in dataset.cases
+            ):
+                try:
+                    swebench_official_harness = await self._run_and_apply_official_swebench(
+                        experiment,
+                        dataset,
+                        runtime_root,
+                        all_attempts,
+                    )
+                except Exception as exc:
+                    swebench_official_harness = {
+                        "status": "error",
+                        "reason": f"{type(exc).__name__}: {str(exc)[:1_000]}",
+                    }
+
             summary = {
                 "case_attempts": len(all_attempts),
-                "completed_attempts": sum(
-                    item.get("attempt_status") == "completed" for item in all_attempts
-                ),
-                "failed_attempts": sum(
-                    item.get("attempt_status") == "failed" for item in all_attempts
-                ),
-                "cancelled_attempts": sum(
-                    item.get("attempt_status") == "cancelled" for item in all_attempts
-                ),
+                "completed_attempts": sum(item.get("attempt_status") == "completed" for item in all_attempts),
+                "failed_attempts": sum(item.get("attempt_status") == "failed" for item in all_attempts),
+                "cancelled_attempts": sum(item.get("attempt_status") == "cancelled" for item in all_attempts),
                 "determinate": sum(item["summary"].get("verdict") != "indeterminate" for item in all_attempts),
                 "passed": sum(item["summary"].get("verdict") == "pass" for item in all_attempts),
                 "failed": sum(item["summary"].get("verdict") == "fail" for item in all_attempts),
@@ -669,6 +829,21 @@ class EvaluationRunner:
                 "effective_max_concurrency": 1,
                 "requested_max_concurrency": experiment.execution.max_concurrency,
             }
+            if swebench_official_harness is not None:
+                summary["swebench_official_harness"] = swebench_official_harness
+            if any(
+                case.code is not None and case.code.repository.kind == "swebench" and case.enabled
+                for case in dataset.cases
+            ):
+                swebench_manifest = swebench_prediction_manifest(
+                    dataset,
+                    self.repository.load_run_envelopes(experiment_id),
+                    model_name_or_path=(experiment.candidate.llm_model_id or experiment.candidate.name),
+                )
+                summary["swebench_predictions_available"] = (
+                    bool(swebench_manifest["predictions"]) and not swebench_manifest["missing_instance_ids"]
+                )
+                summary["swebench_missing_predictions"] = len(swebench_manifest["missing_instance_ids"])
             if not all_attempts:
                 summary["empty_execution_set"] = True
                 summary["indeterminate"] = 1
@@ -699,9 +874,7 @@ class EvaluationRunner:
                         bucket["applicable_count"] += 1
                     if result.get("score") is not None:
                         bucket["scores"].append(float(result["score"]))
-                    bucket["evaluator_versions"].add(
-                        f"{result.get('evaluator_id')}@{result.get('evaluator_version')}"
-                    )
+                    bucket["evaluator_versions"].add(f"{result.get('evaluator_id')}@{result.get('evaluator_version')}")
             dimensions: dict[str, Any] = {}
             for dimension, bucket in dimension_buckets.items():
                 scores = bucket.pop("scores")
@@ -714,16 +887,9 @@ class EvaluationRunner:
                     "evaluator_versions": versions,
                 }
             summary["dimensions"] = dimensions
-            summary["applicable_count"] = sum(
-                item["applicable_count"] for item in dimensions.values()
-            )
-            expected_metrics = sum(
-                item["sample_count"] - item["not_applicable_count"]
-                for item in dimensions.values()
-            )
-            summary["coverage"] = (
-                summary["applicable_count"] / expected_metrics if expected_metrics else None
-            )
+            summary["applicable_count"] = sum(item["applicable_count"] for item in dimensions.values())
+            expected_metrics = sum(item["sample_count"] - item["not_applicable_count"] for item in dimensions.values())
+            summary["coverage"] = summary["applicable_count"] / expected_metrics if expected_metrics else None
             trace_statuses = [str(item.get("agent_trace_export") or "not_started") for item in all_attempts]
             if not trace_statuses:
                 summary["agent_trace_export"] = "not_started"
@@ -742,24 +908,16 @@ class EvaluationRunner:
                 summary["dataset_projection"] = "disabled"
                 summary["experiment_projection"] = "disabled"
             elif dataset_data_classification in {"sensitive", "restricted"} or any(
-                case.data_classification in {"sensitive", "restricted"}
-                for case in dataset.cases
-                if case.enabled
+                case.data_classification in {"sensitive", "restricted"} for case in dataset.cases if case.enabled
             ):
                 summary["dataset_projection"] = "blocked_by_data_policy"
                 summary["experiment_projection"] = "blocked_by_data_policy"
             else:
                 try:
-                    bundle = self.repository.export_bundle(
-                        experiment.dataset_id, experiment.dataset_version
-                    )
-                    mapping = LangSmithDatasetAdapter(
-                        self.repository, self.settings
-                    ).sync_dataset(bundle)
+                    bundle = self.repository.export_bundle(experiment.dataset_id, experiment.dataset_version)
+                    mapping = LangSmithDatasetAdapter(self.repository, self.settings).sync_dataset(bundle)
                 except Exception as exc:
-                    projection_error = str(
-                        _redact(f"{type(exc).__name__}: {str(exc)[:1000]}")
-                    )
+                    projection_error = str(_redact(f"{type(exc).__name__}: {str(exc)[:1000]}"))
                     self.repository.enqueue_outbox(
                         "langsmith",
                         "experiment_projection",
@@ -779,9 +937,7 @@ class EvaluationRunner:
                             experiment, mapping["remote_name"], outputs
                         )
                     except Exception as exc:
-                        projection_error = str(
-                            _redact(f"{type(exc).__name__}: {str(exc)[:1000]}")
-                        )
+                        projection_error = str(_redact(f"{type(exc).__name__}: {str(exc)[:1000]}"))
                         self.repository.enqueue_outbox(
                             "langsmith",
                             "experiment_projection",
@@ -794,27 +950,20 @@ class EvaluationRunner:
                         summary["experiment_projection"] = "synced"
             summary["langsmith_projection"] = (
                 "pending"
-                if "pending"
-                in {summary["dataset_projection"], summary["experiment_projection"]}
+                if "pending" in {summary["dataset_projection"], summary["experiment_projection"]}
                 else summary["experiment_projection"]
             )
             latest = self.repository.get_experiment(experiment_id)
             if latest.status == ExperimentStatus.CANCEL_REQUESTED:
                 self.repository.cancel_running_attempts(experiment_id, "Experiment cancellation requested")
-                cancelled = latest.model_copy(
-                    update={"status": ExperimentStatus.CANCELLED, "finished_at": utc_now()}
-                )
-                return self.repository.update_experiment(
-                    cancelled, expected_status=ExperimentStatus.CANCEL_REQUESTED
-                )
+                cancelled = latest.model_copy(update={"status": ExperimentStatus.CANCELLED, "finished_at": utc_now()})
+                return self.repository.update_experiment(cancelled, expected_status=ExperimentStatus.CANCEL_REQUESTED)
             completed = latest.model_copy(
                 update={
                     "status": ExperimentStatus.COMPLETED,
                     "verdict": (
                         "fail"
-                        if summary["failed"]
-                        or summary["critical_failures"]
-                        or summary["failed_attempts"]
+                        if summary["failed"] or summary["critical_failures"] or summary["failed_attempts"]
                         else "indeterminate"
                         if summary["indeterminate"]
                         else "pass"
@@ -825,19 +974,13 @@ class EvaluationRunner:
                     "summary": summary,
                 }
             )
-            return self.repository.update_experiment(
-                completed, expected_status=ExperimentStatus.RUNNING
-            )
+            return self.repository.update_experiment(completed, expected_status=ExperimentStatus.RUNNING)
         except Exception as exc:
             latest = self.repository.get_experiment(experiment_id)
             if latest.status in {ExperimentStatus.CANCEL_REQUESTED, ExperimentStatus.CANCELLED}:
                 if latest.status == ExperimentStatus.CANCEL_REQUESTED:
-                    latest = latest.model_copy(
-                        update={"status": ExperimentStatus.CANCELLED, "finished_at": utc_now()}
-                    )
-                    return self.repository.update_experiment(
-                        latest, expected_status=ExperimentStatus.CANCEL_REQUESTED
-                    )
+                    latest = latest.model_copy(update={"status": ExperimentStatus.CANCELLED, "finished_at": utc_now()})
+                    return self.repository.update_experiment(latest, expected_status=ExperimentStatus.CANCEL_REQUESTED)
                 return latest
             failed = latest.model_copy(
                 update={
@@ -850,9 +993,7 @@ class EvaluationRunner:
                     ),
                 }
             )
-            return self.repository.update_experiment(
-                failed, expected_status=ExperimentStatus.RUNNING
-            )
+            return self.repository.update_experiment(failed, expected_status=ExperimentStatus.RUNNING)
         finally:
             if not experiment.execution.preserve_workspaces:
                 shutil.rmtree(runtime_root, ignore_errors=True)

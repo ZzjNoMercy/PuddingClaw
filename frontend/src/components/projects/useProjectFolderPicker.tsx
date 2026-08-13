@@ -147,7 +147,7 @@ export function useProjectFolderPicker({ onPathSelected }: UseProjectFolderPicke
               setPathValue(event.target.value);
               if (error) setError(null);
             }}
-            placeholder="/Users/pet/Code/AI/Agent/PuddingClaw"
+            placeholder="/Users/you/Projects/PuddingClaw"
             className="h-11 w-full rounded-2xl border border-black/[0.08] bg-white/70 px-3.5 text-[13px] text-gray-900 outline-none transition-all placeholder:text-gray-300 focus:border-[#002fa7]/35 focus:bg-white focus:ring-4 focus:ring-[#002fa7]/[0.08]"
           />
         </label>

@@ -592,6 +592,33 @@ class SessionManager:
             return None
         return entry.model_dump(mode="json")
 
+    def list_skill_cache_entries(self, session_id: str) -> list[dict[str, Any]]:
+        """Return the Session's cached Skill instructions in activation order.
+
+        Cache entries are discovery state only.  Callers must still validate
+        the current Skill hash and policy epoch before exposing tools or
+        instructions.
+        """
+
+        from harness.models import SkillCacheEntry
+
+        data = self._read_file(session_id)
+        cache = data.get("skill_cache") if isinstance(data, dict) else None
+        if not isinstance(cache, dict):
+            return []
+        entries: list[SkillCacheEntry] = []
+        for raw in cache.values():
+            if not isinstance(raw, dict):
+                continue
+            try:
+                entries.append(SkillCacheEntry.model_validate(raw))
+            except ValueError:
+                continue
+        return [
+            entry.model_dump(mode="json")
+            for entry in sorted(entries, key=lambda item: (item.created_at, item.skill_id))
+        ]
+
     @_session_write_locked
     def record_skill_cache_entry(
         self,

@@ -69,8 +69,11 @@ class NoInput(BaseModel):
 
 
 class WikiCreateRawInput(BaseModel):
-    source: Literal["current_message", "attachments", "knowledge_file"] = Field(
-        description="Authoritative input to snapshot. The server resolves current message and attachments; do not copy their text into arguments."
+    source: Literal["current_message", "conversation", "attachments", "knowledge_file"] = Field(
+        description=(
+            "Authoritative input to snapshot. Use conversation when the user refers to material already established "
+            "in recent visible chat context; the server resolves it without copying text into arguments."
+        )
     )
     title: str = Field(default="", max_length=200)
     attachment_ids: list[str] = Field(
@@ -265,15 +268,17 @@ class LlmWikiCompileTool(_WikiTool):
 class LlmWikiCreateRawTool(_WikiTool):
     name: str = "llm_wiki_create_raw"
     description: str = (
-        "Create immutable LLM Wiki Raw snapshots from the exact current chat message, current Markdown attachments, "
-        "or one existing /knowledge/ Markdown file. The server reads authoritative bytes; never paste document content "
-        "into tool arguments. After success, pass returned raw_paths to llm_wiki_start_ingest."
+        "Create immutable LLM Wiki Raw snapshots from the exact current chat message, recent user-visible conversation, "
+        "current Markdown attachments, or one existing /knowledge/ Markdown file. Use source=conversation when the user "
+        "says to compile material discussed earlier in this Session. The server reads authoritative bytes; never paste "
+        "document content into tool arguments. After success, pass returned raw_paths to llm_wiki_start_ingest."
     )
     args_schema: type[BaseModel] = WikiCreateRawInput
     risk_level: str = "moderate"
     session_id: str = Field(default="", exclude=True, repr=False)
     query_id: str = Field(default="", exclude=True, repr=False)
     current_message: str = Field(default="", exclude=True, repr=False)
+    current_conversation: str = Field(default="", exclude=True, repr=False)
     current_attachments: list[dict[str, Any]] = Field(default_factory=list, exclude=True, repr=False)
 
     def _run(self, **kwargs: Any) -> str:
@@ -302,6 +307,21 @@ class LlmWikiCreateRawTool(_WikiTool):
                         title=clean_title or "聊天文本",
                         content=content,
                         source_path=f"chat://{self.session_id or 'unknown'}/{asset_id}",
+                    )
+                )
+            elif source == "conversation":
+                content = self.current_conversation
+                if not content.strip():
+                    raise LlmWikiError("当前会话没有可写入 Raw 的可见对话内容")
+                asset_id = self.query_id or hashlib.sha256(content.encode("utf-8")).hexdigest()
+                records.append(
+                    await asyncio.to_thread(
+                        self.service.snapshot_raw,
+                        source_id=f"conversation:{self.session_id or 'unknown'}",
+                        asset_id=asset_id,
+                        title=clean_title or "会话整理材料",
+                        content=content,
+                        source_path=f"conversation://{self.session_id or 'unknown'}/{asset_id}",
                     )
                 )
             elif source == "attachments":

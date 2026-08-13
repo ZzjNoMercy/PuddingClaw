@@ -2,12 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 // @ts-ignore Node's native TypeScript runner requires the source suffix.
-import {
-  datasetActions,
-  estimateCaseRuns,
-  experimentIsTerminal,
-  safeRemoteUrl,
-} from "./evaluationState.ts";
+import { datasetActions, estimateCaseRuns, experimentIsTerminal, safeRemoteUrl } from "./evaluationState.ts";
 
 test("published datasets are immutable but exportable and syncable", () => {
   const actions = datasetActions({

@@ -1717,6 +1717,7 @@ class ToolExecutionPipeline(AgentMiddleware):
         }
     )
     SKILL_COMMIT_TOOLS = frozenset({"install_skill", "update_skill"})
+    SEMANTIC_COMMIT_TOOLS = frozenset({"publish_semantic_markdown"})
 
     def __init__(
         self,
@@ -3829,6 +3830,15 @@ class ToolExecutionPipeline(AgentMiddleware):
                 PolicyDecision.ASK,
                 f"managed_skill_write:{tool_name}",
                 "managed_skill_write",
+            )
+        if tool_name in self.SEMANTIC_COMMIT_TOOLS:
+            return ToolPolicyResult(
+                PolicyDecision.ASK,
+                "digest_bound_semantic_definition_publish",
+                "managed_definition_write",
+                explanation=(
+                    "发布会替换用户语义定义；批准只绑定本次调用中的 plan_id 和 plan_digest。"
+                ),
             )
         if tool_name == "install_packages":
             if self.permission_context.backend_mode not in {"spawn", "kernel", "adaptive", "docker"}:

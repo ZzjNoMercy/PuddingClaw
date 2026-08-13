@@ -308,6 +308,32 @@ def test_main_agent_raw_tool_uses_bound_current_message_without_content_argument
     assert snapshot.read_text(encoding="utf-8") == "# 粘贴内容\n\n请把这段内容整理成 Wiki。\n"
 
 
+def test_main_agent_raw_tool_snapshots_recent_visible_conversation(
+    wiki_env: LlmWikiService,
+) -> None:
+    conversation = (
+        "## 用户\n\nhttps://example.com/browser 文档讲了什么\n\n"
+        "## Agent\n\n这是浏览器工具集的介绍。\n\n"
+        "## 用户\n\n把刚才这些编译到 Wiki。"
+    )
+    tool = LlmWikiCreateRawTool(
+        base_dir=wiki_env.base_dir,
+        session_id="session-conversation",
+        query_id="query-conversation",
+        current_message="继续啊",
+        current_conversation=conversation,
+    )
+
+    payload = json.loads(asyncio.run(tool._arun(source="conversation", title="浏览器材料")))
+
+    assert payload["ok"] is True
+    snapshot = wiki_env.raw_dir / payload["raw_paths"][0]
+    assert snapshot.read_text(encoding="utf-8") == f"{conversation}\n"
+    assert payload["snapshots"][0]["source_path"].startswith(
+        "conversation://session-conversation/query-conversation"
+    )
+
+
 def test_main_agent_ingest_tool_rejects_raw_paths_without_current_intake(
     wiki_env: LlmWikiService,
 ) -> None:

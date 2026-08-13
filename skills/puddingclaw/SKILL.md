@@ -10,7 +10,7 @@ Delegate enterprise-data work to the local `puddingclaw` Node CLI. Keep the CLI 
 ## Host contract
 
 - Executable: `puddingclaw`
-- Distribution: `@pudding/worker-puddingclaw` (Node.js 20+)
+- Distribution: `@puddingai/puddingclaw` (Node.js 20+)
 - Authentication: Worker Access Key in `PUDDINGCLAW_TOKEN`
 - Machine protocol: JSON on stdin and one JSON object on stdout
 
@@ -52,7 +52,7 @@ Never put a Worker Access Key in argv, prompt text, stdout, logs, summaries, or 
 Run:
 
 ```text
-puddingclaw models list --json
+puddingclaw agent models list --json
 ```
 
 When using the Skill-local `.env`, replace `puddingclaw` with `node <skill-dir>/scripts/run.mjs` in this and subsequent command shapes.
@@ -64,7 +64,7 @@ This command is informational. Do not select a model, pass a model identifier, o
 Invoke exactly this command shape:
 
 ```text
-argv:  ["puddingclaw", "run", "--input-json", "-", "--json"]
+argv:  ["puddingclaw", "agent", "run", "--input-json", "-", "--json"]
 stdin: {"message":"..."}
 ```
 
@@ -91,7 +91,7 @@ Headless Sessions expire after the Backend's inactivity TTL, which defaults to 2
 For direct human use, the equivalent continuation flag is:
 
 ```text
-puddingclaw run "继续刚才的分析" --session <session_id> --json
+puddingclaw agent run "继续刚才的分析" --session <session_id> --json
 ```
 
 Machine integrations should continue using stdin JSON rather than constructing a shell command.

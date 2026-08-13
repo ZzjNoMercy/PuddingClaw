@@ -2286,7 +2286,7 @@ export default function SettingsPage() {
                         value={knowledgeRootDir}
                         onChange={(e) => setKnowledgeRootDir(e.target.value)}
                         className="form-input"
-                        placeholder="/Users/pet/Documents/PuddingClawKnowledge（留空使用 backend/knowledge）"
+                        placeholder="/Users/you/Documents/PuddingClawKnowledge（留空使用默认知识库目录）"
                       />
                       <button
                         type="button"

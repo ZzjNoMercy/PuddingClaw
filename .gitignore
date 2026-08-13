@@ -58,9 +58,11 @@ iterm2_workspace.iterm2arrangement
 !/docs/spawn-kernel-execution-architecture.md
 !/docs/puddingclaw-harness-engineering.md
 !/docs/puddingclaw-harness-prompt-guide.md
+!/docs/cli-first-architecture-and-init.md
 !/docs/plans/
 /docs/plans/*
 !/docs/plans/2026-08-11-user-home-sessions-and-skills-migration.md
+!/docs/plans/2026-08-12-ai-native-semantic-steward-and-model-authoring.md
 
 # Logs
 *.log
@@ -69,16 +71,13 @@ iterm2_workspace.iterm2arrangement
 dist/
 build/
 dist-electron/
+packages/puddingclaw-deploy-cli/runtime-bundle/
+packages/puddingclaw-deploy-cli/*.tgz
 *.egg-info/
 *.tsbuildinfo
 
 # Local configuration audit generated during Home migration
 /CONFIG_DEFAULTS_REVIEW.md
-
-# The Worker CLI is installed directly from this repository, so its checked-in
-# dependency-free runtime is part of the package rather than a disposable build.
-!packages/puddingclaw-cli/dist/
-!packages/puddingclaw-cli/dist/**
 
 # Docker volumes (if any)
 volumes/

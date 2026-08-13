@@ -1,0 +1,37 @@
+{
+  "schemaVersion": "1",
+  "id": "puddingclaw",
+  "name": "PuddingClaw",
+  "description": "企业数据分析、NL2SQL、知识查询和指标归因 Worker",
+  "kind": "agent-worker",
+  "protocolVersion": "1",
+  "transport": {
+    "type": "cli",
+    "command": "puddingclaw",
+    "input": "stdin-json",
+    "output": "stdout-json"
+  },
+  "capabilities": ["data.query", "data.analysis", "data.nl2sql", "knowledge.query"],
+  "modelRouting": {
+    "strategy": "backend",
+    "input": "message",
+    "discoveryCommand": ["agent", "models", "list", "--json"],
+    "ambiguityOutcome": "analytics_model_clarification_required"
+  },
+  "commands": {
+    "probe": ["doctor", "--json"],
+    "capabilities": ["agent", "capabilities", "--json"],
+    "models": ["agent", "models", "list", "--json"],
+    "run": ["agent", "run", "--input-json", "-", "--json"],
+    "respond": ["agent", "respond", "<run_id>", "--input-json", "-", "--json"],
+    "cancel": ["agent", "cancel", "<run_id>", "--json"]
+  },
+  "operations": {
+    "run": true,
+    "continue": true,
+    "respond": true,
+    "cancel": true
+  },
+  "interactionKinds": ["permission_request"],
+  "progress": "jsonl"
+}

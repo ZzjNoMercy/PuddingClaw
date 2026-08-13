@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 import api.analytics as analytics_api
 from api.analytics import SemanticDimensionBaselineChangeDecisionRequest
 from knowledge.models import Base, SemanticDimensionBuildJob
+from knowledge.semantic_dimension_crosswalk import get_matching_overview, publish_generated_crosswalk
 from knowledge.semantic_dimension_jobs import (
     claim_next_semantic_dimension_build_job,
     create_semantic_dimension_build_job,
@@ -20,8 +21,7 @@ from knowledge.semantic_dimension_jobs import (
     resolve_semantic_dimension_baseline_change,
     semantic_dimension_job_to_dict,
 )
-from knowledge.semantic_dimension_publisher import publish_semantic_dimension_build
-from knowledge.semantic_dimension_crosswalk import get_matching_overview, publish_generated_crosswalk
+from knowledge.semantic_dimension_publisher import _update_dimension_frontmatter, publish_semantic_dimension_build
 
 
 def _crosswalk(*, include_han: bool = True) -> dict:
@@ -61,6 +61,37 @@ def _write_publishable_dimension(base_dir: Path) -> None:
         "---\n",
         encoding="utf-8",
     )
+
+
+def test_dimension_frontmatter_backfill_preserves_body_and_repairs_publisher_fields(tmp_path) -> None:
+    dimension_dir = tmp_path / "semantic-assets" / "dimensions" / "vehicle_series"
+    dimension_dir.mkdir(parents=True)
+    dimension_md = dimension_dir / "dimension.md"
+    dimension_md.write_text(
+        "---\n"
+        "formatter: semantic-asset\n"
+        "name: 车系\n"
+        "type: dimension\n"
+        "resolution_mode: entity_lookup\n"
+        "resolution:\n"
+        "  mode: entity_lookup\n"
+        "  reference_path: references/old.json\n"
+        "---\n\n"
+        "# 车系\n\n这是业务人员审核的正文。\n",
+        encoding="utf-8",
+    )
+
+    updated = _update_dimension_frontmatter(
+        dimension_md,
+        dimension_id="vehicle_series",
+        reference_path="references/active_crosswalk.json",
+        adapter="entity_crosswalk_v1",
+    )
+
+    assert "id: vehicle_series" in updated
+    assert "reference_path: references/active_crosswalk.json" in updated
+    assert "adapter: entity_crosswalk_v1" in updated
+    assert "# 车系\n\n这是业务人员审核的正文。" in updated
 
 
 def test_semantic_dimension_build_job_is_deduplicated_and_never_auto_published(tmp_path) -> None:

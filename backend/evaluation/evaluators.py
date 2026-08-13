@@ -43,9 +43,7 @@ def evaluator_code_hash(spec: EvaluatorSpec, evaluator: EvaluatorFn) -> str:
         "implementation": implementation,
         "artifact": _evaluator_artifact_source(),
     }
-    return hashlib.sha256(
-        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    ).hexdigest()
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
 
 
 def _result(
@@ -121,6 +119,73 @@ def task_completion(case: EvalCase, run: AgentRunEnvelope, evidence: TraceEviden
     )
 
 
+def code_verification(case: EvalCase, run: AgentRunEnvelope, evidence: TraceEvidence) -> EvaluationResult:
+    del evidence
+    metric = "code_verification.v1"
+    if failed := _agent_error(metric, EvaluationDimension.TASK_COMPLETION, run):
+        return failed
+    if case.code is None:
+        return _result(
+            metric,
+            EvaluationDimension.TASK_COMPLETION,
+            EvaluationOutcome.NOT_APPLICABLE,
+            "No code verification contract",
+        )
+    verification = run.metadata.get("code_verification")
+    if not isinstance(verification, dict):
+        return _result(
+            metric,
+            EvaluationDimension.TASK_COMPLETION,
+            EvaluationOutcome.ERROR,
+            "Code verifier evidence is missing",
+            error_type="evidence_missing",
+        )
+    status = str(verification.get("status") or "error")
+    reason = str(verification.get("reason") or "Code verifier returned no reason")
+    artifact = EvidenceReference(
+        kind="code_patch",
+        summary=(
+            f"sha256={verification.get('patch_sha256')}; "
+            f"changed={verification.get('changed_paths') or []}; "
+            f"commands={len(verification.get('commands') or [])}"
+        )[:500],
+    )
+    if status == "passed":
+        return _result(
+            metric,
+            EvaluationDimension.TASK_COMPLETION,
+            EvaluationOutcome.PASS,
+            reason,
+            score=1.0,
+            evidence=[artifact],
+        )
+    if status == "failed":
+        return _result(
+            metric,
+            EvaluationDimension.TASK_COMPLETION,
+            EvaluationOutcome.FAIL,
+            reason,
+            score=0.0,
+            evidence=[artifact],
+        )
+    if status == "not_evaluated":
+        return _result(
+            metric,
+            EvaluationDimension.TASK_COMPLETION,
+            EvaluationOutcome.NOT_EVALUATED,
+            reason,
+            evidence=[artifact],
+        )
+    return _result(
+        metric,
+        EvaluationDimension.TASK_COMPLETION,
+        EvaluationOutcome.ERROR,
+        reason,
+        evidence=[artifact],
+        error_type="verifier_error",
+    )
+
+
 def tool_use(case: EvalCase, run: AgentRunEnvelope, evidence: TraceEvidence) -> EvaluationResult:
     metric = "tool_use.v1"
     if failed := _agent_error(metric, EvaluationDimension.TOOL_USE, run):
@@ -151,8 +216,11 @@ def tool_use(case: EvalCase, run: AgentRunEnvelope, evidence: TraceEvidence) -> 
     violations = sorted(set(exp.forbidden_tools) & observed)
     over_limit = exp.max_tool_calls is not None and len(names) > exp.max_tool_calls
     missing_required = sorted(set(exp.required_tools) - observed)
-    if not sequence_complete and not violations and not over_limit and (
-        missing_required or exp.forbidden_tools or exp.max_tool_calls is not None
+    if (
+        not sequence_complete
+        and not violations
+        and not over_limit
+        and (missing_required or exp.forbidden_tools or exp.max_tool_calls is not None)
     ):
         return _result(
             metric,
@@ -405,11 +473,36 @@ GENERAL_PROFILE = EvaluationProfile(
     dimension_weights={dimension: 1 / 7 for dimension in EvaluationDimension},
 )
 
+CODE_EVALUATOR = (
+    EvaluatorSpec(
+        evaluator_id="code_verification.v1",
+        version="1",
+        dimension=EvaluationDimension.TASK_COMPLETION,
+        description="Sandboxed hidden-test or official SWE-bench patch verification",
+        requires=["code_patch", "code_verification"],
+    ),
+    code_verification,
+)
+
+CODING_PROFILE = EvaluationProfile(
+    profile_id="coding_agent@1",
+    version="1",
+    name="Coding Agent 隔离评估",
+    evaluator_ids=[
+        "code_verification.v1",
+        *[spec.evaluator_id for spec, _ in GENERAL_EVALUATORS if spec.evaluator_id != "task_completion.v1"],
+    ],
+    dimension_weights={dimension: 1 / 7 for dimension in EvaluationDimension},
+)
+
 
 class EvaluatorRegistry:
     def __init__(self) -> None:
-        self._evaluators = {spec.evaluator_id: (spec, fn) for spec, fn in GENERAL_EVALUATORS}
-        self._profiles = {GENERAL_PROFILE.profile_id: GENERAL_PROFILE}
+        self._evaluators = {spec.evaluator_id: (spec, fn) for spec, fn in [*GENERAL_EVALUATORS, CODE_EVALUATOR]}
+        self._profiles = {
+            GENERAL_PROFILE.profile_id: GENERAL_PROFILE,
+            CODING_PROFILE.profile_id: CODING_PROFILE,
+        }
 
     def list_specs(self) -> list[EvaluatorSpec]:
         return [item[0] for item in self._evaluators.values()]
@@ -436,9 +529,7 @@ class EvaluatorRegistry:
                 spec = registered[0]
                 code_hash = evaluator_code_hash(spec, registered[1])
                 if str(spec.version) != str(binding.version) or code_hash != binding.code_hash:
-                    raise RuntimeError(
-                        f"Resolved evaluator drifted: {binding.evaluator_id}@{binding.version}"
-                    )
+                    raise RuntimeError(f"Resolved evaluator drifted: {binding.evaluator_id}@{binding.version}")
         results = []
         for evaluator_id in evaluator_ids:
             spec, evaluator = self._evaluators[evaluator_id]
@@ -479,10 +570,7 @@ class EvaluatorRegistry:
             if critical_failed or any(result.outcome == EvaluationOutcome.FAIL for result in results)
             else "indeterminate"
             if not scored
-            or any(
-                result.outcome in {EvaluationOutcome.ERROR, EvaluationOutcome.NOT_EVALUATED}
-                for result in results
-            )
+            or any(result.outcome in {EvaluationOutcome.ERROR, EvaluationOutcome.NOT_EVALUATED} for result in results)
             else "pass",
         }
 

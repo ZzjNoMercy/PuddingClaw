@@ -4,14 +4,16 @@ from types import SimpleNamespace
 
 import pytest
 from fastapi import HTTPException
+from langchain.agents.middleware.types import ModelRequest
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langgraph.types import Interrupt
 from pydantic import ValidationError
 
 from graph.deepagents_manager import DeepAgentsAgentManager
 from graph.middlewares.user_input_boundary import UserInputBoundaryMiddleware
 from graph.session_manager import SessionManager
-from graph.user_input_resume import UserInputResumeRegistry
 from graph.trace_collector import TraceCollector
+from graph.user_input_resume import UserInputResumeRegistry
 from harness.coordinators import HarnessRunCoordinator
 from harness.models import RunStatus
 from tools.request_user_input_tool import RequestUserInputArgs
@@ -195,6 +197,46 @@ def test_user_input_boundary_rejects_every_sibling_tool_call():
         rejection = UserInputBoundaryMiddleware._rejection(request)
         assert rejection is not None
         assert rejection.status == "error"
+
+
+def test_explicit_wiki_ingest_removes_redundant_confirmation_tool():
+    middleware = UserInputBoundaryMiddleware()
+    request = ModelRequest(
+        model=None,
+        messages=[
+            HumanMessage(content="介绍 Hermes Agent 的浏览器能力"),
+            AIMessage(content="这是 Browser Use 等服务的统一封装。"),
+            HumanMessage(content="把刚才这些编译到 Wiki"),
+        ],
+        system_message=SystemMessage(content="base"),
+        tools=[{"name": "request_user_input"}, {"name": "llm_wiki_create_raw"}],
+        state={},
+        runtime=SimpleNamespace(context={}),
+    )
+
+    prepared = middleware._without_redundant_wiki_confirmation(request)
+
+    assert [item["name"] for item in prepared.tools] == ["llm_wiki_create_raw"]
+
+
+def test_wiki_ingest_continuation_inherits_explicit_authority():
+    messages = [
+        HumanMessage(content="把 Hermes Agent 和 Browser Use 编译到 Wiki"),
+        AIMessage(content="我先加载编译能力。"),
+        HumanMessage(content="继续啊"),
+    ]
+    assert UserInputBoundaryMiddleware._explicit_wiki_ingest(messages) is True
+
+    request = SimpleNamespace(
+        tool_call={"id": "ask-again", "name": "request_user_input", "args": {}},
+        state={"messages": messages},
+    )
+    rejection = UserInputBoundaryMiddleware._rejection(request)
+    assert rejection is not None
+    assert rejection.status == "error"
+    assert rejection.additional_kwargs["puddingclaw_control_plane"]["type"] == (
+        "redundant_llm_wiki_confirmation_blocked"
+    )
 
 
 def test_unknown_hitl_interrupt_fails_closed():

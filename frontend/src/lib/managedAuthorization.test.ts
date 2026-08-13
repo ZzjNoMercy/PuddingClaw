@@ -1,11 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-// @ts-expect-error Node's native TypeScript runner requires the source suffix.
-import {
-  managedAuthorizationFromToolCall,
-  managedAuthorizationRequests,
-  splitTimelineAtManagedAuthorizations,
-} from "./managedAuthorization.ts";
+// @ts-ignore Node's native TypeScript runner requires the source suffix.
+import { managedAuthorizationFromToolCall, managedAuthorizationRequests, splitTimelineAtManagedAuthorizations } from "./managedAuthorization.ts";
 
 function toolCall(output: unknown) {
   return {

@@ -14,15 +14,16 @@ from graph.prompt_cache import append_control_message
 from graph.session_manager import session_manager
 from harness.models import RunTaskProfile
 
-
 _MARKER = "[系统 Skill 提示]"
 
 
 class SkillIntentRouterMiddleware(AgentMiddleware):
-    """Suggest project Skills and gate sibling tools during explicit activation.
+    """Suggest project Skills without deciding the Agent capability surface.
 
-    The middleware intentionally does not activate a Toolset. A successful
-    ``read_file(/skills/<id>/SKILL.md)`` is the only activation signal.
+    The router is advisory. It can normalize explicit invocation tokens and
+    recommend authoritative SKILL.md files, but it neither activates Skills
+    nor blocks sibling tools. Capability restoration belongs to Toolset and
+    concrete authorization remains in the per-call Tool Gate.
     """
 
     def _routing_decision(
@@ -273,10 +274,10 @@ class SkillIntentRouterMiddleware(AgentMiddleware):
             else ""
         )
         load_notice = (
-            "本轮任务已由统一路由器匹配到尚未加载的项目 Skill。"
+            "Task Router 建议当前任务考虑以下尚未加载的项目 Skill。"
             + (
                 "这些 Skill 是用户显式指定或当前文件类型强制要求的；"
-                "在 Skill 激活前，本轮只能使用 read_file 读取对应 SKILL.md，不得并行调用其他工具。"
+                "请优先读取权威 SKILL.md；该建议不决定工具可用性，也不替代每次调用的 Tool Gate。"
                 if decision["explicit_skill_ids"] or decision["required_skill_ids"]
                 else ""
             )
@@ -309,7 +310,7 @@ class SkillIntentRouterMiddleware(AgentMiddleware):
 
     def wrap_model_call(self, request: ModelRequest, handler: Any) -> ModelResponse:
         prepared = self._request_with_routing_prompt(request)
-        return self._response_with_activation_barrier(request, handler(prepared))
+        return handler(prepared)
 
     async def awrap_model_call(
         self,
@@ -317,7 +318,40 @@ class SkillIntentRouterMiddleware(AgentMiddleware):
         handler: Callable[[ModelRequest], Awaitable[ModelResponse]],
     ) -> ModelResponse:
         prepared = self._request_with_routing_prompt(request)
-        return self._response_with_activation_barrier(request, await handler(prepared))
+        return await handler(prepared)
+
+    def wrap_tool_call(self, request: ToolCallRequest, handler: Any) -> Any:
+        return handler(request)
+
+    async def awrap_tool_call(
+        self,
+        request: ToolCallRequest,
+        handler: Callable[[ToolCallRequest], Awaitable[Any]],
+    ) -> Any:
+        return await handler(request)
+
+
+class RequiredSkillBoundaryMiddleware(SkillIntentRouterMiddleware):
+    """Keep deterministic file-protocol safety separate from routing advice."""
+
+    def _pending_barrier_skill_ids(self, request: Any) -> list[str]:
+        decision = self._routing_decision(self._profile_payload(request))
+        active_skill_ids = {str(item) for item in request.state.get("active_skill_ids") or []}
+        return [
+            skill_id
+            for skill_id in decision["required_skill_ids"]
+            if skill_id not in active_skill_ids
+        ]
+
+    def wrap_model_call(self, request: ModelRequest, handler: Any) -> ModelResponse:
+        return self._response_with_activation_barrier(request, handler(request))
+
+    async def awrap_model_call(
+        self,
+        request: ModelRequest,
+        handler: Callable[[ModelRequest], Awaitable[ModelResponse]],
+    ) -> ModelResponse:
+        return self._response_with_activation_barrier(request, await handler(request))
 
     def wrap_tool_call(self, request: ToolCallRequest, handler: Any) -> Any:
         blocked = self._activation_barrier_message(request)

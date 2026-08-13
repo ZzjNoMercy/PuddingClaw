@@ -6,7 +6,10 @@ import pytest
 from langchain.agents.middleware.types import ModelRequest, ModelResponse, ToolCallRequest
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
-from graph.middlewares.skill_intent_router import SkillIntentRouterMiddleware
+from graph.middlewares.skill_intent_router import (
+    RequiredSkillBoundaryMiddleware,
+    SkillIntentRouterMiddleware,
+)
 from graph.middlewares.toolset import (
     ToolsetMiddleware,
     discover_skill_catalog,
@@ -69,10 +72,11 @@ def _cache_test_skill(
     session_id: str,
     run_id: str,
     policy_epoch: int = 1,
+    skill_id: str = "database-analysis",
+    created_at: float | None = None,
 ) -> SkillCacheEntry:
     from graph.session_manager import session_manager
 
-    skill_id = "database-analysis"
     digest = middleware._skill_digest(skill_id)
     content = middleware._skill_content(skill_id)
     assert digest is not None and content is not None
@@ -83,6 +87,7 @@ def _cache_test_skill(
         toolsets=["database_analysis"],
         policy_epoch=policy_epoch,
         source_run_id=run_id,
+        **({"created_at": created_at} if created_at is not None else {}),
     )
     session_manager.record_skill_cache_entry(
         session_id,
@@ -95,6 +100,7 @@ def test_project_skill_frontmatter_declares_known_toolsets() -> None:
     skills = discover_skill_toolsets(Path(__file__).resolve().parents[1] / "skills")
 
     assert skills["build-semantic-dimension"] == {"semantic_dimension_build", "semantic_lookup"}
+    assert skills["semantic-steward"] == {"database_analysis", "semantic_lookup", "semantic_steward"}
     assert skills["build-logical-dataset"] == {"logical_dataset"}
     assert skills["database-analysis"] == {"database_analysis", "semantic_lookup"}
     assert skills["skill-management"] == {"skill_management"}
@@ -202,6 +208,10 @@ def test_every_registered_tool_declares_a_control_descriptor() -> None:
     assert TOOL_CONTROL_DESCRIPTORS["task"].policy == "inherit_parent"
     assert TOOL_CONTROL_DESCRIPTORS["update_memory"].side_effect == "internal_mutation"
     assert TOOL_CONTROL_DESCRIPTORS["commit_external_artifact"].side_effect == "external_mutation"
+    semantic_publish = TOOL_CONTROL_DESCRIPTORS["publish_semantic_markdown"]
+    assert semantic_publish.approval_scope == "call"
+    assert semantic_publish.policy == "digest_bound_user_confirmation"
+    assert "publish_semantic_markdown" in ToolExecutionPipeline.SEMANTIC_COMMIT_TOOLS
 
 
 def test_toolset_activates_only_after_successfully_reading_skill_file(tmp_path) -> None:
@@ -1136,6 +1146,327 @@ def test_hash_bound_session_cache_stays_inactive_without_a_skill_hit(
     assert "database_sql_generate" not in middleware._allowed_tool_names(update)
 
 
+def test_standard_conversation_restores_session_tools_but_only_injects_stub(
+    tmp_path,
+) -> None:
+    from graph.session_manager import session_manager
+
+    skills = tmp_path / "skills"
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    _install_test_skill(skills, "database-analysis", {"database_analysis"})
+    middleware = ToolsetMiddleware(
+        skills_dir=skills,
+        toolsets_by_skill={"database-analysis": {"database_analysis"}},
+        restore_session_skills=True,
+    )
+    session_manager.initialize(state_dir)
+    session_manager.create_session("session-cache-standard")
+    run = RunRecord(
+        run_id="run-cache-standard",
+        query_id="query-cache-standard",
+        session_id="session-cache-standard",
+        objective="现在解释一段普通 Python 代码",
+        task_profile=RunTaskProfile(),
+    )
+    session_manager.start_harness_run(run.session_id, run.model_dump(mode="json"))
+    _cache_test_skill(middleware, session_id=run.session_id, run_id="run-previous")
+    runtime = SimpleNamespace(
+        context={
+            "session_id": run.session_id,
+            "run_id": run.run_id,
+            "run_kind": "standalone",
+        }
+    )
+
+    update = middleware.before_agent(
+        {"messages": [], "task_profile": run.task_profile.model_dump(mode="json")},
+        runtime=runtime,
+    )
+
+    assert update is not None
+    assert update["active_skill_ids"] == ["database-analysis"]
+    persisted_profile = session_manager.get_run_state(run.session_id, run.run_id)["task_profile"]
+    assert persisted_profile["skill_candidates"] == []
+    visible = middleware._request_with_capability_manifest(
+        ModelRequest(
+            model=None,
+            messages=[HumanMessage(content="解释这段 Python")],
+            system_message=SystemMessage(content="base"),
+            tools=[{"name": "read_file"}, {"name": "database_evidence_search"}],
+            state={"messages": [], "task_profile": run.task_profile.model_dump(mode="json"), **update},
+            runtime=runtime,
+        )
+    )
+    assert [item["name"] for item in visible.tools] == [
+        "read_file",
+        "database_evidence_search",
+    ]
+    prompt = str(visible.system_message.content)
+    assert "Session capability stubs" in prompt
+    assert "工具 schema 已恢复" in prompt
+    assert "# Test" not in prompt
+
+
+def test_standard_stable_schema_exposes_mounted_skill_tool_without_granting_it(
+    tmp_path,
+) -> None:
+    from graph.session_manager import session_manager
+
+    skills = tmp_path / "skills"
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    _install_test_skill(skills, "database-analysis", {"database_analysis"})
+    middleware = ToolsetMiddleware(
+        skills_dir=skills,
+        toolsets_by_skill={"database-analysis": {"database_analysis"}},
+        restore_session_skills=True,
+    )
+    session_manager.initialize(state_dir)
+    session_manager.create_session("session-stable-schema-no-cache")
+    run = RunRecord(
+        run_id="run-stable-schema-no-cache",
+        query_id="query-stable-schema-no-cache",
+        session_id="session-stable-schema-no-cache",
+        objective="解释一段普通 Python 代码",
+        task_profile=RunTaskProfile(),
+    )
+    session_manager.start_harness_run(run.session_id, run.model_dump(mode="json"))
+    runtime = SimpleNamespace(
+        context={
+            "session_id": run.session_id,
+            "run_id": run.run_id,
+            "run_kind": "standalone",
+        }
+    )
+    state = {"messages": [], "task_profile": run.task_profile.model_dump(mode="json")}
+
+    prepared = middleware._request_with_capability_manifest(
+        ModelRequest(
+            model=None,
+            messages=[HumanMessage(content="解释这段 Python")],
+            system_message=SystemMessage(content="base"),
+            tools=[{"name": "read_file"}, {"name": "database_evidence_search"}],
+            state=state,
+            runtime=runtime,
+        )
+    )
+
+    assert [item["name"] for item in prepared.tools] == [
+        "read_file",
+        "database_evidence_search",
+    ]
+    assert "database_evidence_search" not in middleware._allowed_tool_names(state)
+    denied = middleware.wrap_tool_call(
+        ToolCallRequest(
+            tool_call={
+                "name": "database_evidence_search",
+                "args": {"question": "配置率"},
+                "id": "stable-schema-denied",
+                "type": "tool_call",
+            },
+            tool=None,
+            state=state,
+            runtime=runtime,
+        ),
+        lambda _request: pytest.fail("unactivated stable-schema tool must not execute"),
+    )
+    assert isinstance(denied, ToolMessage)
+    assert denied.status == "error"
+    assert "not enabled" in str(denied.content)
+
+
+def test_session_skill_restore_is_disabled_outside_standalone_runs(tmp_path) -> None:
+    from graph.session_manager import session_manager
+
+    skills = tmp_path / "skills"
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    _install_test_skill(skills, "database-analysis", {"database_analysis"})
+    middleware = ToolsetMiddleware(
+        skills_dir=skills,
+        toolsets_by_skill={"database-analysis": {"database_analysis"}},
+        restore_session_skills=True,
+    )
+    session_manager.initialize(state_dir)
+    session_manager.create_session("session-cache-goal-run")
+    run = RunRecord(
+        run_id="run-cache-goal-run",
+        query_id="query-cache-goal-run",
+        session_id="session-cache-goal-run",
+        objective="执行一个隔离 Goal",
+        run_kind="goal_execution",
+        task_profile=RunTaskProfile(),
+    )
+    session_manager.start_harness_run(run.session_id, run.model_dump(mode="json"))
+    _cache_test_skill(middleware, session_id=run.session_id, run_id="run-previous")
+
+    update = middleware.before_agent(
+        {"messages": [], "task_profile": run.task_profile.model_dump(mode="json")},
+        runtime=SimpleNamespace(
+            context={
+                "session_id": run.session_id,
+                "run_id": run.run_id,
+                "run_kind": "goal_execution",
+            }
+        ),
+    )
+
+    assert update == {"active_skill_ids": [], "skill_activations": []}
+
+
+def test_restored_session_tool_loads_instructions_on_first_use_then_rechecks(
+    tmp_path,
+) -> None:
+    from graph.session_manager import session_manager
+
+    skills = tmp_path / "skills"
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    _install_test_skill(skills, "database-analysis", {"database_analysis"})
+    middleware = ToolsetMiddleware(
+        skills_dir=skills,
+        toolsets_by_skill={"database-analysis": {"database_analysis"}},
+        restore_session_skills=True,
+    )
+    session_manager.initialize(state_dir)
+    session_manager.create_session("session-cache-jit")
+    run = RunRecord(
+        run_id="run-cache-jit",
+        query_id="query-cache-jit",
+        session_id="session-cache-jit",
+        objective="写代码",
+        task_profile=RunTaskProfile(),
+    )
+    session_manager.start_harness_run(run.session_id, run.model_dump(mode="json"))
+    _cache_test_skill(middleware, session_id=run.session_id, run_id="run-previous")
+    runtime = SimpleNamespace(
+        context={
+            "session_id": run.session_id,
+            "run_id": run.run_id,
+            "run_kind": "standalone",
+        }
+    )
+    update = middleware.before_agent(
+        {"messages": [], "task_profile": run.task_profile.model_dump(mode="json")},
+        runtime=runtime,
+    )
+    assert update is not None
+    executed: list[str] = []
+    result = middleware.wrap_tool_call(
+        ToolCallRequest(
+            tool_call={
+                "name": "database_evidence_search",
+                "args": {"question": "配置率"},
+                "id": "first-restored-call",
+                "type": "tool_call",
+            },
+            tool=None,
+            state={"messages": [], "task_profile": run.task_profile.model_dump(mode="json"), **update},
+            runtime=runtime,
+        ),
+        lambda _request: executed.append("executed"),
+    )
+
+    assert executed == []
+    assert isinstance(result, ToolMessage)
+    assert result.name == "load_skill_context"
+    assert result.additional_kwargs["puddingclaw_control_plane"]["type"] == (
+        "skill_context_loaded_on_demand"
+    )
+    assert "重新判断它是否仍与当前任务相关" in str(result.content)
+    refreshed = middleware.before_model(
+        {"messages": [], "task_profile": run.task_profile.model_dump(mode="json"), **update},
+        runtime=runtime,
+    )
+    assert refreshed is not None
+    prompt_request = middleware._request_with_capability_manifest(
+        ModelRequest(
+            model=None,
+            messages=[HumanMessage(content="继续")],
+            system_message=SystemMessage(content="base"),
+            tools=[{"name": "read_file"}, {"name": "database_evidence_search"}],
+            state={"messages": [], **refreshed},
+            runtime=runtime,
+        )
+    )
+    assert "# Test" in str(prompt_request.system_message.content)
+
+
+def test_shared_tool_provider_uses_first_activation_and_reports_reason(tmp_path) -> None:
+    from graph.session_manager import session_manager
+
+    skills = tmp_path / "skills"
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    _install_test_skill(skills, "database-analysis", {"database_analysis"})
+    _install_test_skill(skills, "database-alt", {"database_analysis"})
+    middleware = ToolsetMiddleware(
+        skills_dir=skills,
+        toolsets_by_skill={
+            "database-analysis": {"database_analysis"},
+            "database-alt": {"database_analysis"},
+        },
+        restore_session_skills=True,
+    )
+    session_manager.initialize(state_dir)
+    session_manager.create_session("session-provider-order")
+    run = RunRecord(
+        run_id="run-provider-order",
+        query_id="query-provider-order",
+        session_id="session-provider-order",
+        objective="普通问答",
+        task_profile=RunTaskProfile(),
+    )
+    session_manager.start_harness_run(run.session_id, run.model_dump(mode="json"))
+    _cache_test_skill(
+        middleware,
+        session_id=run.session_id,
+        run_id="run-first",
+        skill_id="database-analysis",
+        created_at=1.0,
+    )
+    _cache_test_skill(
+        middleware,
+        session_id=run.session_id,
+        run_id="run-second",
+        skill_id="database-alt",
+        created_at=2.0,
+    )
+    runtime = SimpleNamespace(
+        context={
+            "session_id": run.session_id,
+            "run_id": run.run_id,
+            "run_kind": "standalone",
+        }
+    )
+    update = middleware.before_agent(
+        {"messages": [], "task_profile": run.task_profile.model_dump(mode="json")},
+        runtime=runtime,
+    )
+    assert update is not None
+    result = middleware.wrap_tool_call(
+        ToolCallRequest(
+            tool_call={
+                "name": "database_evidence_search",
+                "args": {"question": "配置率"},
+                "id": "shared-provider-call",
+                "type": "tool_call",
+            },
+            tool=None,
+            state={"messages": [], "task_profile": run.task_profile.model_dump(mode="json"), **update},
+            runtime=runtime,
+        ),
+        lambda _request: None,
+    )
+
+    assert isinstance(result, ToolMessage)
+    control = result.additional_kwargs["puddingclaw_control_plane"]
+    assert control["skill_id"] == "database-analysis"
+    assert control["provider_candidates"] == ["database-alt", "database-analysis"]
+    assert control["provider_reason"] == "first_activation_then_skill_id"
+
+
 def test_skill_cache_invalidates_on_hash_or_policy_epoch_change(tmp_path) -> None:
     from graph.session_manager import session_manager
 
@@ -1750,7 +2081,7 @@ def test_pdf_file_route_requires_installed_pdf_skill() -> None:
 
 
 def test_required_pdf_skill_barrier_blocks_direct_file_read() -> None:
-    middleware = SkillIntentRouterMiddleware()
+    middleware = RequiredSkillBoundaryMiddleware()
     request = ToolCallRequest(
         tool_call={
             "name": "read_file",
@@ -1780,7 +2111,7 @@ def test_required_pdf_skill_barrier_blocks_direct_file_read() -> None:
 
 
 def test_missing_pdf_skill_blocks_generic_tool_bypass() -> None:
-    middleware = SkillIntentRouterMiddleware()
+    middleware = RequiredSkillBoundaryMiddleware()
     profile = RunTaskProfile(
         intents=["pdf_document"],
         execution_route="missing_skill",
@@ -1858,11 +2189,11 @@ def test_explicit_skill_token_is_removed_from_model_task_text() -> None:
     assert "规范化任务文本（仅供路由参考）：重新设计byd_sales_launch_correlation.html的样式，并重新补充比亚迪每个月上市车系和款型明细" in routing_hint
     assert "/baoyu-design 重新设计byd_sales_launch_correlation.html" not in routing_hint
     assert "/baoyu-design 是 Skill 调用标记" in routing_hint
-    assert "不得并行调用其他工具" in routing_hint
+    assert "该建议不决定工具可用性" in routing_hint
     assert request.messages == [original]
 
 
-def test_explicit_skill_activation_barrier_blocks_parallel_workspace_read() -> None:
+def test_explicit_skill_advice_does_not_block_parallel_workspace_read() -> None:
     middleware = SkillIntentRouterMiddleware()
     state = {
         "messages": [],
@@ -1885,22 +2216,16 @@ def test_explicit_skill_activation_barrier_blocks_parallel_workspace_read() -> N
         state=state,
         runtime=None,
     )
-    blocked = middleware.wrap_tool_call(
+    result = middleware.wrap_tool_call(
         blocked_request,
         lambda request: executed.append(str(request.tool_call["name"])),
     )
 
-    assert isinstance(blocked, ToolMessage)
-    assert blocked.status == "error"
-    assert blocked.additional_kwargs["puddingclaw_control_plane"] == {
-        "type": "explicit_skill_activation_barrier",
-        "pending_skill_ids": ["baoyu-design"],
-        "original_tool_executed": False,
-    }
-    assert executed == []
+    assert result is None
+    assert executed == ["read_resource"]
 
 
-def test_explicit_skill_activation_barrier_filters_sibling_model_tool_call() -> None:
+def test_explicit_skill_advice_does_not_filter_sibling_model_tool_call() -> None:
     middleware = SkillIntentRouterMiddleware()
     request = ModelRequest(
         model=None,
@@ -1937,13 +2262,16 @@ def test_explicit_skill_activation_barrier_filters_sibling_model_tool_call() -> 
         ]
     )
 
-    filtered = middleware._response_with_activation_barrier(request, response)
+    filtered = middleware.wrap_model_call(request, lambda _request: response)
 
     assert isinstance(filtered.result[0], AIMessage)
-    assert [tool_call["id"] for tool_call in filtered.result[0].tool_calls] == ["read-skill"]
+    assert [tool_call["id"] for tool_call in filtered.result[0].tool_calls] == [
+        "read-skill",
+        "bad-parallel-read",
+    ]
 
 
-def test_explicit_skill_activation_barrier_allows_required_skill_read_then_lifts() -> None:
+def test_explicit_skill_advisor_allows_skill_and_workspace_reads() -> None:
     middleware = SkillIntentRouterMiddleware()
     profile = _routed_profile(
         "baoyu-design",

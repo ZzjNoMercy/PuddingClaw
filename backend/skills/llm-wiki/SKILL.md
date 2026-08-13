@@ -15,9 +15,12 @@ loads the Ingest context itself.
 
 For a user-facing Ingest request, the main Agent is only an orchestrator:
 
-1. Call `llm_wiki_create_raw` with `source=current_message`, `attachments`, or
-   `knowledge_file`. The server resolves the exact current input; never repeat a
-   long document as a tool argument.
+1. Call `llm_wiki_create_raw` with `source=current_message`, `conversation`,
+   `attachments`, or `knowledge_file`. Use `conversation` when the user refers
+   to material already established in recent visible Session context (for
+   example “把刚才这些编译到 Wiki”). The server resolves the exact source;
+   never repeat a long document as a tool argument and never create an
+   intermediate file with generic filesystem tools.
 2. Pass the returned complete `raw_paths` and opaque `intake_id` unchanged to
    `llm_wiki_start_ingest`. This queues (or reuses) the existing durable task
    and returns immediately. Tell the user the task id and that progress is
@@ -28,6 +31,13 @@ For a user-facing Ingest request, the main Agent is only an orchestrator:
    - Set `import_gbrain=true` only when the user explicitly asks to enter,
      import, or sync gbrain. The same task then continues with the validated
      gbrain PostgreSQL import.
+
+An explicit request to compile, organize, add, or turn selected material into
+Wiki is sufficient authority for this two-tool intake. Do not call
+`request_user_input` to reconfirm the scope or whether execution should start.
+Ask only when a genuinely missing source choice would change which user-owned
+material is ingested; Skill activation or tool availability is never such a
+choice.
 
 Do not call `llm_wiki_context`, `llm_wiki_publish`, or `llm_wiki_lint` from the
 chat Session for Ingest. Those low-level protocol tools belong to the dedicated

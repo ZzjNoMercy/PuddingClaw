@@ -458,6 +458,142 @@
     },
     "DatasetBundle": {
       "$defs": {
+        "CodeEvaluationSpec": {
+          "additionalProperties": false,
+          "properties": {
+            "repository": {
+              "$ref": "#/$defs/CodeRepositorySpec"
+            },
+            "schema_version": {
+              "const": "1",
+              "default": "1",
+              "title": "Schema Version",
+              "type": "string"
+            },
+            "verification": {
+              "$ref": "#/$defs/CodeVerificationSpec"
+            }
+          },
+          "required": [
+            "repository",
+            "verification"
+          ],
+          "title": "CodeEvaluationSpec",
+          "type": "object"
+        },
+        "CodeRepositorySpec": {
+          "additionalProperties": false,
+          "properties": {
+            "files": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "title": "Files",
+              "type": "object"
+            },
+            "kind": {
+              "default": "inline",
+              "enum": [
+                "inline",
+                "swebench"
+              ],
+              "title": "Kind",
+              "type": "string"
+            },
+            "swebench": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SWEbenchReference"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null
+            }
+          },
+          "title": "CodeRepositorySpec",
+          "type": "object"
+        },
+        "CodeVerificationCommand": {
+          "additionalProperties": false,
+          "properties": {
+            "command": {
+              "maxLength": 4000,
+              "minLength": 1,
+              "title": "Command",
+              "type": "string"
+            },
+            "command_id": {
+              "maxLength": 128,
+              "minLength": 1,
+              "title": "Command Id",
+              "type": "string"
+            },
+            "expected_exit_code": {
+              "default": 0,
+              "maximum": 255,
+              "minimum": 0,
+              "title": "Expected Exit Code",
+              "type": "integer"
+            },
+            "runner": {
+              "const": "python_callable_json",
+              "default": "python_callable_json",
+              "title": "Runner",
+              "type": "string"
+            },
+            "timeout_seconds": {
+              "default": 120,
+              "maximum": 900,
+              "minimum": 1,
+              "title": "Timeout Seconds",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "command_id",
+            "command"
+          ],
+          "title": "CodeVerificationCommand",
+          "type": "object"
+        },
+        "CodeVerificationSpec": {
+          "additionalProperties": false,
+          "properties": {
+            "commands": {
+              "items": {
+                "$ref": "#/$defs/CodeVerificationCommand"
+              },
+              "maxItems": 20,
+              "title": "Commands",
+              "type": "array"
+            },
+            "hidden_files": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "title": "Hidden Files",
+              "type": "object"
+            },
+            "mode": {
+              "default": "commands",
+              "enum": [
+                "commands",
+                "swebench"
+              ],
+              "title": "Mode",
+              "type": "string"
+            },
+            "require_patch": {
+              "default": true,
+              "title": "Require Patch",
+              "type": "boolean"
+            }
+          },
+          "title": "CodeVerificationSpec",
+          "type": "object"
+        },
         "Criticality": {
           "enum": [
             "normal",
@@ -492,6 +628,17 @@
             "case_id": {
               "title": "Case Id",
               "type": "string"
+            },
+            "code": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/CodeEvaluationSpec"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null
             },
             "created_at": {
               "format": "date-time",
@@ -1103,6 +1250,96 @@
           ],
           "title": "ResolvedEvaluatorBinding",
           "type": "object"
+        },
+        "SWEbenchReference": {
+          "additionalProperties": false,
+          "properties": {
+            "base_commit": {
+              "pattern": "^[0-9a-fA-F]{7,64}$",
+              "title": "Base Commit",
+              "type": "string"
+            },
+            "dataset_name": {
+              "maxLength": 200,
+              "minLength": 1,
+              "title": "Dataset Name",
+              "type": "string"
+            },
+            "environment_setup_commit": {
+              "anyOf": [
+                {
+                  "maxLength": 64,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Environment Setup Commit"
+            },
+            "fail_to_pass": {
+              "items": {
+                "type": "string"
+              },
+              "maxItems": 10000,
+              "title": "Fail To Pass",
+              "type": "array"
+            },
+            "instance_id": {
+              "maxLength": 200,
+              "minLength": 1,
+              "title": "Instance Id",
+              "type": "string"
+            },
+            "pass_to_pass": {
+              "items": {
+                "type": "string"
+              },
+              "maxItems": 10000,
+              "title": "Pass To Pass",
+              "type": "array"
+            },
+            "repo": {
+              "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$",
+              "title": "Repo",
+              "type": "string"
+            },
+            "split": {
+              "default": "test",
+              "maxLength": 64,
+              "minLength": 1,
+              "title": "Split",
+              "type": "string"
+            },
+            "test_patch": {
+              "default": "",
+              "maxLength": 2000000,
+              "title": "Test Patch",
+              "type": "string"
+            },
+            "version": {
+              "anyOf": [
+                {
+                  "maxLength": 100,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Version"
+            }
+          },
+          "required": [
+            "dataset_name",
+            "instance_id",
+            "repo",
+            "base_commit"
+          ],
+          "title": "SWEbenchReference",
+          "type": "object"
         }
       },
       "additionalProperties": false,
@@ -1154,6 +1391,142 @@
     },
     "EvalCase": {
       "$defs": {
+        "CodeEvaluationSpec": {
+          "additionalProperties": false,
+          "properties": {
+            "repository": {
+              "$ref": "#/$defs/CodeRepositorySpec"
+            },
+            "schema_version": {
+              "const": "1",
+              "default": "1",
+              "title": "Schema Version",
+              "type": "string"
+            },
+            "verification": {
+              "$ref": "#/$defs/CodeVerificationSpec"
+            }
+          },
+          "required": [
+            "repository",
+            "verification"
+          ],
+          "title": "CodeEvaluationSpec",
+          "type": "object"
+        },
+        "CodeRepositorySpec": {
+          "additionalProperties": false,
+          "properties": {
+            "files": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "title": "Files",
+              "type": "object"
+            },
+            "kind": {
+              "default": "inline",
+              "enum": [
+                "inline",
+                "swebench"
+              ],
+              "title": "Kind",
+              "type": "string"
+            },
+            "swebench": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SWEbenchReference"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null
+            }
+          },
+          "title": "CodeRepositorySpec",
+          "type": "object"
+        },
+        "CodeVerificationCommand": {
+          "additionalProperties": false,
+          "properties": {
+            "command": {
+              "maxLength": 4000,
+              "minLength": 1,
+              "title": "Command",
+              "type": "string"
+            },
+            "command_id": {
+              "maxLength": 128,
+              "minLength": 1,
+              "title": "Command Id",
+              "type": "string"
+            },
+            "expected_exit_code": {
+              "default": 0,
+              "maximum": 255,
+              "minimum": 0,
+              "title": "Expected Exit Code",
+              "type": "integer"
+            },
+            "runner": {
+              "const": "python_callable_json",
+              "default": "python_callable_json",
+              "title": "Runner",
+              "type": "string"
+            },
+            "timeout_seconds": {
+              "default": 120,
+              "maximum": 900,
+              "minimum": 1,
+              "title": "Timeout Seconds",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "command_id",
+            "command"
+          ],
+          "title": "CodeVerificationCommand",
+          "type": "object"
+        },
+        "CodeVerificationSpec": {
+          "additionalProperties": false,
+          "properties": {
+            "commands": {
+              "items": {
+                "$ref": "#/$defs/CodeVerificationCommand"
+              },
+              "maxItems": 20,
+              "title": "Commands",
+              "type": "array"
+            },
+            "hidden_files": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "title": "Hidden Files",
+              "type": "object"
+            },
+            "mode": {
+              "default": "commands",
+              "enum": [
+                "commands",
+                "swebench"
+              ],
+              "title": "Mode",
+              "type": "string"
+            },
+            "require_patch": {
+              "default": true,
+              "title": "Require Patch",
+              "type": "boolean"
+            }
+          },
+          "title": "CodeVerificationSpec",
+          "type": "object"
+        },
         "Criticality": {
           "enum": [
             "normal",
@@ -1589,6 +1962,96 @@
           ],
           "title": "ResolvedEvaluatorBinding",
           "type": "object"
+        },
+        "SWEbenchReference": {
+          "additionalProperties": false,
+          "properties": {
+            "base_commit": {
+              "pattern": "^[0-9a-fA-F]{7,64}$",
+              "title": "Base Commit",
+              "type": "string"
+            },
+            "dataset_name": {
+              "maxLength": 200,
+              "minLength": 1,
+              "title": "Dataset Name",
+              "type": "string"
+            },
+            "environment_setup_commit": {
+              "anyOf": [
+                {
+                  "maxLength": 64,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Environment Setup Commit"
+            },
+            "fail_to_pass": {
+              "items": {
+                "type": "string"
+              },
+              "maxItems": 10000,
+              "title": "Fail To Pass",
+              "type": "array"
+            },
+            "instance_id": {
+              "maxLength": 200,
+              "minLength": 1,
+              "title": "Instance Id",
+              "type": "string"
+            },
+            "pass_to_pass": {
+              "items": {
+                "type": "string"
+              },
+              "maxItems": 10000,
+              "title": "Pass To Pass",
+              "type": "array"
+            },
+            "repo": {
+              "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$",
+              "title": "Repo",
+              "type": "string"
+            },
+            "split": {
+              "default": "test",
+              "maxLength": 64,
+              "minLength": 1,
+              "title": "Split",
+              "type": "string"
+            },
+            "test_patch": {
+              "default": "",
+              "maxLength": 2000000,
+              "title": "Test Patch",
+              "type": "string"
+            },
+            "version": {
+              "anyOf": [
+                {
+                  "maxLength": 100,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Version"
+            }
+          },
+          "required": [
+            "dataset_name",
+            "instance_id",
+            "repo",
+            "base_commit"
+          ],
+          "title": "SWEbenchReference",
+          "type": "object"
         }
       },
       "additionalProperties": false,
@@ -1596,6 +2059,17 @@
         "case_id": {
           "title": "Case Id",
           "type": "string"
+        },
+        "code": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CodeEvaluationSpec"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         },
         "created_at": {
           "format": "date-time",
@@ -1700,6 +2174,142 @@
     },
     "EvalDataset": {
       "$defs": {
+        "CodeEvaluationSpec": {
+          "additionalProperties": false,
+          "properties": {
+            "repository": {
+              "$ref": "#/$defs/CodeRepositorySpec"
+            },
+            "schema_version": {
+              "const": "1",
+              "default": "1",
+              "title": "Schema Version",
+              "type": "string"
+            },
+            "verification": {
+              "$ref": "#/$defs/CodeVerificationSpec"
+            }
+          },
+          "required": [
+            "repository",
+            "verification"
+          ],
+          "title": "CodeEvaluationSpec",
+          "type": "object"
+        },
+        "CodeRepositorySpec": {
+          "additionalProperties": false,
+          "properties": {
+            "files": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "title": "Files",
+              "type": "object"
+            },
+            "kind": {
+              "default": "inline",
+              "enum": [
+                "inline",
+                "swebench"
+              ],
+              "title": "Kind",
+              "type": "string"
+            },
+            "swebench": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SWEbenchReference"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null
+            }
+          },
+          "title": "CodeRepositorySpec",
+          "type": "object"
+        },
+        "CodeVerificationCommand": {
+          "additionalProperties": false,
+          "properties": {
+            "command": {
+              "maxLength": 4000,
+              "minLength": 1,
+              "title": "Command",
+              "type": "string"
+            },
+            "command_id": {
+              "maxLength": 128,
+              "minLength": 1,
+              "title": "Command Id",
+              "type": "string"
+            },
+            "expected_exit_code": {
+              "default": 0,
+              "maximum": 255,
+              "minimum": 0,
+              "title": "Expected Exit Code",
+              "type": "integer"
+            },
+            "runner": {
+              "const": "python_callable_json",
+              "default": "python_callable_json",
+              "title": "Runner",
+              "type": "string"
+            },
+            "timeout_seconds": {
+              "default": 120,
+              "maximum": 900,
+              "minimum": 1,
+              "title": "Timeout Seconds",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "command_id",
+            "command"
+          ],
+          "title": "CodeVerificationCommand",
+          "type": "object"
+        },
+        "CodeVerificationSpec": {
+          "additionalProperties": false,
+          "properties": {
+            "commands": {
+              "items": {
+                "$ref": "#/$defs/CodeVerificationCommand"
+              },
+              "maxItems": 20,
+              "title": "Commands",
+              "type": "array"
+            },
+            "hidden_files": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "title": "Hidden Files",
+              "type": "object"
+            },
+            "mode": {
+              "default": "commands",
+              "enum": [
+                "commands",
+                "swebench"
+              ],
+              "title": "Mode",
+              "type": "string"
+            },
+            "require_patch": {
+              "default": true,
+              "title": "Require Patch",
+              "type": "boolean"
+            }
+          },
+          "title": "CodeVerificationSpec",
+          "type": "object"
+        },
         "Criticality": {
           "enum": [
             "normal",
@@ -1734,6 +2344,17 @@
             "case_id": {
               "title": "Case Id",
               "type": "string"
+            },
+            "code": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/CodeEvaluationSpec"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null
             },
             "created_at": {
               "format": "date-time",
@@ -2251,6 +2872,96 @@
             "code_hash"
           ],
           "title": "ResolvedEvaluatorBinding",
+          "type": "object"
+        },
+        "SWEbenchReference": {
+          "additionalProperties": false,
+          "properties": {
+            "base_commit": {
+              "pattern": "^[0-9a-fA-F]{7,64}$",
+              "title": "Base Commit",
+              "type": "string"
+            },
+            "dataset_name": {
+              "maxLength": 200,
+              "minLength": 1,
+              "title": "Dataset Name",
+              "type": "string"
+            },
+            "environment_setup_commit": {
+              "anyOf": [
+                {
+                  "maxLength": 64,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Environment Setup Commit"
+            },
+            "fail_to_pass": {
+              "items": {
+                "type": "string"
+              },
+              "maxItems": 10000,
+              "title": "Fail To Pass",
+              "type": "array"
+            },
+            "instance_id": {
+              "maxLength": 200,
+              "minLength": 1,
+              "title": "Instance Id",
+              "type": "string"
+            },
+            "pass_to_pass": {
+              "items": {
+                "type": "string"
+              },
+              "maxItems": 10000,
+              "title": "Pass To Pass",
+              "type": "array"
+            },
+            "repo": {
+              "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$",
+              "title": "Repo",
+              "type": "string"
+            },
+            "split": {
+              "default": "test",
+              "maxLength": 64,
+              "minLength": 1,
+              "title": "Split",
+              "type": "string"
+            },
+            "test_patch": {
+              "default": "",
+              "maxLength": 2000000,
+              "title": "Test Patch",
+              "type": "string"
+            },
+            "version": {
+              "anyOf": [
+                {
+                  "maxLength": 100,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Version"
+            }
+          },
+          "required": [
+            "dataset_name",
+            "instance_id",
+            "repo",
+            "base_commit"
+          ],
+          "title": "SWEbenchReference",
           "type": "object"
         }
       },
@@ -2771,7 +3482,8 @@
               "enum": [
                 "agent_error",
                 "evaluator_error",
-                "evidence_missing"
+                "evidence_missing",
+                "verifier_error"
               ],
               "type": "string"
             },

@@ -23,7 +23,8 @@ class SandboxedWriteFileTool(BaseTool):
     name: str = "write_file"
     description: str = (
         "Write content to a local file. Path is relative to the project root. "
-        "Only files in skills/, semantic-assets/, sql-guardrails/, analytics-models/, workspace/, and memory/ directories can be modified. "
+        "Only files in skills/, sql-guardrails/, workspace/, and memory/ directories can be modified. "
+        "Semantic assets and analytics models are read-only here; use the Semantic Steward tools. "
         "Use this to update SKILL.md files, memory files, or workspace documents. "
         "Example: write_file('skills/skill-creator/SKILL.md', '---\\nname: skill-creator\\n...')"
     )
@@ -45,24 +46,20 @@ class SandboxedWriteFileTool(BaseTool):
             # Whitelist check: only allow curated project authoring roots.
             ALLOWED_PREFIXES = [
                 "skills/",
-                "semantic-assets/",
                 "sql-guardrails/",
-                "analytics-models/",
                 "workspace/",
                 "memory/",
             ]
             if not any(normalized.startswith(prefix) for prefix in ALLOWED_PREFIXES):
                 return (
                     f"❌ Access denied: {file_path} "
-                    "(only skills/, semantic-assets/, sql-guardrails/, analytics-models/, workspace/, memory/ allowed)"
+                    "(only skills/, sql-guardrails/, workspace/, memory/ allowed; use Semantic Steward for definitions)"
                 )
 
             user = PuddingClawPaths.from_environment()
             roots = {
                 "skills/": user.user_skills(),
-                "semantic-assets/": user.user_definitions() / "semantic-assets",
                 "sql-guardrails/": user.user_definitions() / "sql-guardrails",
-                "analytics-models/": user.user_definitions() / "analytics-models",
                 "workspace/": user.agent_workspaces() / "unscoped" / "default",
                 "memory/": user.memory(),
             }
@@ -81,14 +78,6 @@ class SandboxedWriteFileTool(BaseTool):
             # Write file with UTF-8 encoding
             full_path.write_text(content, encoding="utf-8")
             file_cache.put(full_path, content)
-            if normalized.startswith("analytics-models/"):
-                try:
-                    from analytics.models import get_analytics_model_registry
-
-                    get_analytics_model_registry(user.user_definitions() / "analytics-models").refresh()
-                except Exception:
-                    pass
-
             return f"✅ File saved: {file_path} ({len(content)} characters)"
 
         except Exception as e:
