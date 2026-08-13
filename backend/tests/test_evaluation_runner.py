@@ -92,6 +92,14 @@ async def test_langsmith_outage_preserves_local_results_and_completes_with_outbo
 
     monkeypatch.setattr(runner_module.LangSmithDatasetAdapter, "sync_dataset", fail_sync)
     runner = StubRunner(repository, LangSmithSettings(enabled=True, api_key="test"), tmp_path)
+    progress_stages: list[str] = []
+    update_progress = runner._update_progress
+
+    def capture_progress(experiment_id: str, **changes):
+        progress_stages.append(str(changes.get("stage")))
+        return update_progress(experiment_id, **changes)
+
+    runner._update_progress = capture_progress  # type: ignore[method-assign]
     completed = await runner.run(experiment.experiment_id)
 
     assert completed.status == "completed"
@@ -101,6 +109,12 @@ async def test_langsmith_outage_preserves_local_results_and_completes_with_outbo
         "task_completion.v1@1"
     ]
     assert completed.summary["coverage"] is not None
+    assert {"preparing", "agent_running", "case_completed", "scoring", "langsmith_projection"} <= set(
+        progress_stages
+    )
+    assert completed.summary["progress"]["stage"] == "completed"
+    assert completed.summary["progress"]["completed"] == 1
+    assert completed.summary["progress"]["total"] == 1
     assert not (tmp_path / "data" / "evaluation-runs" / experiment.experiment_id).exists()
     assert repository.list_results(experiment.experiment_id)
     with repository._connect() as connection:

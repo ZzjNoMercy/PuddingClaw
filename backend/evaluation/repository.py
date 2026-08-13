@@ -566,6 +566,35 @@ class EvaluationRepository:
             raise NotFoundError(f"Experiment not found: {experiment_id}")
         return EvalExperiment.model_validate_json(row["payload_json"])
 
+    def delete_experiment(self, experiment_id: str) -> None:
+        """Delete one terminal Experiment and all of its local ledger records."""
+
+        terminal_statuses = {
+            ExperimentStatus.COMPLETED.value,
+            ExperimentStatus.FAILED.value,
+            ExperimentStatus.CANCELLED.value,
+        }
+        with self._lock, self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT status FROM eval_experiments WHERE experiment_id=?",
+                (experiment_id,),
+            ).fetchone()
+            if row is None:
+                raise NotFoundError(f"Experiment not found: {experiment_id}")
+            if str(row["status"]) not in terminal_statuses:
+                raise ConflictError("Only terminal Experiments can be deleted; cancel the Experiment first")
+
+            # Attempts and evaluator results are removed by foreign-key cascade.
+            # Outbox and remote mapping are deliberately local-only records and
+            # therefore need explicit cleanup. This does not delete LangSmith data.
+            connection.execute("DELETE FROM eval_outbox WHERE aggregate_id=?", (experiment_id,))
+            connection.execute(
+                "DELETE FROM eval_remote_mappings WHERE local_type='experiment' AND local_id=?",
+                (experiment_id,),
+            )
+            connection.execute("DELETE FROM eval_experiments WHERE experiment_id=?", (experiment_id,))
+
     def update_experiment(
         self,
         experiment: EvalExperiment,
@@ -596,6 +625,58 @@ class EvaluationRepository:
                         f"Experiment {experiment.experiment_id} status changed; expected {expected_status}"
                     )
                 raise NotFoundError(f"Experiment not found: {experiment.experiment_id}")
+        return experiment
+
+    def reset_experiment_execution(
+        self,
+        experiment: EvalExperiment,
+        *,
+        expected_status: ExperimentStatus | str,
+    ) -> EvalExperiment:
+        """Atomically clear an interrupted run and move its Experiment state.
+
+        This is used only for application-restart recovery. A run is restarted
+        from Case zero because partially synchronized Agent/Docker state cannot
+        be resumed truthfully after the owning process has exited.
+        """
+
+        with self._lock, self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT status FROM eval_experiments WHERE experiment_id=?",
+                (experiment.experiment_id,),
+            ).fetchone()
+            if row is None:
+                raise NotFoundError(f"Experiment not found: {experiment.experiment_id}")
+            if str(row["status"]) != str(expected_status):
+                raise ConflictError(
+                    f"Experiment {experiment.experiment_id} status changed; expected {expected_status}"
+                )
+            connection.execute(
+                "DELETE FROM eval_outbox WHERE aggregate_id=?",
+                (experiment.experiment_id,),
+            )
+            # Evaluator rows are removed through the attempt foreign-key
+            # cascade, keeping the reset as one transaction.
+            connection.execute(
+                "DELETE FROM eval_case_attempts WHERE experiment_id=?",
+                (experiment.experiment_id,),
+            )
+            cursor = connection.execute(
+                "UPDATE eval_experiments SET payload_json=?, status=?, updated_at=? "
+                "WHERE experiment_id=? AND status=?",
+                (
+                    _json(experiment),
+                    experiment.status,
+                    utc_now().isoformat(),
+                    experiment.experiment_id,
+                    str(expected_status),
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ConflictError(
+                    f"Experiment {experiment.experiment_id} changed during restart recovery"
+                )
         return experiment
 
     def create_attempt(self, experiment_id: str, case_id: str, repetition: int) -> str:
@@ -644,21 +725,28 @@ class EvaluationRepository:
     def list_results(self, experiment_id: str) -> list[dict[str, Any]]:
         with self._connect() as connection:
             rows = connection.execute(
-                "SELECT a.case_id, a.repetition, a.attempt_id, a.status AS attempt_status, r.payload_json "
+                "SELECT a.case_id, a.repetition, a.attempt_id, a.status AS attempt_status, "
+                "a.error_json, a.run_envelope_json, a.created_at, a.updated_at, r.payload_json "
                 "FROM eval_case_attempts a LEFT JOIN eval_results r ON r.attempt_id=a.attempt_id "
                 "WHERE a.experiment_id=? ORDER BY a.created_at, r.evaluator_id",
                 (experiment_id,),
             ).fetchall()
-        return [
-            {
+        items: list[dict[str, Any]] = []
+        for row in rows:
+            run = json.loads(row["run_envelope_json"]) if row["run_envelope_json"] else None
+            timing = dict(run.get("timing") or {}) if isinstance(run, dict) else {}
+            items.append({
                 "case_id": row["case_id"],
                 "repetition": row["repetition"],
                 "attempt_id": row["attempt_id"],
                 "attempt_status": row["attempt_status"],
+                "error": json.loads(row["error_json"]) if row["error_json"] else None,
+                "created_at": row["created_at"],
+                "updated_at": row["updated_at"],
+                "latency_ms": timing.get("latency_ms"),
                 "result": json.loads(row["payload_json"]) if row["payload_json"] else None,
-            }
-            for row in rows
-        ]
+            })
+        return items
 
     def load_run_envelopes(self, experiment_id: str) -> dict[str, list[dict[str, Any]]]:
         with self._connect() as connection:

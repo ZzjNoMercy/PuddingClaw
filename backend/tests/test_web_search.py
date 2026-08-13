@@ -353,3 +353,15 @@ def test_managed_tool_returns_structured_citations(tmp_path, monkeypatch) -> Non
     assert "搜索路由：grok" in context
     assert sources[0]["uri"] == "https://grok.example/result"
     assert sources[0]["metadata"]["provider"] == "grok"
+
+
+def test_web_search_schema_declares_internal_knowledge_first_boundary() -> None:
+    from tools.web_search_tool import ManagedWebSearchTool
+
+    description = ManagedWebSearchTool().description
+
+    assert "Public-internet search fallback" in description
+    assert "first query the internal Markdown LLM Wiki" in description
+    assert "open-source, projects, or recommend" in description
+    assert "explicitly requests current/latest information" in description
+    assert "clear knowledge gap" in description

@@ -1,6 +1,6 @@
 [project]
 name = "puddingclaw-backend"
-version = "0.1.2"
+version = "0.1.16"
 description = "PuddingClaw backend API, agent, and knowledge base services"
 requires-python = ">=3.11,<3.13"
 license = { text = "MIT" }
@@ -23,6 +23,9 @@ dependencies = [
     # Database
     "sqlalchemy[asyncio]>=2.0.48",
     "aiosqlite>=0.22.0",
+    # PostgreSQL is a core catalog option in every init profile, including
+    # Harness-only. Keep its runtime driver out of extension-only extras.
+    "asyncpg>=0.29.0",
     # LangChain / LangGraph
     "deepagents>=0.6.12",
     "langchain>=1.3.11",
@@ -66,7 +69,6 @@ evaluation = [
 ]
 
 knowledge = [
-    "asyncpg>=0.29.0",
     "pymilvus==2.6.15",
     "llama-index-core>=0.14.17",
     "llama-index-embeddings-openai>=0.6.0",
@@ -83,7 +85,6 @@ knowledge = [
 ]
 
 analytics = [
-    "asyncpg>=0.29.0",
     "pymilvus==2.6.15",
     "pandas>=2.3.0",
     "pyarrow>=18.0.0",

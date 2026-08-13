@@ -20,6 +20,7 @@ def test_evaluation_hooks_are_opt_in_and_normal_memory_path_is_unchanged(tmp_pat
     assert signature.parameters["evaluation_tool_allowlist"].default is None
     assert signature.parameters["disable_mcp"].default is False
     assert signature.parameters["evaluation_builtin_tool_allowlist"].default is None
+    assert signature.parameters["evaluation_required_toolset"].default is None
 
     isolated = tmp_path / "isolated"
     monkeypatch.setenv("PUDDINGCLAW_EVALUATION_RUNTIME_ROOT", str(isolated))
@@ -62,7 +63,9 @@ def test_candidate_fingerprint_captures_effective_model_binding(tmp_path: Path, 
 
     assert first.fingerprint != second.fingerprint
     assert first.config["effective_llm"]["api_key"] == "[REDACTED]"
-    assert first.config["capability_profile"] == "isolated_workspace_core@1"
+    assert first.config["capability_profile"] == "puddingclaw_workspace_harness@1"
+    assert "patch_file" in first.config["offered_tools"]
+    assert "edit_file" not in first.config["offered_tools"]
 
     harness = tmp_path / "harness"
     harness.mkdir()
@@ -118,3 +121,102 @@ def test_evaluation_boundary_filters_and_rejects_deepagents_builtin_tools():
     assert visible.tools == [{"name": "read_file"}]
     assert denied.status == "error"
     assert "disabled" in str(denied.content)
+
+
+def test_evaluation_boundary_fails_before_model_when_harness_capability_drifted():
+    middleware = EvaluationToolBoundaryMiddleware(
+        {"read_file", "patch_file"},
+        required_tools={"read_file", "patch_file"},
+    )
+
+    class Request:
+        tools = [{"name": "read_file"}]
+
+        def override(self, **updates):
+            clone = Request()
+            clone.tools = updates.get("tools", self.tools)
+            return clone
+
+    with pytest.raises(RuntimeError, match="patch_file"):
+        middleware._filter_request(Request())
+
+
+@pytest.mark.parametrize("backend_kind", ["production_spawn", "swebench_docker"])
+def test_coding_capability_matches_real_deepagents_model_surface(
+    tmp_path: Path,
+    monkeypatch,
+    backend_kind: str,
+):
+    """Exercise the final bound schema for every coding execution backend."""
+
+    from typing import Any
+    from unittest import mock
+
+    from deepagents import create_deep_agent
+    from langchain_core.language_models.chat_models import BaseChatModel
+    from langchain_core.messages import AIMessage
+    from langchain_core.outputs import ChatGeneration, ChatResult
+    from pydantic import PrivateAttr
+
+    from evaluation.candidate import CODING_WORKSPACE_TOOLS
+    from evaluation.swebench_agent_backend import SWEbenchAgentWorkspaceBackend
+    from harness.workspace_backends import SpawnWorkspaceBackend
+    from llm import model_client as model_client_module
+    from tools.filesystem.factory import VersionedPatchMiddleware
+
+    class CapturingModel(BaseChatModel):
+        _bound_tools: list[str] = PrivateAttr(default_factory=list)
+
+        @property
+        def _llm_type(self) -> str:
+            return "evaluation_capability_probe"
+
+        def bind_tools(self, tools: list[Any], **_kwargs: Any):
+            self._bound_tools = [str(getattr(tool, "name", "")) for tool in tools]
+            return self
+
+        def _generate(self, *_args: Any, **_kwargs: Any) -> ChatResult:
+            return ChatResult(generations=[ChatGeneration(message=AIMessage(content="ok"))])
+
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    if backend_kind == "swebench_docker":
+        monkeypatch.setattr(SWEbenchAgentWorkspaceBackend, "_start", lambda _self: None)
+        backend = SWEbenchAgentWorkspaceBackend(
+            workspace_path=tmp_path,
+            scratch_path=scratch,
+            test_spec=type(
+                "TestSpecFixture",
+                (),
+                {"instance_id": "astropy__astropy-12907"},
+            )(),
+            base_commit="d09ad3939c02713f0af5f9d5ba3dfd2e8319d9e6",
+            experiment_id="exp_schema_probe",
+        )
+    else:
+        backend = SpawnWorkspaceBackend(root_dir=tmp_path, scratch_path=scratch)
+    direct_model = CapturingModel()
+    fake_config = {
+        "provider": "fixture",
+        "model": "fixture",
+        "temperature": 0,
+        "thinking_enabled": False,
+    }
+    required = set(CODING_WORKSPACE_TOOLS)
+    with (
+        mock.patch.object(model_client_module, "get_fallback_llm_config", return_value=fake_config),
+        mock.patch.object(model_client_module.ModelClient, "_direct_model", return_value=direct_model),
+    ):
+        model = model_client_module.ModelClientChatModel(force_direct=True, streaming=False)
+        agent = create_deep_agent(
+            model=model,
+            tools=[],
+            backend=backend,
+            middleware=[
+                EvaluationToolBoundaryMiddleware(required, required_tools=required),
+                VersionedPatchMiddleware(backend, compact_model_surface=True),
+            ],
+        )
+        agent.invoke({"messages": [{"role": "user", "content": "reply ok"}]})
+
+    assert set(direct_model._bound_tools) == required

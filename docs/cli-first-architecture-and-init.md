@@ -1,32 +1,36 @@
 # PuddingClaw CLI-first 部署工具与初始化方案
 
-> 状态：0.1.2 实现基线；无参数交互 init、Provider bootstrap、条件依赖探测与 Runtime 裁剪已落地
-> 日期：2026-08-12
+> 状态：0.1.16 实现基线；无参数交互 init、核心数据库独立配置与重配、Agent/图片分析 SubAgent Provider bootstrap、条件依赖探测与 Runtime 裁剪已落地
+> 日期：2026-08-13
 
 当前实现位于 `packages/puddingclaw-deploy-cli`，唯一命令为 `puddingclaw`，默认 Home 为
-`~/.puddingclaw`。已完成独立配置、交互式 Profile/Provider 初始化、Python/uv/端口探测、Knowledge
+`~/.puddingclaw`。已完成独立配置、交互式 Profile/Provider 初始化、图片分析 SubAgent 多模态模型绑定、Python/uv/端口探测、Knowledge
 依赖图探测、受校验的 Runtime Bundle 安装，以及带实例挑战应答的
 `start/restart/status/open/stop/logs`。生产 Runtime 下载与签名、Analytics 数据源完整向导和安装后增量
 扩展向导仍属于后续阶段。现有 Headless
 `run/respond/cancel/models/capabilities` 已合并到产品 CLI 开发包，并保持 JSON、JSONL、Session、HITL
 和 artifact export 协议兼容。
 `init --plan --json` 会输出按 Profile 裁剪、含 `depends_on` 和 `execution_order` 的 Settings/Probe 计划。
-0.1.2 已接入首次可用所需的 Provider、Catalog、PostgreSQL/pgvector、Milvus、Embedding 与 MinerU
+0.1.16 已接入首次可用所需的 Agent Provider、图片分析 SubAgent Provider、Catalog、PostgreSQL/pgvector、Milvus、Embedding 与 MinerU
 分支；Harness 高级调优项仍使用产品默认值，后续由共享 Settings Schema 驱动高级向导，避免 Node CLI
 复制一套会漂移的字段校验。
 
-### 0.1.2 已落地的初始化顺序
+### 0.1.16 已落地的初始化顺序
 
 ```text
 Profile
   └─ Initial Agent Provider + API Key 验证
-      └─ Python / uv / Home / Ports
-          ├─ Harness-only
-          │   └─ 安装 requirements-harness.lock
-          └─ Knowledge
-              ├─ 本机 PostgreSQL 发现
-              │   ├─ SQLite 轻量分支
-              │   └─ PostgreSQL URL → 认证 → pgvector
+      └─ image_analyzer SubAgent 多模态 Provider + API Key 验证
+          └─ 核心数据库探测
+          ├─ 连接现有 PostgreSQL
+          ├─ 本机安装（Ubuntu/Debian，需 sudo）
+          ├─ Docker 部署（用户显式选择）
+          └─ SQLite 保底
+              └─ Python / uv / Home / Ports
+                  ├─ Harness-only
+                  │   └─ 安装 requirements-harness.lock
+                  └─ Knowledge
+              ├─ PostgreSQL 分支复检认证与 pgvector
               ├─ 本机/远程 Milvus → Collection API
               │   └─ 启用时要求 Embedding Provider
               └─ MinerU /health（可选，不阻断）
@@ -36,8 +40,31 @@ Profile
 Python requirements。源码开发启动没有 CLI 扩展契约时继续默认全量，因而不会改变当前开发实例；只有
 CLI 管理的 Runtime 使用显式裁剪状态。
 
+数据库属于 Core 基础设施，在 GUI 设置中使用独立的“数据库”一级入口，不再挂在知识库或智能问数
+下面。该入口始终展示连接模式、主机、端口、数据库名、凭证状态、配置来源和连通性测试；知识库只
+追加 pgvector/Milvus 等扩展依赖，智能问数只管理业务数据源与查询策略。
+
+数据库方案按部署位置分为四类：本机 PostgreSQL、Docker PostgreSQL、SQLite、外部 PostgreSQL，不使用
+“PuddingClaw 管理的 PostgreSQL”作为类型。CLI 只在 `init` 时完成选择、必要的安装或连接探测并写入
+配置；初始化完成后 Backend 只负责连接，数据库服务生命周期仍由操作系统、Docker 或外部服务所有者负责。
+
+数据库初始化必须形成闭环：先选择方案，再采集该方案需要的端口、数据库名、用户名与密码（密码留空
+时安全生成）；只探测 TCP 端口不能算数据库可用。Runtime 准备完成后还要验证认证和目标数据库：CLI
+新安装的本机 PostgreSQL、以及新建的 Docker PostgreSQL，会在用户确认具体参数后创建目标数据库；
+既有本机或外部 PostgreSQL 若缺少目标数据库，必须再次取得“允许创建”的明确授权。未授权不得执行
+`CREATE DATABASE`。Harness-only 不要求 pgvector，只有 Knowledge 分支才继续检查或安装 pgvector。
+
+`init` 不是数据库配置的唯一修改时机。初始化后使用 `puddingclaw database configure` 单独重走上述
+数据库状态机，不重复 Provider、Python、端口或扩展向导。新连接必须完整验证后才能原子替换旧配置；
+运行中的 Backend 不热切换数据库，CLI 返回 `restart_required` 并提示执行 `puddingclaw restart`。
+
 CLI 控制面写入 `deploy.json`；Backend/GUI 共享的产品设置继续写入 Home 下的 `config.json`。两者不能
 混用：前者描述安装、端口、Profile 和 Runtime，后者必须严格遵守 Backend Settings Schema。
+
+每次成功执行 `init` 都以 `initialized_at` 形成一次性 Provider bootstrap generation。Backend 首次看到
+新 generation 时才把 `agent` 与 `image_analyzer` Binding 合并进已有 Provider Registry，并记录不含密钥
+的 marker；同一 generation 后续启动不会覆盖 GUI 中的模型调整。再次执行 `puddingclaw init --force`
+会产生新 generation，并按用户本次选择重新绑定一次。
 
 发行方式采用接近 OpenClaw 的单 npm 包体验：npm 包内携带 Node CLI、Backend wheel、锁定依赖描述和
 Next standalone Web；`init` 再在用户 Home 内用 uv 准备版本隔离的 Python 环境。平台相关的大型可选
@@ -97,17 +124,16 @@ npm install -g @puddingai/puddingclaw
 - 本轮不重写 Python Backend 或 Next.js GUI。
 - 本轮不要求 Electron 立即删除。
 - npm 包不内嵌完整 Python 解释器；缺失时由 `init` 一键准备用户级 Python 环境。
-- `init` 不应擅自安装 Docker、PostgreSQL、pgvector、MinerU 或终止未知进程。
+- `init` 不擅自安装任何系统依赖。未发现 PostgreSQL 时，交互模式必须让用户在“本机安装、Docker 部署、SQLite 回退”之间明确选择；本机安装会提前说明需要 `sudo`。CLI 不自动安装 Docker、不安装 MinerU，也不终止未知进程或接管未知容器。
 - 不把所有内部兼容参数都暴露成新手问题；`init` 覆盖当前用户可见设置，隐藏的 legacy/internal 参数继续使用默认值。
 
 ### 2.3 产品能力分层
 
 | 层 | 内容 | 默认 |
 | --- | --- | --- |
-| Harness Core | Agent 对话、模型调用、Session、工具编排、文件与终端、Skill、SubAgent、权限、上下文、Goal/Rubric、Trace | 必选 |
+| Harness Core | Agent 对话、模型调用、Session、工具编排、文件与终端、Skill、SubAgent、权限、上下文、Goal/Rubric、Trace、Worker/Headless API、Worker Access Key 与运行审计 | 必选 |
 | Knowledge 扩展 | 知识目录、导入任务、RAG、MinerU、Milvus、LLM Wiki、gbrain | 可选，默认关闭 |
 | Analytics 扩展 | 数据源、Profile、语义资产、智能问数、NL2SQL/Vanna、结果存储 | 可选，默认关闭 |
-| Headless Worker 扩展 | Worker Access Key、外部调用、运行审计 | 可选，默认关闭 |
 
 知识库和智能问数彼此独立。用户可以选择：
 
@@ -126,7 +152,7 @@ npm install -g @puddingai/puddingclaw
   "extensions": {
     "knowledge": {"enabled": false},
     "analytics": {"enabled": false},
-    "headless_worker": {"enabled": false}
+    "headless_worker": {"enabled": true}
   }
 }
 ```
@@ -149,6 +175,7 @@ npm install -g @puddingai/puddingclaw
 ├── secrets/
 │   ├── headless-token          # CLI 与本地 Backend 的随机认证凭证，0600
 │   ├── initial-provider-api-key# 首次 Provider Key，仅注入 Backend
+│   ├── initial-multimodal-provider-api-key # 图片分析 SubAgent Key；同 Provider 时不重复保存
 │   ├── embedding-provider-api-key
 │   └── database-url            # 含数据库密码时也不进入 deploy.json
 ├── runtime.json                # 当前实例 URL、PID、版本和所有权
@@ -218,7 +245,7 @@ Backend 启动时根据 `extensions.*.enabled` 构建 Runtime Composition：
 Harness Core
 ├── knowledge enabled?  ──► Knowledge API / Tools / Workers / Guides
 ├── analytics enabled?  ──► Analytics API / Tools / Workers / Guides
-└── headless enabled?   ──► Worker API / Access / Audit
+└── Worker/Headless API / Access / Audit（始终启用）
 ```
 
 未启用扩展时必须同时满足：
@@ -511,7 +538,7 @@ Python bridge 与 FastAPI 的 `/api/settings/.../test`、`/api/capabilities` 共
 | + 智能问数 | Analytics DB/数据源、Profile、NL2SQL、结果配置 | 知识库导入/RAG；共享基础设施按需配置 |
 | 完整功能 | 全部已选择模块 | 无 |
 
-扩展可以保存默认配置模板，但未启用时不得进行连接、创建资源或激活 Tool。用户以后可以通过 `puddingclaw extension enable knowledge`、`puddingclaw extension enable analytics` 或重新运行 `init` 补充配置。
+Agent Worker/Headless API 属于 Agent Harness 核心能力，所有标准 Profile 都启用；它与 Backend 同进程运行，不是独立守护进程。知识库和智能问数是可选业务扩展，可以保存默认配置模板，但未启用时不得进行连接、创建资源或激活 Tool。用户以后可以通过 `puddingclaw extension enable knowledge`、`puddingclaw extension enable analytics` 或重新运行 `init` 补充配置。
 
 ### 8.3 阶段 2：本地服务与端口
 
@@ -582,7 +609,7 @@ database 不存在时只能询问是否创建；pgvector 缺失时显示精确�
 | Binding | 用途 | 必需性 |
 | --- | --- | --- |
 | `agent` | 对话、规划与工具调用 | Core 必需 |
-| `image_analyzer` | 图片理解 | 可选 |
+| `image_analyzer` | 图片理解 SubAgent | Harness Core 必需；`init` 独立选择，可与 Agent Provider 复用凭证 |
 | `text_embedding` | 文本检索、部分分析能力 | 仅所选扩展按需必需 |
 | `multimodal_embedding` | 图文向量索引 | 可选 |
 | `rerank` | 候选重排 | 可选 |
@@ -785,7 +812,7 @@ database 不存在时只能询问是否创建；pgvector 缺失时显示精确�
 - 默认项目目录和项目上下文文档；
 - MCP server enabled list、超时、allowlist；
 - Web Search / Connector 的显式启用状态；
-- 是否启用 Headless Worker Access；
+- Worker/Headless Access 作为 Harness Core 固定启用；
 - Worker Key 名称、允许的能力和项目根目录。
 
 探测：
@@ -813,7 +840,10 @@ Harness Core
 Extensions
   ○ Knowledge disabled
   ○ Analytics disabled
-  ○ Headless Worker disabled
+
+Harness Worker
+  ✓ Headless API enabled
+  ✓ Worker Access Key Store ready
 
 Ports
   Backend: 127.0.0.1:8888
@@ -842,7 +872,7 @@ Ports
 | 知识库 | 阶段 3、5、6、7，仅 Knowledge | PostgreSQL/pgvector、目录、MinerU、Milvus、gbrain |
 | 记忆管理 | 阶段 14 | 文件/索引目录、mem0 模型依赖 |
 | Harness 配置 | 阶段 10、11、12、13 | 模型预算、Docker/Kernel Sandbox、SubAgent/Skill |
-| Worker Access | 阶段 14，仅 Headless Worker | Key Store、项目根目录；创建 Key 需单独确认 |
+| Worker Access | 阶段 14，所有 Profile | Key Store、项目根目录；创建 Key 需单独确认 |
 | 高级设置 | 已选模块各阶段的 advanced 问题 | 范围、依赖和交叉字段校验 |
 | 系统状态 | 阶段 15 与 `doctor` | 聚合 Core 和已启用扩展探测，区分 available/degraded/disabled |
 
@@ -951,8 +981,7 @@ CLI 骨架、独立 Home 与 Runtime Supervisor
 Harness-only 最小部署切片
         │
         ├─► Knowledge 扩展步骤
-        ├─► Analytics 扩展步骤
-        └─► Headless Worker 扩展步骤
+        └─► Analytics 扩展步骤
                     │
                     ▼
               Full Profile 部署验收
@@ -963,7 +992,7 @@ Harness-only 最小部署切片
 1. 先实现 CLI 命令框架、独立 Home、Python 一键准备、Runtime 下载/安装和进程管理。
 2. Init Engine 从第一版就支持 Step Registry、条件执行和 `extensions.*.enabled`，避免后面重写一套线性全量向导。
 3. 首个可部署 Profile 采用 Harness-only：新电脑只配置 Agent 模型即可启动 GUI 并完成 Agent Run。
-4. 再增加 Knowledge、Analytics、Headless Worker 的配置步骤、探测、依赖和 Runtime Composition。
+4. 再增加 Knowledge、Analytics 的配置步骤、探测、依赖和 Runtime Composition；Worker 已包含在 Harness 最小切片中。
 5. 最后在干净机器上验收 Full Profile，确认所有已选步骤可以组合部署。
 
 因此不建议先写死“全量部署向导”再补 Harness-only。不是因为需要兼容当前运行实例，而是为了避免 CLI 自身的向导、依赖和探测逻辑返工。
@@ -988,7 +1017,7 @@ PUDDINGCLAW_HOME="$HOME/.puddingclaw-test" puddingclaw start --port auto
 ### Phase 0：CLI 独立路径与配置 Schema
 
 - 在 CLI-managed Runtime 中引入统一 `PUDDINGCLAW_HOME` 路径模块；
-- 增加 `extensions.knowledge/analytics/headless_worker.enabled` 作为运行时组合事实源；
+- 增加 `extensions.knowledge/analytics/headless_worker.enabled` 作为运行时组合事实源；标准 Profile 中 `headless_worker` 恒为 `true`，字段仅保留运行时契约兼容；
 - 新部署直接把配置写入 CLI Home，不自动迁移开发机的 `backend/config.json`；
 - Provider、Credential、Session、日志都使用 CLI Home；
 - 为 GUI 和 CLI 提供共享配置 Schema、迁移器和脱敏展示。

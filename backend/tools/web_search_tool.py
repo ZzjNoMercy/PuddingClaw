@@ -54,7 +54,13 @@ class WebSearchInput(BaseModel):
 class ManagedWebSearchTool(BaseTool):
     name: str = "web_search"
     description: str = (
-        "Search the configured public internet providers and return citation-ready sources. "
+        "Public-internet search fallback that returns citation-ready sources. For ordinary factual questions, "
+        "concept explanations, project/product lists, comparisons, recommendations, summaries, or document "
+        "generation, first query the internal Markdown LLM Wiki according to /skills/llm-wiki/SKILL.md; words "
+        "such as open-source, projects, or recommend do not by themselves authorize skipping internal knowledge. "
+        "Use this tool first only when the user explicitly requests current/latest information, public Web research, "
+        "a specific webpage, or a URL source. Otherwise use it only after internal retrieval reports no result, "
+        "a clear knowledge gap, or insufficient coverage. "
         "Use scope=domestic for Chinese mainland public-web intent, scope=global for global sources, "
         "and source=x when the user asks what people or accounts say on X. "
         "Use provider only when the user explicitly names Tavily, DeepSeek, or Grok."

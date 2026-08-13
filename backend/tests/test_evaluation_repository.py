@@ -1,9 +1,18 @@
+import asyncio
 from pathlib import Path
 
 import pytest
 
-from evaluation.contracts import EvalCase, EvalDataset, EvalExpectations, EvalInput
-from evaluation.repository import ConflictError, EvaluationRepository, ValidationError
+from evaluation.contracts import (
+    EvalCase,
+    EvalDataset,
+    EvalExpectations,
+    EvalExperiment,
+    EvalInput,
+    ExperimentCandidate,
+)
+from evaluation.repository import ConflictError, EvaluationRepository, NotFoundError, ValidationError
+from evaluation.worker_manager import EvaluationWorkerManager
 
 
 def _dataset() -> EvalDataset:
@@ -134,3 +143,110 @@ def test_outbox_has_single_claimant_and_retryable_lease(tmp_path: Path):
     assert row["status"] == "delivered"
     assert row["attempts"] == 2
     assert row["last_error"] == "network unavailable"
+
+
+def test_delete_experiment_requires_terminal_status_and_cascades_local_records(tmp_path: Path):
+    repository = EvaluationRepository(tmp_path / "evaluation.db")
+    experiment = repository.create_experiment(
+        EvalExperiment(
+            name="Delete me",
+            dataset_id="ds-delete",
+            dataset_version=1,
+            dataset_version_id="version-delete",
+            dataset_content_hash="a" * 64,
+            candidate=ExperimentCandidate(name="agent"),
+        )
+    )
+    attempt_id = repository.create_attempt(experiment.experiment_id, "case-delete", 0)
+    repository.enqueue_outbox("langsmith", "experiment_projection", experiment.experiment_id, {"x": 1})
+    repository.save_remote_mapping(
+        provider="langsmith",
+        local_type="experiment",
+        local_id=experiment.experiment_id,
+        version_id="",
+        remote_id="remote-delete",
+        remote_name="remote",
+        content_hash=None,
+        status="synced",
+    )
+
+    with pytest.raises(ConflictError, match="terminal"):
+        repository.delete_experiment(experiment.experiment_id)
+
+    repository.update_experiment(experiment.model_copy(update={"status": "failed"}))
+    repository.delete_experiment(experiment.experiment_id)
+
+    with pytest.raises(NotFoundError):
+        repository.get_experiment(experiment.experiment_id)
+    with repository._connect() as connection:
+        assert connection.execute(
+            "SELECT 1 FROM eval_case_attempts WHERE attempt_id=?", (attempt_id,)
+        ).fetchone() is None
+        assert connection.execute(
+            "SELECT 1 FROM eval_outbox WHERE aggregate_id=?", (experiment.experiment_id,)
+        ).fetchone() is None
+        assert connection.execute(
+            "SELECT 1 FROM eval_remote_mappings WHERE local_id=?", (experiment.experiment_id,)
+        ).fetchone() is None
+
+
+def test_application_shutdown_requeues_worker_and_clears_partial_attempts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    repository = EvaluationRepository(tmp_path / "evaluation.db")
+    experiment = repository.create_experiment(
+        EvalExperiment(
+            name="Reload recovery",
+            dataset_id="ds-reload",
+            dataset_version=1,
+            dataset_version_id="version-reload",
+            dataset_content_hash="b" * 64,
+            candidate=ExperimentCandidate(name="agent"),
+            status="running",
+            started_at="2026-08-13T00:00:00Z",
+        )
+    )
+    repository.create_attempt(experiment.experiment_id, "case-reload", 0)
+    repository.enqueue_outbox(
+        "langsmith",
+        "experiment_projection",
+        experiment.experiment_id,
+        {"stale": True},
+    )
+    monkeypatch.setattr(
+        "evaluation.repository.get_evaluation_repository",
+        lambda: repository,
+    )
+
+    class Process:
+        returncode = None
+
+    process = Process()
+    manager = EvaluationWorkerManager()
+    manager._processes[experiment.experiment_id] = process  # noqa: SLF001
+
+    async def terminate(_process):
+        _process.returncode = -15
+
+    async def noop(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(manager, "_terminate_worker_group", terminate)
+    monkeypatch.setattr(manager, "_terminate_official_harness", noop)
+    monkeypatch.setattr(manager, "_terminate_swebench_image_preparation", noop)
+
+    asyncio.run(manager.stop())
+
+    recovered = repository.get_experiment(experiment.experiment_id)
+    assert recovered.status == "queued"
+    assert recovered.started_at is None
+    assert recovered.finished_at is None
+    assert recovered.summary["application_restart_pending"] is True
+    assert recovered.summary["progress"]["completed"] == 0
+    assert repository.list_results(experiment.experiment_id) == []
+    with repository._connect() as connection:
+        assert connection.execute(
+            "SELECT 1 FROM eval_outbox WHERE aggregate_id=?",
+            (experiment.experiment_id,),
+        ).fetchone() is None

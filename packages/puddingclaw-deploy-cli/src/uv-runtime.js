@@ -1,5 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
+import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
 import { CliError } from "./errors.js";
@@ -12,6 +13,9 @@ export function managedUvInstaller(platform = process.platform) {
   return {
     url: `https://astral.sh/uv/${MANAGED_UV_VERSION}/install.${windows ? "ps1" : "sh"}`,
     filename: windows ? "install.ps1" : "install.sh",
+    sha256: windows
+      ? "d84b0d973693497f8c1c1d82b2d2f52e32e50c7c24efa3d925341bd6fc5238b2"
+      : "43aff33a967fe40e8c17949d8c85c65bc43f3b5c94742393c957f56ab5ba80f4",
   };
 }
 
@@ -63,6 +67,7 @@ async function runInstaller(script, installDir, { stderr = process.stderr } = {}
 export async function bootstrapUv(home, {
   fetchImpl = globalThis.fetch,
   stderr = process.stderr,
+  installerSha256,
 } = {}) {
   const installDir = path.join(home, "toolchains", "uv");
   const executable = managedUvExecutable(installDir);
@@ -102,6 +107,15 @@ export async function bootstrapUv(home, {
         code: "uv_download_failed",
         exitCode: 1,
         details: { url: installer.url, bytes: body.length },
+      });
+    }
+    const actualSha256 = createHash("sha256").update(body).digest("hex");
+    const expectedSha256 = installerSha256 || installer.sha256;
+    if (actualSha256 !== expectedSha256) {
+      throw new CliError("official uv installer checksum does not match the pinned release", {
+        code: "uv_integrity_failed",
+        exitCode: 1,
+        details: { url: installer.url, expected: expectedSha256, actual: actualSha256 },
       });
     }
     await fs.writeFile(script, body, { mode: 0o600 });

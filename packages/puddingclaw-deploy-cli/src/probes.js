@@ -119,12 +119,6 @@ export function probeNode() {
 }
 
 export async function probePort(port, host = "127.0.0.1") {
-  if (process.platform !== "win32") {
-    const owner = await portOwner(port);
-    return owner
-      ? { probe: "runtime.port", status: "occupied", required: true, host, port, owner }
-      : { probe: "runtime.port", status: "available", required: true, host, port };
-  }
   return new Promise((resolve) => {
     const server = net.createServer();
     server.unref();

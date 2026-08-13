@@ -2,6 +2,8 @@
 
 `web_search` is the only public-network discovery tool. The Backend owns provider credentials, availability, routing, fallback, and citations.
 
+- Public Web search is a fallback for ordinary knowledge work. Unless the user explicitly asks for current/latest public information, public Web research, a specific webpage, or a URL source, query the internal Markdown LLM Wiki first. Project/product lists, technical comparisons, recommendations, and the word “open-source” do not by themselves justify skipping internal retrieval. Use Web only after the internal paths required by `Knowledge Source Routing` report no result, a clear knowledge gap, or insufficient coverage, and label Web findings as external supplementation.
+
 - Use `scope=domestic` for Chinese-mainland public sites and domestic services; use `scope=global` for worldwide sources. Keep `scope=auto` when the user did not express a regional preference.
 - Use `source=x` when the request explicitly asks about X/Twitter posts, accounts, threads, reactions, or current discourse. Use `source=both` only when the user asks to compare public webpages with X. Otherwise use `source=web` or `auto`.
 - Keep `provider=auto` unless the user explicitly names Tavily, DeepSeek, or Grok. User-configured routing is authoritative.

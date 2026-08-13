@@ -473,6 +473,22 @@ def test_database_puddingclaw_env_can_override_config_json(tmp_path, monkeypatch
     assert database["environment_override"] is True
 
 
+def test_cli_sqlite_mode_overrides_postgres_defaults(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.json"
+    config_path.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(config, "CONFIG_FILE", config_path)
+    monkeypatch.delenv("PUDDINGCLAW_DATABASE_URL", raising=False)
+    monkeypatch.setenv("PUDDINGCLAW_DATABASE_MODE", "sqlite")
+    monkeypatch.setenv("PUDDINGCLAW_DATABASE_SOURCE", "fallback")
+
+    database = config.get_database_config()
+
+    assert database["mode"] == "sqlite"
+    assert database["url"] == ""
+    assert database["configured_by"] == "environment"
+    assert database["environment_override"] is True
+
+
 def test_default_agent_thinking_and_rubric_use_flash(tmp_path, monkeypatch):
     config_path = tmp_path / "config.json"
     config_path.write_text("{}", encoding="utf-8")
@@ -1370,3 +1386,33 @@ def test_web_markdown_url_is_not_extracted_as_local_windows_path(tmp_path):
         session_id="session-web-md",
         workspace_path=tmp_path,
     ) == f"帮我安装飞书 CLI：{url}"
+
+
+def test_pasted_html_does_not_become_a_multiline_local_path(tmp_path):
+    from harness.artifact_paths import extract_local_resource_paths
+
+    message = (
+        '<meta charset="utf-8"/>\r\n'
+        '<meta content="text/html;charset=UTF-8" http-equiv="Content-type"/>\r\n'
+        'See [`write()`](https://docs.astropy.org/en/stable/api/astropy.io.ascii.write.html#write).'
+    )
+
+    assert extract_local_resource_paths(message) == []
+    assert DeepAgentsAgentManager._build_user_content(
+        message,
+        session_id="session-pasted-html",
+        workspace_path=tmp_path,
+    ) == message
+
+
+def test_overlong_local_path_candidate_does_not_abort_user_content(tmp_path):
+    from harness.artifact_paths import extract_local_resource_paths
+
+    message = "/" + ("a" * 5000) + ".html"
+
+    assert extract_local_resource_paths(message) == []
+    assert DeepAgentsAgentManager._build_user_content(
+        message,
+        session_id="session-overlong-path",
+        workspace_path=tmp_path,
+    ) == message

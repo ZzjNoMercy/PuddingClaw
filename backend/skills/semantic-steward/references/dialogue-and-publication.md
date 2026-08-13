@@ -33,9 +33,15 @@ body_outline:
 
 The Brief prevents repeated questions and lost decisions. It is required as a preparation gate but is not a definition. Deleting it must not affect published behavior. `reviewed_topics` means each topic was either confirmed, supported by named evidence, or explicitly marked not applicable in the body; it does not authorize the Agent to invent an answer.
 
+## Discovery boundary
+
+Call `discover_semantic_definitions` before deciding reuse, edit, or create. For an inventory question, an empty query lists the selected kinds with pagination. For authoring, search the user's actual business concept and read every plausible candidate's full Markdown. Explain the comparison to the user.
+
+The targeted call returns a Session-bound receipt. It proves that the relevant Registry snapshot was searched; it does not prove the Agent made the correct business decision. If results are incomplete, narrow the query or request a complete result before drafting. `prepare_semantic_markdown` rejects missing, inventory-only, incomplete, expired, wrong-kind, cross-Session, or stale receipts.
+
 ## Prepare boundary
 
-Call `prepare_semantic_markdown` only when unresolved decisions are empty. Pass complete Markdown, not fragments. The tool:
+Call `prepare_semantic_markdown` only when unresolved decisions are empty. Pass the targeted discovery receipt and complete Markdown, not fragments. The tool:
 
 - reads the current baseline;
 - fills only target-derived technical metadata;

@@ -4,6 +4,7 @@ import Link from "next/link";
 import {
   Activity,
   ArrowLeft,
+  BarChart3,
   Bot,
   Brain,
   Database,
@@ -11,10 +12,13 @@ import {
   Globe2,
   KeyRound,
   Network,
+  ScanSearch,
 } from "lucide-react";
+import type { RuntimeExtensions } from "@/lib/useRuntimeProfile";
 
 export type SettingsCategory =
   | "ai"
+  | "database"
   | "databaseQa"
   | "rag"
   | "knowledge"
@@ -30,8 +34,9 @@ export const SETTINGS_CATEGORIES: Array<{
   color: string;
 }> = [
   { key: "ai", label: "模型服务", icon: Network, color: "#002fa7" },
-  { key: "databaseQa", label: "智能问数设置", icon: Database, color: "#002fa7" },
-  { key: "rag", label: "RAG 设置", icon: Database, color: "#002fa7" },
+  { key: "database", label: "数据库", icon: Database, color: "#002fa7" },
+  { key: "databaseQa", label: "智能问数设置", icon: BarChart3, color: "#002fa7" },
+  { key: "rag", label: "RAG 设置", icon: ScanSearch, color: "#002fa7" },
   { key: "knowledge", label: "知识库", icon: FolderOpen, color: "#002fa7" },
   { key: "memory", label: "记忆管理", icon: Brain, color: "#002fa7" },
   { key: "harness", label: "Harness 配置", icon: Bot, color: "#002fa7" },
@@ -39,14 +44,25 @@ export const SETTINGS_CATEGORIES: Array<{
   { key: "system", label: "系统状态", icon: Activity, color: "#002fa7" },
 ];
 
+export function settingsCategoryEnabled(
+  category: SettingsCategory,
+  extensions: RuntimeExtensions | null,
+): boolean {
+  if (category === "databaseQa") return Boolean(extensions?.analytics);
+  if (category === "rag" || category === "knowledge") return Boolean(extensions?.knowledge);
+  return true;
+}
+
 export default function SettingsNavigation({
   active,
   onSelectCategory,
   onReturnToApp,
+  extensions,
 }: {
   active: SettingsCategory | "webSearch";
   onSelectCategory?: (category: SettingsCategory) => void;
   onReturnToApp?: () => void;
+  extensions: RuntimeExtensions | null;
 }) {
   const rowClass = (selected: boolean) =>
     `flex w-full items-center gap-2.5 rounded-lg px-3 py-2 text-left text-[12px] transition-all ${
@@ -67,7 +83,7 @@ export default function SettingsNavigation({
       </Link>
 
       <div className="space-y-0.5">
-        {SETTINGS_CATEGORIES.map((item, index) => {
+        {SETTINGS_CATEGORIES.filter((item) => settingsCategoryEnabled(item.key, extensions)).map((item, index) => {
           const Icon = item.icon;
           const selected = active === item.key;
           const content = (

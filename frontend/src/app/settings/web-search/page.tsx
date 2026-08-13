@@ -24,6 +24,7 @@ import xaiLogo from "@lobehub/icons-static-svg/icons/xai.svg";
 
 import Navbar from "@/components/layout/Navbar";
 import SettingsNavigation from "@/components/settings/SettingsNavigation";
+import { useRuntimeProfile } from "@/lib/useRuntimeProfile";
 import { useApp } from "@/lib/store";
 import {
   deleteWebSearchCredential,
@@ -107,6 +108,7 @@ export default function WebSearchSettingsPage() {
   const [keyDrafts, setKeyDrafts] = useState<Partial<Record<WebSearchProviderId, string>>>({});
   const [editingKeys, setEditingKeys] = useState<Set<WebSearchProviderId>>(() => new Set());
   const [notice, setNotice] = useState<{ tone: "success" | "error"; text: string } | null>(null);
+  const runtimeExtensions = useRuntimeProfile();
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -226,7 +228,7 @@ export default function WebSearchSettingsPage() {
         <div className="workspace-sidebar-shell shrink-0 overflow-hidden panel-transition" style={{ width: !mounted || sidebarOpen ? 208 : 0 }}>
           <div className="flex h-full w-52 flex-col">
             <div className="h-11 shrink-0" />
-            <SettingsNavigation active="webSearch" onReturnToApp={handleReturnToApp} />
+            <SettingsNavigation active="webSearch" extensions={runtimeExtensions} onReturnToApp={handleReturnToApp} />
           </div>
         </div>
 

@@ -49,14 +49,20 @@ export async function prepareRuntimePython(paths, {
   allowUvBootstrap = false,
   stderr = process.stderr,
 } = {}) {
+  const config = await loadConfig(paths.config);
+  if (!config) {
+    throw new CliError("PuddingClaw is not initialized; run `puddingclaw init` first", {
+      code: "not_initialized",
+      exitCode: 1,
+    });
+  }
   const active = await loadActiveRuntime(paths);
   if (!active) {
     throw new CliError("no runtime is installed", { code: "runtime_not_installed", exitCode: 1 });
   }
   const install = active.manifest.install?.python;
   if (!install) return { status: "not_required", release_version: active.manifest.release_version };
-  const config = await loadConfig(paths.config);
-  let uv = probeUv(config?.runtime?.uv?.command);
+  let uv = probeUv(config.runtime?.uv?.command);
   if (uv.status !== "available" && allowUvBootstrap) {
     const bootstrapped = await bootstrapUv(paths.home, { stderr });
     uv = { ...probeUv(bootstrapped.selected.command), selected: bootstrapped.selected };

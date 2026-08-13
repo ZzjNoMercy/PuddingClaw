@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any
 
 CLI_COMMAND = "puddingclaw"
-CLI_VERSION = "0.1.2"
+CLI_VERSION = "0.1.16"
 MIN_NODE_MAJOR = 20
 INSTALL_POLICIES = frozenset({"auto", "prompt", "never"})
 CommandRunner = Callable[..., subprocess.CompletedProcess[str]]

@@ -63,18 +63,15 @@ class EvaluationWorkerManager:
         return endpoint
 
     @staticmethod
-    async def _terminate_official_harness(experiment_id: str) -> None:
+    async def _terminate_managed_process(
+        experiment_id: str,
+        *,
+        pid_path: Path,
+        command_markers: tuple[str, ...],
+    ) -> None:
         if os.name == "nt":
             return
-        from runtime_identity.paths import PuddingClawPaths
-
-        pid_path = (
-            PuddingClawPaths.from_environment().data()
-            / "evaluation-runs"
-            / experiment_id
-            / "official-swebench"
-            / "harness.pid"
-        )
+        unlink_receipt = False
         try:
             flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
             descriptor = os.open(pid_path, flags)
@@ -87,7 +84,10 @@ class EvaluationWorkerManager:
                 os.close(descriptor)
             if len(payload) > 1_024:
                 return
-            identity = json.loads(payload.decode("ascii"))
+            # PID receipts are JSON.  Read them as UTF-8 so localized process
+            # identity values remain valid even if a producer stops escaping
+            # non-ASCII characters in a future revision.
+            identity = json.loads(payload.decode("utf-8"))
             pid = int(identity["pid"])
             expected_run_id = f"puddingclaw-{experiment_id}"
             if identity.get("run_id") != expected_run_id:
@@ -103,31 +103,88 @@ class EvaluationWorkerManager:
             )
             stdout, _ = await asyncio.wait_for(inspect.communicate(), timeout=5)
             process_line = stdout.decode("utf-8", errors="replace").strip()
+            if inspect.returncode != 0 or not process_line:
+                try:
+                    os.kill(pid, 0)
+                except ProcessLookupError:
+                    unlink_receipt = True
+                return
             fields = process_line.split(maxsplit=7)
-            observed_started_at = " ".join(fields[2:7]) if len(fields) >= 8 else ""
-            command = fields[7] if len(fields) >= 8 else ""
+            if len(fields) < 8:
+                return
+            observed_started_at = " ".join(fields[2:7])
+            command = fields[7]
+            if identity.get("process_started_at") != observed_started_at:
+                # A different kernel start identity proves PID reuse.
+                unlink_receipt = True
+                return
             if (
-                inspect.returncode != 0
-                or len(fields) < 8
-                or fields[0] != str(pid)
+                fields[0] != str(pid)
                 or fields[1] != str(pid)
-                or identity.get("process_started_at") != observed_started_at
-                or "puddingclaw_swebench_entry" not in command
-                or f"--run_id {expected_run_id}" not in command
+                or (
+                    f"--run_id {expected_run_id}" not in command
+                    and f"--run-id {expected_run_id}" not in command
+                )
+                or any(marker not in command for marker in command_markers)
             ):
+                # Formatting/PG/command mismatches do not prove reuse. Keep
+                # the receipt so a later cleanup pass can inspect it again.
                 return
             os.killpg(pid, signal.SIGTERM)
             for _ in range(50):
                 try:
                     os.killpg(pid, 0)
                 except ProcessLookupError:
+                    unlink_receipt = True
                     return
                 await asyncio.sleep(0.1)
             os.killpg(pid, signal.SIGKILL)
+            for _ in range(50):
+                try:
+                    os.killpg(pid, 0)
+                except ProcessLookupError:
+                    unlink_receipt = True
+                    return
+                await asyncio.sleep(0.1)
         except (OSError, TimeoutError, ValueError):
+            # Preserve the receipt on transient inspection/termination errors
+            # so restart and explicit cleanup can retry the same process group.
             return
         finally:
-            pid_path.unlink(missing_ok=True)
+            if unlink_receipt:
+                pid_path.unlink(missing_ok=True)
+
+    @staticmethod
+    async def _terminate_official_harness(experiment_id: str) -> None:
+        from runtime_identity.paths import PuddingClawPaths
+
+        await EvaluationWorkerManager._terminate_managed_process(
+            experiment_id,
+            pid_path=(
+                PuddingClawPaths.from_environment().data()
+                / "evaluation-runs"
+                / experiment_id
+                / "official-swebench"
+                / "harness.pid"
+            ),
+            command_markers=("puddingclaw_swebench_entry",),
+        )
+
+    @staticmethod
+    async def _terminate_swebench_image_preparation(experiment_id: str) -> None:
+        from runtime_identity.paths import PuddingClawPaths
+
+        runtime_root = (
+            PuddingClawPaths.from_environment().data()
+            / "evaluation-runs"
+            / experiment_id
+        )
+        for pid_path in runtime_root.glob("agent-scratch/*/image-preparation/candidate-image.pid"):
+            await EvaluationWorkerManager._terminate_managed_process(
+                experiment_id,
+                pid_path=pid_path,
+                command_markers=("evaluation.swebench_agent_backend", "--prepare-image"),
+            )
 
     @staticmethod
     async def _cleanup_official_swebench_containers(experiment_id: str) -> None:
@@ -276,7 +333,8 @@ class EvaluationWorkerManager:
         async with self._lock:
             if self._processes.get(experiment_id) is process:
                 self._processes.pop(experiment_id, None)
-        if return_code != 0:
+            stopping = self._stopping
+        if return_code != 0 and not stopping:
             from .contracts import EvalError, ExperimentStatus, utc_now
             from .repository import get_evaluation_repository
 
@@ -301,10 +359,63 @@ class EvaluationWorkerManager:
             except Exception:
                 pass
         await self._terminate_official_harness(experiment_id)
+        await self._terminate_swebench_image_preparation(experiment_id)
         await self._cleanup_official_swebench_containers(experiment_id)
         self._cleanup_runtime_if_needed(experiment_id)
         if not self._stopping:
             await self.start_pending(recover_orphans=False)
+
+    @staticmethod
+    def _restart_summary(experiment: object, *, total_attempts: int | None = None) -> dict[str, object]:
+        from .contracts import utc_now
+
+        summary = dict(getattr(experiment, "summary", {}) or {})
+        lineage = {
+            key: value
+            for key, value in summary.items()
+            if key in {"retry_of_experiment_id", "retry_root_experiment_id", "retry_generation"}
+        }
+        previous_progress = dict(summary.get("progress") or {})
+        total = total_attempts if total_attempts is not None else int(previous_progress.get("total") or 0)
+        return {
+            **lineage,
+            "application_restart_pending": True,
+            "progress": {
+                "stage": "queued",
+                "message": "开发服务已热重载，评测将从第一个 Case 自动重启",
+                "total": total,
+                "completed": 0,
+                "failed": 0,
+                "updated_at": utc_now().isoformat(),
+            },
+        }
+
+    @staticmethod
+    def _refresh_restart_candidate(repository: object, experiment: object) -> object:
+        """Freeze the post-reload source/model snapshot before restarting."""
+
+        from .candidate import CandidateRequest, bind_candidate_capability, resolve_candidate
+
+        backend_dir = Path(__file__).resolve().parent.parent
+        previous = experiment.candidate
+        candidate = resolve_candidate(
+            backend_dir,
+            CandidateRequest(
+                name=previous.name,
+                llm_model_id=previous.llm_model_id,
+                thinking_level=previous.thinking_level,
+                credential_name=previous.credential_name,
+                analytics_model_id=previous.analytics_model_id,
+            ),
+        )
+        candidate = bind_candidate_capability(candidate, experiment.profile_id)
+        summary = dict(experiment.summary)
+        summary.pop("application_restart_pending", None)
+        refreshed = experiment.model_copy(update={"candidate": candidate, "summary": summary})
+        return repository.update_experiment(
+            refreshed,
+            expected_status="queued",
+        )
 
     async def start_pending(self, *, recover_orphans: bool = True) -> None:
         from .contracts import ExperimentStatus
@@ -321,6 +432,30 @@ class EvaluationWorkerManager:
             }
         for experiment in repository.list_experiments():
             if experiment.status == ExperimentStatus.QUEUED:
+                if experiment.summary.get("application_restart_pending"):
+                    try:
+                        experiment = self._refresh_restart_candidate(repository, experiment)
+                    except Exception as exc:
+                        from .contracts import EvalError, utc_now
+
+                        repository.update_experiment(
+                            experiment.model_copy(
+                                update={
+                                    "status": ExperimentStatus.FAILED,
+                                    "finished_at": utc_now(),
+                                    "error": EvalError(
+                                        code="restart_snapshot_failed",
+                                        message=(
+                                            "Failed to freeze the Agent snapshot after application restart: "
+                                            f"{type(exc).__name__}: {str(exc)[:500]}"
+                                        ),
+                                        retryable=True,
+                                    ),
+                                }
+                            ),
+                            expected_status=ExperimentStatus.QUEUED,
+                        )
+                        continue
                 await self.start(experiment.experiment_id)
             elif (
                 recover_orphans
@@ -355,6 +490,7 @@ class EvaluationWorkerManager:
                     expected_status=experiment.status,
                 )
                 await self._terminate_official_harness(experiment.experiment_id)
+                await self._terminate_swebench_image_preparation(experiment.experiment_id)
                 await self._cleanup_official_swebench_containers(experiment.experiment_id)
                 self._cleanup_runtime_if_needed(experiment.experiment_id)
 
@@ -368,7 +504,35 @@ class EvaluationWorkerManager:
             ]
         for experiment_id, process in processes:
             await self._terminate_official_harness(experiment_id)
+            await self._terminate_swebench_image_preparation(experiment_id)
             await self._terminate_worker_group(process)
+            from .contracts import ExperimentStatus
+            from .repository import get_evaluation_repository
+
+            repository = get_evaluation_repository()
+            try:
+                experiment = repository.get_experiment(experiment_id)
+                if experiment.status in {ExperimentStatus.QUEUED, ExperimentStatus.RUNNING}:
+                    restart = experiment.model_copy(
+                        update={
+                            "status": ExperimentStatus.QUEUED,
+                            "verdict": "pending",
+                            "error": None,
+                            "started_at": None,
+                            "finished_at": None,
+                            "remote_experiment_id": None,
+                            "remote_url": None,
+                            "summary": self._restart_summary(experiment),
+                        }
+                    )
+                    repository.reset_experiment_execution(
+                        restart,
+                        expected_status=experiment.status,
+                    )
+            except Exception:
+                # Shutdown must continue even if the durable recovery marker
+                # cannot be written; startup orphan handling remains fail-closed.
+                pass
 
     async def cancel(self, experiment_id: str) -> bool:
         async with self._lock:
@@ -376,7 +540,26 @@ class EvaluationWorkerManager:
             if process is None or process.returncode is not None:
                 return False
         await self._terminate_official_harness(experiment_id)
+        await self._terminate_swebench_image_preparation(experiment_id)
         await self._terminate_worker_group(process)
+        return True
+
+    async def delete_artifacts(self, experiment_id: str) -> bool:
+        """Remove local runtime artifacts after a terminal Experiment is deleted."""
+
+        async with self._lock:
+            process = self._processes.get(experiment_id)
+            if process is not None and process.returncode is None:
+                return False
+        await self._terminate_official_harness(experiment_id)
+        await self._terminate_swebench_image_preparation(experiment_id)
+        await self._cleanup_official_swebench_containers(experiment_id)
+        from runtime_identity.paths import PuddingClawPaths
+
+        shutil.rmtree(
+            PuddingClawPaths.from_environment().data() / "evaluation-runs" / experiment_id,
+            ignore_errors=True,
+        )
         return True
 
 

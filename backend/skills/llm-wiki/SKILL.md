@@ -1,6 +1,6 @@
 ---
 name: llm-wiki
-description: Compile immutable raw knowledge snapshots into the Schema-bound LLM Wiki, query published Wiki knowledge, or lint the Wiki.
+description: Primary internal source for ordinary knowledge questions, including concepts, project or product lists, comparisons, recommendations, summaries, and document generation; also compiles immutable raw snapshots into the Schema-bound LLM Wiki and lints it. Use before public Web search unless the user explicitly asks for current/latest public information, a specific webpage, or a URL source.
 toolsets:
   - llm_wiki
   - gbrain_query
@@ -16,11 +16,19 @@ loads the Ingest context itself.
 For a user-facing Ingest request, the main Agent is only an orchestrator:
 
 1. Call `llm_wiki_create_raw` with `source=current_message`, `conversation`,
-   `attachments`, or `knowledge_file`. Use `conversation` when the user refers
-   to material already established in recent visible Session context (for
-   example “把刚才这些编译到 Wiki”). The server resolves the exact source;
-   never repeat a long document as a tool argument and never create an
-   intermediate file with generic filesystem tools.
+   `attachments`, or `knowledge_file`. For `source=conversation`, first call
+   `llm_wiki_conversation_documents` with no ids to inspect the catalog. Use
+   the full visible context to choose exactly the document ids that match the
+   user's requested scope, including the current instruction when it adds a
+   correction, classification, or boundary. Read those selected ids with the
+   same tool, then synthesize one clean, self-contained Markdown document in
+   `raw_markdown`. It must reflect the user's latest corrections; do not dump
+   or concatenate chat transcripts. Pass both `conversation_document_ids` and
+   `raw_markdown` to `llm_wiki_create_raw`. The server validates provenance and
+   snapshots the Agent-authored Markdown exactly. It never guesses from a
+   “recent N messages” window. Do not create an intermediate file with generic
+   filesystem tools. The optional Raw `title` is only a provenance label, not
+   a compiler instruction or Schema constraint.
 2. Pass the returned complete `raw_paths` and opaque `intake_id` unchanged to
    `llm_wiki_start_ingest`. This queues (or reuses) the existing durable task
    and returns immediately. Tell the user the task id and that progress is
@@ -31,6 +39,9 @@ For a user-facing Ingest request, the main Agent is only an orchestrator:
    - Set `import_gbrain=true` only when the user explicitly asks to enter,
      import, or sync gbrain. The same task then continues with the validated
      gbrain PostgreSQL import.
+   - The queue response proves only the selected Raw, task id, and requested
+     stages. Do not predict or promise final page types, slugs, titles, page
+     count, or relationships before the background Compiler finishes.
 
 An explicit request to compile, organize, add, or turn selected material into
 Wiki is sufficient authority for this two-tool intake. Do not call

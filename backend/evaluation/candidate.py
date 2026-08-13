@@ -15,24 +15,33 @@ from runtime_identity.paths import PuddingClawPaths
 
 from .contracts import ExperimentCandidate
 
-ISOLATED_WORKSPACE_CORE_TOOLS = (
-    "edit_file",
-    "glob",
-    "grep",
+# Evaluation must exercise the same model-facing workspace protocol as a normal
+# PuddingClaw Agent Run.  In particular, ``edit_file`` is intentionally not a
+# production Harness tool: the canonical Agent surface uses the versioned
+# ``patch_file`` protocol.  Keep this list aligned with the compact production
+# surface assembled by VersionedPatchMiddleware and DeepAgents itself.
+HARNESS_WORKSPACE_CORE_TOOLS = (
     "ls",
     "read_file",
+    "glob",
+    "grep",
     "write_file",
+    "task",
     "update_todos",
+    "patch_file",
+    "materialize_source_ref",
+    "delete_file",
+    "validate_artifact_contract",
 )
-ISOLATED_CAPABILITY_PROFILE = "isolated_workspace_core@1"
-CODING_WORKSPACE_TOOLS = (*ISOLATED_WORKSPACE_CORE_TOOLS, "execute")
-CODING_CAPABILITY_PROFILE = "isolated_code_workspace@1"
+HARNESS_CAPABILITY_PROFILE = "puddingclaw_workspace_harness@1"
+CODING_WORKSPACE_TOOLS = (*HARNESS_WORKSPACE_CORE_TOOLS, "execute")
+CODING_CAPABILITY_PROFILE = "puddingclaw_coding_harness@1"
 
 
 def capability_for_profile(profile_id: str) -> tuple[str, tuple[str, ...]]:
     if profile_id == "coding_agent@1":
         return CODING_CAPABILITY_PROFILE, CODING_WORKSPACE_TOOLS
-    return ISOLATED_CAPABILITY_PROFILE, ISOLATED_WORKSPACE_CORE_TOOLS
+    return HARNESS_CAPABILITY_PROFILE, HARNESS_WORKSPACE_CORE_TOOLS
 
 
 def bind_candidate_capability(candidate: ExperimentCandidate, profile_id: str) -> ExperimentCandidate:
@@ -47,6 +56,7 @@ def bind_candidate_capability(candidate: ExperimentCandidate, profile_id: str) -
 
 
 _CANDIDATE_SOURCE_ROOTS = [
+    "evaluation",
     "graph",
     "harness",
     "llm",
@@ -195,8 +205,8 @@ def resolve_candidate(base_dir: Path, request: CandidateRequest) -> ExperimentCa
         "runtime_hash": _tree_hash(base_dir, ["graph", "pyproject.toml"]),
         "source_manifest_hash": _tree_hash(base_dir, _CANDIDATE_SOURCE_ROOTS),
         "tool_allowlist": sorted(set(request.tool_allowlist)),
-        "capability_profile": ISOLATED_CAPABILITY_PROFILE,
-        "offered_tools": list(ISOLATED_WORKSPACE_CORE_TOOLS),
+        "capability_profile": HARNESS_CAPABILITY_PROFILE,
+        "offered_tools": list(HARNESS_WORKSPACE_CORE_TOOLS),
         "requested_config": request.config,
     }
     fingerprint = hashlib.sha256(json.dumps(snapshots, sort_keys=True, separators=(",", ":")).encode()).hexdigest()[:20]

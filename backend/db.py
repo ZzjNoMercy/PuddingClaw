@@ -95,14 +95,14 @@ async def init_database() -> bool:
 def get_database_status() -> dict[str, object]:
     url = get_database_url()
     config = get_database_config()
-    postgres_configured = bool(config.get("url"))
     provider = "postgresql" if url.startswith("postgresql") else "sqlite" if url.startswith("sqlite") else "unknown"
+    configured = provider == "sqlite" or bool(config.get("url"))
     safe_url = url
     if "@" in safe_url and "://" in safe_url:
         scheme, rest = safe_url.split("://", 1)
         safe_url = f"{scheme}://***@{rest.split('@', 1)[1]}"
     return {
-        "configured": postgres_configured,
+        "configured": configured,
         "provider": provider,
         "url": safe_url,
         "configured_by": config.get("configured_by"),
@@ -110,11 +110,11 @@ def get_database_status() -> dict[str, object]:
         "mode": config.get("mode"),
         "configuration_hint": (
             ""
-            if postgres_configured
-            else "PostgreSQL 未配置；请前往 Settings -> 知识库 -> Catalog Database 配置 bundled 或 external DATABASE_URL。"
+            if configured
+            else "PostgreSQL 未配置；请前往 Settings -> 数据库配置共享数据库连接。"
         ),
         "last_error": _last_error,
-        "healthy": postgres_configured and _last_error is None,
+        "healthy": configured and _last_error is None,
     }
 
 

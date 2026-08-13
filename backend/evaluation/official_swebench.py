@@ -173,18 +173,28 @@ async def _run_process(
             if identity_process.returncode != 0 or not identity_stdout.strip():
                 await _terminate_process_tree(process, process_group=isolate_process_group)
                 raise RuntimeError("Could not establish official Harness process identity")
-            process_started_at = identity_stdout.decode("ascii", errors="strict").strip()
-        pid_path.write_text(
-            json.dumps(
-                {
-                    "pid": process.pid,
-                    "run_id": environment.get("PUDDINGCLAW_SWEBENCH_RUN_ID"),
-                    "process_started_at": process_started_at,
-                },
-                separators=(",", ":"),
-            ),
-            encoding="ascii",
-        )
+            # ``ps`` formats ``lstart`` using the host locale.  On a Chinese
+            # macOS/Linux host the value may therefore start with UTF-8 bytes
+            # such as 0xe5.  Process identity is opaque comparison data, not an
+            # ASCII protocol, so decoding it as strict ASCII prevents the
+            # SWE-bench image preparation process from starting at all.
+            process_started_at = identity_stdout.decode("utf-8", errors="replace").strip()
+        pid_payload = json.dumps(
+            {
+                "pid": process.pid,
+                "run_id": environment.get("PUDDINGCLAW_SWEBENCH_RUN_ID"),
+                "process_started_at": process_started_at,
+            },
+            separators=(",", ":"),
+        ).encode("ascii")
+        temporary_pid_path = pid_path.with_name(f".{pid_path.name}.{process.pid}.tmp")
+        descriptor = os.open(temporary_pid_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            os.write(descriptor, pid_payload)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        os.replace(temporary_pid_path, pid_path)
     tail = bytearray()
     written = 0
     timed_out = False

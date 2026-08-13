@@ -1,7 +1,13 @@
 import { createInterface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 import { CliError } from "./errors.js";
-import { defaultConfig, PROFILES, saveConfig } from "./config.js";
+import {
+  DEFAULT_BACKEND_PORT,
+  DEFAULT_FRONTEND_PORT,
+  defaultConfig,
+  PROFILES,
+  saveConfig,
+} from "./config.js";
 import { integerFlag } from "./args.js";
 import { findFreePort, probeHome, probeNode, probePlatform, probePort, probePython, probeUv } from "./probes.js";
 import { prepareManagedPython } from "./python-runtime.js";
@@ -14,10 +20,11 @@ import { bootstrapUv } from "./uv-runtime.js";
 import { ensureLocalWorkerToken } from "./local-worker-token.js";
 import {
   discoverExtensionInfrastructure,
+  discoverInitialMultimodalProvider,
   discoverInitialProvider,
   validatePreparedInfrastructure,
 } from "./init-discovery.js";
-import { writeSecret } from "./secrets.js";
+import { readSecret, writeSecret } from "./secrets.js";
 
 const PROFILE_LABELS = {
   harness: "只使用 Agent Harness",
@@ -52,8 +59,26 @@ async function confirmSummary(summary) {
     output.write(`  Backend:  127.0.0.1:${summary.backend_port}\n`);
     output.write(`  Frontend: 127.0.0.1:${summary.frontend_port}\n`);
     output.write(`  Provider: ${summary.provider?.name || "稍后配置"}${summary.provider?.model ? ` / ${summary.provider.model}` : ""}\n`);
+    output.write(`  Image AI: ${summary.multimodal_provider?.name || "稍后配置"}${summary.multimodal_provider?.model ? ` / ${summary.multimodal_provider.model}` : ""}\n`);
     if (summary.infrastructure?.catalog) {
-      output.write(`  Catalog:  ${summary.infrastructure.catalog.mode}\n`);
+      const sourceLabels = {
+        native_apt: "本机 PostgreSQL",
+        local: "本机 PostgreSQL",
+        docker: "Docker PostgreSQL",
+        external: "外部 PostgreSQL",
+        fallback: "SQLite",
+      };
+      const catalogSource = sourceLabels[summary.infrastructure.catalog.source];
+      output.write(`  Catalog:  ${summary.infrastructure.catalog.mode}${catalogSource ? `（${catalogSource}）` : ""}\n`);
+      if (summary.infrastructure.catalog.mode === "postgresql") {
+        output.write(`  Database: ${summary.infrastructure.catalog.host}:${summary.infrastructure.catalog.port}/${summary.infrastructure.catalog.database}\n`);
+        output.write(`  DB User:  ${summary.infrastructure.catalog.username || "（由连接 URL 提供）"}\n`);
+        if (summary.infrastructure.catalog.create_if_missing) {
+          output.write("  Create:   数据库不存在时，经本次授权创建\n");
+        }
+      }
+    }
+    if (["knowledge", "full"].includes(summary.profile) && summary.infrastructure?.milvus) {
       output.write(`  Milvus:   ${summary.infrastructure.milvus.enabled ? summary.infrastructure.milvus.uri : "disabled"}\n`);
     }
     const answer = String(await rl.question("\n确认初始化？[Y/n] ")).trim().toLowerCase();
@@ -176,10 +201,18 @@ export async function runInit({ flags, paths, interactive = process.stdin.isTTY 
   }
 
   const providerDiscovery = await discoverInitialProvider({ flags, nonInteractive });
+  const multimodalProviderDiscovery = await discoverInitialMultimodalProvider({
+    flags,
+    nonInteractive,
+    primaryDiscovery: providerDiscovery,
+  });
   const infrastructureDiscovery = await discoverExtensionInfrastructure({
     profile,
     flags,
     nonInteractive,
+    home: paths.home,
+    existingDatabaseUrl: existing && flags.force ? await readSecret(paths.databaseUrl) : "",
+    existingCatalog: existing && flags.force ? existing.infrastructure?.catalog : null,
   });
 
   let pythonProbe = probePython(flags.python);
@@ -211,8 +244,12 @@ export async function runInit({ flags, paths, interactive = process.stdin.isTTY 
     });
   }
 
-  const requestedBackendPort = flags.backend_port ? integerFlag(flags.backend_port, "--backend-port") : 8888;
-  const requestedFrontendPort = flags.frontend_port ? integerFlag(flags.frontend_port, "--frontend-port") : 3000;
+  const requestedBackendPort = flags.backend_port
+    ? integerFlag(flags.backend_port, "--backend-port")
+    : DEFAULT_BACKEND_PORT;
+  const requestedFrontendPort = flags.frontend_port
+    ? integerFlag(flags.frontend_port, "--frontend-port")
+    : DEFAULT_FRONTEND_PORT;
   const selectedPorts = await selectInitPorts({
     backendPort: requestedBackendPort,
     frontendPort: requestedFrontendPort,
@@ -225,6 +262,7 @@ export async function runInit({ flags, paths, interactive = process.stdin.isTTY 
     profile,
     home: paths.home,
     provider: providerDiscovery.provider,
+    multimodal_provider: multimodalProviderDiscovery.provider,
     infrastructure: {
       catalog: infrastructureDiscovery.catalog,
       milvus: infrastructureDiscovery.milvus,
@@ -242,11 +280,10 @@ export async function runInit({ flags, paths, interactive = process.stdin.isTTY 
       requested_backend_port: initialBackendProbe,
       requested_frontend_port: initialFrontendProbe,
       provider: providerDiscovery.probe,
+      multimodal_provider: multimodalProviderDiscovery.probe,
       extensions: infrastructureDiscovery.probes,
     },
     settings_plan: {
-      field_count: settingsPlan.field_count,
-      probe_count: settingsPlan.probe_count,
       selected_steps: settingsPlan.steps.filter((step) => step.status === "selected").map((step) => step.id),
       disabled_steps: settingsPlan.steps.filter((step) => step.status === "disabled").map((step) => step.id),
     },
@@ -267,6 +304,10 @@ export async function runInit({ flags, paths, interactive = process.stdin.isTTY 
     ...config.provider,
     ...providerDiscovery.provider,
   };
+  config.multimodal_provider = {
+    ...config.multimodal_provider,
+    ...multimodalProviderDiscovery.provider,
+  };
   config.infrastructure = {
     catalog: infrastructureDiscovery.catalog,
     milvus: infrastructureDiscovery.milvus,
@@ -282,6 +323,9 @@ export async function runInit({ flags, paths, interactive = process.stdin.isTTY 
   }
   await ensureLocalWorkerToken(paths);
   if (providerDiscovery.apiKey) await writeSecret(paths.providerApiKey, providerDiscovery.apiKey);
+  if (multimodalProviderDiscovery.apiKey) {
+    await writeSecret(paths.multimodalProviderApiKey, multimodalProviderDiscovery.apiKey);
+  }
   if (infrastructureDiscovery.embeddingApiKey) {
     await writeSecret(paths.embeddingApiKey, infrastructureDiscovery.embeddingApiKey);
   }
@@ -295,29 +339,56 @@ export async function runInit({ flags, paths, interactive = process.stdin.isTTY 
   );
   let runtime = { status: embedded.available ? "available" : "not_bundled" };
   if (installRequested) {
-    try {
-      const installed = await installRuntimeBundle(embedded.path, paths);
+    const prepareAndValidate = async (installed) => {
       const prepared = await prepareRuntimePython(paths, { allowUvBootstrap: true });
       const validation = validatePreparedInfrastructure({
         python: prepared.python,
         databaseUrl: infrastructureDiscovery.databaseUrl,
+        createDatabaseIfMissing: infrastructureDiscovery.createDatabaseIfMissing,
         milvus: infrastructureDiscovery.milvus,
+        requirePgvector: profile === "knowledge" || profile === "full",
       });
-      runtime = { status: "prepared", installed, prepared, infrastructure_validation: validation };
-    } catch (error) {
-      if (error?.code !== "runtime_already_installed") throw error;
-      const prepared = await prepareRuntimePython(paths, { allowUvBootstrap: true });
-      const validation = validatePreparedInfrastructure({
-        python: prepared.python,
-        databaseUrl: infrastructureDiscovery.databaseUrl,
-        milvus: infrastructureDiscovery.milvus,
-      });
-      runtime = {
+      const databaseProbe = validation.find((probe) => probe.probe === "database.connection");
+      if (databaseProbe?.code === "runtime_dependency_missing") {
+        throw new CliError(
+          `Runtime 缺少 PostgreSQL 驱动，拒绝错误回退 SQLite：${databaseProbe.reason}`,
+          { code: "runtime_dependency_missing", exitCode: 1 },
+        );
+      }
+      let databaseFallback = null;
+      if (infrastructureDiscovery.databaseUrl && databaseProbe?.status !== "available") {
+        const reason = databaseProbe?.reason || "PostgreSQL 认证验证失败";
+        databaseFallback = { from: "postgresql", to: "sqlite", reason };
+        config.infrastructure.catalog = {
+          mode: "sqlite",
+          preferred_mode: "postgresql",
+          fallback_mode: "sqlite",
+          source: "fallback",
+          host: "",
+          port: 0,
+          database: "",
+          probe_status: "available",
+          fallback_reason: reason,
+        };
+        infrastructureDiscovery.databaseUrl = "";
+        summary.infrastructure.catalog = config.infrastructure.catalog;
+        await saveConfig(paths.config, config);
+        if (!nonInteractive) output.write(`! PostgreSQL 验证失败，已回退 SQLite：${reason}\n`);
+      }
+      return {
         status: "prepared",
-        installed: { status: "already_installed" },
+        installed,
         prepared,
         infrastructure_validation: validation,
+        ...(databaseFallback ? { database_fallback: databaseFallback } : {}),
       };
+    };
+    try {
+      const installed = await installRuntimeBundle(embedded.path, paths);
+      runtime = await prepareAndValidate(installed);
+    } catch (error) {
+      if (error?.code !== "runtime_already_installed") throw error;
+      runtime = await prepareAndValidate({ status: "already_installed" });
     }
   }
   return { schema_version: 1, status: "initialized", ...summary, config_path: paths.config, runtime };

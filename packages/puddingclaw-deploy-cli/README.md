@@ -8,6 +8,8 @@ Agent Harness protocol. Its default Home is `~/.puddingclaw`.
 npm install -g ./packages/puddingclaw-deploy-cli
 puddingclaw init
 puddingclaw init --profile harness --plan --json
+puddingclaw database configure
+puddingclaw database show --json
 puddingclaw doctor
 ```
 
@@ -26,10 +28,21 @@ is a separate, explicit release action and is not performed by build or verifica
 - Separate `deploy.json` control-plane state; Backend-owned product settings keep
   their canonical `config.json` path.
 - No-argument interactive `init` for Harness-only and optional extensions, including
-  an initial Provider/API Key bootstrap so the GUI can enter a usable Agent state.
+  separate Agent and image-analysis SubAgent model bindings. Credentials are validated
+  and stored independently, or safely reused when both bindings share one Provider.
 - Ordered Knowledge discovery for SQLite/PostgreSQL, authenticated PostgreSQL and
   pgvector checks, Milvus/Collection checks, required Embedding configuration when
   vector indexing is selected, and optional MinerU health detection.
+- Core database discovery for every Profile, with four explicit schemes: local
+  PostgreSQL, Docker PostgreSQL, SQLite, or external PostgreSQL. Interactive init
+  collects the applicable port/database/user/password fields; an empty password is
+  generated securely. Existing local/external connections ask before creating a
+  missing database. No package, container, database, or unknown process is changed
+  without the user's selection and confirmation.
+- Database configuration remains mutable after init. `puddingclaw database
+  configure` reuses the same decision and validation flow without rerunning
+  Provider, Python, port, or extension setup. The previous connection remains
+  active until the new one validates and a running Backend is restarted.
 - Read-only init plans covering the current Provider, Harness, Knowledge,
   Analytics, and Headless settings/probe groups; disabled extensions are removed
   from the selected plan.
@@ -47,6 +60,8 @@ is a separate, explicit release action and is not performed by build or verifica
   the selected runtime port.
 - `runtime prepare`, which selects one of four hash-locked Harness/Knowledge/Analytics/
   Full dependency profiles and creates a release-specific uv environment under Home.
+- `runtime prune`, which removes inactive Runtime releases and their matching managed
+  venvs while protecting the active and recorded running versions.
 - Runtime extension gates shared by GUI navigation, direct page routing, FastAPI
   routers, Agent Tool registration, middleware, background workers, and dependencies.
 - The existing Headless Agent protocol is merged into this CLI under the single

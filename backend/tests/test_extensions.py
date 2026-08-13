@@ -9,8 +9,8 @@ from extensions import (
     extension_states,
     runtime_profile,
 )
-from tools.toolsets import agent_custom_tool_names
 from provider_registry import _default_registry
+from tools.toolsets import agent_custom_tool_names
 
 
 def test_source_checkout_defaults_to_all_extensions() -> None:
@@ -101,7 +101,86 @@ def test_init_provider_bootstrap_keeps_secret_in_environment_reference(monkeypat
     )
     monkeypatch.setenv("PUDDINGCLAW_INITIAL_PROVIDER_API_KEY", "secret-value")
     payload = _default_registry()
-    assert payload["bindings"]["agent"].startswith("initial-deepseek:")
-    provider = next(item for item in payload["providers"] if item["id"] == "initial-deepseek")
+    assert payload["bindings"]["agent"] == "deepseek:deepseek-openai:deepseek-chat:llm"
+    assert [item["id"] for item in payload["providers"]].count("deepseek") == 1
+    assert not any(item["id"] == "initial-deepseek" for item in payload["providers"])
+    provider = next(item for item in payload["providers"] if item["id"] == "deepseek")
     assert provider["credentials"]["default"] == "env://PUDDINGCLAW_INITIAL_PROVIDER_API_KEY"
+    assert provider["endpoints"][0]["credential_ref"] == "env://PUDDINGCLAW_INITIAL_PROVIDER_API_KEY"
     assert "secret-value" not in json.dumps(payload)
+
+
+def test_init_multimodal_provider_binds_image_analyzer_with_separate_secret(monkeypatch) -> None:
+    monkeypatch.delenv("PUDDINGCLAW_INITIAL_PROVIDER", raising=False)
+    monkeypatch.setenv(
+        "PUDDINGCLAW_INITIAL_MULTIMODAL_PROVIDER",
+        json.dumps(
+            {
+                "status": "configured",
+                "id": "dashscope",
+                "name": "阿里云百炼",
+                "protocol": "openai_compatible",
+                "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+                "model": "qwen3.7-plus",
+                "reuse_primary_credential": False,
+            }
+        ),
+    )
+    monkeypatch.setenv("PUDDINGCLAW_INITIAL_MULTIMODAL_PROVIDER_API_KEY", "mm-secret")
+
+    payload = _default_registry()
+
+    assert payload["bindings"]["image_analyzer"] == (
+        "dashscope:dashscope-compatible:qwen3-7-plus:llm"
+    )
+    provider = next(item for item in payload["providers"] if item["id"] == "dashscope")
+    model = next(item for item in provider["models"] if item["id"] == payload["bindings"]["image_analyzer"])
+    assert "multimodal_llm" in model["categories"]
+    assert provider["credentials"]["default"] == (
+        "env://PUDDINGCLAW_INITIAL_MULTIMODAL_PROVIDER_API_KEY"
+    )
+    assert "mm-secret" not in json.dumps(payload)
+
+
+def test_image_analyzer_can_reuse_primary_provider_credential(monkeypatch) -> None:
+    initial = {
+        "status": "configured",
+        "id": "dashscope",
+        "name": "阿里云百炼",
+        "protocol": "openai_compatible",
+        "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        "model": "qwen3.7-plus",
+    }
+    monkeypatch.setenv("PUDDINGCLAW_INITIAL_PROVIDER", json.dumps(initial))
+    monkeypatch.setenv(
+        "PUDDINGCLAW_INITIAL_MULTIMODAL_PROVIDER",
+        json.dumps({**initial, "reuse_primary_credential": True}),
+    )
+
+    payload = _default_registry()
+
+    assert payload["bindings"]["agent"] == payload["bindings"]["image_analyzer"]
+    provider = next(item for item in payload["providers"] if item["id"] == "dashscope")
+    assert provider["credentials"]["default"] == "env://PUDDINGCLAW_INITIAL_PROVIDER_API_KEY"
+
+
+def test_init_custom_provider_bootstrap_adds_one_provider(monkeypatch) -> None:
+    monkeypatch.setenv(
+        "PUDDINGCLAW_INITIAL_PROVIDER",
+        json.dumps(
+            {
+                "status": "configured",
+                "id": "company-gateway",
+                "name": "Company Gateway",
+                "protocol": "openai_compatible",
+                "base_url": "https://llm.example.com/v1",
+                "model": "company-chat",
+            }
+        ),
+    )
+
+    payload = _default_registry()
+
+    provider = next(item for item in payload["providers"] if item["id"] == "company-gateway")
+    assert provider["name"] == "Company Gateway"
+    assert payload["bindings"]["agent"] == "company-gateway:company-gateway-openai:company-chat:llm"

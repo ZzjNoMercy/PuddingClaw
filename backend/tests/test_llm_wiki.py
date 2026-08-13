@@ -29,6 +29,7 @@ from knowledge.llm_wiki_compiler_agent import COMPILER_SYSTEM_PROMPT, LlmWikiCom
 from knowledge.llm_wiki_job_runner import BACKGROUND_INGEST_GROUNDING_RULES, process_llm_wiki_ingest_job
 from knowledge.models import Base
 from tools.llm_wiki_tools import (
+    LlmWikiConversationDocumentsTool,
     LlmWikiCreateRawTool,
     LlmWikiQueryTool,
     LlmWikiRetirePagesTool,
@@ -308,30 +309,143 @@ def test_main_agent_raw_tool_uses_bound_current_message_without_content_argument
     assert snapshot.read_text(encoding="utf-8") == "# 粘贴内容\n\n请把这段内容整理成 Wiki。\n"
 
 
-def test_main_agent_raw_tool_snapshots_recent_visible_conversation(
+def test_main_agent_raw_tool_snapshots_only_selected_conversation_documents(
     wiki_env: LlmWikiService,
 ) -> None:
-    conversation = (
-        "## 用户\n\nhttps://example.com/browser 文档讲了什么\n\n"
-        "## Agent\n\n这是浏览器工具集的介绍。\n\n"
-        "## 用户\n\n把刚才这些编译到 Wiki。"
-    )
+    pi_exchange = "## 用户\n\n评估 Pi 学习网站\n\n## Agent\n\n这是 Pi 学习路线。"
+    current_instruction = "## 用户\n\n只编译 Pi，类型是 framework"
+    documents = [
+        {
+            "document_id": "exchange:query-pi",
+            "kind": "exchange",
+            "title": "评估 Pi 学习网站",
+            "preview": "这是 Pi 学习路线。",
+            "character_count": len(pi_exchange),
+            "content": pi_exchange,
+        },
+        {
+            "document_id": "current:query-conversation",
+            "kind": "current_message",
+            "title": "只编译 Pi",
+            "preview": "只编译 Pi，类型是 framework",
+            "character_count": len(current_instruction),
+            "content": current_instruction,
+        },
+    ]
     tool = LlmWikiCreateRawTool(
         base_dir=wiki_env.base_dir,
         session_id="session-conversation",
         query_id="query-conversation",
         current_message="继续啊",
-        current_conversation=conversation,
+        current_conversation_documents=documents,
+    )
+    synthesized = (
+        "# Pi Agent 学习路线\n\n"
+        "Pi Agent 作为 software framework 收录。四个学习资源从使用到源码逐步深入。"
     )
 
-    payload = json.loads(asyncio.run(tool._arun(source="conversation", title="浏览器材料")))
+    payload = json.loads(
+        asyncio.run(
+            tool._arun(
+                source="conversation",
+                title="Pi 材料",
+                conversation_document_ids=[
+                    "exchange:query-pi",
+                    "current:query-conversation",
+                ],
+                raw_markdown=synthesized,
+            )
+        )
+    )
 
     assert payload["ok"] is True
     snapshot = wiki_env.raw_dir / payload["raw_paths"][0]
-    assert snapshot.read_text(encoding="utf-8") == f"{conversation}\n"
+    assert snapshot.read_text(encoding="utf-8") == f"{synthesized}\n"
+    assert payload["conversation_document_ids"] == [
+        "exchange:query-pi",
+        "current:query-conversation",
+    ]
     assert payload["snapshots"][0]["source_path"].startswith(
-        "conversation://session-conversation/query-conversation"
+        "conversation-synthesis://session-conversation/query-conversation"
     )
+
+
+def test_main_agent_raw_tool_rejects_implicit_conversation_window(
+    wiki_env: LlmWikiService,
+) -> None:
+    tool = LlmWikiCreateRawTool(
+        base_dir=wiki_env.base_dir,
+        session_id="session-conversation",
+        query_id="query-conversation",
+        current_conversation_documents=[],
+    )
+
+    payload = json.loads(asyncio.run(tool._arun(source="conversation")))
+
+    assert payload["ok"] is False
+    assert "必须显式传 conversation_document_ids" in payload["error"]
+
+
+def test_main_agent_raw_tool_requires_agent_synthesized_markdown(
+    wiki_env: LlmWikiService,
+) -> None:
+    tool = LlmWikiCreateRawTool(
+        base_dir=wiki_env.base_dir,
+        session_id="session-conversation",
+        query_id="query-conversation",
+        current_conversation_documents=[
+            {
+                "document_id": "exchange:query-pi",
+                "content": "## 用户\n\nPi\n\n## Agent\n\n结论",
+            }
+        ],
+    )
+
+    payload = json.loads(
+        asyncio.run(
+            tool._arun(
+                source="conversation",
+                conversation_document_ids=["exchange:query-pi"],
+            )
+        )
+    )
+
+    assert payload["ok"] is False
+    assert "实时生成的 raw_markdown" in payload["error"]
+
+
+def test_conversation_documents_tool_exposes_catalog_without_full_content(
+    wiki_env: LlmWikiService,
+) -> None:
+    tool = LlmWikiConversationDocumentsTool(
+        base_dir=wiki_env.base_dir,
+        current_conversation_documents=[
+            {
+                "document_id": "exchange:query-pi",
+                "kind": "exchange",
+                "title": "Pi 学习网站",
+                "preview": "四个网站的学习路线",
+                "character_count": 1234,
+                "content": "不应直接暴露的完整正文",
+            }
+        ],
+    )
+
+    payload = json.loads(tool._run(document_ids=[]))
+
+    assert payload["documents"] == [
+        {
+            "document_id": "exchange:query-pi",
+            "kind": "exchange",
+            "title": "Pi 学习网站",
+            "preview": "四个网站的学习路线",
+            "character_count": 1234,
+        }
+    ]
+    assert "不应直接暴露" not in tool._run(document_ids=[])
+
+    selected = json.loads(tool._run(document_ids=["exchange:query-pi"]))
+    assert selected["documents"][0]["content"] == "不应直接暴露的完整正文"
 
 
 def test_main_agent_ingest_tool_rejects_raw_paths_without_current_intake(
@@ -1227,7 +1341,8 @@ def test_retire_pages_rewrites_links_rebuilds_index_and_is_idempotent(wiki_env: 
     assert "[[practices/canonical-practice|Canonical Practice]]" in index
     log = (wiki_env.wiki_dir / "log.md").read_text(encoding="utf-8")
     assert "## [" in log and "] retire | Remove duplicate classification" in log
-    assert "[[concepts/duplicate-practice]] -> [[practices/canonical-practice]]" in log
+    assert "`concepts/duplicate-practice` -> [[practices/canonical-practice]]" in log
+    assert "[[concepts/duplicate-practice]] ->" not in log
     archived = wiki_env.root / result["archive_dir"] / "concepts" / "duplicate-practice.md"
     assert archived.is_file()
     assert result["lint"]["ok"] is True

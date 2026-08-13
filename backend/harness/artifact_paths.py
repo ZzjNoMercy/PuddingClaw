@@ -47,6 +47,7 @@ LOCAL_RESOURCE_SUFFIXES = tuple(
         reverse=True,
     )
 )
+MAX_LOCAL_RESOURCE_PATH_CHARS = 4096
 
 _DIRECT_ACTIONS = (
     "修改",
@@ -113,7 +114,15 @@ def extract_local_directory_paths(message: str) -> list[str]:
             continue
         if any(existing_start <= start < existing_end for existing_start, existing_end in occupied):
             continue
-        for end in range(len(message), start, -1):
+        line_breaks = [
+            position
+            for marker in ("\r", "\n", "\0")
+            if (position := message.find(marker, start)) >= 0
+        ]
+        lexical_end = min(line_breaks) if line_breaks else len(message)
+        if lexical_end - start > MAX_LOCAL_RESOURCE_PATH_CHARS:
+            continue
+        for end in range(lexical_end, start, -1):
             raw = message[start:end].replace("\\ ", " ").strip().strip("`'\"()（）[]【】{},，。；;:：")
             if not raw:
                 continue
@@ -123,6 +132,10 @@ def extract_local_directory_paths(message: str) -> list[str]:
                     continue
                 resolved = str(candidate.resolve())
             except OSError:
+                continue
+            # A slash discovered inside pasted markup is not an explicit
+            # request to expose the host filesystem root.
+            if resolved == str(Path(resolved).anchor):
                 continue
             if resolved not in found:
                 found.append(resolved)
@@ -317,10 +330,22 @@ def _path_spans(message: str) -> list[tuple[str, int, int]]:
         if any(existing_start <= start < existing_end for _, existing_start, existing_end in found):
             continue
         best_end: int | None = None
+        # A local filesystem path is a single-line lexical token.  Without
+        # this bound, an HTML self-closing tag such as ``<meta .../>`` can be
+        # mistaken for the start of a path and consume pasted issue text up to
+        # a later ``.html`` URL.  Besides being a false attachment detection,
+        # passing that multi-kilobyte value to pathlib can raise ENAMETOOLONG
+        # before the Agent gets its first model turn.
+        line_breaks = [
+            position
+            for marker in ("\r", "\n", "\0")
+            if (position := message.find(marker, start)) >= 0
+        ]
+        lexical_end = min(line_breaks) if line_breaks else len(message)
         for suffix in LOCAL_RESOURCE_SUFFIXES:
             search_from = start
             while True:
-                suffix_at = lowered.find(suffix, search_from)
+                suffix_at = lowered.find(suffix, search_from, lexical_end)
                 if suffix_at < 0:
                     break
                 end = suffix_at + len(suffix)
@@ -335,6 +360,8 @@ def _path_spans(message: str) -> list[tuple[str, int, int]]:
                     break
                 search_from = end
         if best_end is None:
+            continue
+        if best_end - start > MAX_LOCAL_RESOURCE_PATH_CHARS:
             continue
         path = message[start:best_end].replace("\\ ", " ").strip().strip("`'\"")
         if path and all(existing[0] != path for existing in found):

@@ -154,12 +154,15 @@ def test_skill_catalog_is_discovered_from_installed_frontmatter() -> None:
     assert by_id["database-analysis"]["name"] == "database-analysis"
     assert "relational data" in by_id["database-analysis"]["description"]
     assert by_id["database-analysis"]["path"] == ("/skills/database-analysis/SKILL.md")
+    assert "Primary internal source for ordinary knowledge questions" in by_id["llm-wiki"]["description"]
+    assert "Use before public Web search" in by_id["llm-wiki"]["description"]
     assert {"tavily-search", "web-tools-guide"}.isdisjoint(by_id)
 
 
 def test_every_registered_agent_custom_tool_has_an_explicit_policy() -> None:
     assert agent_custom_tool_names() == business_tool_names() | DEFAULT_CUSTOM_TOOL_NAMES
     assert {
+        "llm_wiki_conversation_documents",
         "llm_wiki_create_raw",
         "llm_wiki_start_ingest",
         "llm_wiki_retire_pages",

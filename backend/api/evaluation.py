@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from pathlib import Path
 from typing import Any, Literal
 
@@ -493,6 +494,17 @@ async def create_experiment(body: CreateExperimentRequest) -> dict[str, Any]:
             candidate=candidate,
             profile_id=body.profile_id,
             execution=body.execution,
+            summary={
+                "progress": {
+                    "stage": "queued",
+                    "message": "评测已入队，正在等待隔离 Worker",
+                    "total": sum(1 for case in bundle.dataset.cases if case.enabled)
+                    * body.execution.repetitions,
+                    "completed": 0,
+                    "failed": 0,
+                    "updated_at": utc_now().isoformat(),
+                }
+            },
         )
         created = await run_in_threadpool(repository.create_experiment, experiment)
     except EvaluationRepositoryError as exc:
@@ -510,6 +522,21 @@ async def get_experiment(experiment_id: str) -> dict[str, Any]:
     except EvaluationRepositoryError as exc:
         _raise_repository_error(exc)
     return experiment.model_dump(mode="json")
+
+
+@router.delete("/experiments/{experiment_id}", status_code=204)
+async def delete_experiment(experiment_id: str) -> Response:
+    repository = get_evaluation_repository()
+    try:
+        experiment = await run_in_threadpool(repository.get_experiment, experiment_id)
+        if experiment.status not in {"completed", "failed", "cancelled"}:
+            raise ConflictError("Only terminal Experiments can be deleted; cancel the Experiment first")
+        if not await evaluation_worker_manager.delete_artifacts(experiment_id):
+            raise ConflictError("Experiment Worker is still running; cancel the Experiment first")
+        await run_in_threadpool(repository.delete_experiment, experiment_id)
+    except EvaluationRepositoryError as exc:
+        _raise_repository_error(exc)
+    return Response(status_code=204)
 
 
 @router.get("/experiments/{experiment_id}/results")
@@ -811,7 +838,20 @@ async def cancel_experiment(experiment_id: str) -> dict[str, Any]:
         experiment = await run_in_threadpool(repository.get_experiment, experiment_id)
         if experiment.status in {"completed", "failed", "cancelled"}:
             raise ConflictError("Experiment is already terminal")
-        updated = experiment.model_copy(update={"status": "cancel_requested"})
+        updated = experiment.model_copy(
+            update={
+                "status": "cancel_requested",
+                "summary": {
+                    **experiment.summary,
+                    "progress": {
+                        **dict(experiment.summary.get("progress") or {}),
+                        "stage": "cancel_requested",
+                        "message": "正在停止 Worker 并清理隔离运行环境",
+                        "updated_at": utc_now().isoformat(),
+                    },
+                },
+            }
+        )
         updated = await run_in_threadpool(repository.update_experiment, updated, expected_status=experiment.status)
     except EvaluationRepositoryError as exc:
         _raise_repository_error(exc)
@@ -862,12 +902,50 @@ async def retry_experiment(experiment_id: str) -> dict[str, Any]:
     repository = get_evaluation_repository()
     try:
         experiment = await run_in_threadpool(repository.get_experiment, experiment_id)
-        if experiment.status not in {"failed", "cancelled"}:
-            raise ConflictError("Only failed or cancelled Experiments can be retried")
+        if experiment.status not in {"completed", "failed", "cancelled"}:
+            raise ConflictError("Only terminal Experiments can be retried")
+        dataset = await run_in_threadpool(
+            repository.get_dataset,
+            experiment.dataset_id,
+            experiment.dataset_version,
+        )
+        total_attempts = (
+            sum(1 for case in dataset.cases if case.enabled)
+            * experiment.execution.repetitions
+        )
+        # A retry is a new execution against the current Agent implementation,
+        # not a replay of a stale source snapshot. Freeze a fresh Candidate so
+        # the audit record remains truthful after a deployment/code change.
+        candidate_request = CandidateRequest(
+            name=experiment.candidate.name,
+            llm_model_id=experiment.candidate.llm_model_id,
+            thinking_level=experiment.candidate.thinking_level,
+            credential_name=experiment.candidate.credential_name,
+            analytics_model_id=experiment.candidate.analytics_model_id,
+        )
+        candidate = await run_in_threadpool(resolve_candidate, BASE_DIR, candidate_request)
+        candidate = bind_candidate_capability(candidate, experiment.profile_id)
+        retry_root_id = str(experiment.summary.get("retry_root_experiment_id") or experiment.experiment_id)
+        retry_generation = int(experiment.summary.get("retry_generation") or 0) + 1
+        clean_name = re.sub(r"(?:\s*\(retry\))+\s*$", "", experiment.name).strip() or experiment.name
+        is_swebench = any(
+            case.enabled and case.code is not None and case.code.repository.kind == "swebench"
+            for case in dataset.cases
+        )
+        execution = experiment.execution
+        timeout_policy_migrated_from: int | None = None
+        if is_swebench and execution.timeout_seconds == 300:
+            # 300s was the old undifferentiated UI default. Existing SWE
+            # Experiments retried after this release adopt the coding default;
+            # newly created API runs can still explicitly choose another budget.
+            timeout_policy_migrated_from = execution.timeout_seconds
+            execution = execution.model_copy(update={"timeout_seconds": 900})
         retried = experiment.model_copy(
             update={
                 "experiment_id": new_id("exp"),
-                "name": f"{experiment.name} (retry)",
+                "name": clean_name,
+                "candidate": candidate,
+                "execution": execution,
                 "status": "queued",
                 "verdict": "pending",
                 "error": None,
@@ -875,7 +953,27 @@ async def retry_experiment(experiment_id: str) -> dict[str, Any]:
                 "finished_at": None,
                 "remote_experiment_id": None,
                 "remote_url": None,
-                "summary": {},
+                "summary": {
+                    "retry_of_experiment_id": experiment.experiment_id,
+                    "retry_root_experiment_id": retry_root_id,
+                    "retry_generation": retry_generation,
+                    **(
+                        {
+                            "timeout_policy_migrated_from_seconds": timeout_policy_migrated_from,
+                            "timeout_policy_seconds": execution.timeout_seconds,
+                        }
+                        if timeout_policy_migrated_from is not None
+                        else {}
+                    ),
+                    "progress": {
+                        "stage": "queued",
+                        "message": "重新评测已入队，正在等待隔离 Worker",
+                        "total": total_attempts,
+                        "completed": 0,
+                        "failed": 0,
+                        "updated_at": utc_now().isoformat(),
+                    }
+                },
                 "created_at": utc_now(),
             }
         )

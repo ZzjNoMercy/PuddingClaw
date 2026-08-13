@@ -2,8 +2,16 @@
 
 from __future__ import annotations
 
+import json
 import re
+from pathlib import Path
 from typing import Any
+
+from analytics.models import AnalyticsModelError, get_analytics_model_registry
+from analytics.models.registry import _normalize_semantic_assets, canonical_model_resource_path
+from analytics.semantic_assets import SemanticAssetError, get_semantic_asset_registry
+from analytics.semantic_assets.registry import _normalize_dimension_definition, _normalize_relation_definition
+from knowledge.paths import get_knowledge_root
 
 from .contracts import (
     KIND_EFFECTS,
@@ -115,22 +123,19 @@ def _validate_common_frontmatter(
     return diagnostics
 
 
-def _body_mentions(value: Any, body_lower: str) -> bool:
+def _business_tokens(value: Any) -> list[str]:
     if isinstance(value, str):
         text = value.strip().lower()
-        return not text or text in body_lower
+        return [text] if text else []
     if isinstance(value, list):
-        strings = [item for item in value if isinstance(item, str) and item.strip()]
-        return all(item.strip().lower() in body_lower for item in strings)
+        return [token for item in value for token in _business_tokens(item)]
     if isinstance(value, dict):
-        strings: list[str] = []
-        for nested in value.values():
-            if isinstance(nested, str) and (":" in nested or "/" in nested):
-                strings.append(nested)
-            elif isinstance(nested, list):
-                strings.extend(item for item in nested if isinstance(item, str) and (":" in item or "/" in item))
-        return all(item.strip().lower() in body_lower for item in strings if item.strip())
-    return True
+        return [token for nested in value.values() for token in _business_tokens(nested)]
+    return []
+
+
+def _body_mentions(value: Any, body_lower: str) -> bool:
+    return all(token in body_lower for token in _business_tokens(value))
 
 
 def _validate_business_frontmatter(
@@ -153,11 +158,297 @@ def _validate_business_frontmatter(
     return diagnostics
 
 
+def _error(code: str, message: str) -> dict[str, str]:
+    return {"code": code, "severity": "error", "message": message}
+
+
+def _json_mapping(path: Path) -> dict[str, Any] | None:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _validate_kind_contract(
+    document: MarkdownDocument,
+    kind: DefinitionKind,
+    *,
+    logical_path: str,
+    definitions_root: Path | None,
+) -> list[dict[str, str]]:
+    """Validate existing runtime contracts without inferring business values."""
+
+    meta = document.frontmatter
+    diagnostics: list[dict[str, str]] = []
+    if kind == "dimension":
+        resolution_mode = str(meta.get("resolution_mode") or "").strip()
+        resolution = meta.get("resolution")
+        if not resolution_mode or not isinstance(resolution, dict):
+            return [_error("invalid_dimension_contract", "dimension requires resolution_mode and resolution")]
+        embedded_mode = str(resolution.get("mode") or resolution.get("resolution_mode") or "").strip()
+        if embedded_mode and embedded_mode != resolution_mode:
+            return [_error("dimension_mode_conflict", "resolution mode conflicts with resolution_mode")]
+        try:
+            normalized_mode, normalized = _normalize_dimension_definition({**resolution, "mode": resolution_mode})
+        except SemanticAssetError as exc:
+            return [_error("invalid_dimension_contract", str(exc))]
+        if normalized_mode == "entity_lookup":
+            return [
+                _error(
+                    "entity_lookup_requires_dimension_builder",
+                    "entity_lookup Dimensions require the dedicated build-semantic-dimension workflow",
+                )
+            ]
+        bindings = normalized.get("bindings") or []
+        if normalized_mode in {"source_field", "derived", "calendar_lookup"}:
+            if not bindings or any(
+                not str(item.get("asset_ref") or "").strip() or not (item.get("fields") or {})
+                for item in bindings
+            ):
+                diagnostics.append(
+                    _error(
+                        "invalid_dimension_binding",
+                        "ordinary Dimension resolution requires bindings with asset_ref and fields",
+                    )
+                )
+        if normalized_mode == "derived" and (
+            not normalized.get("source_fields") or not str(normalized.get("expression") or "").strip()
+        ):
+            diagnostics.append(
+                _error("invalid_derived_dimension", "derived Dimension requires source_fields and expression")
+            )
+        if normalized_mode == "calendar_lookup" and not str(normalized.get("date_field") or "").strip():
+            diagnostics.append(
+                _error("invalid_calendar_dimension", "calendar_lookup Dimension requires date_field")
+            )
+    elif kind == "relation":
+        relation_type = str(meta.get("relation_type") or "").strip()
+        relation = meta.get("relation")
+        if not relation_type or not isinstance(relation, dict):
+            return [_error("invalid_relation_contract", "relation requires relation_type and relation")]
+        embedded_type = str(relation.get("type") or relation.get("relation_type") or "").strip()
+        if embedded_type and embedded_type != relation_type:
+            return [_error("relation_type_conflict", "relation type conflicts with relation_type")]
+        try:
+            normalized_type, normalized = _normalize_relation_definition({**relation, "type": relation_type})
+        except SemanticAssetError as exc:
+            return [_error("invalid_relation_contract", str(exc))]
+        if definitions_root is not None and normalized_type == "dimension_binding":
+            dimension_ref = str((normalized.get("dimension") or {}).get("ref") or "")
+            try:
+                assets = get_semantic_asset_registry(definitions_root)
+                assets.refresh()
+                asset = assets.get_asset(dimension_ref)
+                if asset.get("type") != "dimension":
+                    raise SemanticAssetError("referenced asset is not a Dimension")
+            except Exception:
+                diagnostics.append(
+                    _error("missing_relation_dependency", f"referenced Dimension does not exist: {dimension_ref}")
+                )
+        if normalized_type == "direct_join":
+            mapping = normalized.get("field_mapping") or {}
+            for side in ("left", "right"):
+                endpoint_fields = set((normalized.get(side) or {}).get("key_fields") or [])
+                mapped_fields = set(mapping.get(side) or [])
+                if not mapped_fields.issubset(endpoint_fields):
+                    diagnostics.append(
+                        _error(
+                            "relation_key_mapping_conflict",
+                            f"relation field_mapping.{side} must use fields declared in {side}.key_fields",
+                        )
+                    )
+    elif kind == "analytics_model":
+        required_mappings = ("data_assets", "semantic_assets", "templates")
+        required_lists = ("asset_relations", "guardrails")
+        for field in required_mappings:
+            if not isinstance(meta.get(field), dict):
+                diagnostics.append(_error("invalid_model_contract", f"model field '{field}' must be a mapping"))
+        for field in required_lists:
+            value = meta.get(field)
+            if not isinstance(value, list) or any(not isinstance(item, str) or not item.strip() for item in value):
+                diagnostics.append(_error("invalid_model_contract", f"model field '{field}' must be a string list"))
+        default_template = meta.get("default_template")
+        if not isinstance(default_template, str):
+            diagnostics.append(_error("invalid_model_contract", "model field 'default_template' must be a string"))
+        if diagnostics:
+            return diagnostics
+        data_assets = meta["data_assets"]
+        tables = data_assets.get("tables")
+        table_aliases = data_assets.get("table_aliases", {})
+        if not isinstance(tables, list) or any(not isinstance(item, str) or not item.strip() for item in tables):
+            diagnostics.append(_error("invalid_model_contract", "data_assets.tables must be a string list"))
+        if not isinstance(table_aliases, dict):
+            diagnostics.append(_error("invalid_model_contract", "data_assets.table_aliases must be a mapping"))
+        raw_semantic_assets = meta["semantic_assets"]
+        for group in ("measures", "dimensions", "grains"):
+            values = raw_semantic_assets.get(group, [])
+            if not isinstance(values, list) or any(not isinstance(item, str) or not item.strip() for item in values):
+                diagnostics.append(
+                    _error("invalid_model_contract", f"semantic_assets.{group} must be a string list")
+                )
+        if diagnostics:
+            return diagnostics
+        semantic_assets = _normalize_semantic_assets(meta["semantic_assets"])
+        for group in ("measures", "dimensions", "grains"):
+            if semantic_assets[group] != raw_semantic_assets.get(group, []):
+                diagnostics.append(
+                    _error(
+                        "noncanonical_model_reference",
+                        f"semantic_assets.{group} must use unique typed ids such as '{group[:-1]}:<id>'",
+                    )
+                )
+        if diagnostics:
+            return diagnostics
+        asset_relations = meta["asset_relations"]
+        try:
+            registry = get_analytics_model_registry(definitions_root) if definitions_root is not None else None
+            if registry is not None:
+                assets = get_semantic_asset_registry(definitions_root)
+                assets.refresh()
+                registry._validate_asset_graph(  # noqa: SLF001 - validate the canonical Registry contract
+                    data_assets=data_assets,
+                    semantic_assets=semantic_assets,
+                    asset_relations=asset_relations,
+                )
+                for group in ("measures", "dimensions", "grains"):
+                    for asset_id in semantic_assets[group]:
+                        asset = assets.get_asset(asset_id)
+                        if asset.get("type") != group[:-1]:
+                            raise AnalyticsModelError(f"semantic asset type mismatch: {asset_id}")
+                for relation_id in asset_relations:
+                    relation_asset = assets.get_asset(relation_id)
+                    if relation_asset.get("type") != "relation":
+                        raise AnalyticsModelError(f"not a Relation: {relation_id}")
+                    relation_meta = relation_asset.get("frontmatter") or {}
+                    relation_definition = relation_meta.get("relation") or {}
+                    relation_type = str(relation_meta.get("relation_type") or "")
+                    selected_tables = set(tables)
+                    selected_dimensions = set(semantic_assets["dimensions"])
+                    if relation_type == "dimension_binding":
+                        asset_ref = str((relation_definition.get("asset") or {}).get("ref") or "")
+                        dimension_ref = str((relation_definition.get("dimension") or {}).get("ref") or "")
+                        if asset_ref not in selected_tables or dimension_ref not in selected_dimensions:
+                            raise AnalyticsModelError(
+                                f"Relation endpoints must be selected by the model: {relation_id}"
+                            )
+                    elif relation_type == "direct_join":
+                        left_ref = str((relation_definition.get("left") or {}).get("ref") or "")
+                        right_ref = str((relation_definition.get("right") or {}).get("ref") or "")
+                        if left_ref not in selected_tables or right_ref not in selected_tables:
+                            raise AnalyticsModelError(
+                                f"Relation endpoints must be selected by the model: {relation_id}"
+                            )
+        except (AnalyticsModelError, SemanticAssetError, KeyError, ValueError) as exc:
+            diagnostics.append(_error("invalid_model_dependency_graph", str(exc)))
+        templates = meta["templates"]
+        if default_template and default_template not in templates:
+            diagnostics.append(
+                _error("invalid_default_template", "default_template must name an entry in templates")
+            )
+        if definitions_root is not None:
+            model_dir = definitions_root / Path(*Path(logical_path).parent.parts)
+            for table_ref in tables:
+                if not table_ref.startswith("table_asset:"):
+                    continue
+                asset_id = table_ref.removeprefix("table_asset:").strip()
+                logical_dataset = (
+                    definitions_root.parent / "data" / "analytics-concat-datasets" / asset_id / "dataset.json"
+                )
+                profile = get_knowledge_root(definitions_root) / ".puddingclaw" / "table_profiles" / f"{asset_id}.profile.json"
+                logical_definition = _json_mapping(logical_dataset)
+                profile_definition = _json_mapping(profile)
+                logical_exists = bool(
+                    logical_definition and logical_definition.get("formatter") == "logical-data-asset"
+                )
+                profile_exists = profile_definition is not None
+                if not asset_id or "/" in asset_id or "\\" in asset_id or not (logical_exists or profile_exists):
+                    diagnostics.append(
+                        _error("missing_model_data_asset", f"selected table asset does not exist: {table_ref}")
+                    )
+            requested_guardrails = set(meta["guardrails"])
+            if requested_guardrails:
+                available_guardrails: set[str] = set()
+                for rule_path in (definitions_root / "sql-guardrails" / "rules").glob("**/guardrail.md"):
+                    try:
+                        rule_document = parse_markdown_document(rule_path.read_text(encoding="utf-8"))
+                        rule_id = str(rule_document.frontmatter.get("id") or "").strip()
+                        if rule_id:
+                            available_guardrails.add(rule_id)
+                    except (OSError, MarkdownDocumentError):
+                        continue
+                for guardrail_id in sorted(requested_guardrails - available_guardrails):
+                    diagnostics.append(
+                        _error("missing_model_guardrail", f"selected Guardrail does not exist: {guardrail_id}")
+                    )
+            for template_id, raw_definition in templates.items():
+                definition = raw_definition if isinstance(raw_definition, dict) else {"path": raw_definition}
+                if "semantic_scope" in definition:
+                    diagnostics.append(
+                        _error(
+                            "invalid_model_template",
+                            f"template {template_id} semantic_scope belongs in its guide frontmatter",
+                        )
+                    )
+                declared_paths: list[tuple[object, str]] = [
+                    (definition.get("path"), "templates"),
+                    (definition.get("guide"), "templates"),
+                ]
+                raw_assets = definition.get("assets") or []
+                if not isinstance(raw_assets, list):
+                    diagnostics.append(
+                        _error("invalid_model_template", f"template {template_id} assets must be a list")
+                    )
+                    continue
+                declared_paths.extend((item, "templates") for item in raw_assets)
+                for raw_path, root in declared_paths:
+                    if not str(raw_path or "").strip():
+                        continue
+                    try:
+                        relative = canonical_model_resource_path(raw_path, root=root)
+                    except AnalyticsModelError as exc:
+                        diagnostics.append(_error("invalid_model_resource_path", str(exc)))
+                        continue
+                    if not (model_dir / relative).is_file():
+                        diagnostics.append(
+                            _error(
+                                "missing_model_resource",
+                                f"template {template_id} references a missing package file: {relative}",
+                            )
+                        )
+            references = meta.get("references", {})
+            if not isinstance(references, dict):
+                diagnostics.append(_error("invalid_model_contract", "model field 'references' must be a mapping"))
+            else:
+                for reference_id, raw_definition in references.items():
+                    definition = raw_definition if isinstance(raw_definition, dict) else {"path": raw_definition}
+                    raw_path = definition.get("path")
+                    if not str(raw_path or "").strip():
+                        diagnostics.append(
+                            _error("invalid_model_reference", f"reference {reference_id} requires a path")
+                        )
+                        continue
+                    try:
+                        relative = canonical_model_resource_path(raw_path, root="references")
+                    except AnalyticsModelError as exc:
+                        diagnostics.append(_error("invalid_model_resource_path", str(exc)))
+                        continue
+                    if not (model_dir / relative).is_file():
+                        diagnostics.append(
+                            _error(
+                                "missing_model_resource",
+                                f"reference {reference_id} points to a missing package file: {relative}",
+                            )
+                        )
+    return diagnostics
+
+
 def validate_markdown_definition(
     content: str,
     *,
     logical_path: str,
     brief: AuthoringBrief | None = None,
+    definitions_root: Path | None = None,
 ) -> dict[str, Any]:
     try:
         kind = kind_from_logical_path(logical_path)
@@ -190,11 +481,19 @@ def validate_markdown_definition(
             diagnostics.append(
                 {
                     "code": "missing_authoring_topic",
-                    "severity": "error" if kind == "measure" else "warning",
+                    "severity": "error",
                     "message": f"body may not explain required topic: {topic}",
                 }
             )
     diagnostics.extend(_validate_business_frontmatter(document, kind))
+    diagnostics.extend(
+        _validate_kind_contract(
+            document,
+            kind,
+            logical_path=logical_path,
+            definitions_root=definitions_root,
+        )
+    )
     if brief is not None:
         if brief.kind != kind:
             diagnostics.append({"code": "brief_kind_mismatch", "severity": "error", "message": "brief kind does not match path"})

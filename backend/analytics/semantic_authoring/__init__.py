@@ -10,6 +10,7 @@ from .contracts import (
     inspect_frontmatter_contract,
     repair_technical_frontmatter,
 )
+from .discovery import discover_semantic_definitions
 from .documents import MarkdownDocument, parse_markdown_document, render_markdown_document
 from .validation import validate_markdown_definition
 
@@ -18,6 +19,7 @@ __all__ = [
     "FrontmatterEffect",
     "MarkdownDocument",
     "inspect_frontmatter_contract",
+    "discover_semantic_definitions",
     "parse_markdown_document",
     "render_markdown_document",
     "repair_technical_frontmatter",

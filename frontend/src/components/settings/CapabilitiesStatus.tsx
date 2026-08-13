@@ -14,10 +14,12 @@ import {
   XCircle,
 } from "lucide-react";
 import { getCapabilities, type Capabilities, type CapabilityStatus } from "@/lib/settingsApi";
+import type { RuntimeExtensions } from "@/lib/useRuntimeProfile";
 
 interface CapabilitiesStatusProps {
   refreshIntervalMs?: number;
   onChange?: (capabilities: Capabilities) => void;
+  extensions: RuntimeExtensions | null;
 }
 
 const SERVICE_META: Record<
@@ -31,14 +33,14 @@ const SERVICE_META: Record<
   }
 > = {
   database: {
-    label: "PostgreSQL 核心数据库",
-    description: "知识库 catalog、任务状态与后续业务事实库",
+    label: "核心数据库",
+    description: "SQLite 或 PostgreSQL 共享持久化存储",
     icon: Database,
     color: "#0f766e",
     details: [
-      { label: "功能", value: "知识库目录 / 文档版本 / 任务状态 / 引用元数据" },
-      { label: "检测地址", value: "postgresql://localhost:5432" },
-      { label: "降级策略", value: "不可用时，知识库管理降级，聊天能力保持可用" },
+      { label: "功能", value: "Core 状态 / 扩展目录 / 任务与引用元数据" },
+      { label: "模式", value: "SQLite 本地文件或 PostgreSQL 服务" },
+      { label: "职责", value: "CLI 初始化时写连接配置；Backend 运行时只连接" },
     ],
   },
   pgvector: {
@@ -201,13 +203,13 @@ function SummaryBar({
   lastChecked,
   onRefresh,
 }: {
-  services: Capabilities;
+  services: CapabilityStatus[];
   loading: boolean;
   lastChecked: string | null;
   onRefresh: () => void;
 }) {
-  const total = Object.keys(services).length;
-  const online = Object.values(services).filter((s) => s.available).length;
+  const total = services.length;
+  const online = services.filter((service) => service.available).length;
   const healthy = online === total;
 
   return (
@@ -241,7 +243,7 @@ function SummaryBar({
   );
 }
 
-export default function CapabilitiesStatus({ refreshIntervalMs = 30000, onChange }: CapabilitiesStatusProps) {
+export default function CapabilitiesStatus({ refreshIntervalMs = 30000, onChange, extensions }: CapabilitiesStatusProps) {
   const [capabilities, setCapabilities] = useState<Capabilities | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -314,16 +316,19 @@ export default function CapabilitiesStatus({ refreshIntervalMs = 30000, onChange
 
   if (!capabilities) return null;
 
+  const visibleEntries = (Object.entries(capabilities) as [keyof Capabilities, CapabilityStatus][])
+    .filter(([key]) => extensions?.knowledge || !["pgvector", "milvus", "mineru"].includes(key));
+
   return (
     <div className="space-y-4">
       <SummaryBar
-        services={capabilities}
+        services={visibleEntries.map(([, status]) => status)}
         loading={loading}
         lastChecked={lastChecked}
         onRefresh={fetchCapabilities}
       />
       <div className="grid gap-3">
-        {(Object.entries(capabilities) as [keyof Capabilities, CapabilityStatus][]).map(([key, status]) => (
+        {visibleEntries.map(([key, status]) => (
           <ServiceCard
             key={key}
             serviceKey={key}
@@ -334,7 +339,10 @@ export default function CapabilitiesStatus({ refreshIntervalMs = 30000, onChange
         ))}
       </div>
       <p className="text-[11px] text-gray-500 leading-relaxed px-1">
-        PostgreSQL 与 pgvector 是知识库数据库基础设施；Docker 用于本地隔离运行，Milvus、MinerU 可按能力逐步启用。模型请求统一通过内部网关路由，不参与外部服务健康检测。
+        {extensions?.knowledge
+          ? "PostgreSQL 是 Core 共享数据库；知识库在此基础上额外使用 pgvector，并可按需启用 Milvus、MinerU。"
+          : "数据库作为 Harness Core 基础设施独立显示；知识库专属的 pgvector、Milvus 与 MinerU 不探测也不显示。"}
+        模型请求统一通过内部网关路由，不参与外部服务健康检测。
       </p>
     </div>
   );

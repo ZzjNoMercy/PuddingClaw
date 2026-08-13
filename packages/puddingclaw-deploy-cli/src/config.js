@@ -2,15 +2,21 @@ import { CliError, assertArgument } from "./errors.js";
 import { readJson, writeJsonAtomic } from "./store.js";
 
 export const PROFILES = Object.freeze({
-  harness: { knowledge: false, analytics: false, headless_worker: false },
-  knowledge: { knowledge: true, analytics: false, headless_worker: false },
-  analytics: { knowledge: false, analytics: true, headless_worker: false },
+  harness: { knowledge: false, analytics: false, headless_worker: true },
+  knowledge: { knowledge: true, analytics: false, headless_worker: true },
+  analytics: { knowledge: false, analytics: true, headless_worker: true },
   full: { knowledge: true, analytics: true, headless_worker: true },
 });
 
 export const EXTENSIONS = Object.freeze(["knowledge", "analytics", "headless_worker"]);
+export const DEFAULT_BACKEND_PORT = 8888;
+export const DEFAULT_FRONTEND_PORT = 3000;
 
-export function defaultConfig({ profile = "harness", backendPort = 8888, frontendPort = 3000 } = {}) {
+export function defaultConfig({
+  profile = "harness",
+  backendPort = DEFAULT_BACKEND_PORT,
+  frontendPort = DEFAULT_FRONTEND_PORT,
+} = {}) {
   assertArgument(Object.hasOwn(PROFILES, profile), `unknown profile: ${profile}`);
   const selected = PROFILES[profile];
   return {
@@ -36,8 +42,26 @@ export function defaultConfig({ profile = "harness", backendPort = 8888, fronten
       base_url: "",
       model: "",
     },
+    multimodal_provider: {
+      status: "unconfigured",
+      id: "",
+      name: "",
+      protocol: "openai_compatible",
+      base_url: "",
+      model: "",
+      reuse_primary_credential: false,
+    },
     infrastructure: {
-      catalog: { mode: "sqlite", host: "", port: 0, database: "", probe_status: "skipped" },
+      catalog: {
+        mode: "sqlite",
+        preferred_mode: "postgresql",
+        fallback_mode: "sqlite",
+        source: "fallback",
+        host: "",
+        port: 0,
+        database: "",
+        probe_status: "skipped",
+      },
       milvus: { enabled: false, uri: "http://127.0.0.1:19530", probe_status: "skipped" },
       embedding: { status: "disabled", provider: "", model: "" },
       mineru: { enabled: false, base_url: "http://127.0.0.1:8002", probe_status: "skipped" },
@@ -53,13 +77,14 @@ export function defaultConfig({ profile = "harness", backendPort = 8888, fronten
 export async function loadConfig(file) {
   const config = await readJson(file, null);
   if (!config) return null;
-  const profile = Object.hasOwn(PROFILES, config.profile) ? config.profile : "harness";
+  const standardProfile = Object.hasOwn(PROFILES, config.profile);
+  const profile = standardProfile ? config.profile : "harness";
   const defaults = defaultConfig({
     profile,
-    backendPort: config.server?.backend_port || 8888,
-    frontendPort: config.server?.frontend_port || 3000,
+    backendPort: config.server?.backend_port || DEFAULT_BACKEND_PORT,
+    frontendPort: config.server?.frontend_port || DEFAULT_FRONTEND_PORT,
   });
-  return {
+  const normalized = {
     ...defaults,
     ...config,
     server: { ...defaults.server, ...config.server },
@@ -70,6 +95,7 @@ export async function loadConfig(file) {
       ]),
     ),
     provider: { ...defaults.provider, ...config.provider },
+    multimodal_provider: { ...defaults.multimodal_provider, ...config.multimodal_provider },
     infrastructure: {
       ...defaults.infrastructure,
       ...config.infrastructure,
@@ -80,6 +106,10 @@ export async function loadConfig(file) {
     },
     harness: { ...defaults.harness, ...config.harness },
   };
+  // 0.1.2-0.1.7 incorrectly modeled Worker/Headless as a Full-only
+  // extension. It is part of Harness Core in every standard profile.
+  if (standardProfile) normalized.extensions.headless_worker.enabled = true;
+  return normalized;
 }
 
 export async function saveConfig(file, config) {
@@ -129,6 +159,18 @@ export function validateConfig(config) {
   }
   if (!config.provider || !["unconfigured", "configured", "needs_action"].includes(config.provider.status)) {
     throw new CliError("provider.status must be unconfigured, configured, or needs_action", {
+      code: "configuration_error",
+    });
+  }
+  if (!config.multimodal_provider
+      || !["unconfigured", "configured", "needs_action"].includes(config.multimodal_provider.status)) {
+    throw new CliError(
+      "multimodal_provider.status must be unconfigured, configured, or needs_action",
+      { code: "configuration_error" },
+    );
+  }
+  if (typeof config.multimodal_provider.reuse_primary_credential !== "boolean") {
+    throw new CliError("multimodal_provider.reuse_primary_credential must be boolean", {
       code: "configuration_error",
     });
   }
@@ -184,11 +226,7 @@ export function setConfigValue(config, dottedPath, value) {
 export function applyExtension(config, name, enabled) {
   assertArgument(EXTENSIONS.includes(name), `unknown extension: ${name}`);
   config.extensions[name].enabled = enabled;
-  const active = EXTENSIONS.filter((item) => config.extensions[item].enabled);
-  config.profile = active.length === 0
-    ? "harness"
-    : active.length === EXTENSIONS.length
-      ? "full"
-      : "custom";
+  config.profile = Object.entries(PROFILES).find(([, expected]) =>
+    EXTENSIONS.every((item) => config.extensions[item].enabled === expected[item]))?.[0] || "custom";
   return config;
 }

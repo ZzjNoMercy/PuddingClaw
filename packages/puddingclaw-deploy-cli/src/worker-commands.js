@@ -1,15 +1,16 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
+import { createRequire } from "node:module";
 import { createInterface } from "node:readline/promises";
 import { CliError } from "./errors.js";
-import { loadConfig } from "./config.js";
+import { DEFAULT_BACKEND_PORT, loadConfig } from "./config.js";
 import { writeJson } from "./output.js";
 import { readJson } from "./store.js";
 import { WorkerClient, WorkerClientError } from "./worker-client.js";
 import { readLocalWorkerToken } from "./local-worker-token.js";
 
-export const AGENT_CAPABILITIES = ["data.query", "data.analysis", "data.nl2sql", "knowledge.query"];
+const WORKER_MANIFEST = createRequire(import.meta.url)("../worker.manifest.json");
 
 function assertFlags(flags, allowed) {
   const accepted = new Set(["json", ...allowed]);
@@ -27,7 +28,9 @@ export async function agentClientConfig(paths) {
   const configuredEndpoint = process.env.PUDDINGCLAW_URL || process.env.PUDDINGCLAW_BACKEND_URL;
   const deployHost = deploy?.server?.host === "::1" ? "[::1]" : deploy?.server?.host;
   const fallbackEndpoint = runtime?.backend_url
-    || (deploy?.server ? `http://${deployHost}:${deploy.server.backend_port}` : "http://127.0.0.1:8888");
+    || (deploy?.server
+      ? `http://${deployHost}:${deploy.server.backend_port}`
+      : `http://127.0.0.1:${DEFAULT_BACKEND_PORT}`);
   const endpoint = String(configuredEndpoint || fallbackEndpoint).replace(/\/+$/, "");
   let parsed;
   try { parsed = new URL(endpoint); } catch {
@@ -415,16 +418,16 @@ export async function workerCommand(command, args, flags, paths) {
         schema_version: "1",
         agent_id: "puddingclaw",
         protocol_version: "1",
-        capabilities: AGENT_CAPABILITIES,
-        operations: { run: true, continue: true, respond: true, cancel: true },
-        interaction_kinds: ["permission_request"],
-        progress: "jsonl",
-        transport: "cli",
+        capabilities: WORKER_MANIFEST.capabilities,
+        operations: WORKER_MANIFEST.operations,
+        interaction_kinds: WORKER_MANIFEST.interactionKinds,
+        progress: WORKER_MANIFEST.progress,
+        transport: WORKER_MANIFEST.transport.type,
         analytics_model_routing: {
-          strategy: "backend",
-          input: "message",
-          discovery_command: ["agent", "models", "list", "--json"],
-          ambiguity_outcome: "analytics_model_clarification_required",
+          strategy: WORKER_MANIFEST.modelRouting.strategy,
+          input: WORKER_MANIFEST.modelRouting.input,
+          discovery_command: WORKER_MANIFEST.modelRouting.discoveryCommand,
+          ambiguity_outcome: WORKER_MANIFEST.modelRouting.ambiguityOutcome,
         },
       },
       forceJson: !flags.json,

@@ -120,6 +120,17 @@ export interface EvalExperiment {
   started_at?: string | null;
   finished_at?: string | null;
 }
+export interface EvalExperimentResultRow {
+  case_id: string;
+  repetition: number;
+  attempt_id: string;
+  attempt_status: "queued" | "running" | "completed" | "failed" | "cancelled";
+  error?: { code?: string; message?: string; retryable?: boolean } | null;
+  created_at?: string | null;
+  updated_at?: string | null;
+  latency_ms?: number | null;
+  result?: Record<string, unknown> | null;
+}
 
 async function request<T>(path: string, init?: RequestInit, signal?: AbortSignal): Promise<T> {
   const response = await fetch(`${API_BASE}${path}`, { cache: "no-store", ...init, signal });
@@ -203,11 +214,21 @@ export async function testLangSmithConnection() {
 export async function listEvaluationExperiments(signal?: AbortSignal) {
   return request<{ items: EvalExperiment[]; total: number }>("/experiments", undefined, signal);
 }
+export async function getEvaluationExperimentResults(id: string, signal?: AbortSignal) {
+  return request<{ items: EvalExperimentResultRow[]; total: number }>(
+    `/experiments/${encodeURIComponent(id)}/results`,
+    undefined,
+    signal,
+  );
+}
 export async function createEvaluationExperiment(body: Record<string, unknown>) {
   return request<EvalExperiment>("/experiments", json(body));
 }
 export async function cancelEvaluationExperiment(id: string) {
   return request<EvalExperiment>(`/experiments/${encodeURIComponent(id)}/cancel`, { method: "POST" });
+}
+export async function deleteEvaluationExperiment(id: string) {
+  return request<void>(`/experiments/${encodeURIComponent(id)}`, { method: "DELETE" });
 }
 export async function retryEvaluationExperiment(id: string) {
   return request<EvalExperiment>(`/experiments/${encodeURIComponent(id)}/retry`, { method: "POST" });

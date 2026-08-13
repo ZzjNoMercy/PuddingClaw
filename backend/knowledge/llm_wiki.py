@@ -1320,8 +1320,11 @@ class LlmWikiService:
             prior_log = (self.wiki_dir / "log.md").read_text(encoding="utf-8")
             today = datetime.now(UTC).date().isoformat()
             safe_summary = _single_line(summary, fallback="Retire obsolete Wiki pages")
+            # A retired slug must not remain a clickable unresolved WikiLink:
+            # Obsidian creates a new zero-byte page when users follow it. Keep
+            # the historical identifier as code and link only the live target.
             retirement_lines = ", ".join(
-                f"[[{slug}]] -> [[{replacement}]]" for slug, replacement in sorted(replacements.items())
+                f"`{slug}` -> [[{replacement}]]" for slug, replacement in sorted(replacements.items())
             )
             log_entry = (
                 f"\n## [{today}] retire | {safe_summary}\n\n"

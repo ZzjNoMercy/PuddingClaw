@@ -31,7 +31,7 @@ version: 0.1.0
 
 The Backend may fill a missing `formatter` or `type` from the explicit Measure target path. It must reject a conflicting value. The Agent owns proposals for `name`, `description`, `aliases`, `tags`, and `version` because they change retrieval, display, or audit behavior.
 
-Do not add `authoring_schema` to published files in the first vertical. The Skill reference itself selects this guide.
+Do not add `authoring_schema` to published files. The Skill reference itself selects this guide.
 
 ## Example body shape
 

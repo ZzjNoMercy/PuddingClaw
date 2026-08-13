@@ -2837,12 +2837,13 @@ wheels = [
 
 [[package]]
 name = "puddingclaw-backend"
-version = "0.1.2"
+version = "0.1.16"
 source = { editable = "." }
 dependencies = [
     { name = "aiohttp" },
     { name = "aiosqlite" },
     { name = "anyio" },
+    { name = "asyncpg" },
     { name = "beautifulsoup4" },
     { name = "cryptography" },
     { name = "deepagents" },
@@ -2882,7 +2883,6 @@ dependencies = [
 
 [package.optional-dependencies]
 analytics = [
-    { name = "asyncpg" },
     { name = "openpyxl" },
     { name = "pandas" },
     { name = "plotly" },
@@ -2897,7 +2897,6 @@ evaluation = [
     { name = "swebench" },
 ]
 knowledge = [
-    { name = "asyncpg" },
     { name = "jieba" },
     { name = "llama-index-core" },
     { name = "llama-index-embeddings-openai" },
@@ -2941,8 +2940,7 @@ requires-dist = [
     { name = "aiohttp", specifier = ">=3.13.0" },
     { name = "aiosqlite", specifier = ">=0.22.0" },
     { name = "anyio", specifier = ">=4.12.0" },
-    { name = "asyncpg", marker = "extra == 'analytics'", specifier = ">=0.29.0" },
-    { name = "asyncpg", marker = "extra == 'knowledge'", specifier = ">=0.29.0" },
+    { name = "asyncpg", specifier = ">=0.29.0" },
     { name = "beautifulsoup4", specifier = ">=4.14.0" },
     { name = "cryptography", specifier = ">=49.0.0" },
     { name = "dashscope", marker = "extra == 'multimodal'", specifier = ">=1.24.0" },

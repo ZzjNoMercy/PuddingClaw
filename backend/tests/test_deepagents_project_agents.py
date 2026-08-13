@@ -379,6 +379,10 @@ def test_default_agent_prompt_routes_markdown_wiki_first_and_documents_condition
     )
 
     assert "## Knowledge Source Routing" in prompt
+    assert "内部知识优先是普通知识任务的默认来源策略" in prompt
+    assert "不要求用户先说“知识库”" in prompt
+    assert "项目/产品清单、技术比较、选型建议" in prompt
+    assert "出现“开源”“有哪些项目”“推荐”" in prompt
     assert "先读取 `/skills/llm-wiki/SKILL.md`" in prompt
     assert "读取 Skill 只完成能力激活，不等于已经检索" in prompt
     assert '`llm_wiki_context(operation="query")`' in prompt
@@ -389,6 +393,7 @@ def test_default_agent_prompt_routes_markdown_wiki_first_and_documents_condition
     assert "仅在实体关系、图谱遍历或结构化筛选有价值时" in prompt
     assert "不得替代或跳过本轮 `llm_wiki_query`" in prompt
     assert "本轮按上述条件需要的补充路径" in prompt
+    assert "才把 Web 作为补充来源" in prompt
 
 
 def test_knowledge_search_skill_requires_actual_document_index_query() -> None:

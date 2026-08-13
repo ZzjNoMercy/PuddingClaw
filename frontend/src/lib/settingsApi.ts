@@ -92,7 +92,8 @@ export interface KnowledgeSettings {
 }
 
 export interface DatabaseSettings {
-  mode: "bundled" | "external";
+  mode: "sqlite" | "bundled" | "external";
+  source?: string;
   host: string;
   port: number;
   database: string;
@@ -416,7 +417,7 @@ export interface TestDatabaseConnectionResult {
 }
 
 export async function testDatabaseConnection(params: {
-  mode: "bundled" | "external";
+  mode: "sqlite" | "bundled" | "external";
   host?: string;
   port: number;
   database: string;

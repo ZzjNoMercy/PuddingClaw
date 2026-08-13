@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import { createRequire } from "node:module";
 import { parseArgs } from "./args.js";
 import { CliError } from "./errors.js";
 import { resolveHome, homePaths } from "./home.js";
@@ -9,9 +10,46 @@ import { logsCommand, requireRuntimeForStart, runtimeCommand } from "./runtime-c
 import { openRuntime, startRuntime, stopRuntime } from "./supervisor.js";
 import { writeError, writeHuman, writeJson } from "./output.js";
 import { workerCommand, workerDoctorCommand } from "./worker-commands.js";
-import { WorkerClientError } from "./worker-client.js";
+import { databaseCommand } from "./database-commands.js";
 
-const VERSION = "0.1.2";
+const { version: VERSION } = createRequire(import.meta.url)("../package.json");
+
+const COMMAND_FLAGS = Object.freeze({
+  init: [
+    "api_key", "backend_port", "base_url", "database_create_if_missing", "database_mode",
+    "database_name", "database_port", "database_url", "database_username", "embedding_api_key",
+    "force", "frontend_port", "install_runtime", "milvus", "milvus_uri", "model",
+    "multimodal_api_key", "multimodal_base_url", "multimodal_model", "multimodal_provider",
+    "multimodal_provider_id", "multimodal_provider_name", "non_interactive", "plan", "port",
+    "prepare_python", "profile", "provider", "provider_id", "provider_name", "python", "uv", "yes",
+  ],
+  database: [
+    "database_create_if_missing", "database_mode", "database_name", "database_port", "database_url",
+    "database_username", "non_interactive",
+  ],
+  agent: ["export", "input_json", "jsonl", "session"],
+  start: ["port"],
+  stop: ["force"],
+  restart: ["force", "port"],
+  config: [],
+  extension: [],
+  runtime: [],
+  logs: [],
+  open: [],
+  status: [],
+  doctor: [],
+  version: [],
+});
+
+function assertCommandFlags(command, flags) {
+  const accepted = new Set(["help", "json", ...(COMMAND_FLAGS[command] || [])]);
+  const unknown = Object.keys(flags).find((name) => !accepted.has(name));
+  if (unknown) {
+    throw new CliError(`unknown option: --${unknown.replaceAll("_", "-")}`, {
+      code: "argument_error",
+    });
+  }
+}
 
 function usage() {
   return [
@@ -21,6 +59,7 @@ function usage() {
     "  puddingclaw init [--profile <harness|knowledge|analytics|full>] [--port auto] [--python /path] [--uv /path] [--prepare-python] [--install-runtime]",
     "  puddingclaw init --profile <profile> --plan --json",
     "  puddingclaw config show|get|set ...",
+    "  puddingclaw database show|configure",
     "  puddingclaw extension list|enable|disable ...",
     "  puddingclaw agent run <message> [--session <id>] [--export <dir>] [--json|--jsonl]",
     "  puddingclaw agent respond <run_id> --input-json - [--json]",
@@ -30,6 +69,7 @@ function usage() {
     "  puddingclaw runtime install <bundle-directory|bundled>",
     "  puddingclaw runtime prepare",
     "  puddingclaw runtime inspect",
+    "  puddingclaw runtime prune",
     "  puddingclaw logs [--json]",
     "  puddingclaw start [--port auto] [--json]",
     "  puddingclaw stop [--force] [--json]",
@@ -41,11 +81,11 @@ function usage() {
   ].join("\n");
 }
 
-async function main(argv) {
-  const { positionals, flags } = parseArgs(argv);
+async function main({ positionals, flags }) {
   const [command, ...rest] = positionals;
   const paths = homePaths(resolveHome());
   if (!command || command === "help" || flags.help) return { value: usage(), humanOnly: true, code: 0 };
+  assertCommandFlags(command, flags);
   if (command === "version") {
     return {
       value: {
@@ -70,6 +110,7 @@ async function main(argv) {
   }
   if (command === "init") return { value: await runInit({ flags, paths }), code: 0 };
   if (command === "config") return { value: await configCommand(rest, paths), code: 0 };
+  if (command === "database") return { value: await databaseCommand(rest, flags, paths), code: 0 };
   if (command === "extension") return { value: await extensionCommand(rest, paths), code: 0 };
   if (command === "runtime") return { value: await runtimeCommand(rest, paths), code: 0 };
   if (command === "logs") return { value: await logsCommand(paths), code: 0 };
@@ -112,7 +153,7 @@ async function main(argv) {
 
 try {
   const parsed = parseArgs(process.argv.slice(2));
-  const result = await main(process.argv.slice(2));
+  const result = await main(parsed);
   process.exitCode = result.code;
   if (result.suppressOutput) {
     // Streaming commands already emitted their protocol events.
@@ -128,7 +169,7 @@ try {
   if (process.argv.includes("--json")) {
     const outcomeCodes = new Set(["session_expired", "interaction_expired", "interaction_conflict", "run_expired"]);
     writeJson({
-      schema_version: cliError instanceof WorkerClientError ? "1" : 1,
+      schema_version: "1",
       status: "error",
       ...(outcomeCodes.has(cliError.code) ? { outcome: cliError.code } : {}),
       error_code: cliError.code,

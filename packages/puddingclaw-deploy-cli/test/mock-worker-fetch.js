@@ -1,15 +1,19 @@
+import { createRequire } from "node:module";
+
+const packageVersion = createRequire(import.meta.url)("../package.json").version;
+
 globalThis.fetch = async (url, options) => {
   const body = options?.body ? JSON.parse(options.body) : {};
   if (String(url).endsWith("/api/headless/health")) {
     return new Response(JSON.stringify({
       schema_version: "1",
       agent_id: "puddingclaw",
-      cli_version: "0.1.2",
+      cli_version: packageVersion,
       protocol_version: "1",
       configured: true,
       authenticated: true,
       reachable: true,
-      server_version: "0.1.2",
+      server_version: packageVersion,
       project_id: "proj_test",
       workspace_ready: true,
     }), { status: 200 });

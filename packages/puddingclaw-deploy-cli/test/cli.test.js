@@ -2,20 +2,29 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import net from "node:net";
+import { createRequire } from "node:module";
+import { chmod, mkdir, mkdtemp, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
 import crypto from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { selectPorts } from "../src/init.js";
-import { loadConfig } from "../src/config.js";
+import {
+  discoverInitialMultimodalProvider,
+  multimodalProviderPreset,
+  providerPreset,
+} from "../src/init-discovery.js";
+import { defaultConfig, loadConfig } from "../src/config.js";
 import { buildInitPlan } from "../src/init-schema.js";
 import { resolveRuntimeProcess } from "../src/runtime-bundle.js";
 import { bootstrapUv, MANAGED_UV_VERSION, managedUvInstaller } from "../src/uv-runtime.js";
 import { pythonHeadersAvailable } from "../src/runtime-python.js";
+import { probePort } from "../src/probes.js";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const cli = path.join(root, "src", "cli.js");
+const packageVersion = createRequire(import.meta.url)("../package.json").version;
 
 async function runCli(args, { home, env = {} } = {}) {
   const child = spawn(process.execPath, [cli, ...args], {
@@ -74,17 +83,59 @@ test("unified CLI exposes the stable Worker and deployment identity", async () =
   const home = await tempHome();
   try {
     const result = await runCli(["version", "--json"], { home });
-    assert.equal(result.code, 0, result.stderr);
+    assert.equal(result.code, 0, `${result.stderr}\n${result.stdout}`);
     assert.deepEqual(JSON.parse(result.stdout), {
       schema_version: "1",
       cli: "puddingclaw",
-      cli_version: "0.1.2",
+      cli_version: packageVersion,
       agent_id: "puddingclaw",
       protocol_version: "1",
     });
   } finally {
     await rm(home, { recursive: true, force: true });
   }
+});
+
+test("DeepSeek init defaults to the product Flash model", () => {
+  assert.equal(providerPreset("1").model, "deepseek-v4-flash");
+});
+
+test("image analyzer init defaults to the DashScope multimodal model", () => {
+  assert.deepEqual(multimodalProviderPreset("1"), {
+    id: "dashscope",
+    name: "阿里云百炼",
+    protocol: "openai_compatible",
+    base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    model: "qwen3.7-plus",
+  });
+});
+
+test("image analyzer init keeps a dedicated Provider credential", async () => {
+  const discovery = await discoverInitialMultimodalProvider({
+    flags: {
+      multimodal_provider: "custom",
+      multimodal_provider_id: "vision-provider",
+      multimodal_provider_name: "Vision Provider",
+      multimodal_base_url: "https://vision.example.com/v1",
+      multimodal_model: "vision-model",
+      multimodal_api_key: "image-secret",
+    },
+    nonInteractive: true,
+    primaryDiscovery: {
+      provider: {
+        status: "configured",
+        id: "agent-provider",
+        base_url: "https://agent.example.com/v1",
+        model: "agent-model",
+      },
+      apiKey: "agent-secret",
+    },
+    probeProvider: async () => ({ probe: "provider.endpoint", status: "available", required: true }),
+  });
+  assert.equal(discovery.provider.status, "configured");
+  assert.equal(discovery.provider.model, "vision-model");
+  assert.equal(discovery.provider.reuse_primary_credential, false);
+  assert.equal(discovery.apiKey, "image-secret");
 });
 
 test("managed uv bootstrap uses a pinned official installer per platform", () => {
@@ -97,6 +148,8 @@ test("managed uv bootstrap uses a pinned official installer per platform", () =>
     managedUvInstaller("win32").url,
     `https://astral.sh/uv/${MANAGED_UV_VERSION}/install.ps1`,
   );
+  assert.match(managedUvInstaller("darwin").sha256, /^[a-f0-9]{64}$/);
+  assert.match(managedUvInstaller("win32").sha256, /^[a-f0-9]{64}$/);
 });
 
 test("Python runtime detects whether a selected interpreter provides Python.h", async () => {
@@ -127,6 +180,7 @@ test("managed uv bootstrap installs only under the isolated Home", {
         return new Response(body, { status: 200 });
       },
       stderr: { write() {} },
+      installerSha256: crypto.createHash("sha256").update(body).digest("hex"),
     });
     assert.equal(result.status, "prepared");
     assert.equal(result.selected.version, MANAGED_UV_VERSION);
@@ -140,20 +194,45 @@ test("managed uv bootstrap installs only under the isolated Home", {
   }
 });
 
+test("managed uv bootstrap rejects an installer with the wrong checksum", async () => {
+  const home = await tempHome();
+  try {
+    const body = "x".repeat(200);
+    await assert.rejects(
+      bootstrapUv(home, {
+        fetchImpl: async () => new Response(body, { status: 200 }),
+        installerSha256: "0".repeat(64),
+        stderr: { write() {} },
+      }),
+      (error) => error.code === "uv_integrity_failed",
+    );
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
 test("init plan covers core settings and excludes disabled extension probes", async () => {
   const harness = buildInitPlan("harness");
-  assert.ok(harness.field_count > 30);
   assert.ok(harness.steps.some((step) => step.id === "provider.agent" && step.status === "selected"));
+  assert.ok(harness.steps.some((step) => step.id === "provider.multimodal" && step.status === "selected"));
+  assert.deepEqual(
+    harness.steps.find((step) => step.id === "harness.subagents").depends_on,
+    ["provider.agent", "provider.multimodal"],
+  );
   assert.ok(harness.steps
-    .filter((step) => ["knowledge", "analytics", "headless_worker"].includes(step.extension))
+    .filter((step) => ["knowledge", "analytics"].includes(step.extension))
     .every((step) => step.status === "disabled"));
-  assert.equal(harness.steps.find((step) => step.id === "database.shared").status, "disabled");
+  assert.equal(harness.steps.find((step) => step.id === "headless.worker").status, "selected");
+  assert.equal(harness.steps.find((step) => step.id === "database.shared").status, "selected");
+  assert.deepEqual(harness.branches.database, [
+    "postgresql_detect", "existing_or_native_or_docker", "sqlite_fallback",
+  ]);
 
   const full = buildInitPlan("full");
-  assert.ok(full.field_count > harness.field_count);
+  assert.ok(full.execution_order.length > harness.execution_order.length);
   assert.ok(full.steps.every((step) => step.status === "selected"));
-  assert.ok(full.execution_order.indexOf("knowledge.storage") < full.execution_order.indexOf("database.shared"));
-  assert.ok(full.execution_order.indexOf("database.shared") < full.execution_order.indexOf("knowledge.index"));
+  assert.ok(full.execution_order.indexOf("database.shared") < full.execution_order.indexOf("knowledge.storage"));
+  assert.ok(full.execution_order.indexOf("knowledge.storage") < full.execution_order.indexOf("knowledge.index"));
   assert.deepEqual(
     full.steps.find((step) => step.id === "knowledge.rag").depends_on,
     ["knowledge.index", "provider.agent"],
@@ -175,14 +254,14 @@ test("init --plan is read-only and machine-readable", async () => {
   }
 });
 
-test("non-interactive Harness init writes isolated config and disables extensions", async () => {
+test("non-interactive Harness init enables its Worker and disables business extensions", async () => {
   const home = await tempHome();
   try {
     const env = await fakePython(home);
     const result = await runCli([
       "init", "--profile", "harness", "--non-interactive", "--port", "auto", "--json",
     ], { home, env });
-    assert.equal(result.code, 0, result.stderr);
+    assert.equal(result.code, 0, `${result.stderr}\n${result.stdout}`);
     const response = JSON.parse(result.stdout);
     assert.equal(response.status, "initialized");
     assert.equal(response.profile, "harness");
@@ -194,11 +273,14 @@ test("non-interactive Harness init writes isolated config and disables extension
     assert.deepEqual(config.extensions, {
       knowledge: { enabled: false },
       analytics: { enabled: false },
-      headless_worker: { enabled: false },
+      headless_worker: { enabled: true },
     });
     assert.equal(config.server.host, "127.0.0.1");
     assert.equal(config.provider.status, "unconfigured");
+    assert.equal(config.multimodal_provider.status, "unconfigured");
     assert.equal(config.infrastructure.catalog.mode, "sqlite");
+    assert.equal(config.infrastructure.catalog.preferred_mode, "postgresql");
+    assert.equal(config.infrastructure.catalog.fallback_mode, "sqlite");
     assert.equal(config.infrastructure.milvus.enabled, false);
     const tokenFile = path.join(home, "secrets", "headless-token");
     assert.match(await readFile(tokenFile, "utf8"), /^pck_[A-Za-z0-9_-]{32,}\n$/);
@@ -209,7 +291,39 @@ test("non-interactive Harness init writes isolated config and disables extension
   }
 });
 
-test("0.1.1 deploy config is normalized for the 0.1.2 runtime contract", async () => {
+test("database configure updates only the database after init", async () => {
+  const home = await tempHome();
+  try {
+    const env = await fakePython(home);
+    const initialized = await runCli([
+      "init", "--profile", "harness", "--non-interactive", "--port", "auto", "--json",
+    ], { home, env });
+    assert.equal(initialized.code, 0, `${initialized.stderr}\n${initialized.stdout}`);
+    const before = JSON.parse(await readFile(path.join(home, "deploy.json"), "utf8"));
+
+    const configured = await runCli([
+      "database", "configure", "--database-mode", "sqlite", "--non-interactive", "--json",
+    ], { home, env });
+    assert.equal(configured.code, 0, configured.stderr);
+    const response = JSON.parse(configured.stdout);
+    assert.equal(response.status, "updated");
+    assert.equal(response.database.mode, "sqlite");
+
+    const after = JSON.parse(await readFile(path.join(home, "deploy.json"), "utf8"));
+    assert.equal(after.provider.status, before.provider.status);
+    assert.deepEqual(after.extensions, before.extensions);
+    assert.deepEqual(after.server, before.server);
+    assert.equal(after.infrastructure.catalog.mode, "sqlite");
+
+    const shown = await runCli(["database", "show", "--json"], { home, env });
+    assert.equal(shown.code, 0, shown.stderr);
+    assert.equal(JSON.parse(shown.stdout).database.mode, "sqlite");
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("0.1.1 deploy config is normalized for the current runtime contract", async () => {
   const home = await tempHome();
   try {
     const file = path.join(home, "deploy.json");
@@ -235,6 +349,7 @@ test("0.1.1 deploy config is normalized for the 0.1.2 runtime contract", async (
     assert.equal(config.provider.status, "unconfigured");
     assert.equal(config.infrastructure.catalog.mode, "sqlite");
     assert.equal(config.infrastructure.embedding.status, "disabled");
+    assert.equal(config.extensions.headless_worker.enabled, true);
   } finally {
     await rm(home, { recursive: true, force: true });
   }
@@ -249,7 +364,7 @@ test("non-interactive init accepts an explicit Python executable", async () => {
       "init", "--profile", "harness", "--non-interactive", "--port", "auto",
       "--python", python, "--json",
     ], { home, env: { PUDDINGCLAW_DEPLOY_PYTHON: "" } });
-    assert.equal(result.code, 0, result.stderr);
+    assert.equal(result.code, 0, `${result.stderr}\n${result.stdout}`);
     const config = JSON.parse(await readFile(path.join(home, "deploy.json"), "utf8"));
     assert.equal(config.runtime.python.command, python);
   } finally {
@@ -274,7 +389,7 @@ test("init resolves a PATH Python command to an absolute executable", async () =
         PUDDINGCLAW_DEPLOY_PYTHON: "",
       },
     });
-    assert.equal(result.code, 0, result.stderr);
+    assert.equal(result.code, 0, `${result.stderr}\n${result.stdout}`);
     const config = JSON.parse(await readFile(path.join(home, "deploy.json"), "utf8"));
     assert.equal(config.runtime.python.command, python);
   } finally {
@@ -294,7 +409,7 @@ test("extension enable updates only deploy CLI config", async () => {
     assert.equal(enabled.code, 0, enabled.stderr);
     assert.deepEqual(JSON.parse(enabled.stdout), {
       status: "updated",
-      profile: "custom",
+      profile: "knowledge",
       extension: "knowledge",
       enabled: true,
     });
@@ -353,6 +468,21 @@ test("occupied port fails closed and auto mode selects another port", async () =
   assert.equal(selected.frontendPort, 3000);
 });
 
+test("port probing detects a real listener without relying on lsof", async () => {
+  const server = net.createServer();
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen({ host: "127.0.0.1", port: 0, exclusive: true }, resolve);
+  });
+  try {
+    const port = server.address().port;
+    const result = await probePort(port);
+    assert.equal(result.status, "occupied");
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
 test("doctor and status expose initialized state without probing disabled extensions", async () => {
   const home = await tempHome();
   try {
@@ -366,10 +496,11 @@ test("doctor and status expose initialized state without probing disabled extens
     const diagnostic = JSON.parse(doctor.stdout);
     assert.equal(diagnostic.status, "needs_action");
     assert.equal(diagnostic.configured, true);
-    assert.equal(diagnostic.reachable, false);
+    assert.equal(diagnostic.authenticated, false);
+    assert.equal(typeof diagnostic.reachable, "boolean");
     assert.equal(diagnostic.deployment.initialized, true);
     assert.equal(diagnostic.deployment.status, "ok");
-    assert.deepEqual(diagnostic.deployment.extensions.map((item) => item.status), ["disabled", "disabled", "disabled"]);
+    assert.deepEqual(diagnostic.deployment.extensions.map((item) => item.status), ["disabled", "disabled", "enabled"]);
     const status = await runCli(["status", "--json"], { home });
     assert.equal(status.code, 0, status.stderr);
     assert.equal(JSON.parse(status.stdout).instance.status, "stopped");
@@ -403,6 +534,9 @@ test("CLI help is a boolean flag and legacy top-level run is not kept in paralle
     const legacy = await runCli(["run", "hello", "--json"], { home });
     assert.equal(legacy.code, 2);
     assert.equal(JSON.parse(legacy.stdout).error_code, "argument_error");
+    const unknown = await runCli(["version", "--typo", "value", "--json"], { home });
+    assert.equal(unknown.code, 2);
+    assert.equal(JSON.parse(unknown.stdout).error_code, "argument_error");
   } finally {
     await rm(home, { recursive: true, force: true });
   }
@@ -411,6 +545,10 @@ test("CLI help is a boolean flag and legacy top-level run is not kept in paralle
 test("runtime install verifies checksums and activates an immutable release", async () => {
   const home = await tempHome();
   try {
+    const abandoned = path.join(home, "runtime", "releases", ".install-abandoned");
+    await mkdir(abandoned, { recursive: true });
+    const old = new Date(Date.now() - 2 * 60 * 60 * 1000);
+    await utimes(abandoned, old, old);
     const bundle = await runtimeBundle(home);
     const installed = await runCli(["runtime", "install", bundle, "--json"], { home });
     assert.equal(installed.code, 0, installed.stderr);
@@ -422,6 +560,62 @@ test("runtime install verifies checksums and activates an immutable release", as
     assert.equal(response.manifest.release_version, "1.0.0-test");
     assert.equal(response.manifest.file_count, 1);
     assert.equal(response.manifest.files, undefined);
+    await assert.rejects(stat(abandoned), { code: "ENOENT" });
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("runtime prepare reports not initialized instead of an internal error", async () => {
+  const home = await tempHome();
+  try {
+    const bundle = await runtimeBundle(home);
+    const installed = await runCli(["runtime", "install", bundle, "--json"], { home });
+    assert.equal(installed.code, 0, installed.stderr);
+    const prepared = await runCli(["runtime", "prepare", "--json"], { home });
+    assert.equal(prepared.code, 1);
+    assert.equal(JSON.parse(prepared.stdout).error_code, "not_initialized");
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("runtime prune removes only recognized inactive releases and managed venvs", async () => {
+  const home = await tempHome();
+  try {
+    const bundle = await runtimeBundle(home);
+    const installed = await runCli(["runtime", "install", bundle, "--json"], { home });
+    assert.equal(installed.code, 0, installed.stderr);
+    const releases = path.join(home, "runtime", "releases");
+    const venvs = path.join(home, "runtime", "venvs");
+    for (const version of ["0.8.0", "0.9.0"]) {
+      await mkdir(path.join(releases, version), { recursive: true });
+      await writeFile(path.join(releases, version, "manifest.json"), `${JSON.stringify({ release_version: version })}\n`);
+      await mkdir(path.join(venvs, version), { recursive: true });
+      await writeFile(path.join(venvs, version, "pyvenv.cfg"), "home = managed\n");
+    }
+    await mkdir(path.join(releases, "unknown"), { recursive: true });
+    await writeFile(path.join(releases, "unknown", "manifest.json"), '{"release_version":"other"}\n');
+    await mkdir(path.join(venvs, "unknown"), { recursive: true });
+    await writeFile(path.join(home, "runtime.json"), `${JSON.stringify({
+      schema_version: 1,
+      home,
+      release_version: "0.8.0",
+    })}\n`);
+
+    const pruned = await runCli(["runtime", "prune", "--json"], { home });
+    assert.equal(pruned.code, 0, `${pruned.stderr}\n${pruned.stdout}`);
+    const response = JSON.parse(pruned.stdout);
+    assert.deepEqual(response.removed_releases, ["0.9.0"]);
+    assert.deepEqual(response.removed_venvs, ["0.9.0"]);
+    assert.deepEqual(response.protected_versions, ["1.0.0-test", "0.8.0"]);
+    await stat(path.join(releases, "1.0.0-test"));
+    await stat(path.join(releases, "0.8.0"));
+    await stat(path.join(venvs, "0.8.0"));
+    await stat(path.join(releases, "unknown"));
+    await stat(path.join(venvs, "unknown"));
+    await assert.rejects(stat(path.join(releases, "0.9.0")), { code: "ENOENT" });
+    await assert.rejects(stat(path.join(venvs, "0.9.0")), { code: "ENOENT" });
   } finally {
     await rm(home, { recursive: true, force: true });
   }
@@ -537,6 +731,25 @@ test("start, restart, and stop manage only authenticated processes under the iso
     const stopped = await runCli(["stop", "--json"], { home, env });
     assert.equal(stopped.code, 0, `${stopped.stderr}\n${stopped.stdout}`);
     assert.equal(JSON.parse(stopped.stdout).status, "stopped");
+
+    const staleControl = path.join(home, "control", "stale-test");
+    await mkdir(staleControl, { recursive: true });
+    await writeFile(path.join(home, "runtime.json"), `${JSON.stringify({
+      schema_version: 1,
+      instance_id: "stale-after-reboot",
+      home,
+      backend_pid: 2147483647,
+      frontend_pid: 2147483646,
+      processes: {
+        backend: { pid: 2147483647, control_path: staleControl },
+        frontend: { pid: 2147483646, control_path: staleControl },
+      },
+    })}\n`);
+    const recovered = await runCli(["start", "--port", "auto", "--json"], { home, env });
+    assert.equal(recovered.code, 0, `${recovered.stderr}\n${recovered.stdout}`);
+    assert.equal(JSON.parse(recovered.stdout).status, "running");
+    const recoveredStop = await runCli(["stop", "--json"], { home, env });
+    assert.equal(recoveredStop.code, 0, `${recoveredStop.stderr}\n${recoveredStop.stdout}`);
   } finally {
     const statePath = path.join(home, "runtime.json");
     try {
@@ -556,10 +769,17 @@ test("stop refuses an unverified PID and leaves the unknown process alive", asyn
   });
   await once(unknown, "spawn");
   try {
+    const config = defaultConfig();
+    config.initialized = true;
+    await writeFile(path.join(home, "deploy.json"), `${JSON.stringify(config)}\n`, { mode: 0o600 });
+    const bundle = await runtimeBundle(home, { longRunning: true });
+    const installed = await runCli(["runtime", "install", bundle, "--json"], { home });
+    assert.equal(installed.code, 0, installed.stderr);
     await writeFile(path.join(home, "runtime.json"), `${JSON.stringify({
       schema_version: 1,
       instance_id: "forged-instance",
       home,
+      release_version: "1.0.0-test",
       backend_pid: unknown.pid,
       frontend_pid: unknown.pid,
       processes: {
@@ -570,7 +790,16 @@ test("stop refuses an unverified PID and leaves the unknown process alive", asyn
     assert.equal(JSON.parse(status.stdout).instance.status, "unverified");
     const stopped = await runCli(["stop", "--json"], { home });
     assert.equal(stopped.code, 2);
-    assert.equal(JSON.parse(stopped.stdout).error_code, "runtime_ownership_mismatch");
+    const stopError = JSON.parse(stopped.stdout);
+    assert.equal(stopError.error_code, "runtime_ownership_mismatch");
+    assert.match(stopError.error, /delete .*runtime\.json/);
+    assert.equal(stopError.details.recovery.inspect, "puddingclaw status --json");
+    const started = await runCli(["start", "--port", "auto", "--json"], { home });
+    assert.equal(started.code, 1);
+    const startError = JSON.parse(started.stdout);
+    assert.equal(startError.error_code, "stale_runtime_state");
+    assert.match(startError.error, /do not kill unknown PIDs/);
+    assert.equal(startError.details.recovery.state_file, path.join(home, "runtime.json"));
     assert.doesNotThrow(() => process.kill(unknown.pid, 0));
   } finally {
     unknown.kill("SIGKILL");

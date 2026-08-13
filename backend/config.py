@@ -56,13 +56,13 @@ _DEFAULT_CONFIG: dict[str, Any] = {
         },
     },
     "database": {
-        # Catalog database for knowledge documents, ingestion jobs and future
-        # business facts. start-local-infra.sh detects local PostgreSQL and
-        # writes either bundled or external into this section.
+        # Shared Core database for runtime state and extension metadata.
+        # Knowledge additionally requires pgvector when PostgreSQL is selected.
         #
         # Settings page is the normal desktop source of truth. Only the
-        # PUDDINGCLAW_DATABASE_URL deployment escape hatch can override it.
-        "mode": "bundled",  # bundled | external
+        # CLI Runtime uses the PUDDINGCLAW_DATABASE_MODE / URL / SOURCE
+        # deployment contract to override it.
+        "mode": "bundled",  # sqlite | bundled | external
         "host": "127.0.0.1",
         "port": 5432,
         "database": "puddingclaw",
@@ -1228,16 +1228,18 @@ def get_database_qa_config() -> dict[str, Any]:
 def get_database_config() -> dict[str, Any]:
     """Read catalog database connection config.
 
-    Settings page / config.json is the normal desktop source of truth. The only
-    environment override is PUDDINGCLAW_DATABASE_URL, reserved for deployment or
-    CI. Generic DATABASE_URL / POSTGRES_URL are intentionally ignored here:
+    Settings page / config.json is the normal desktop source of truth. CLI
+    Runtime can override mode, source and URL through the PUDDINGCLAW_DATABASE_*
+    deployment contract. Generic DATABASE_URL / POSTGRES_URL are ignored here:
     they are too easy to inherit from Docker shells and make the UI look wrong.
     """
 
     import os
-    from urllib.parse import quote
+    from urllib.parse import quote, unquote, urlparse
 
     env_url = (os.getenv("PUDDINGCLAW_DATABASE_URL") or "").strip()
+    env_mode = (os.getenv("PUDDINGCLAW_DATABASE_MODE") or "").strip().lower()
+    env_source = (os.getenv("PUDDINGCLAW_DATABASE_SOURCE") or "").strip().lower()
     database = load_config().get("database", {})
     configured_url = str(database.get("url", "") or "").strip()
     mode = str(database.get("mode", "bundled") or "bundled").strip() or "bundled"
@@ -1254,13 +1256,23 @@ def get_database_config() -> dict[str, Any]:
     password = LocalCredentialStore().get(password_ref) if password_ref else ""
     if not password:
         password = os.getenv("PUDDINGCLAW_DATABASE_PASSWORD", "")
+    if env_mode == "sqlite":
+        mode = "sqlite"
+    elif env_url:
+        parsed = urlparse(env_url.replace("postgresql+asyncpg://", "postgresql://", 1))
+        host = parsed.hostname or host
+        port = int(parsed.port or port)
+        db_name = unquote(parsed.path.lstrip("/")) or db_name
+        username = unquote(parsed.username or username)
+        mode = "external" if env_source == "external" else "bundled"
     assembled_url = ""
     if mode in {"bundled", "external"}:
         assembled_url = (
             "postgresql+asyncpg://"
             f"{quote(username)}:{quote(password)}@{host}:{port}/{quote(db_name)}"
         )
-    effective_config_url = configured_url or assembled_url
+    effective_config_url = "" if mode == "sqlite" else configured_url or assembled_url
+    environment_override = bool(env_url or env_mode)
     return {
         "mode": mode,
         "host": host,
@@ -1269,16 +1281,17 @@ def get_database_config() -> dict[str, Any]:
         "username": username,
         "password": password,
         "password_ref": password_ref,
-        "url": env_url or effective_config_url,
+        "source": env_source or ("config" if not environment_override else "unknown"),
+        "url": "" if mode == "sqlite" else env_url or effective_config_url,
         "configured_url": configured_url,
         "configured_by": (
             "environment"
-            if env_url
+            if environment_override
             else "config.json"
             if effective_config_url
             else "default"
         ),
-        "environment_override": bool(env_url),
+        "environment_override": environment_override,
     }
 
 
@@ -1514,7 +1527,9 @@ def update_settings(updates: dict[str, Any]) -> None:
         if isinstance(database_update, dict):
             if "mode" in database_update:
                 mode = str(database_update.get("mode") or "bundled").strip() or "bundled"
-                config["database"]["mode"] = "external" if mode == "external" else "bundled"
+                config["database"]["mode"] = (
+                    "sqlite" if mode == "sqlite" else "external" if mode == "external" else "bundled"
+                )
             for key in ("host", "database", "username", "password", "url"):
                 if key in database_update:
                     value = str(database_update.get(key) or "").strip()

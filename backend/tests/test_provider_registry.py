@@ -5,7 +5,12 @@ import json
 import httpx
 import pytest
 
-from provider_registry import DEFAULT_AGENT_MODEL, DASHSCOPE_NATIVE_MODEL_CATALOG, ProviderRegistry, _default_registry
+from provider_registry import (
+    DASHSCOPE_NATIVE_MODEL_CATALOG,
+    DEFAULT_AGENT_MODEL,
+    ProviderRegistry,
+    _default_registry,
+)
 
 
 def _configured_registry(tmp_path) -> ProviderRegistry:
@@ -37,6 +42,106 @@ def test_fresh_registry_has_canonical_models_and_bindings(tmp_path):
     multimodal = registry.resolve_binding("multimodal_embedding")
     assert multimodal["api_key"] == "dashscope-text-secret"
     assert multimodal["protocol"] == "dashscope_multimodal_embedding"
+
+
+def test_legacy_init_provider_is_merged_into_builtin_provider(tmp_path, monkeypatch):
+    monkeypatch.delenv("PUDDINGCLAW_INITIAL_PROVIDER", raising=False)
+    payload = _default_registry()
+    payload["providers"].insert(
+        0,
+        {
+            "id": "initial-deepseek",
+            "name": "DeepSeek",
+            "enabled": True,
+            "credentials": {"default": "env://PUDDINGCLAW_INITIAL_PROVIDER_API_KEY"},
+            "endpoints": [
+                {
+                    "id": "initial-deepseek-initial",
+                    "protocol": "deepseek",
+                    "base_url": "https://api.deepseek.com",
+                    "credential_ref": "env://PUDDINGCLAW_INITIAL_PROVIDER_API_KEY",
+                    "capabilities": ["llm"],
+                }
+            ],
+            "models": [
+                {
+                    "id": "initial-deepseek:initial-deepseek-initial:deepseek-chat:llm",
+                    "name": "deepseek-chat",
+                    "endpoint_id": "initial-deepseek-initial",
+                    "capability": "llm",
+                    "categories": ["llm"],
+                }
+            ],
+        },
+    )
+    payload["bindings"]["agent"] = "initial-deepseek:initial-deepseek-initial:deepseek-chat:llm"
+    (tmp_path / "providers.json").write_text(json.dumps(payload), encoding="utf-8")
+
+    migrated = ProviderRegistry(tmp_path)._payload()
+
+    assert not any(provider["id"] == "initial-deepseek" for provider in migrated["providers"])
+    assert [provider["id"] for provider in migrated["providers"]].count("deepseek") == 1
+    assert migrated["bindings"]["agent"] == "deepseek:deepseek-openai:deepseek-chat:llm"
+    assert json.loads((tmp_path / "providers.json").read_text(encoding="utf-8")) == migrated
+
+
+def test_cli_init_bootstrap_updates_existing_registry_once_per_generation(tmp_path, monkeypatch):
+    monkeypatch.delenv("PUDDINGCLAW_INITIAL_PROVIDER", raising=False)
+    monkeypatch.delenv("PUDDINGCLAW_INITIAL_MULTIMODAL_PROVIDER", raising=False)
+    payload = _default_registry()
+    (tmp_path / "providers.json").write_text(json.dumps(payload), encoding="utf-8")
+    monkeypatch.setenv("PUDDINGCLAW_INITIAL_PROVIDER_BOOTSTRAP_ID", "init-generation-1")
+    monkeypatch.setenv(
+        "PUDDINGCLAW_INITIAL_PROVIDER",
+        json.dumps(
+            {
+                "status": "configured",
+                "id": "deepseek",
+                "name": "DeepSeek",
+                "protocol": "deepseek",
+                "base_url": "https://api.deepseek.com",
+                "model": "deepseek-chat",
+            }
+        ),
+    )
+    monkeypatch.setenv(
+        "PUDDINGCLAW_INITIAL_MULTIMODAL_PROVIDER",
+        json.dumps(
+            {
+                "status": "configured",
+                "id": "vision-provider",
+                "name": "Vision Provider",
+                "protocol": "openai_compatible",
+                "base_url": "https://vision.example.com/v1",
+                "model": "vision-model",
+                "reuse_primary_credential": False,
+            }
+        ),
+    )
+    registry = ProviderRegistry(tmp_path)
+
+    first = registry._payload()
+
+    assert first["bindings"]["agent"] == "deepseek:deepseek-openai:deepseek-chat:llm"
+    assert first["bindings"]["image_analyzer"] == (
+        "vision-provider:vision-provider-openai:vision-model:llm"
+    )
+    assert json.loads((tmp_path / ".cli-provider-bootstrap.json").read_text())["bootstrap_id"] == (
+        "init-generation-1"
+    )
+
+    first["bindings"]["image_analyzer"] = "dashscope:dashscope-compatible:qwen3-7-plus:llm"
+    (tmp_path / "providers.json").write_text(json.dumps(first), encoding="utf-8")
+    unchanged = registry._payload()
+    assert unchanged["bindings"]["image_analyzer"] == (
+        "dashscope:dashscope-compatible:qwen3-7-plus:llm"
+    )
+
+    monkeypatch.setenv("PUDDINGCLAW_INITIAL_PROVIDER_BOOTSTRAP_ID", "init-generation-2")
+    reapplied = registry._payload()
+    assert reapplied["bindings"]["image_analyzer"] == (
+        "vision-provider:vision-provider-openai:vision-model:llm"
+    )
 
 
 def test_display_never_contains_plaintext_credentials(tmp_path):

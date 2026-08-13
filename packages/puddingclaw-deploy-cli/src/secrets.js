@@ -1,10 +1,17 @@
 import fs from "node:fs/promises";
 import path from "node:path";
+import { randomUUID } from "node:crypto";
 
 export async function writeSecret(file, value) {
   await fs.mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
-  await fs.writeFile(file, `${String(value).trim()}\n`, { mode: 0o600 });
-  if (process.platform !== "win32") await fs.chmod(file, 0o600);
+  const temporary = path.join(path.dirname(file), `.${path.basename(file)}.${randomUUID()}.tmp`);
+  try {
+    await fs.writeFile(temporary, `${String(value).trim()}\n`, { mode: 0o600 });
+    await fs.rename(temporary, file);
+    if (process.platform !== "win32") await fs.chmod(file, 0o600);
+  } finally {
+    await fs.rm(temporary, { force: true }).catch(() => {});
+  }
 }
 
 export async function readSecret(file) {

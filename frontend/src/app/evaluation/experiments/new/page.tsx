@@ -33,7 +33,9 @@ export default function NewExperimentPage() {
       getProviders(),
     ]).then(([versions, registry]) => {
       setDatasets(versions);
-      setDatasetKey(versions[0] ? `${versions[0].dataset_id}@${versions[0].current_version}` : "");
+      const requested = new URLSearchParams(window.location.search).get("dataset") || "";
+      const requestedExists = versions.some((item) => `${item.dataset_id}@${item.current_version}` === requested);
+      setDatasetKey(requestedExists ? requested : versions[0] ? `${versions[0].dataset_id}@${versions[0].current_version}` : "");
       setProviderRegistry(registry);
     }).catch((cause) => setError(cause instanceof Error ? cause.message : "加载配置失败"));
   }, []);
@@ -44,7 +46,8 @@ export default function NewExperimentPage() {
   );
   const isSWEbench = Boolean(selected?.tags.includes("swebench"));
   useEffect(() => {
-    if (isSWEbench) setRepetitions(1);
+    setRepetitions(1);
+    setTimeoutSeconds(isSWEbench ? 900 : 300);
   }, [isSWEbench]);
   const models = useMemo(() => providerRegistry?.providers.flatMap((provider) => (
     provider.models
@@ -112,9 +115,9 @@ export default function NewExperimentPage() {
         {selectableKeys.length > 1 && <label className="block text-xs text-gray-500">评测 API Key（不选使用 default）<select value={credentialName} onChange={(event) => setCredentialName(event.target.value)} className={inputClass}><option value="">default</option>{selectableKeys.filter((item) => !item.is_default).map((item) => <option key={item.name} value={item.name}>{item.name}</option>)}</select></label>}
         <div className="grid grid-cols-2 gap-4">
           <label className="text-xs text-gray-500">重复次数<input disabled={isSWEbench} type="number" min={1} max={20} value={repetitions} onChange={(event) => setRepetitions(Number(event.target.value))} className={`${inputClass} disabled:bg-gray-50`} /></label>
-          <label className="text-xs text-gray-500">单 Case 超时（秒）<input type="number" min={1} max={3600} value={timeout} onChange={(event) => setTimeoutSeconds(Number(event.target.value))} className={inputClass} /></label>
+          <label className="text-xs text-gray-500">单 Case Agent 预算（秒）{isSWEbench && <span className="ml-1 text-amber-600">默认 900</span>}<input type="number" min={1} max={3600} value={timeout} onChange={(event) => setTimeoutSeconds(Number(event.target.value))} className={inputClass} /></label>
         </div>
-        <div className="rounded-lg bg-amber-50 p-3 text-xs text-amber-800">预计执行 {estimateCaseRuns(selected?.cases.length || 0, repetitions)} 个 Case Run。自定义生产 Tool 与 MCP 默认禁用；{isSWEbench ? "Agent 完成后平台会自动启动官方 SWE-bench Docker Harness。首次运行需要拉取/构建镜像，耗时和磁盘占用明显高于普通评测。" : selected?.default_profile === "coding_agent@1" ? "代码题可使用隔离 execute，评分以可信隐藏验证结果为准。" : "workspace 内建文件工具仍可用于 fixture 场景。"}</div>
+        <div className="rounded-lg bg-amber-50 p-3 text-xs text-amber-800">预计执行 {estimateCaseRuns(selected?.cases.length || 0, repetitions)} 个 Case Run。评测消息走生产 PuddingClaw Harness；业务 Tool 与 MCP 默认禁用。{isSWEbench ? "平台先准备与官方 TestSpec 一致的 Agent 依赖环境，Agent 产出 patch 后再启动干净的官方 Docker Verifier。首次运行需要拉取/构建镜像，耗时和磁盘占用明显高于普通评测。" : selected?.default_profile === "coding_agent@1" ? "代码题使用生产 Harness 的文件与 execute 协议，评分以可信隐藏验证结果为准。" : "workspace 内建文件工具仍可用于 fixture 场景。"}</div>
         <button disabled={busy || !selected} onClick={submit} className="w-full rounded-lg bg-[#002fa7] py-2.5 text-sm text-white disabled:opacity-40">{busy ? "正在创建…" : "创建并运行"}</button>
       </div>
     </div>

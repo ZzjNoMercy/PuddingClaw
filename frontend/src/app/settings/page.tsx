@@ -32,6 +32,7 @@ import {
   KeyRound,
   RotateCcw,
   Globe2,
+  Copy,
 } from "lucide-react";
 import {
   getSettings,
@@ -62,7 +63,8 @@ import {
 import MemoryEditor from "@/components/settings/MemoryEditor";
 import CapabilitiesStatus from "@/components/settings/CapabilitiesStatus";
 import WorkerAccessKeysPanel from "@/components/settings/WorkerAccessKeysPanel";
-import SettingsNavigation, { SETTINGS_CATEGORIES, type SettingsCategory } from "@/components/settings/SettingsNavigation";
+import SettingsNavigation, { SETTINGS_CATEGORIES, settingsCategoryEnabled, type SettingsCategory } from "@/components/settings/SettingsNavigation";
+import { useRuntimeProfile } from "@/lib/useRuntimeProfile";
 import Navbar from "@/components/layout/Navbar";
 import Link from "next/link";
 import deepseekLogo from "@lobehub/icons-static-svg/icons/deepseek-color.svg";
@@ -380,6 +382,11 @@ export default function SettingsPage() {
     const valid = SETTINGS_CATEGORIES.some((c) => c.key === saved);
     return (valid ? (saved as SettingsCategory) : "ai");
   });
+  const runtimeExtensions = useRuntimeProfile();
+  const activeCategory = settingsCategoryEnabled(category, runtimeExtensions) ? category : "ai";
+  useEffect(() => {
+    if (runtimeExtensions && activeCategory !== category) setCategory(activeCategory);
+  }, [activeCategory, category, runtimeExtensions]);
   const [providerRegistry, setProviderRegistry] = useState<ProviderRegistry | null>(null);
   const agentModels = providerRegistry?.providers.flatMap((provider) =>
     provider.models
@@ -458,14 +465,15 @@ export default function SettingsPage() {
   const [dbQaProfileEnabled, setDbQaProfileEnabled] = useState(true);
   const [dbQaAgentSqlFallbackEnabled, setDbQaAgentSqlFallbackEnabled] = useState(true);
 
-  // Knowledge base
-  const [databaseMode, setDatabaseMode] = useState<"bundled" | "external">("bundled");
+  // Core database
+  const [databaseMode, setDatabaseMode] = useState<"sqlite" | "bundled" | "external">("bundled");
   const [databaseHost, setDatabaseHost] = useState("127.0.0.1");
   const [databasePort, setDatabasePort] = useState("5432");
   const [databaseName, setDatabaseName] = useState("puddingclaw");
   const [databaseUsername, setDatabaseUsername] = useState("pet");
   const [databasePassword, setDatabasePassword] = useState("");
   const [databaseConfiguredBy, setDatabaseConfiguredBy] = useState("default");
+  const [databaseSource, setDatabaseSource] = useState("config");
   const [databaseEnvOverride, setDatabaseEnvOverride] = useState(false);
   const [databaseTesting, setDatabaseTesting] = useState(false);
   const [databaseTestResult, setDatabaseTestResult] = useState<{ ok: boolean; msg: string } | null>(null);
@@ -564,6 +572,7 @@ export default function SettingsPage() {
 
   // Load settings and capabilities on mount
   useEffect(() => {
+    if (!runtimeExtensions) return;
     // Infrastructure probes can wait on several network timeouts. They update
     // status indicators in the background and must not block the settings form.
     getCapabilities()
@@ -601,8 +610,15 @@ export default function SettingsPage() {
         setDbQaExportEnabled(databaseQa?.export_enabled ?? true);
         setDbQaProfileEnabled(databaseQa?.profile_enabled ?? true);
         setDbQaAgentSqlFallbackEnabled(databaseQa?.database_agent_sql_fallback_enabled ?? true);
-        // Knowledge base
-        setDatabaseMode(s.database?.mode === "external" ? "external" : "bundled");
+        // Core database. "bundled" is deployment provenance, not a third
+        // database type users should select in the standalone settings UI.
+        const databaseEnvironmentOverride = Boolean(s.database?.environment_override);
+        const loadedDatabaseMode = s.database?.mode === "sqlite"
+          ? "sqlite"
+          : s.database?.mode === "external"
+            ? "external"
+            : "bundled";
+        setDatabaseMode(databaseEnvironmentOverride ? loadedDatabaseMode : loadedDatabaseMode === "sqlite" ? "sqlite" : "external");
         setDatabaseHost(s.database?.host || "127.0.0.1");
         setDatabasePort(String(s.database?.port || 5432));
         setDatabaseName(s.database?.database || "puddingclaw");
@@ -611,7 +627,8 @@ export default function SettingsPage() {
         // credential" when the rest of the settings form is saved.
         setDatabasePassword("");
         setDatabaseConfiguredBy(s.database?.configured_by || "default");
-        setDatabaseEnvOverride(Boolean(s.database?.environment_override));
+        setDatabaseSource(s.database?.source || "config");
+        setDatabaseEnvOverride(databaseEnvironmentOverride);
         setKnowledgeRootDir(s.knowledge?.root_dir || "");
         setKnowledgeConfiguredBy(s.knowledge?.configured_by || "default");
         setKnowledgeEnvOverride(Boolean(s.knowledge?.environment_override));
@@ -624,7 +641,7 @@ export default function SettingsPage() {
         setGbrainDatabaseName("llm_wiki");
         setGbrainDatabaseUsername(s.database?.username || "puddingclaw");
         setGbrainDatabasePassword(s.database?.password || "");
-        getLlmWikiWorkspaceStatus()
+        if (runtimeExtensions?.knowledge) getLlmWikiWorkspaceStatus()
           .then((workspace) => {
             setGbrainWorkspace(workspace);
             const postgres = workspace.gbrain.postgres;
@@ -709,7 +726,7 @@ export default function SettingsPage() {
       })
       .catch(() => {})
       .finally(() => setLoading(false));
-  }, []);
+  }, [makeDefaultSubAgentItem, runtimeExtensions]);
 
   const showToast = useCallback((type: "success" | "error", message: string) => {
     setToast({ type, message });
@@ -1006,8 +1023,8 @@ export default function SettingsPage() {
       if (retainedToolTokens < 1000 || retainedToolTokens > 500000) {
         throw new Error("工具上下文保留预算必须在 1,000 到 500,000 tokens 之间");
       }
-      await updateSettings({
-        rag: {
+      const updates: Record<string, unknown> = {
+        ...(runtimeExtensions?.knowledge ? { rag: {
           top_k: ragTopK,
           similarity_threshold: ragThreshold,
           hybrid: {
@@ -1025,8 +1042,8 @@ export default function SettingsPage() {
             top_n: ragTopK,
             candidate_top_k: ragRerankCandidateTopK,
           },
-        },
-        analytics: {
+        }} : {}),
+        ...(runtimeExtensions?.analytics ? { analytics: {
           database_qa: {
             full_rows_token_budget: positiveIntOrNull(dbQaFullRowsTokenBudget) ?? 10000,
             preview_rows_token_budget: positiveIntOrNull(dbQaPreviewRowsTokenBudget) ?? 3000,
@@ -1045,8 +1062,8 @@ export default function SettingsPage() {
             profile_enabled: dbQaProfileEnabled,
             database_agent_sql_fallback_enabled: dbQaAgentSqlFallbackEnabled,
           },
-        },
-        database: {
+        }} : {}),
+        ...(activeCategory === "database" ? { database: {
           mode: databaseMode,
           host: databaseHost || "127.0.0.1",
           port: positiveIntOrNull(databasePort) ?? 5432,
@@ -1054,8 +1071,8 @@ export default function SettingsPage() {
           username: databaseUsername || "puddingclaw",
           password: databasePassword,
           url: "",
-        },
-        knowledge: {
+        }} : {}),
+        ...(runtimeExtensions?.knowledge ? { knowledge: {
           root_dir: knowledgeRootDir,
           llm_wiki: {
             compiler_agent: {
@@ -1077,7 +1094,7 @@ export default function SettingsPage() {
             image_collection: kbImageCollection,
             embedding_batch_size: Number.parseInt(mmBatchSize, 10) || 10,
           },
-        },
+        }} : {}),
         compression: {
           deepagents: {
             summarization: {
@@ -1130,21 +1147,25 @@ export default function SettingsPage() {
           },
         },
         subagents: subagentItemsToConfig(subagentItems),
-      });
+      };
+      await updateSettings(updates);
       showToast("success", "设置已保存，将从下一次 Agent 运行生效");
       const fresh = await getSettings();
       setDatabaseConfiguredBy(fresh.database?.configured_by || "default");
+      setDatabaseSource(fresh.database?.source || "config");
       setDatabaseEnvOverride(Boolean(fresh.database?.environment_override));
       setKnowledgeConfiguredBy(fresh.knowledge?.configured_by || "default");
       setKnowledgeEnvOverride(Boolean(fresh.knowledge?.environment_override));
       setWikiHybridEnabled(fresh.knowledge?.llm_wiki?.retrieval?.hybrid_enabled ?? true);
-      getLlmWikiWorkspaceStatus().then(setGbrainWorkspace).catch(() => {});
+      if (runtimeExtensions?.knowledge) {
+        getLlmWikiWorkspaceStatus().then(setGbrainWorkspace).catch(() => {});
+      }
     } catch (err) {
       showToast("error", err instanceof Error ? err.message : "保存失败");
     } finally {
       setSaving(false);
     }
-  }, [ragTopK, ragThreshold, ragTextVectorWeight, ragImageVectorWeight, ragBm25Weight, ragHybridCandidateTopK, ragRerankEnabled, ragRerankCandidateTopK, dbQaFullRowsTokenBudget, dbQaPreviewRowsTokenBudget, dbQaProfileTokenBudget, dbQaFullRowsHardRowCap, dbQaFullRowsHardColumnCap, dbQaMaxCellCharsForLlm, dbQaResultMaterializationRowCap, dbQaQueryTimeoutSeconds, dbQaSqlGenerationTimeoutSeconds, dbQaResultStoreEnabled, dbQaResultStoreTtlHours, dbQaDefaultPageSize, dbQaMaxPageSize, dbQaExportEnabled, dbQaProfileEnabled, dbQaAgentSqlFallbackEnabled, databaseMode, databaseHost, databasePort, databaseName, databaseUsername, databasePassword, mmBatchSize, knowledgeRootDir, wikiCompilerModelId, wikiHybridEnabled, wikiGbrainEmbeddingModelId, wikiGbrainThinkModelId, kbIndexEnabled, kbVectorStore, kbMilvusUri, kbTextCollection, kbImageCollection, contextSummaryTriggerTokens, contextSummaryKeepTokens, toolContextEnabled, immediateToolCompactionEnabled, singleToolTriggerTokens, backgroundMinResultTokens, retainToolContextTokens, modelCallLimitEnabled, modelCallRunLimit, modelCallThreadLimit, modelCallExitBehavior, rubricEnabled, rubricMaxIterations, rubricMaxStagnantRepairs, customRubricRulesEnabled, customRubricRules, goalsEnabled, goalMaxRounds, executionMode, subagentItems, showToast]);
+  }, [activeCategory, ragTopK, ragThreshold, ragTextVectorWeight, ragImageVectorWeight, ragBm25Weight, ragHybridCandidateTopK, ragRerankEnabled, ragRerankCandidateTopK, dbQaFullRowsTokenBudget, dbQaPreviewRowsTokenBudget, dbQaProfileTokenBudget, dbQaFullRowsHardRowCap, dbQaFullRowsHardColumnCap, dbQaMaxCellCharsForLlm, dbQaResultMaterializationRowCap, dbQaQueryTimeoutSeconds, dbQaSqlGenerationTimeoutSeconds, dbQaResultStoreEnabled, dbQaResultStoreTtlHours, dbQaDefaultPageSize, dbQaMaxPageSize, dbQaExportEnabled, dbQaProfileEnabled, dbQaAgentSqlFallbackEnabled, databaseMode, databaseHost, databasePort, databaseName, databaseUsername, databasePassword, mmBatchSize, knowledgeRootDir, wikiCompilerModelId, wikiHybridEnabled, wikiGbrainEmbeddingModelId, wikiGbrainThinkModelId, kbIndexEnabled, kbVectorStore, kbMilvusUri, kbTextCollection, kbImageCollection, contextSummaryTriggerTokens, contextSummaryKeepTokens, toolContextEnabled, immediateToolCompactionEnabled, singleToolTriggerTokens, backgroundMinResultTokens, retainToolContextTokens, modelCallLimitEnabled, modelCallRunLimit, modelCallThreadLimit, modelCallExitBehavior, rubricEnabled, rubricMaxIterations, rubricMaxStagnantRepairs, customRubricRulesEnabled, customRubricRules, goalsEnabled, goalMaxRounds, executionMode, subagentItems, showToast, runtimeExtensions]);
 
   const handleWikiHybridChange = useCallback(async (enabled: boolean) => {
     if (wikiHybridSaving) return;
@@ -1174,11 +1195,15 @@ export default function SettingsPage() {
     }
   }, [showToast, wikiHybridEnabled, wikiHybridSaving]);
 
-  const handleDatabaseModeChange = useCallback((mode: "bundled" | "external") => {
+  const handleDatabaseModeChange = useCallback((mode: "sqlite" | "bundled" | "external") => {
     setDatabaseMode(mode);
     setDatabaseHost("127.0.0.1");
     setDatabasePort("5432");
-    if (mode === "bundled") {
+    if (mode === "sqlite") {
+      setDatabaseName("catalog.sqlite3");
+      setDatabaseUsername("");
+      setDatabasePassword("");
+    } else if (mode === "bundled") {
       setDatabaseName("puddingclaw");
       setDatabaseUsername("puddingclaw");
       setDatabasePassword("");
@@ -1200,17 +1225,27 @@ export default function SettingsPage() {
   }), [databaseHost, databaseMode, databaseName, databasePassword, databasePort, databaseUsername]);
 
   const handleTestDatabase = useCallback(async () => {
+    if (databaseMode === "sqlite") {
+      setDatabaseTestResult({ ok: true, msg: "SQLite 使用 PuddingClaw Home 内的 catalog.sqlite3，无需网络连接测试" });
+      showToast("success", "SQLite 配置可用");
+      return;
+    }
     setDatabaseTesting(true);
     setDatabaseTestResult(null);
     try {
       const result = await testDatabaseConnection(databaseConnectionPayload(false));
       if (result.success) {
-        if (result.pgvector && !result.pgvector.available) {
+        if (runtimeExtensions?.knowledge && result.pgvector && !result.pgvector.available) {
           const message = `PostgreSQL 已连接，但缺少必备 pgvector。请运行：${result.pgvector.install_command}`;
           setDatabaseTestResult({ ok: false, msg: message });
           showToast("error", "PostgreSQL 缺少 pgvector");
         } else {
-          setDatabaseTestResult({ ok: true, msg: result.created ? "数据库已创建并连接成功，pgvector 可用" : `连接成功 · pgvector 可用 · ${result.latency_ms}ms` });
+          const pgvectorDetail = result.pgvector?.available
+            ? " · pgvector 可用"
+            : runtimeExtensions?.knowledge
+              ? ""
+              : " · pgvector 未安装（仅知识库需要）";
+          setDatabaseTestResult({ ok: true, msg: result.created ? `数据库已创建并连接成功${pgvectorDetail}` : `连接成功${pgvectorDetail} · ${result.latency_ms}ms` });
           showToast("success", result.created ? "数据库已创建并连接成功" : "数据库连接成功");
         }
       } else if (result.database_missing && result.can_create) {
@@ -1224,11 +1259,16 @@ export default function SettingsPage() {
         }
         setDatabaseTesting(true);
         const created = await testDatabaseConnection(databaseConnectionPayload(true));
-        if (created.pgvector && !created.pgvector.available) {
+        if (runtimeExtensions?.knowledge && created.pgvector && !created.pgvector.available) {
           setDatabaseTestResult({ ok: false, msg: `数据库已创建，但缺少必备 pgvector。请运行：${created.pgvector.install_command}` });
           showToast("error", "数据库已创建，但 pgvector 未安装");
         } else {
-          setDatabaseTestResult({ ok: true, msg: `数据库已创建并连接成功 · pgvector 可用 · ${created.latency_ms}ms` });
+          const pgvectorDetail = created.pgvector?.available
+            ? " · pgvector 可用"
+            : runtimeExtensions?.knowledge
+              ? ""
+              : " · pgvector 未安装（仅知识库需要）";
+          setDatabaseTestResult({ ok: true, msg: `数据库已创建并连接成功${pgvectorDetail} · ${created.latency_ms}ms` });
           showToast("success", "数据库已创建并连接成功");
         }
       } else {
@@ -1241,7 +1281,7 @@ export default function SettingsPage() {
     } finally {
       setDatabaseTesting(false);
     }
-  }, [databaseConnectionPayload, databaseName, showToast]);
+  }, [databaseConnectionPayload, databaseMode, databaseName, runtimeExtensions?.knowledge, showToast]);
 
   const gbrainDatabaseConnectionPayload = useCallback((createIfMissing = false) => ({
     mode: "external" as const,
@@ -1526,6 +1566,7 @@ export default function SettingsPage() {
   const editableModelCategories = MODEL_CATEGORY_OPTIONS.filter((option) => (
     pendingModelEndpoint?.capabilities.includes(option.capability)
     && (!pendingModelCategoryEdit?.capability || option.capability === pendingModelCategoryEdit.capability)
+    && (runtimeExtensions?.knowledge || option.capability === "llm")
   ));
 
   return (
@@ -1547,7 +1588,7 @@ export default function SettingsPage() {
         >
           <div className="h-full w-52 flex flex-col">
             <div className="h-11 shrink-0" />
-            <SettingsNavigation active={category} onSelectCategory={setCategory} onReturnToApp={handleReturnToApp} />
+            <SettingsNavigation active={activeCategory} extensions={runtimeExtensions} onSelectCategory={setCategory} onReturnToApp={handleReturnToApp} />
           </div>
         </div>
 
@@ -1555,9 +1596,9 @@ export default function SettingsPage() {
         <main className="workspace-content-frame flex min-w-0 flex-1 flex-col overflow-hidden">
           <div className="flex-1 overflow-y-auto px-8 pb-8 pt-6">
             <div className={`${
-              category === "ai" ? "max-w-none" : category === "databaseQa" || category === "harness" ? "max-w-6xl" : "max-w-2xl"
+              activeCategory === "ai" ? "max-w-none" : activeCategory === "databaseQa" || activeCategory === "harness" ? "max-w-6xl" : "max-w-2xl"
             } mx-auto space-y-6`}>
-            {category === "ai" && (
+            {activeCategory === "ai" && (
               <section className="provider-light min-h-[calc(100vh-96px)] overflow-hidden rounded-2xl border border-slate-200 bg-white text-slate-900 shadow-xl shadow-slate-200/50" data-screen-label="模型服务">
                 <style jsx>{`
                   .provider-light :global([class*="border-white"]) { border-color: rgb(226 232 240 / 0.9) !important; }
@@ -1648,7 +1689,9 @@ export default function SettingsPage() {
                             ["text_embedding", "文本 Embedding", "文档、表格与知识库文本"],
                             ["multimodal_embedding", "多模态 Embedding", "图片与图文混合内容"],
                             ["rerank", "Rerank", "召回结果的相关性重排"],
-                          ] as const).map(([binding, label, description]) => {
+                          ] as const).filter(([binding]) => (
+                            runtimeExtensions?.knowledge || binding === "agent" || binding === "image_analyzer"
+                          )).map(([binding, label, description]) => {
                             const capability = binding === "agent" || binding === "image_analyzer" ? "llm" : binding;
                             const boundId = providerRegistry?.bindings[binding] || "";
                             const requiredCategory: ProviderModelCategory = binding === "agent"
@@ -1717,7 +1760,9 @@ export default function SettingsPage() {
                             <div className="mb-5 flex flex-wrap items-center justify-between gap-3"><div className="flex items-center gap-3"><h2 className="text-[16px] font-semibold text-white">全部模型</h2><span className="rounded-full bg-white/[0.08] px-2.5 py-1 text-[10px] text-white/45">{activeProvider.models.length}</span></div><button type="button" onClick={() => handleOpenProviderModelPicker(activeProvider, activeEndpoint.id)} className="inline-flex items-center gap-1.5 rounded-lg border border-white/[0.14] px-3 py-2 text-[11px] font-semibold text-white/75 transition hover:bg-white/[0.07] hover:text-white"><RefreshCw className="h-3.5 w-3.5" />获取当前接口模型</button></div>
 
                             <div className="space-y-3">
-                              {MODEL_CATEGORY_OPTIONS.map((categoryOption) => {
+                              {MODEL_CATEGORY_OPTIONS.filter((categoryOption) => (
+                                runtimeExtensions?.knowledge || categoryOption.capability === "llm"
+                              )).map((categoryOption) => {
                                 const models = activeProvider.models.filter((model) => modelCategories(model).includes(categoryOption.id));
                                 if (!models.length) return null;
                                 const groupKey = `${activeProvider.id}:${categoryOption.id}`;
@@ -1737,7 +1782,7 @@ export default function SettingsPage() {
                 </div>
               </section>
             )}
-            {category === "databaseQa" && (
+            {activeCategory === "databaseQa" && (
               <div className="flex flex-col gap-5 lg:flex-row">
                 <aside className="flex w-full flex-col gap-4 lg:sticky lg:top-6 lg:w-56 lg:self-start lg:shrink-0">
                   <div>
@@ -2027,7 +2072,7 @@ export default function SettingsPage() {
             )}
 
             {/* RAG Settings */}
-            {category === "rag" && (
+            {activeCategory === "rag" && (
               <SettingsCard title="RAG 检索设置" icon={Database} color="#002fa7">
                 <div className="rounded-lg border border-black/[0.06] bg-white/50 px-3.5 py-3">
                   <p className="text-[12px] font-medium text-gray-700">知识库检索默认开启</p>
@@ -2173,41 +2218,77 @@ export default function SettingsPage() {
               </SettingsCard>
             )}
 
-            {/* Knowledge Base Settings */}
-            {category === "knowledge" && (
+            {/* Core Database Settings */}
+            {activeCategory === "database" && (
               <div className="space-y-5">
-                <SettingsCard title="知识库数据库" icon={Database} color="#0f172a">
+                <div>
+                  <h1 className="text-[18px] font-semibold text-gray-900">数据库</h1>
+                  <p className="mt-1 text-[11px] text-gray-500">PuddingClaw Core 的持久化连接，与知识库和智能问数扩展开关解耦</p>
+                </div>
+                <SettingsCard title="核心数据库" icon={Database} color="#0f172a">
                   <div className="rounded-xl border border-slate-200 bg-slate-50 px-3.5 py-3">
                     <p className="text-[11px] leading-relaxed text-slate-600">
-                      用来记录知识库里的文件、导入进度和检索信息。一般不用手动改；启动脚本会自动选择本机数据库或 PuddingClaw 内置数据库。
+                      数据库方案在 CLI 初始化时确定。CLI 负责探测、验证并写入连接配置；Backend 启动后只按配置连接，不负责数据库服务的启动、停止、升级或删除。
                     </p>
                   </div>
 
                   {databaseEnvOverride ? (
                     <div className="rounded-xl border border-amber-100 bg-amber-50/60 px-3.5 py-3 text-[11px] text-amber-700">
-                      当前数据库连接由启动环境覆盖；保存这里的配置后，不会改变当前运行时连接。
+                      <p>当前连接由 CLI 配置提供。这里展示实际生效的信息；更换数据库不需要重新初始化其他配置。</p>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          void navigator.clipboard.writeText("puddingclaw database configure");
+                          showToast("success", "已复制数据库重配命令");
+                        }}
+                        className="mt-2 inline-flex items-center gap-1.5 rounded-lg border border-amber-200 bg-white/70 px-2.5 py-1.5 font-medium text-amber-800 hover:bg-white"
+                      >
+                        <Copy className="h-3.5 w-3.5" />
+                        puddingclaw database configure
+                      </button>
                     </div>
                   ) : null}
 
                   <div className="grid gap-4 md:grid-cols-2">
-                    <FormField label="模式">
-                      <select
-                        value={databaseMode}
-                        onChange={(e) => handleDatabaseModeChange(e.target.value as "bundled" | "external")}
-                        className="form-select"
-                      >
-                        <option value="bundled">PuddingClaw 内置 PostgreSQL</option>
-                        <option value="external">本机 PostgreSQL</option>
-                      </select>
+                    <FormField label={databaseEnvOverride ? "当前方案" : "存储方式"}>
+                      {databaseEnvOverride ? (
+                        <div className="form-input flex items-center bg-gray-50 text-gray-700">
+                          {databaseMode === "sqlite"
+                            ? "SQLite · Home 内单文件"
+                            : databaseSource === "native_apt" || databaseSource === "local"
+                              ? "本机 PostgreSQL"
+                              : databaseSource === "docker"
+                                ? "Docker PostgreSQL"
+                                : "外部 PostgreSQL"}
+                        </div>
+                      ) : (
+                        <select
+                          value={databaseMode === "sqlite" ? "sqlite" : "external"}
+                          onChange={(e) => handleDatabaseModeChange(e.target.value as "sqlite" | "external")}
+                          className="form-select"
+                        >
+                          <option value="sqlite">SQLite · Home 内单文件</option>
+                          <option value="external">PostgreSQL · 填写连接信息</option>
+                        </select>
+                      )}
                     </FormField>
-                    <FormField label="本机端口">
+                    <FormField label="主机">
+                      <input
+                        value={databaseHost}
+                        onChange={(e) => setDatabaseHost(e.target.value)}
+                        disabled={databaseEnvOverride || databaseMode === "sqlite"}
+                        className="form-input disabled:cursor-not-allowed disabled:bg-gray-50 disabled:text-gray-400"
+                        placeholder="127.0.0.1"
+                      />
+                    </FormField>
+                    <FormField label="端口">
                       <input
                         type="number"
                         min="1"
                         max="65535"
                         value={databasePort}
                         onChange={(e) => setDatabasePort(e.target.value)}
-                        disabled={databaseEnvOverride}
+                        disabled={databaseEnvOverride || databaseMode === "sqlite"}
                         className="form-input disabled:cursor-not-allowed disabled:bg-gray-50 disabled:text-gray-400"
                         placeholder="5432"
                       />
@@ -2216,7 +2297,7 @@ export default function SettingsPage() {
                       <input
                         value={databaseName}
                         onChange={(e) => setDatabaseName(e.target.value)}
-                        disabled={databaseEnvOverride}
+                        disabled={databaseEnvOverride || databaseMode === "sqlite"}
                         className="form-input disabled:cursor-not-allowed disabled:bg-gray-50 disabled:text-gray-400"
                         placeholder="puddingclaw"
                       />
@@ -2225,7 +2306,7 @@ export default function SettingsPage() {
                       <input
                         value={databaseUsername}
                         onChange={(e) => setDatabaseUsername(e.target.value)}
-                        disabled={databaseEnvOverride}
+                        disabled={databaseEnvOverride || databaseMode === "sqlite"}
                         className="form-input disabled:cursor-not-allowed disabled:bg-gray-50 disabled:text-gray-400"
                         placeholder="puddingclaw"
                       />
@@ -2235,11 +2316,23 @@ export default function SettingsPage() {
                         type="password"
                         value={databasePassword}
                         onChange={(e) => setDatabasePassword(e.target.value)}
-                        disabled={databaseEnvOverride}
+                        disabled={databaseEnvOverride || databaseMode === "sqlite"}
                         className="form-input disabled:cursor-not-allowed disabled:bg-gray-50 disabled:text-gray-400"
-                        placeholder="puddingclaw"
+                        placeholder="留空表示保留已保存的密码"
                       />
                     </FormField>
+                  </div>
+
+                  <div className="rounded-xl border border-blue-100 bg-blue-50/50 px-3.5 py-3 text-[11px] leading-relaxed text-blue-700">
+                    {databaseMode === "sqlite"
+                      ? "SQLite 位于 PuddingClaw Home 的 databases/catalog.sqlite3，不依赖数据库服务，适合 Harness-only 和轻量体验。"
+                      : databaseSource === "native_apt" || databaseSource === "local"
+                        ? "初始化向导通过系统包安装或复用本机 PostgreSQL，创建应用所需的角色与数据库并写入连接信息；后续服务生命周期归用户和操作系统管理。"
+                        : databaseSource === "docker"
+                          ? "初始化向导创建或复用 Docker PostgreSQL 并写入连接配置；后续服务生命周期由 Docker 管理。"
+                          : databaseMode === "external"
+                            ? "初始化向导验证并保存外部 PostgreSQL 的连接信息；Backend 后续只建立连接。"
+                            : "该 PostgreSQL 的连接信息来自初始化向导；实际来源会在 CLI 确认页和此处的“当前来源”中标明。"}
                   </div>
 
                   <div className="flex flex-wrap items-center gap-2">
@@ -2253,22 +2346,32 @@ export default function SettingsPage() {
                       测试连接
                     </button>
                     <span className="text-[11px] text-gray-400">
-                      当前来源：{databaseConfiguredBy}
+                      当前来源：{databaseConfiguredBy === "environment" ? "CLI Runtime" : databaseConfiguredBy}
+                      {databaseSource && databaseSource !== "config" ? ` · ${({
+                        native_apt: "本机 PostgreSQL",
+                        local: "本机 PostgreSQL",
+                        docker: "Docker",
+                        external: "外部 PostgreSQL",
+                        fallback: "SQLite",
+                      } as Record<string, string>)[databaseSource] || databaseSource}` : ""}
                     </span>
                   </div>
                   {databaseTestResult ? (
-                    <div
-                      className={`rounded-xl border px-3.5 py-3 text-[11px] ${
-                        databaseTestResult.ok
-                          ? "border-emerald-100 bg-emerald-50 text-emerald-700"
-                          : "border-red-100 bg-red-50 text-red-700"
-                      }`}
-                    >
+                    <div className={`rounded-xl border px-3.5 py-3 text-[11px] ${
+                      databaseTestResult.ok
+                        ? "border-emerald-100 bg-emerald-50 text-emerald-700"
+                        : "border-red-100 bg-red-50 text-red-700"
+                    }`}>
                       {databaseTestResult.msg}
                     </div>
                   ) : null}
                 </SettingsCard>
+              </div>
+            )}
 
+            {/* Knowledge Base Settings */}
+            {activeCategory === "knowledge" && (
+              <div className="space-y-5">
                 <SettingsCard title="本地知识库目录" icon={FolderOpen} color="#002fa7">
                   <div className="rounded-xl border border-blue-100 bg-blue-50/50 px-3.5 py-3">
                     <p className="text-[11px] leading-relaxed text-blue-700">
@@ -2640,7 +2743,7 @@ export default function SettingsPage() {
             )}
 
             {/* Agent / Harness Config */}
-            {category === "harness" && (
+            {activeCategory === "harness" && (
               <div className="flex flex-col lg:flex-row gap-5">
                 {/* Left: harness category sidebar */}
                 <aside className="flex w-full flex-col gap-4 lg:sticky lg:top-6 lg:w-56 lg:self-start lg:shrink-0">
@@ -3406,24 +3509,24 @@ export default function SettingsPage() {
               </div>
             )}
             {/* Worker Access */}
-            {category === "worker" && <WorkerAccessKeysPanel />}
+            {activeCategory === "worker" && <WorkerAccessKeysPanel />}
 
             {/* Memory Editor */}
-            {category === "memory" && (
+            {activeCategory === "memory" && (
               <div className="h-[calc(100vh-140px)]">
                 <MemoryEditor />
               </div>
             )}
 
             {/* System Status */}
-            {category === "system" && (
+            {activeCategory === "system" && (
               <SettingsCard title="系统状态" icon={Activity} color="#002fa7">
-                <CapabilitiesStatus refreshIntervalMs={30000} onChange={setCapabilities} />
+                <CapabilitiesStatus refreshIntervalMs={30000} onChange={setCapabilities} extensions={runtimeExtensions} />
               </SettingsCard>
             )}
 
             {/* Save Button */}
-            {category !== "ai" && category !== "databaseQa" && category !== "memory" && category !== "worker" && category !== "system" && <div className="flex justify-end pt-2 pb-8">
+            {activeCategory !== "ai" && activeCategory !== "databaseQa" && activeCategory !== "memory" && activeCategory !== "worker" && activeCategory !== "system" && !(activeCategory === "database" && databaseEnvOverride) && <div className="flex justify-end pt-2 pb-8">
               <button
                 onClick={handleSave}
                 disabled={saving}

@@ -302,6 +302,133 @@ def _provider_presets() -> list[dict[str, Any]]:
     ]
 
 
+def _bootstrap_provider_binding(
+    payload: dict[str, Any],
+    initial: dict[str, Any] | None,
+    *,
+    binding: str,
+    credential_ref: str,
+    multimodal: bool = False,
+) -> None:
+    if not isinstance(initial, dict) or initial.get("status") not in {"configured", "needs_action"}:
+        return
+    provider_id = _slug(str(initial.get("id") or initial.get("name") or "provider"))
+    provider_name = str(initial.get("name") or provider_id)
+    base_url = str(initial.get("base_url") or "").rstrip("/")
+    model_name = str(initial.get("model") or "").strip()
+    if not base_url or not model_name:
+        return
+    configured_provider = next(
+        (provider for provider in payload["providers"] if provider.get("id") == provider_id),
+        None,
+    )
+    if configured_provider is None:
+        endpoint_id = f"{provider_id}-openai"
+        configured_provider = {
+            "id": provider_id,
+            "name": provider_name,
+            "enabled": True,
+            "website": base_url,
+            "credentials": {DEFAULT_CREDENTIAL_NAME: credential_ref},
+            "endpoints": [{
+                "id": endpoint_id,
+                "protocol": str(initial.get("protocol") or "openai_compatible"),
+                "base_url": base_url,
+                "credential_ref": credential_ref,
+                "capabilities": ["llm"],
+            }],
+            "models": [],
+        }
+        payload["providers"].insert(0, configured_provider)
+    else:
+        configured_provider["enabled"] = True
+        configured_provider["credentials"] = {
+            **configured_provider.get("credentials", {}),
+            DEFAULT_CREDENTIAL_NAME: credential_ref,
+        }
+        llm_endpoints = [
+            endpoint
+            for endpoint in configured_provider.get("endpoints", [])
+            if "llm" in endpoint.get("capabilities", [])
+        ]
+        if not llm_endpoints:
+            endpoint_id = f"{provider_id}-openai"
+            llm_endpoints = [{
+                "id": endpoint_id,
+                "protocol": str(initial.get("protocol") or "openai_compatible"),
+                "base_url": base_url,
+                "credential_ref": credential_ref,
+                "capabilities": ["llm"],
+            }]
+            configured_provider.setdefault("endpoints", []).extend(llm_endpoints)
+        endpoint = llm_endpoints[0]
+        endpoint_id = str(endpoint["id"])
+        endpoint["protocol"] = str(initial.get("protocol") or endpoint.get("protocol") or "openai_compatible")
+        endpoint["base_url"] = base_url
+        endpoint["credential_ref"] = credential_ref
+        if configured_provider.get("credential_scope") == "provider":
+            for item in configured_provider.get("endpoints", []):
+                item["credential_ref"] = credential_ref
+
+    models = configured_provider.setdefault("models", [])
+    configured_model = next(
+        (
+            model
+            for model in models
+            if model.get("endpoint_id") == endpoint_id
+            and model.get("capability") == "llm"
+            and model.get("name") == model_name
+        ),
+        None,
+    )
+    if configured_model is None:
+        model_id = f"{provider_id}:{endpoint_id}:{_slug(model_name)}:llm"
+        configured_model = {
+            "id": model_id,
+            "name": model_name,
+            "endpoint_id": endpoint_id,
+            "capability": "llm",
+            "categories": ["llm", "multimodal_llm"] if multimodal else ["llm"],
+            "temperature": 0.7,
+            "max_tokens": 4096,
+        }
+        models.append(configured_model)
+    elif multimodal:
+        categories = list(configured_model.get("categories") or ["llm"])
+        if "multimodal_llm" not in categories:
+            categories.append("multimodal_llm")
+        configured_model["categories"] = categories
+    payload["bindings"][binding] = str(configured_model["id"])
+
+
+def _environment_provider(name: str) -> dict[str, Any] | None:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return None
+    try:
+        value = json.loads(raw)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _bootstrap_multimodal_binding(payload: dict[str, Any]) -> dict[str, Any]:
+    initial = _environment_provider("PUDDINGCLAW_INITIAL_MULTIMODAL_PROVIDER")
+    credential_ref = (
+        "env://PUDDINGCLAW_INITIAL_PROVIDER_API_KEY"
+        if initial and initial.get("reuse_primary_credential") is True
+        else "env://PUDDINGCLAW_INITIAL_MULTIMODAL_PROVIDER_API_KEY"
+    )
+    _bootstrap_provider_binding(
+        payload,
+        initial,
+        binding="image_analyzer",
+        credential_ref=credential_ref,
+        multimodal=True,
+    )
+    return payload
+
+
 def _default_registry() -> dict[str, Any]:
     payload = {
         "version": REGISTRY_VERSION,
@@ -318,36 +445,86 @@ def _default_registry() -> dict[str, Any]:
     }
     raw = os.getenv("PUDDINGCLAW_INITIAL_PROVIDER", "").strip()
     if not raw:
-        return payload
+        return _bootstrap_multimodal_binding(payload)
     try:
         initial = json.loads(raw)
     except (TypeError, ValueError, json.JSONDecodeError):
-        return payload
+        return _bootstrap_multimodal_binding(payload)
     if not isinstance(initial, dict) or initial.get("status") not in {"configured", "needs_action"}:
-        return payload
-    provider_id = f"initial-{_slug(str(initial.get('id') or initial.get('name') or 'provider'))}"
+        return _bootstrap_multimodal_binding(payload)
+    provider_id = _slug(str(initial.get("id") or initial.get("name") or "provider"))
     provider_name = str(initial.get("name") or provider_id)
     base_url = str(initial.get("base_url") or "").rstrip("/")
     model_name = str(initial.get("model") or "").strip()
     if not base_url or not model_name:
-        return payload
-    endpoint_id = f"{provider_id}-initial"
-    model_id = f"{provider_id}:{endpoint_id}:{model_name}:llm"
+        return _bootstrap_multimodal_binding(payload)
     credential_ref = "env://PUDDINGCLAW_INITIAL_PROVIDER_API_KEY"
-    configured_provider = {
-        "id": provider_id,
-        "name": provider_name,
-        "enabled": True,
-        "website": base_url,
-        "credentials": {DEFAULT_CREDENTIAL_NAME: credential_ref},
-        "endpoints": [{
-            "id": endpoint_id,
-            "protocol": str(initial.get("protocol") or "openai_compatible"),
-            "base_url": base_url,
-            "credential_ref": credential_ref,
-            "capabilities": ["llm"],
-        }],
-        "models": [{
+    configured_provider = next(
+        (provider for provider in payload["providers"] if provider.get("id") == provider_id),
+        None,
+    )
+    if configured_provider is None:
+        endpoint_id = f"{provider_id}-openai"
+        configured_provider = {
+            "id": provider_id,
+            "name": provider_name,
+            "enabled": True,
+            "website": base_url,
+            "credentials": {DEFAULT_CREDENTIAL_NAME: credential_ref},
+            "endpoints": [{
+                "id": endpoint_id,
+                "protocol": str(initial.get("protocol") or "openai_compatible"),
+                "base_url": base_url,
+                "credential_ref": credential_ref,
+                "capabilities": ["llm"],
+            }],
+            "models": [],
+        }
+        payload["providers"].insert(0, configured_provider)
+    else:
+        configured_provider["enabled"] = True
+        configured_provider["credentials"] = {
+            **configured_provider.get("credentials", {}),
+            DEFAULT_CREDENTIAL_NAME: credential_ref,
+        }
+        llm_endpoints = [
+            endpoint
+            for endpoint in configured_provider.get("endpoints", [])
+            if "llm" in endpoint.get("capabilities", [])
+        ]
+        if not llm_endpoints:
+            endpoint_id = f"{provider_id}-openai"
+            llm_endpoints = [{
+                "id": endpoint_id,
+                "protocol": str(initial.get("protocol") or "openai_compatible"),
+                "base_url": base_url,
+                "credential_ref": credential_ref,
+                "capabilities": ["llm"],
+            }]
+            configured_provider.setdefault("endpoints", []).extend(llm_endpoints)
+        endpoint = llm_endpoints[0]
+        endpoint_id = str(endpoint["id"])
+        endpoint["protocol"] = str(initial.get("protocol") or endpoint.get("protocol") or "openai_compatible")
+        endpoint["base_url"] = base_url
+        endpoint["credential_ref"] = credential_ref
+        if configured_provider.get("credential_scope") == "provider":
+            for item in configured_provider.get("endpoints", []):
+                item["credential_ref"] = credential_ref
+
+    models = configured_provider.setdefault("models", [])
+    configured_model = next(
+        (
+            model
+            for model in models
+            if model.get("endpoint_id") == endpoint_id
+            and model.get("capability") == "llm"
+            and model.get("name") == model_name
+        ),
+        None,
+    )
+    if configured_model is None:
+        model_id = f"{provider_id}:{endpoint_id}:{_slug(model_name)}:llm"
+        configured_model = {
             "id": model_id,
             "name": model_name,
             "endpoint_id": endpoint_id,
@@ -355,20 +532,111 @@ def _default_registry() -> dict[str, Any]:
             "categories": ["llm"],
             "temperature": 0.7,
             "max_tokens": 4096,
-        }],
-    }
-    payload["providers"] = [
-        provider for provider in payload["providers"] if provider.get("id") != provider_id
-    ]
-    payload["providers"].insert(0, configured_provider)
+        }
+        models.append(configured_model)
+    model_id = str(configured_model["id"])
     payload["bindings"]["agent"] = model_id
-    return payload
+    return _bootstrap_multimodal_binding(payload)
+
+
+def _migrate_legacy_initial_provider(payload: dict[str, Any]) -> bool:
+    """Fold the short-lived initial-* bootstrap shape into its built-in preset."""
+    providers = payload.get("providers", [])
+    bindings = payload.get("bindings", {})
+    agent_model_id = str(bindings.get("agent") or "")
+    for legacy in list(providers):
+        legacy_id = str(legacy.get("id") or "") if isinstance(legacy, dict) else ""
+        if not legacy_id.startswith("initial-") or not agent_model_id.startswith(f"{legacy_id}:"):
+            continue
+        provider_id = legacy_id.removeprefix("initial-")
+        target = next(
+            (
+                provider
+                for provider in providers
+                if isinstance(provider, dict) and provider.get("id") == provider_id
+            ),
+            None,
+        )
+        if target is None:
+            continue
+        selected_model = next(
+            (
+                model
+                for model in legacy.get("models", [])
+                if isinstance(model, dict) and model.get("id") == agent_model_id
+            ),
+            None,
+        )
+        if selected_model is None:
+            continue
+        source_endpoint = next(
+            (
+                endpoint
+                for endpoint in legacy.get("endpoints", [])
+                if isinstance(endpoint, dict)
+                and endpoint.get("id") == selected_model.get("endpoint_id")
+            ),
+            None,
+        )
+        target_endpoint = next(
+            (
+                endpoint
+                for endpoint in target.get("endpoints", [])
+                if isinstance(endpoint, dict) and "llm" in endpoint.get("capabilities", [])
+            ),
+            None,
+        )
+        if source_endpoint is None or target_endpoint is None:
+            continue
+        credential_ref = str(
+            legacy.get("credentials", {}).get(DEFAULT_CREDENTIAL_NAME)
+            or source_endpoint.get("credential_ref")
+            or ""
+        )
+        target["enabled"] = True
+        if credential_ref:
+            target["credentials"] = {
+                **target.get("credentials", {}),
+                DEFAULT_CREDENTIAL_NAME: credential_ref,
+            }
+        for field in ("protocol", "base_url"):
+            if source_endpoint.get(field):
+                target_endpoint[field] = source_endpoint[field]
+        if credential_ref:
+            target_endpoint["credential_ref"] = credential_ref
+            if target.get("credential_scope") == "provider":
+                for endpoint in target.get("endpoints", []):
+                    endpoint["credential_ref"] = credential_ref
+        model_name = str(selected_model.get("name") or "").strip()
+        target_model = next(
+            (
+                model
+                for model in target.get("models", [])
+                if isinstance(model, dict)
+                and model.get("endpoint_id") == target_endpoint.get("id")
+                and model.get("capability") == "llm"
+                and model.get("name") == model_name
+            ),
+            None,
+        )
+        if target_model is None:
+            target_model = {
+                **selected_model,
+                "id": f"{provider_id}:{target_endpoint['id']}:{_slug(model_name)}:llm",
+                "endpoint_id": target_endpoint["id"],
+            }
+            target.setdefault("models", []).append(target_model)
+        bindings["agent"] = target_model["id"]
+        providers.remove(legacy)
+        return True
+    return False
 
 
 class ProviderRegistry:
     def __init__(self, root: Path | None = None) -> None:
         self.root = root or user_data_dir()
         self.path = self.root / "providers.json"
+        self.bootstrap_marker_path = self.root / ".cli-provider-bootstrap.json"
         self.credentials = LocalCredentialStore(self.root)
         self._dashscope_native_discovery_cache: dict[
             tuple[str, str, int], tuple[float, list[dict[str, Any]]]
@@ -376,7 +644,9 @@ class ProviderRegistry:
 
     def _payload(self) -> dict[str, Any]:
         if not self.path.is_file():
-            return _default_registry()
+            payload = _default_registry()
+            self._mark_environment_bootstrap()
+            return payload
         try:
             payload = json.loads(self.path.read_text(encoding="utf-8"))
         except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -390,6 +660,8 @@ class ProviderRegistry:
             raise ValueError(f"Unsupported Provider Registry version: {payload.get('version')}")
         if not isinstance(payload.get("providers"), list) or not isinstance(payload.get("bindings"), dict):
             raise ValueError("Provider Registry requires providers and bindings")
+        migrated = _migrate_legacy_initial_provider(payload)
+        bootstrapped = self._apply_environment_bootstrap_once(payload)
         model_ids = {
             str(model.get("id") or "")
             for provider in payload["providers"]
@@ -408,7 +680,39 @@ class ProviderRegistry:
         )
         if dangling_bindings:
             raise ValueError(f"Provider Registry has unknown bound models: {', '.join(dangling_bindings)}")
+        if migrated or bootstrapped:
+            self._save(payload)
+        if bootstrapped:
+            self._mark_environment_bootstrap()
         return payload
+
+    def _bootstrap_id(self) -> str:
+        return os.getenv("PUDDINGCLAW_INITIAL_PROVIDER_BOOTSTRAP_ID", "").strip()
+
+    def _mark_environment_bootstrap(self) -> None:
+        bootstrap_id = self._bootstrap_id()
+        if bootstrap_id:
+            _atomic_json_write(
+                self.bootstrap_marker_path,
+                {"version": 1, "bootstrap_id": bootstrap_id},
+                mode=0o600,
+            )
+
+    def _apply_environment_bootstrap_once(self, payload: dict[str, Any]) -> bool:
+        bootstrap_id = self._bootstrap_id()
+        if not bootstrap_id:
+            return False
+        marker = _read_json(self.bootstrap_marker_path, {})
+        if marker.get("bootstrap_id") == bootstrap_id:
+            return False
+        _bootstrap_provider_binding(
+            payload,
+            _environment_provider("PUDDINGCLAW_INITIAL_PROVIDER"),
+            binding="agent",
+            credential_ref="env://PUDDINGCLAW_INITIAL_PROVIDER_API_KEY",
+        )
+        _bootstrap_multimodal_binding(payload)
+        return True
 
     def _save(self, payload: dict[str, Any]) -> None:
         payload["version"] = REGISTRY_VERSION

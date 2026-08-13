@@ -1341,10 +1341,22 @@ class AttachmentAuthorityBoundaryMiddleware(AgentMiddleware):
 
 
 class EvaluationToolBoundaryMiddleware(AgentMiddleware):
-    """Opt-in boundary for DeepAgents built-ins during isolated evaluation."""
+    """Opt-in boundary for the production Harness surface used by evaluation.
 
-    def __init__(self, allowed_tools: set[str]) -> None:
+    ``required_tools`` turns capability drift into a preflight failure instead
+    of silently benchmarking a degraded Agent.  The check runs against the
+    final model request, after DeepAgents and PuddingClaw middleware have
+    mounted their native and versioned-file tools.
+    """
+
+    def __init__(
+        self,
+        allowed_tools: set[str],
+        *,
+        required_tools: set[str] | None = None,
+    ) -> None:
         self.allowed_tools = frozenset(allowed_tools)
+        self.required_tools = frozenset(required_tools or ())
 
     @staticmethod
     def _tool_name(tool: Any) -> str:
@@ -1356,9 +1368,14 @@ class EvaluationToolBoundaryMiddleware(AgentMiddleware):
         return str(getattr(tool, "name", "") or "")
 
     def _filter_request(self, request: ModelRequest) -> ModelRequest:
-        return request.override(
-            tools=[tool for tool in request.tools if self._tool_name(tool) in self.allowed_tools]
-        )
+        mounted = {self._tool_name(tool) for tool in request.tools}
+        missing = sorted(self.required_tools - mounted)
+        if missing:
+            raise RuntimeError(
+                "Evaluation Harness capability drift: required production tools are missing: "
+                + ", ".join(missing)
+            )
+        return request.override(tools=[tool for tool in request.tools if self._tool_name(tool) in self.allowed_tools])
 
     def wrap_model_call(self, request: ModelRequest, handler: Callable[[ModelRequest], ModelResponse]) -> Any:
         return handler(self._filter_request(request))
@@ -3070,6 +3087,7 @@ class DeepAgentsAgentManager:
         query_id: str = "",
         goal_id: str = "",
         goal_revision: int | None = None,
+        workspace_backend_override: Any | None = None,
     ):
         assert self._base_dir is not None
         user_root = self._user_root or PuddingClawPaths.from_environment().root
@@ -3150,11 +3168,27 @@ class DeepAgentsAgentManager:
                 "_scratch_relative": scratch_relative,
             },
         }
-        selection = build_workspace_execution_backend(
-            workspace_path,
-            terminal_config,
-        )
-        workspace_backend = selection.backend
+        if workspace_backend_override is None:
+            selection = build_workspace_execution_backend(
+                workspace_path,
+                terminal_config,
+            )
+            workspace_backend = selection.backend
+            backend_mode = selection.mode
+            fallback_reason = selection.fallback_reason
+            dependency_plan = selection.dependency_plan
+        else:
+            override_workspace = Path(
+                str(getattr(workspace_backend_override, "workspace_path", workspace_path))
+            ).resolve()
+            if override_workspace != workspace_path.resolve():
+                raise ValueError("Evaluation workspace backend is bound to a different workspace")
+            workspace_backend = workspace_backend_override
+            backend_mode = str(getattr(workspace_backend, "mode", "kernel"))
+            if backend_mode not in {"spawn", "kernel"}:
+                raise ValueError("Evaluation workspace backend must expose spawn or kernel Harness semantics")
+            fallback_reason = None
+            dependency_plan = getattr(workspace_backend, "dependency_plan", None)
         routes: dict[str, Any] = {
             "/workspace/": workspace_backend,
             "/knowledge/": FilesystemBackend(root_dir=knowledge_dir, virtual_mode=True),
@@ -3188,11 +3222,11 @@ class DeepAgentsAgentManager:
             run_id=run_id,
             query_id=query_id,
         )
-        backend.execution_mode = selection.mode
+        backend.execution_mode = backend_mode
         backend.execution_backend_id = workspace_backend.id
         backend.execution_backend = workspace_backend
-        backend.execution_fallback_reason = selection.fallback_reason
-        backend.execution_dependency_plan = selection.dependency_plan
+        backend.execution_fallback_reason = fallback_reason
+        backend.execution_dependency_plan = dependency_plan
         backend.execution_scratch_host_path = str(scratch_scope_dir.resolve())
         backend.execution_scratch_goal_id = goal_id
         backend.execution_scratch_goal_revision = goal_revision
@@ -3223,6 +3257,7 @@ class DeepAgentsAgentManager:
         managed_cli_service: Any | None = None,
         permission_reviewer: PermissionReviewer | None = None,
         evaluation_builtin_tool_allowlist: set[str] | None = None,
+        evaluation_required_toolset: set[str] | None = None,
         rubric_config: dict[str, Any] | None = None,
         attachment_observation_only: bool = False,
         workspace_path: str | Path | None = None,
@@ -3248,7 +3283,12 @@ class DeepAgentsAgentManager:
         toolset_mapping = skill_toolsets or discover_skill_toolsets(self._skills_runtime_root())
         middlewares: list[Any] = [
             *(
-                [EvaluationToolBoundaryMiddleware(evaluation_builtin_tool_allowlist)]
+                [
+                    EvaluationToolBoundaryMiddleware(
+                        evaluation_builtin_tool_allowlist,
+                        required_tools=evaluation_required_toolset,
+                    )
+                ]
                 if evaluation_builtin_tool_allowlist is not None
                 else []
             ),
@@ -3435,7 +3475,7 @@ class DeepAgentsAgentManager:
         query_id: str = "",
         run_id: str = "",
         current_message: str = "",
-        current_conversation: str = "",
+        current_conversation_documents: list[dict[str, Any]] | None = None,
         current_attachments: list[dict[str, Any]] | None = None,
         goal_id: str = "",
         goal_revision: int | None = None,
@@ -3533,6 +3573,7 @@ class DeepAgentsAgentManager:
                 "request_dimension_build_rule",
                 "inspect_dimension_build_input",
                 "enqueue_semantic_dimension_build",
+                "discover_semantic_definitions",
                 "prepare_semantic_markdown",
                 "publish_semantic_markdown",
                 "request_logical_dataset_rule",
@@ -3559,12 +3600,29 @@ class DeepAgentsAgentManager:
                 except Exception:
                     for key, value in database_updates.items():
                         setattr(tool, key, value)
+            elif getattr(tool, "name", "") == "llm_wiki_conversation_documents":
+                try:
+                    tool = tool.model_copy(
+                        update={
+                            "current_conversation_documents": list(
+                                current_conversation_documents or []
+                            )
+                        }
+                    )
+                except Exception:
+                    setattr(
+                        tool,
+                        "current_conversation_documents",
+                        list(current_conversation_documents or []),
+                    )
             elif getattr(tool, "name", "") == "llm_wiki_create_raw":
                 wiki_intake_updates = {
                     "session_id": session_id,
                     "query_id": query_id,
                     "current_message": current_message,
-                    "current_conversation": current_conversation,
+                    "current_conversation_documents": list(
+                        current_conversation_documents or []
+                    ),
                     "current_attachments": list(current_attachments or []),
                 }
                 try:
@@ -4042,8 +4100,10 @@ class DeepAgentsAgentManager:
         """Convert an explicitly provided local image path into an OpenAI image_url block."""
 
         raw = path_text.replace("\\ ", " ").strip().strip("'\"")
-        path = Path(raw).expanduser().resolve()
         try:
+            if len(raw) > 4096 or any(marker in raw for marker in ("\0", "\r", "\n")):
+                return None
+            path = Path(raw).expanduser().resolve()
             if not path.is_file():
                 return None
             mime = IMAGE_MIME_BY_EXT.get(path.suffix.lower())
@@ -4198,7 +4258,14 @@ class DeepAgentsAgentManager:
                 if workspace is None or not cls._is_relative_to(path, workspace):
                     external_directory_paths.append(str(path))
             for raw_path in local_resource_paths:
-                path = Path(raw_path.replace("\\ ", " ").strip().strip("'\"")).expanduser().resolve()
+                try:
+                    path = Path(
+                        raw_path.replace("\\ ", " ").strip().strip("'\"")
+                    ).expanduser().resolve()
+                except (OSError, RuntimeError, ValueError):
+                    # User text is untrusted input. A malformed/overlong path
+                    # candidate is not allowed to abort the Agent turn.
+                    continue
                 if path.is_dir():
                     directory_raw_paths.add(raw_path)
                     if workspace is None or not cls._is_relative_to(path, workspace):
@@ -4225,10 +4292,18 @@ class DeepAgentsAgentManager:
             generic_resource_paths = [
                 path for path in non_image_resource_paths if path not in set(pdf_resource_paths)
             ]
-            external_pdf_paths = {
-                str(Path(path.replace("\\ ", " ").strip().strip("'\"")).expanduser().resolve())
-                for path in pdf_resource_paths
-            }
+            external_pdf_paths: set[str] = set()
+            for path in pdf_resource_paths:
+                try:
+                    external_pdf_paths.add(
+                        str(
+                            Path(path.replace("\\ ", " ").strip().strip("'\""))
+                            .expanduser()
+                            .resolve()
+                        )
+                    )
+                except (OSError, RuntimeError, ValueError):
+                    continue
 
             if not attachment_refs and not local_resource_paths and not local_directory_paths:
                 return message
@@ -4340,7 +4415,12 @@ class DeepAgentsAgentManager:
                     seen_urls.add(url)
                     content.append(block)
                 continue
-            path = Path(raw_path.replace("\\ ", " ").strip().strip("'\"")).expanduser().resolve()
+            try:
+                path = Path(
+                    raw_path.replace("\\ ", " ").strip().strip("'\"")
+                ).expanduser().resolve()
+            except (OSError, RuntimeError, ValueError):
+                continue
             workspace = Path(workspace_path).expanduser().resolve() if workspace_path else None
             if (
                 workspace is not None
@@ -4821,40 +4901,70 @@ class DeepAgentsAgentManager:
         return profile
 
     @staticmethod
-    def _llm_wiki_conversation_source(session_id: str, *, limit: int = 16) -> str:
-        """Project recent user-visible conversation into one traceable Raw source.
+    def _llm_wiki_conversation_documents(
+        session_id: str,
+        *,
+        query_id: str,
+        current_message: str,
+    ) -> list[dict[str, Any]]:
+        """Expose selectable, server-owned conversation documents.
 
-        This deliberately excludes hidden reasoning and nested Tool payloads.
-        URLs and citations already shown in user/assistant messages remain in
-        the snapshot, so the background compiler receives the same material the
-        user referred to with phrases such as “把刚才这些编译到 Wiki”.
+        The Agent chooses document ids; this method never guesses a semantic
+        range. Hidden reasoning and Tool payloads are not document sources.
         """
 
         if not session_id:
-            return ""
+            return []
         messages = session_manager.load_session(session_id)
-        sections: list[str] = []
-        total_chars = 0
-        for item in messages[-max(1, limit) :]:
+        documents: list[dict[str, Any]] = []
+        pending_user = ""
+        for item in messages:
             if not isinstance(item, dict):
                 continue
             role = str(item.get("role") or "")
-            if role not in {"user", "assistant"}:
+            if role == "user":
+                pending_user = str(item.get("content") or "").strip()
                 continue
-            content = str(item.get("content") or "").strip()
-            if not content:
+            if role != "assistant" or not pending_user:
                 continue
-            # Keep the projection bounded without silently changing the most
-            # recent turns. Older long answers are clipped first by this
-            # per-message ceiling and the global ceiling below.
-            content = content[:16_000]
-            label = "用户" if role == "user" else "Agent"
-            section = f"## {label}\n\n{content}"
-            if total_chars + len(section) > 64_000:
-                break
-            sections.append(section)
-            total_chars += len(section)
-        return "\n\n".join(sections)
+            assistant = str(item.get("content") or "").strip()
+            if not assistant:
+                continue
+            exchange_query_id = str(item.get("query_id") or "").strip()
+            if not exchange_query_id:
+                exchange_query_id = hashlib.sha256(
+                    f"{pending_user}\n{assistant}".encode("utf-8")
+                ).hexdigest()[:20]
+            content = f"## 用户\n\n{pending_user}\n\n## Agent\n\n{assistant}"
+            documents.append(
+                {
+                    "document_id": f"exchange:{exchange_query_id}",
+                    "kind": "exchange",
+                    "title": pending_user.splitlines()[0][:160],
+                    "preview": assistant.replace("\n", " ")[:320],
+                    "character_count": len(content),
+                    "content": content,
+                }
+            )
+            pending_user = ""
+
+        clean_current = str(current_message or "").strip()
+        if clean_current:
+            current_id = str(query_id or "").strip() or hashlib.sha256(
+                clean_current.encode("utf-8")
+            ).hexdigest()[:20]
+            content = f"## 用户\n\n{clean_current}"
+            documents.append(
+                {
+                    "document_id": f"current:{current_id}",
+                    "kind": "current_message",
+                    "title": clean_current.splitlines()[0][:160],
+                    "preview": clean_current.replace("\n", " ")[:320],
+                    "character_count": len(content),
+                    "content": content,
+                }
+            )
+        return documents
 
     @staticmethod
     def _frozen_goal_rubric_config(
@@ -6688,6 +6798,8 @@ class DeepAgentsAgentManager:
         evaluation_tool_allowlist: set[str] | None = None,
         disable_mcp: bool = False,
         evaluation_builtin_tool_allowlist: set[str] | None = None,
+        evaluation_required_toolset: set[str] | None = None,
+        evaluation_workspace_backend: Any | None = None,
         query_created_at: float | None = None,
     ) -> AsyncGenerator[dict[str, str], None]:
         """Stream one user request and autonomously advance recoverable Goal Runs."""
@@ -6968,6 +7080,8 @@ class DeepAgentsAgentManager:
                 evaluation_tool_allowlist=evaluation_tool_allowlist,
                 disable_mcp=disable_mcp,
                 evaluation_builtin_tool_allowlist=evaluation_builtin_tool_allowlist,
+                evaluation_required_toolset=evaluation_required_toolset,
+                evaluation_workspace_backend=evaluation_workspace_backend,
                 precomputed_rubric_profile_result=precomputed_rubric_profile_result,
                 query_created_at=query_created_at,
             ):
@@ -7130,6 +7244,8 @@ class DeepAgentsAgentManager:
         evaluation_tool_allowlist: set[str] | None = None,
         disable_mcp: bool = False,
         evaluation_builtin_tool_allowlist: set[str] | None = None,
+        evaluation_required_toolset: set[str] | None = None,
+        evaluation_workspace_backend: Any | None = None,
         precomputed_rubric_profile_result: dict[str, Any] | None = None,
         query_created_at: float | None = None,
     ) -> AsyncGenerator[dict[str, str], None]:
@@ -7749,6 +7865,7 @@ class DeepAgentsAgentManager:
                 query_id=query_id,
                 goal_id=str(run_record.goal_id or ""),
                 goal_revision=run_record.goal_revision,
+                workspace_backend_override=evaluation_workspace_backend,
             )
             agent_tools = self._build_tools(
                 workspace_path,
@@ -7757,7 +7874,11 @@ class DeepAgentsAgentManager:
                 query_id=query_id,
                 run_id=run_record.run_id,
                 current_message=message,
-                current_conversation=self._llm_wiki_conversation_source(session_id),
+                current_conversation_documents=self._llm_wiki_conversation_documents(
+                    session_id,
+                    query_id=query_id,
+                    current_message=message,
+                ),
                 current_attachments=attachments,
                 goal_id=str(run_record.goal_id or ""),
                 goal_revision=run_record.goal_revision,
@@ -7834,6 +7955,7 @@ class DeepAgentsAgentManager:
                 managed_cli_service=managed_cli_service,
                 permission_reviewer=permission_reviewer,
                 evaluation_builtin_tool_allowlist=evaluation_builtin_tool_allowlist,
+                evaluation_required_toolset=evaluation_required_toolset,
                 rubric_config=(
                     effective_rubric_config
                     if run_record.requires_goal_verification

@@ -327,6 +327,9 @@ async def test_coding_runner_exposes_execute_and_forces_kernel(tmp_path: Path, m
 
     async def fake_astream(**kwargs):
         assert "execute" in kwargs["evaluation_builtin_tool_allowlist"]
+        assert "patch_file" in kwargs["evaluation_builtin_tool_allowlist"]
+        assert "edit_file" not in kwargs["evaluation_builtin_tool_allowlist"]
+        assert kwargs["evaluation_required_toolset"] == kwargs["evaluation_builtin_tool_allowlist"]
         assert kwargs["disable_mcp"] is True
         assert project_registry.get_execution_mode(kwargs["project_id"]) == "kernel"
         assert kwargs["interaction_mode"] == "auto"

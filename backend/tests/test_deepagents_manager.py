@@ -77,7 +77,7 @@ def test_filesystem_discovery_tool_descriptions_prefer_known_exact_paths():
     assert "Do not use glob to confirm a known path" in glob_description
 
 
-def test_llm_wiki_conversation_source_uses_visible_messages_only(monkeypatch):
+def test_llm_wiki_conversation_documents_use_visible_messages_only(monkeypatch):
     import graph.deepagents_manager as manager_module
 
     monkeypatch.setattr(
@@ -86,16 +86,79 @@ def test_llm_wiki_conversation_source_uses_visible_messages_only(monkeypatch):
         lambda _session_id: [
             {"role": "user", "content": "介绍浏览器功能"},
             {"role": "tool", "content": "隐藏的大段工具结果"},
-            {"role": "assistant", "content": "Browser Use 是独立框架。"},
+            {"role": "assistant", "content": "Browser Use 是独立框架。", "query_id": "query-browser"},
             {"role": "user", "content": "把刚才这些编译到 Wiki"},
         ],
     )
 
-    source = manager_module.DeepAgentsAgentManager._llm_wiki_conversation_source("session-1")
+    documents = manager_module.DeepAgentsAgentManager._llm_wiki_conversation_documents(
+        "session-1",
+        query_id="query-current",
+        current_message="把刚才这些编译到 Wiki",
+    )
 
-    assert "## 用户\n\n介绍浏览器功能" in source
-    assert "## Agent\n\nBrowser Use 是独立框架。" in source
-    assert "隐藏的大段工具结果" not in source
+    assert [item["document_id"] for item in documents] == [
+        "exchange:query-browser",
+        "current:query-current",
+    ]
+    assert "## 用户\n\n介绍浏览器功能" in documents[0]["content"]
+    assert "## Agent\n\nBrowser Use 是独立框架。" in documents[0]["content"]
+    assert all("隐藏的大段工具结果" not in item["content"] for item in documents)
+
+
+def test_llm_wiki_conversation_documents_keep_topics_separately_selectable(monkeypatch):
+    import graph.deepagents_manager as manager_module
+
+    monkeypatch.setattr(
+        manager_module.session_manager,
+        "load_session",
+        lambda _session_id: [
+            {"role": "user", "content": "调研开源 Computer Use 项目"},
+            {"role": "assistant", "content": "UI-TARS 与 Agent S 的调研结果。", "query_id": "query-cua"},
+            {"role": "user", "content": "评估这四个 Pi Agent 学习网站"},
+            {"role": "assistant", "content": "Pi Agent 四个学习资源的分层结论。", "query_id": "query-pi"},
+            {"role": "user", "content": "把这个整理到 Wiki，Pi 适合作为 framework"},
+        ],
+    )
+
+    documents = manager_module.DeepAgentsAgentManager._llm_wiki_conversation_documents(
+        "session-1",
+        query_id="query-current",
+        current_message="把这个整理到 Wiki，Pi 适合作为 framework",
+    )
+
+    assert [item["document_id"] for item in documents] == [
+        "exchange:query-cua",
+        "exchange:query-pi",
+        "current:query-current",
+    ]
+    assert "Computer Use" in documents[0]["content"]
+    assert "Pi Agent 四个学习资源" in documents[1]["content"]
+    assert "Pi 适合作为 framework" in documents[2]["content"]
+
+
+def test_llm_wiki_conversation_documents_add_unpersisted_current_instruction(monkeypatch):
+    import graph.deepagents_manager as manager_module
+
+    monkeypatch.setattr(
+        manager_module.session_manager,
+        "load_session",
+        lambda _session_id: [
+            {"role": "user", "content": "旧话题"},
+            {"role": "assistant", "content": "旧话题结论", "query_id": "query-old"},
+            {"role": "user", "content": "Pi Agent 学习资源"},
+            {"role": "assistant", "content": "Pi Agent 学习路线", "query_id": "query-pi"},
+        ],
+    )
+
+    documents = manager_module.DeepAgentsAgentManager._llm_wiki_conversation_documents(
+        "session-1",
+        query_id="query-current",
+        current_message="只编译 Pi，类型是 framework",
+    )
+
+    assert documents[-1]["document_id"] == "current:query-current"
+    assert "只编译 Pi" in documents[-1]["content"]
 
 
 def test_effective_agent_messages_uses_summary_and_preserved_tail():
@@ -5496,7 +5559,16 @@ def test_deepagents_manager_uses_backend_execute_instead_of_custom_terminal(tmp_
         session_id="session-1",
         query_id="query-1",
         current_message="# pasted markdown",
-        current_conversation="## 用户\n\n前文\n\n## Agent\n\n结论",
+        current_conversation_documents=[
+            {
+                "document_id": "exchange:query-previous",
+                "kind": "exchange",
+                "title": "前文",
+                "preview": "结论",
+                "character_count": 24,
+                "content": "## 用户\n\n前文\n\n## Agent\n\n结论",
+            }
+        ],
         current_attachments=[{"id": "attachment-1", "name": "source.md"}],
     )
     by_name = {tool.name: tool for tool in tools}
@@ -5522,10 +5594,18 @@ def test_deepagents_manager_uses_backend_execute_instead_of_custom_terminal(tmp_
     assert by_name["llm_wiki_create_raw"].session_id == "session-1"
     assert by_name["llm_wiki_create_raw"].query_id == "query-1"
     assert by_name["llm_wiki_create_raw"].current_message == "# pasted markdown"
-    assert by_name["llm_wiki_create_raw"].current_conversation == "## 用户\n\n前文\n\n## Agent\n\n结论"
+    assert by_name["llm_wiki_create_raw"].current_conversation_documents[0]["document_id"] == (
+        "exchange:query-previous"
+    )
+    assert by_name["llm_wiki_conversation_documents"].current_conversation_documents[0]["document_id"] == (
+        "exchange:query-previous"
+    )
     assert by_name["llm_wiki_create_raw"].current_attachments == [{"id": "attachment-1", "name": "source.md"}]
     assert by_name["llm_wiki_start_ingest"].session_id == "session-1"
     assert by_name["llm_wiki_start_ingest"].query_id == "query-1"
+    assert by_name["discover_semantic_definitions"].session_id == "session-1"
+    assert by_name["prepare_semantic_markdown"].session_id == "session-1"
+    assert by_name["publish_semantic_markdown"].session_id == "session-1"
 
 
 def test_memory_dir_and_memory_md_creation(tmp_path):

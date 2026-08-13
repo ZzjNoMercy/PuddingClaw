@@ -4,6 +4,12 @@ import { stdin as input, stdout as output } from "node:process";
 import { spawnSync } from "node:child_process";
 import { CliError } from "./errors.js";
 import { probeHttpHealth, probeProviderEndpoint, probeTcpEndpoint } from "./probes.js";
+import {
+  installDockerPostgres,
+  installNativePostgres,
+  nativePostgresInstaller,
+  probeDocker,
+} from "./postgres-runtime.js";
 
 async function question(prompt, fallback = "") {
   const rl = createInterface({ input, output });
@@ -37,17 +43,30 @@ async function secretQuestion(prompt) {
   }
 }
 
-function providerPreset(selected) {
+export function providerPreset(selected) {
   if (selected === "1") {
     return {
       id: "deepseek",
       name: "DeepSeek",
       protocol: "deepseek",
       base_url: "https://api.deepseek.com",
-      model: "deepseek-chat",
+      model: "deepseek-v4-flash",
     };
   }
   if (selected === "2") {
+    return {
+      id: "dashscope",
+      name: "阿里云百炼",
+      protocol: "openai_compatible",
+      base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1",
+      model: "qwen3.7-plus",
+    };
+  }
+  return null;
+}
+
+export function multimodalProviderPreset(selected) {
+  if (selected === "1" || selected === "dashscope") {
     return {
       id: "dashscope",
       name: "阿里云百炼",
@@ -129,80 +148,550 @@ export async function discoverInitialProvider({ flags, nonInteractive }) {
   };
 }
 
+export async function discoverInitialMultimodalProvider({
+  flags,
+  nonInteractive,
+  primaryDiscovery,
+  probeProvider = probeProviderEndpoint,
+}) {
+  const requested = String(flags.multimodal_provider || "").trim().toLowerCase();
+  const configuredByFlags = requested
+    || flags.multimodal_api_key
+    || process.env.PUDDINGCLAW_INIT_MULTIMODAL_API_KEY;
+  if (nonInteractive && !configuredByFlags) {
+    return {
+      provider: { status: "unconfigured" },
+      apiKey: "",
+      probe: { probe: "provider.multimodal_endpoint", status: "skipped", required: true },
+    };
+  }
+
+  let provider;
+  let reusePrimaryCredential = false;
+  if (nonInteractive) {
+    if (["none", "skip", "unconfigured"].includes(requested)) {
+      return {
+        provider: { status: "unconfigured" },
+        apiKey: "",
+        probe: { probe: "provider.multimodal_endpoint", status: "skipped", required: true },
+      };
+    }
+    if (requested === "same") {
+      if (!primaryDiscovery?.provider?.base_url || !primaryDiscovery?.provider?.model) {
+        throw new CliError("multimodal-provider=same requires a configured primary provider", {
+          code: "multimodal_provider_required",
+        });
+      }
+      provider = { ...primaryDiscovery.provider };
+      reusePrimaryCredential = true;
+    } else {
+      provider = {
+        ...multimodalProviderPreset("1"),
+        ...(requested === "custom" ? {
+          id: String(flags.multimodal_provider_id || "custom-multimodal"),
+          name: String(flags.multimodal_provider_name || "Custom Multimodal Provider"),
+          protocol: "openai_compatible",
+        } : {}),
+        ...(flags.multimodal_base_url ? { base_url: String(flags.multimodal_base_url) } : {}),
+        ...(flags.multimodal_model ? { model: String(flags.multimodal_model) } : {}),
+      };
+      reusePrimaryCredential = provider.id === primaryDiscovery?.provider?.id
+        && provider.base_url === primaryDiscovery?.provider?.base_url;
+    }
+  } else {
+    output.write("\n配置图片分析 SubAgent 的多模态模型（Harness Core）：\n\n");
+    output.write("[1] 阿里云百炼 / qwen3.7-plus（推荐）\n");
+    if (primaryDiscovery?.provider?.model) {
+      output.write(`[2] 复用主模型 / ${primaryDiscovery.provider.model}（需确认支持图片输入）\n`);
+    } else {
+      output.write("[2] 复用主模型（当前主模型未配置）\n");
+    }
+    output.write("[3] 其他 OpenAI-compatible 多模态 Provider\n[4] 暂不配置\n\n");
+    const selected = await question("请选择", "1");
+    if (selected === "4") {
+      return {
+        provider: { status: "unconfigured" },
+        apiKey: "",
+        probe: { probe: "provider.multimodal_endpoint", status: "skipped", required: true },
+      };
+    }
+    if (selected === "2") {
+      if (!primaryDiscovery?.provider?.base_url || !primaryDiscovery?.provider?.model) {
+        throw new CliError("请先配置主模型，或为图片分析选择独立 Provider", {
+          code: "multimodal_provider_required",
+        });
+      }
+      provider = { ...primaryDiscovery.provider };
+      reusePrimaryCredential = true;
+    } else if (selected === "3") {
+      const name = await question("Provider 名称", "Custom Multimodal Provider");
+      provider = {
+        id: name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || "custom-multimodal",
+        name,
+        protocol: "openai_compatible",
+        base_url: await question("API Base URL", "https://api.openai.com/v1"),
+        model: await question("多模态模型名称"),
+      };
+    } else {
+      provider = multimodalProviderPreset(selected);
+      if (!provider) {
+        throw new CliError("invalid multimodal provider selection", { code: "argument_error" });
+      }
+      provider.base_url = await question("多模态 API Base URL", provider.base_url);
+      provider.model = await question("多模态模型名称", provider.model);
+      reusePrimaryCredential = provider.id === primaryDiscovery?.provider?.id
+        && provider.base_url === primaryDiscovery?.provider?.base_url;
+    }
+  }
+
+  const apiKey = String(
+    reusePrimaryCredential
+      ? primaryDiscovery?.apiKey || ""
+      : flags.multimodal_api_key
+        || process.env.PUDDINGCLAW_INIT_MULTIMODAL_API_KEY
+        || (nonInteractive ? "" : await secretQuestion(`${provider.name} 多模态 API Key`)),
+  ).trim();
+  if (!apiKey) {
+    if (nonInteractive) {
+      throw new CliError(
+        "multimodal provider API key is required; use PUDDINGCLAW_INIT_MULTIMODAL_API_KEY",
+        { code: "multimodal_provider_key_required" },
+      );
+    }
+    return {
+      provider: {
+        ...provider,
+        status: "needs_action",
+        reuse_primary_credential: reusePrimaryCredential,
+      },
+      apiKey: "",
+      probe: {
+        probe: "provider.multimodal_endpoint",
+        status: "needs_action",
+        required: true,
+        reason: "多模态 API Key 未配置",
+      },
+    };
+  }
+
+  output.write("正在验证多模态 Provider 连通性…\n");
+  const endpointProbe = await probeProvider({ baseUrl: provider.base_url, apiKey });
+  const probe = { ...endpointProbe, probe: "provider.multimodal_endpoint" };
+  if (!nonInteractive) {
+    output.write(probe.status === "available"
+      ? `✓ ${provider.name} 多模态模型端点可访问\n`
+      : `! 多模态 Provider 尚不可用：${probe.reason}\n`);
+  }
+  return {
+    provider: {
+      ...provider,
+      status: probe.status === "available" ? "configured" : "needs_action",
+      reuse_primary_credential: reusePrimaryCredential,
+    },
+    apiKey: reusePrimaryCredential ? "" : apiKey,
+    probe,
+  };
+}
+
 function safeDatabaseMetadata(raw) {
   const parsed = new URL(raw.replace(/^postgresql\+asyncpg:/, "postgresql:"));
   return {
     host: parsed.hostname,
     port: Number(parsed.port || 5432),
-    database: parsed.pathname.replace(/^\//, ""),
+    database: decodeURIComponent(parsed.pathname.replace(/^\//, "")),
+    username: decodeURIComponent(parsed.username || ""),
   };
 }
 
-export async function discoverExtensionInfrastructure({ profile, flags, nonInteractive }) {
+function databaseUrlWithName(raw, database) {
+  const normalized = String(database || "").trim();
+  if (!normalized) throw new CliError("数据库名不能为空", { code: "database_name_required" });
+  const parsed = new URL(raw.replace(/^postgresql\+asyncpg:/, "postgresql:"));
+  parsed.pathname = `/${encodeURIComponent(normalized)}`;
+  return parsed.toString().replace(/^postgresql:/, "postgresql+asyncpg:");
+}
+
+async function confirmCreateMissingDatabase() {
+  const answer = String(await question("如果数据库不存在，是否创建", "Y")).trim().toLowerCase();
+  return answer === "" || answer === "y" || answer === "yes";
+}
+
+async function promptInstalledDatabase({ docker = false, defaults = {}, allowedOccupiedPort = 0 } = {}) {
+  let port = Number(defaults.port || 5432);
+  if (docker) {
+    port = Number.parseInt(await question("宿主机映射端口", String(port)), 10);
+    if (!Number.isInteger(port) || port < 1 || port > 65535) {
+      throw new CliError("Docker PostgreSQL 端口必须在 1-65535 之间", { code: "argument_error" });
+    }
+    let occupied = await probeTcpEndpoint({
+      probe: "database.docker.port",
+      host: "127.0.0.1",
+      port,
+      required: false,
+    });
+    while (occupied.status === "available" && port !== allowedOccupiedPort) {
+      output.write(`! 端口 ${port} 已被占用；不会终止占用进程\n`);
+      port = Number.parseInt(await question("请选择其他宿主机端口", String(port + 1)), 10);
+      if (!Number.isInteger(port) || port < 1 || port > 65535) {
+        throw new CliError("Docker PostgreSQL 端口必须在 1-65535 之间", { code: "argument_error" });
+      }
+      occupied = await probeTcpEndpoint({
+        probe: "database.docker.port",
+        host: "127.0.0.1",
+        port,
+        required: false,
+      });
+    }
+  }
+  const database = await question("数据库名", defaults.database || "puddingclaw");
+  const username = await question("用户名", defaults.username || "puddingclaw");
+  const password = await secretQuestion("密码（留空则安全随机生成）");
+  return { port, database, username, password };
+}
+
+async function confirmDatabaseProvisioning(label, connection) {
+  output.write(`\n${label} 配置：\n`);
+  output.write(`  地址:     127.0.0.1:${connection.port}\n`);
+  output.write(`  数据库名: ${connection.database}\n`);
+  output.write(`  用户名:   ${connection.username}\n`);
+  output.write(`  密码:     ${connection.password ? "使用输入的密码" : "安全随机生成"}\n`);
+  const answer = String(await question("确认安装/配置并创建上述数据库", "Y")).trim().toLowerCase();
+  return answer === "" || answer === "y" || answer === "yes";
+}
+
+function sqliteFallback(reason = "", selectionExplicit = false) {
+  return {
+    catalog: {
+      mode: "sqlite",
+      preferred_mode: "postgresql",
+      fallback_mode: "sqlite",
+      source: "fallback",
+      host: "",
+      port: 0,
+      database: "",
+      probe_status: "available",
+      selection_explicit: selectionExplicit,
+      ...(reason ? { fallback_reason: reason } : {}),
+    },
+    databaseUrl: "",
+  };
+}
+
+async function externalPostgres({
+  rawUrl,
+  nonInteractive,
+  probes,
+  createDatabaseIfMissing = false,
+  source = "external",
+}) {
+  const databaseUrl = String(rawUrl || "").trim();
+  if (!databaseUrl) {
+    if (nonInteractive) {
+      throw new CliError("PostgreSQL URL is required for database_mode=postgresql", {
+        code: "database_url_required",
+      });
+    }
+    return sqliteFallback("未提供 PostgreSQL URL");
+  }
+  let metadata;
+  try { metadata = safeDatabaseMetadata(databaseUrl); } catch {
+    if (nonInteractive) throw new CliError("PostgreSQL URL is invalid", { code: "argument_error" });
+    return sqliteFallback("PostgreSQL URL 无效");
+  }
+  const probe = await probeTcpEndpoint({
+    probe: "database.postgresql",
+    host: metadata.host,
+    port: metadata.port,
+    required: false,
+  });
+  probes.push(probe);
+  if (probe.status !== "available") {
+    return sqliteFallback(`PostgreSQL ${metadata.host}:${metadata.port} 不可达`);
+  }
+  return {
+    catalog: {
+      mode: "postgresql",
+      preferred_mode: "postgresql",
+      fallback_mode: "sqlite",
+      source,
+      ...metadata,
+      create_if_missing: createDatabaseIfMissing,
+      probe_status: probe.status,
+    },
+    databaseUrl,
+    createDatabaseIfMissing,
+  };
+}
+
+async function promptExistingPostgres({ configuredUrl, nonInteractive, probes, source, label }) {
+  const rawUrl = configuredUrl || await secretQuestion(`${label} URL（postgresql+asyncpg://...）`);
+  const metadata = safeDatabaseMetadata(rawUrl);
+  const database = await question("数据库名", metadata.database || "puddingclaw");
+  const targetUrl = databaseUrlWithName(rawUrl, database);
+  const createDatabaseIfMissing = await confirmCreateMissingDatabase();
+  return externalPostgres({
+    rawUrl: targetUrl,
+    nonInteractive,
+    probes,
+    createDatabaseIfMissing,
+    source,
+  });
+}
+
+export async function discoverCoreDatabase({
+  profile,
+  flags,
+  nonInteractive,
+  home,
+  existingDatabaseUrl = "",
+  existingCatalog = null,
+  reuseExistingDatabaseUrl = true,
+}) {
+  const probes = [];
+  if (!nonInteractive) {
+    output.write("\n核心数据库探索（PostgreSQL 优先，SQLite 保底）：\n");
+    output.write("正在探测本机 PostgreSQL 127.0.0.1:5432…\n");
+  }
+  const localProbe = await probeTcpEndpoint({
+    probe: "database.postgresql.discovery",
+    host: "127.0.0.1",
+    port: 5432,
+    required: false,
+  });
+  probes.push(localProbe);
+  const explicitMode = String(flags.database_mode || "").trim().toLowerCase();
+  const configuredUrl = String(
+    flags.database_url
+      || process.env.PUDDINGCLAW_INIT_DATABASE_URL
+      || (reuseExistingDatabaseUrl ? existingDatabaseUrl : "")
+      || "",
+  ).trim();
+
+  if (nonInteractive) {
+    if (["postgresql", "external"].includes(explicitMode) || (!explicitMode && configuredUrl)) {
+      return {
+        ...await externalPostgres({
+          rawUrl: configuredUrl,
+          nonInteractive,
+          probes,
+          createDatabaseIfMissing: Boolean(flags.database_create_if_missing),
+        }),
+        probes,
+      };
+    }
+    if (explicitMode === "native") {
+      try {
+        const installed = await installNativePostgres({
+          requirePgvector: profile === "knowledge" || profile === "full",
+          database: flags.database_name || "puddingclaw",
+          username: flags.database_username || "puddingclaw",
+          password: process.env.PUDDINGCLAW_INIT_DATABASE_PASSWORD || "",
+        });
+        return { catalog: installed.catalog, databaseUrl: installed.databaseUrl, probes: [...probes, installed.probe] };
+      } catch (error) {
+        const reason = error?.message || String(error);
+        probes.push({ probe: "database.postgresql.install", status: "needs_action", required: false, reason });
+        return { ...sqliteFallback(reason), probes };
+      }
+    }
+    if (explicitMode === "docker") {
+      try {
+        const installed = await installDockerPostgres({
+          home,
+          requirePgvector: profile === "knowledge" || profile === "full",
+          port: flags.database_port || 5432,
+          database: flags.database_name || "puddingclaw",
+          username: flags.database_username || "puddingclaw",
+          password: process.env.PUDDINGCLAW_INIT_DATABASE_PASSWORD || "",
+        });
+        return { catalog: installed.catalog, databaseUrl: installed.databaseUrl, probes: [...probes, installed.probe] };
+      } catch (error) {
+        const reason = error?.message || String(error);
+        probes.push({ probe: "database.postgresql.install", status: "needs_action", required: false, reason });
+        return { ...sqliteFallback(reason), probes };
+      }
+    }
+    return {
+      ...sqliteFallback(
+        explicitMode === "sqlite" ? "用户选择 SQLite" : "非交互模式未显式选择 PostgreSQL",
+        explicitMode === "sqlite",
+      ),
+      probes,
+    };
+  }
+
+  if (localProbe.status === "available") {
+    output.write("✓ 发现本机 5432 端口；仍需认证并验证目标数据库\n");
+    const docker = await probeDocker();
+    probes.push(docker);
+    output.write("[1] 本机 PostgreSQL（填写连接信息）\n");
+    output.write(`[2] Docker PostgreSQL${docker.status === "available" ? "" : `（不可用：${docker.reason}）`}\n`);
+    output.write("[3] SQLite（Home 内单文件）\n");
+    output.write("[4] 外部 PostgreSQL（提供连接 URL）\n");
+    const selected = explicitMode || await question(
+      "请选择数据库方案",
+      "1",
+    );
+    if (["1", "local", "postgresql"].includes(selected.toLowerCase())) {
+      const discovered = await promptExistingPostgres({
+        configuredUrl: reuseExistingDatabaseUrl && ["local", "native_apt"].includes(existingCatalog?.source)
+          ? configuredUrl
+          : "",
+        nonInteractive,
+        probes,
+        source: "local",
+        label: "本机 PostgreSQL",
+      });
+      if (discovered.catalog.mode === "postgresql") {
+        output.write("✓ PostgreSQL 端口可访问；认证将在 Runtime 准备后复检\n");
+      } else {
+        output.write(`! ${discovered.catalog.fallback_reason}，将回退 SQLite\n`);
+      }
+      return { ...discovered, probes };
+    }
+    if (["2", "docker"].includes(selected.toLowerCase())) {
+      if (docker.status !== "available") {
+        throw new CliError(docker.reason, { code: "docker_required" });
+      }
+      const currentDocker = existingCatalog?.source === "docker" ? existingCatalog : {};
+      const connection = await promptInstalledDatabase({
+        docker: true,
+        defaults: currentDocker,
+        allowedOccupiedPort: Number(currentDocker.port || 0),
+      });
+      if (!(await confirmDatabaseProvisioning("Docker PostgreSQL", connection))) {
+        return { ...sqliteFallback("用户取消 Docker PostgreSQL 配置"), probes };
+      }
+      const installed = await installDockerPostgres({
+        home,
+        requirePgvector: profile === "knowledge" || profile === "full",
+        ...connection,
+      });
+      return { catalog: installed.catalog, databaseUrl: installed.databaseUrl, probes: [...probes, installed.probe] };
+    }
+    if (["4", "external"].includes(selected.toLowerCase())) {
+      const discovered = await promptExistingPostgres({
+        configuredUrl: reuseExistingDatabaseUrl && existingCatalog?.source === "external" ? configuredUrl : "",
+        nonInteractive,
+        probes,
+        source: "external",
+        label: "外部 PostgreSQL",
+      });
+      return { ...discovered, probes };
+    }
+    output.write("- 已选择 SQLite；不会修改或停止占用 5432 的进程\n");
+    return { ...sqliteFallback("用户选择 SQLite", true), probes };
+  }
+
+  output.write("- 未发现本机 PostgreSQL\n");
+  const native = nativePostgresInstaller();
+  const docker = await probeDocker();
+  probes.push(docker);
+  output.write(`[1] 本机 PostgreSQL${native.available ? "（安装/配置，需要 sudo）" : `（不可用：${native.reason}）`}\n`);
+  output.write(`[2] Docker PostgreSQL${docker.status === "available" ? "" : `（不可用：${docker.reason}）`}\n`);
+  output.write("[3] SQLite（Home 内单文件）\n");
+  output.write("[4] 外部 PostgreSQL（提供连接 URL）\n");
+  const selected = explicitMode || await question("请选择数据库方案", native.available ? "1" : docker.status === "available" ? "2" : "3");
+  try {
+    if (["1", "native"].includes(selected.toLowerCase())) {
+      if (!native.available) throw new CliError(native.reason, { code: "native_postgres_installer_unavailable" });
+      output.write("CLI 将通过 sudo apt 安装/配置 PostgreSQL 并写入连接信息；初始化完成后，服务生命周期仍归用户和操作系统管理。\n");
+      const connection = await promptInstalledDatabase();
+      if (!(await confirmDatabaseProvisioning("本机 PostgreSQL", connection))) {
+        output.write("- 已取消本机 PostgreSQL 安装/配置，将使用 SQLite\n");
+        return { ...sqliteFallback("用户取消本机 PostgreSQL 配置"), probes };
+      }
+      const installed = await installNativePostgres({
+        requirePgvector: profile === "knowledge" || profile === "full",
+        ...connection,
+      });
+      output.write("✓ 本机 PostgreSQL 已准备完成\n");
+      return { catalog: installed.catalog, databaseUrl: installed.databaseUrl, probes: [...probes, installed.probe] };
+    }
+    if (["2", "docker"].includes(selected.toLowerCase())) {
+      if (docker.status !== "available") throw new CliError(docker.reason, { code: "docker_required" });
+      output.write("CLI 将创建 Docker PostgreSQL 并写入连接信息；初始化完成后，服务生命周期由 Docker 管理。\n");
+      const currentDocker = existingCatalog?.source === "docker" ? existingCatalog : {};
+      const connection = await promptInstalledDatabase({
+        docker: true,
+        defaults: currentDocker,
+        allowedOccupiedPort: Number(currentDocker.port || 0),
+      });
+      if (!(await confirmDatabaseProvisioning("Docker PostgreSQL", connection))) {
+        output.write("- 已取消 Docker PostgreSQL 配置，将使用 SQLite\n");
+        return { ...sqliteFallback("用户取消 Docker PostgreSQL 配置"), probes };
+      }
+      const installed = await installDockerPostgres({
+        home,
+        requirePgvector: profile === "knowledge" || profile === "full",
+        ...connection,
+      });
+      output.write("✓ Docker PostgreSQL 已准备完成\n");
+      return { catalog: installed.catalog, databaseUrl: installed.databaseUrl, probes: [...probes, installed.probe] };
+    }
+    if (["4", "external"].includes(selected.toLowerCase())) {
+      const discovered = await promptExistingPostgres({
+        configuredUrl: reuseExistingDatabaseUrl && existingCatalog?.source === "external" ? configuredUrl : "",
+        nonInteractive,
+        probes,
+        source: "external",
+        label: "外部 PostgreSQL",
+      });
+      if (discovered.catalog.mode === "postgresql") {
+        output.write("✓ 外部 PostgreSQL 端口可访问；认证将在 Runtime 准备后复检\n");
+      } else {
+        output.write(`! ${discovered.catalog.fallback_reason}，将使用 SQLite\n`);
+      }
+      return { ...discovered, probes };
+    }
+  } catch (error) {
+    const reason = error?.message || String(error);
+    probes.push({
+      probe: "database.postgresql.install",
+      status: "needs_action",
+      required: false,
+      reason,
+    });
+    output.write(`! PostgreSQL 配置未完成：${reason}\n`);
+    output.write("- 已回退 SQLite，PuddingClaw 仍可继续初始化\n");
+    return { ...sqliteFallback(reason), probes };
+  }
+  output.write("- 已选择 SQLite，Backend 将使用 Home 内的数据库文件\n");
+  return { ...sqliteFallback("用户选择 SQLite", true), probes };
+}
+
+export async function discoverExtensionInfrastructure({
+  profile,
+  flags,
+  nonInteractive,
+  home,
+  existingDatabaseUrl = "",
+  existingCatalog = null,
+}) {
   const knowledgeEnabled = profile === "knowledge" || profile === "full";
+  const coreDatabase = await discoverCoreDatabase({
+    profile,
+    flags,
+    nonInteractive,
+    home,
+    existingDatabaseUrl,
+    existingCatalog,
+  });
   const result = {
-    catalog: { mode: "sqlite", host: "", port: 0, database: "", probe_status: "skipped" },
+    catalog: coreDatabase.catalog,
     milvus: { enabled: false, uri: "http://127.0.0.1:19530", probe_status: "skipped" },
     embedding: { status: "disabled", provider: "", model: "" },
     mineru: { enabled: false, base_url: "http://127.0.0.1:8002", probe_status: "skipped" },
     embeddingApiKey: "",
-    databaseUrl: "",
-    probes: [],
+    databaseUrl: coreDatabase.databaseUrl,
+    createDatabaseIfMissing: Boolean(coreDatabase.createDatabaseIfMissing),
+    probes: [...coreDatabase.probes],
   };
   if (!knowledgeEnabled) return result;
 
   if (!nonInteractive) {
     output.write("\n知识库依赖探索（按依赖顺序执行）：\n");
-    output.write("  1. Catalog 存储 → 2. Milvus 向量索引 → 3. Embedding 配置\n\n");
-  }
-  let localPostgresProbe = null;
-  if (!nonInteractive) {
-    output.write("正在探测本机 PostgreSQL 127.0.0.1:5432…\n");
-    localPostgresProbe = await probeTcpEndpoint({
-      probe: "database.postgresql.discovery",
-      host: "127.0.0.1",
-      port: 5432,
-      required: false,
-    });
-    result.probes.push(localPostgresProbe);
-    output.write(localPostgresProbe.status === "available"
-      ? "✓ 发现 PostgreSQL 端口；仍需 URL 验证认证和 pgvector\n"
-      : "- 未发现本机 PostgreSQL；可选择轻量 SQLite，或填写远程 PostgreSQL\n");
-  }
-  const databaseMode = String(flags.database_mode || (nonInteractive
-    ? "sqlite"
-    : await question(
-      "Catalog 存储：[1] PostgreSQL（完整） [2] SQLite（轻量）",
-      localPostgresProbe?.status === "available" ? "1" : "2",
-    )))
-    .toLowerCase();
-  const usePostgres = databaseMode === "postgresql" || databaseMode === "1";
-  if (usePostgres) {
-    const databaseUrl = String(flags.database_url || process.env.PUDDINGCLAW_INIT_DATABASE_URL || (
-      nonInteractive ? "" : await secretQuestion("PostgreSQL URL（postgresql+asyncpg://...）")
-    )).trim();
-    if (!databaseUrl) {
-      throw new CliError("PostgreSQL URL is required for the selected knowledge catalog", {
-        code: "database_url_required",
-      });
-    }
-    let metadata;
-    try {
-      metadata = safeDatabaseMetadata(databaseUrl);
-    } catch {
-      throw new CliError("PostgreSQL URL is invalid", { code: "argument_error" });
-    }
-    const probe = await probeTcpEndpoint({ probe: "database.postgresql", host: metadata.host, port: metadata.port });
-    result.catalog = { mode: "postgresql", ...metadata, probe_status: probe.status };
-    result.databaseUrl = databaseUrl;
-    result.probes.push(probe);
-    if (!nonInteractive) {
-      output.write(probe.status === "available"
-        ? `✓ PostgreSQL ${metadata.host}:${metadata.port} 端口可访问（认证与 pgvector 将在 Runtime 准备后复检）\n`
-        : `! PostgreSQL 不可达：${probe.reason}；配置会保存为待修复状态\n`);
-    }
-  } else if (!nonInteractive) {
-    output.write("- PostgreSQL：已按轻量分支跳过，知识目录使用 Home 内 SQLite\n");
+    output.write("  1. 核心数据库已决策 → 2. Milvus 向量索引 → 3. Embedding 配置\n\n");
   }
 
   let localMilvusProbe = null;
@@ -300,25 +789,55 @@ export async function discoverExtensionInfrastructure({ profile, flags, nonInter
   return result;
 }
 
-export function validatePreparedInfrastructure({ python, databaseUrl, milvus }) {
+export function validatePreparedInfrastructure({
+  python,
+  databaseUrl,
+  createDatabaseIfMissing = false,
+  milvus,
+  requirePgvector = false,
+  spawn = spawnSync,
+}) {
   const probes = [];
   if (databaseUrl) {
     const script = [
       "import asyncio,json,os",
+      "from urllib.parse import unquote,urlsplit,urlunsplit",
       "import asyncpg",
       "async def main():",
       " url=os.environ['PUDDINGCLAW_PROBE_DATABASE_URL'].replace('postgresql+asyncpg:', 'postgresql:', 1)",
-      " conn=await asyncpg.connect(url, timeout=5)",
+      " allow_create=os.environ.get('PUDDINGCLAW_CREATE_DATABASE_IF_MISSING')=='1'",
+      " created=False",
+      " try:",
+      "  conn=await asyncpg.connect(url, timeout=5)",
+      " except asyncpg.InvalidCatalogNameError:",
+      "  if not allow_create: raise",
+      "  parts=urlsplit(url)",
+      "  database=unquote(parts.path.lstrip('/'))",
+      "  if not database: raise RuntimeError('target database name is empty')",
+      "  maintenance=urlunsplit((parts.scheme,parts.netloc,'/postgres',parts.query,parts.fragment))",
+      "  admin=await asyncpg.connect(maintenance, timeout=5)",
+      "  try:",
+      "   exists=await admin.fetchval('select 1 from pg_database where datname=$1',database)",
+      "   if not exists:",
+      "    identifier='\"'+database.replace('\"','\"\"')+'\"'",
+      "    await admin.execute('CREATE DATABASE '+identifier)",
+      "    created=True",
+      "  finally: await admin.close()",
+      "  conn=await asyncpg.connect(url, timeout=5)",
       " try:",
       "  version=await conn.fetchval(\"select extversion from pg_extension where extname='vector'\")",
-      "  print(json.dumps({'connected':True,'pgvector':version or ''}))",
+      "  print(json.dumps({'connected':True,'created':created,'pgvector':version or ''}))",
       " finally: await conn.close()",
       "asyncio.run(main())",
     ].join("\n");
-    const checked = spawnSync(python, ["-c", script], {
+    const checked = spawn(python, ["-c", script], {
       encoding: "utf8",
       timeout: 10_000,
-      env: { ...process.env, PUDDINGCLAW_PROBE_DATABASE_URL: databaseUrl },
+      env: {
+        ...process.env,
+        PUDDINGCLAW_PROBE_DATABASE_URL: databaseUrl,
+        PUDDINGCLAW_CREATE_DATABASE_IF_MISSING: createDatabaseIfMissing ? "1" : "0",
+      },
       stdio: ["ignore", "pipe", "pipe"],
     });
     if (checked.status === 0) {
@@ -327,16 +846,22 @@ export function validatePreparedInfrastructure({ python, databaseUrl, milvus }) 
         probe: "database.connection",
         status: "available",
         required: true,
+        created: Boolean(payload.created),
         pgvector: payload.pgvector
           ? { status: "available", version: payload.pgvector }
-          : { status: "needs_action", reason: "pgvector extension is not installed in this database" },
+          : requirePgvector
+            ? { status: "needs_action", reason: "pgvector extension is not installed in this database" }
+            : { status: "skipped", reason: "当前 Profile 不需要 pgvector" },
       });
     } else {
+      const stderr = String(checked.stderr || "PostgreSQL authentication failed").trim();
+      const missingDependency = /ModuleNotFoundError: No module named ['\"]asyncpg['\"]/.test(stderr);
       probes.push({
         probe: "database.connection",
-        status: "needs_action",
+        status: missingDependency ? "error" : "needs_action",
         required: true,
-        reason: String(checked.stderr || "PostgreSQL authentication failed").trim().split("\n").at(-1),
+        ...(missingDependency ? { code: "runtime_dependency_missing" } : {}),
+        reason: stderr.split("\n").at(-1),
       });
     }
   }
@@ -347,7 +872,7 @@ export function validatePreparedInfrastructure({ python, databaseUrl, milvus }) 
       "client=MilvusClient(uri=os.environ['PUDDINGCLAW_PROBE_MILVUS_URI'], timeout=5)",
       "print(json.dumps({'collections':client.list_collections()}))",
     ].join("\n");
-    const checked = spawnSync(python, ["-c", script], {
+    const checked = spawn(python, ["-c", script], {
       encoding: "utf8",
       timeout: 10_000,
       env: { ...process.env, PUDDINGCLAW_PROBE_MILVUS_URI: milvus.uri },

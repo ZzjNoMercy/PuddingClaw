@@ -11,8 +11,8 @@ import logging
 import os
 import socket
 from dataclasses import dataclass
-from pathlib import Path
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
@@ -20,8 +20,9 @@ import httpx
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 
-from config import get_database_config, get_knowledge_mineru_config, load_config
 from cli_runtime import current_cli_runtime_status
+from config import get_database_config, get_knowledge_mineru_config, load_config
+from extensions import extension_enabled
 from postgres_dependencies import PGVECTOR_STATUS_SQL, normalize_pgvector_status
 
 logger = logging.getLogger(__name__)
@@ -34,6 +35,10 @@ _CACHE_TTL = timedelta(seconds=60)
 DEFAULT_MILVUS_URL = "http://localhost:19530"
 DEFAULT_MINERU_URL = "http://localhost:8002"
 DEFAULT_POSTGRES_URL = ""
+
+
+def _profile_disabled(name: str) -> CapabilityStatus:
+    return CapabilityStatus(available=False, reason=f"{name} is disabled by the current Runtime Profile")
 
 @dataclass
 class CapabilityStatus:
@@ -177,6 +182,12 @@ def _is_postgres_url(url: str) -> bool:
 async def _check_postgres(url: str | None) -> CapabilityStatus:
     target = _resolve_postgres_url(url)
     if not _is_postgres_url(target):
+        if get_database_config().get("mode") == "sqlite":
+            return CapabilityStatus(
+                available=True,
+                reason="SQLite catalog in PuddingClaw Home",
+                details={"mode": "sqlite"},
+            )
         return CapabilityStatus(available=False, reason="PostgreSQL URL not configured")
 
     engine = None
@@ -247,20 +258,27 @@ async def detect_capabilities(
     mineru_config = get_knowledge_mineru_config()
     mineru_target = mineru_url or str(mineru_config.get("base_url") or DEFAULT_MINERU_URL)
 
-    results = await asyncio.gather(
-        _check_postgres(postgres_target),
+    knowledge_enabled = extension_enabled("knowledge")
+    knowledge_results = await asyncio.gather(
         _check_pgvector(postgres_target),
-        _check_docker(),
         _check_milvus(milvus_target),
         _check_http_get(mineru_target, "/health"),
+    ) if knowledge_enabled else (
+        _profile_disabled("pgvector"),
+        _profile_disabled("Milvus"),
+        _profile_disabled("MinerU"),
+    )
+    core_results = await asyncio.gather(
+        _check_postgres(postgres_target),
+        _check_docker(),
     )
 
     caps = Capabilities(
-        database=results[0],
-        pgvector=results[1],
-        docker=results[2],
-        milvus=results[3],
-        mineru=results[4],
+        database=core_results[0],
+        pgvector=knowledge_results[0],
+        docker=core_results[1],
+        milvus=knowledge_results[1],
+        mineru=knowledge_results[2],
         cli=_check_cli(),
     )
 
@@ -335,15 +353,16 @@ def _detect_capabilities_sync_fallback(
     mineru_config = get_knowledge_mineru_config()
     mineru_target = mineru_url or str(mineru_config.get("base_url") or DEFAULT_MINERU_URL)
 
+    knowledge_enabled = extension_enabled("knowledge")
     caps = Capabilities(
         database=_check_postgres_sync(postgres_target),
         pgvector=CapabilityStatus(
             available=False,
             reason="pgvector status is verified by the asynchronous infrastructure probe",
-        ),
+        ) if knowledge_enabled else _profile_disabled("pgvector"),
         docker=_check_docker_sync(),
-        milvus=_check_milvus_sync(milvus_target),
-        mineru=_check_http_get_sync(mineru_target, "/health"),
+        milvus=_check_milvus_sync(milvus_target) if knowledge_enabled else _profile_disabled("Milvus"),
+        mineru=_check_http_get_sync(mineru_target, "/health") if knowledge_enabled else _profile_disabled("MinerU"),
         cli=_check_cli(),
     )
     _CAPABILITIES_CACHE = caps
@@ -391,6 +410,12 @@ def _check_postgres_sync(url: str | None) -> CapabilityStatus:
     """同步路径只做 TCP 探测，避免在已有事件循环里阻塞 asyncpg。"""
     target = _resolve_postgres_url(url)
     if not _is_postgres_url(target):
+        if get_database_config().get("mode") == "sqlite":
+            return CapabilityStatus(
+                available=True,
+                reason="SQLite catalog in PuddingClaw Home",
+                details={"mode": "sqlite"},
+            )
         return CapabilityStatus(available=False, reason="PostgreSQL URL not configured")
 
     parsed = urlparse(target.replace("postgresql+asyncpg://", "postgresql://", 1))

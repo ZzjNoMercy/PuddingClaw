@@ -1,6 +1,6 @@
 # AI Native 语义资产与分析模型对话共创方案
 
-> 状态：**P0 开发中；Measure 单对象纵切已落地并通过目标测试**
+> 状态：**P0 五类单文件纵切已落地并通过组合回归**
 >
 > 日期：2026-08-12
 >
@@ -26,7 +26,10 @@ PuddingClaw 下一阶段不能继续以“用户在表单或 Markdown 编辑器�
                发现事实、识别歧义、逐步引导决策
                              │
                              ▼
-             LLM-readable Authoring Brief（可选临时写作提纲）
+        Registry Discovery：列举/检索候选、读取正文、比较复用/修改/新增
+                             │
+                             ▼
+             LLM-readable Authoring Brief（必需的临时控制提纲）
                  整理事实、决策、证据与未决问题
                              │
                              ▼
@@ -48,7 +51,7 @@ PuddingClaw 下一阶段不能继续以“用户在表单或 Markdown 编辑器�
      $PUDDINGCLAW_HOME/definitions/{semantic-assets,analytics-models}
 ```
 
-本文固定采用“**Schema/Skill 引导 + 可选 Authoring Brief + 完整 Markdown 候选 + digest-bound Prepared Plan + Home Markdown 唯一事实源**”。Authoring Brief 是给 LLM 看的写作提纲，可以用结构化 Markdown/YAML 整理事实、决策和未决问题，但不参与运行时、不编译成定义，也不能脱离最终 Markdown 独立发布。P0 先冻结单文件候选、基线、校验、预览和发布摘要；只有在单对象纵切证明需要后，才增加跨 Session ChangeSet，不把控制面当作第一阶段前置。
+本文固定采用“**Schema/Skill 引导 + 必需 Authoring Brief + 完整 Markdown 候选 + digest-bound Prepared Plan + Home Markdown 唯一事实源**”。Authoring Brief 是给 LLM 看的临时控制提纲，用来证明必要主题已经检查、未决问题已清零；它可以整理事实、决策和证据，但不参与运行时、不编译成定义，也不能脱离最终 Markdown 独立发布。P0 冻结单文件候选、基线、校验、预览和发布摘要；只有在单对象纵切证明需要后，才增加跨 Session ChangeSet，不把控制面当作第一阶段前置。
 
 用户的主要创作面是自然语言对话和 Markdown 正文，不是 YAML、Schema 或领域表单。Agent 负责把用户的业务表达整理为清晰、完整、可维护的正文；frontmatter、稳定 ID、引用语法、版本和文件位置由 Agent/Toolset 自动处理。技术用户可以查看原始 Markdown，但普通用户默认只审核渲染后的正文、业务变化和风险。任何会改变运行时业务行为的 frontmatter 都必须在正文中有等价表达；后端只能自动修缮机器表示，不能在正文之外创造新的业务口径。
 
@@ -188,7 +191,7 @@ Agent 不能把 `inferred` 在无提示情况下提升为 `confirmed`。
 
 ### 5.4 用户可以中断和恢复
 
-对话最终需要支持跨 Session 恢复，但这不是首个发布纵切的前置。当前 Measure P0 将完整候选、基线 digest、校验结果和预览冻结为短期 Prepared Plan：
+对话最终需要支持跨 Session 恢复，但这不是当前单文件发布协议的前置。五类对象都将完整候选、基线 digest、校验结果和预览冻结为短期 Prepared Plan：
 
 ```yaml
 plan_id: semantic-plan-...
@@ -642,28 +645,31 @@ P0 的目标是给 Agent Toolset 提供单 Backend、单定义文件的安全发
 
 `semantic_dimension_publisher.py` 已有 staging、显式发布和单文件 `_atomic_write` / `_atomic_copy`；crosswalk 流程也已有版本快照经验。这些应抽取为公共 primitive，并保留现有 Dimension Builder 的调用兼容。
 
-现有实现不是通用多文件事务框架，因此不能直接宣称“真正原子”。Measure P0 复用其思路实现单文件临时写入 + `os.replace`、基线 CAS、Registry refresh 和失败恢复；不抽取目录 lease 或多文件事务。此次审计同时修复 Dimension Publisher 对预存 `id`/`build_skill.adapter` 的脆弱正则前置要求，改为结构化修缮 frontmatter 并保留正文。
+现有实现不是通用多文件事务框架，因此不能直接宣称“真正原子”。五类单文件发布复用其思路实现临时写入 + `os.replace`、基线 CAS、对应 Registry refresh 和失败恢复；不抽取目录 lease 或多文件事务。此次审计同时修复 Dimension Publisher 对预存 `id`/`build_skill.adapter` 的脆弱正则前置要求，改为结构化修缮 frontmatter 并保留正文。
 
 ## 10. Backend 工具边界
 
 新增 `semantic_steward` Toolset，仅在 `semantic-steward` Skill 激活后暴露。工具名为建议契约，实施时可按现有命名规范调整。
 
-### 10.1 只读发现能力优先复用
+### 10.1 Registry Discovery 是创作前置门禁
 
-首个纵切不新增一组同义只读工具。Agent 继续复用 native read/glob/grep、`database_analysis` 和 `semantic_lookup` 读取 Markdown、Catalog 和 Profile。Frontmatter Effect Registry 先作为 Backend 契约和 Skill reference 暴露；只有现有能力无法回答反向依赖或 Trace 问题时，才增加新的专用只读工具。
+文件遍历可以临时回答清单问题，但不能稳定证明 Agent 在新增前检查过已有定义。因此增加一个统一的 `discover_semantic_definitions`：直接刷新 Semantic Asset 与 Analytics Model Registry，按 kind 列举或按业务概念检索，返回稳定 ID、逻辑路径、匹配依据、definition digest 和 Analytics Model 反向引用。空查询用于分页清单；非空查询生成 Session-bound、Catalog-digest-bound discovery receipt。
 
-### 10.2 Measure P0 只提供两个写工具
+Receipt 只证明“指定 Catalog 快照已经被检索”，不替 Agent 或用户决定业务语义。Agent 必须读取所有合理候选的完整 Markdown，向用户解释复用、修改或新增的判断。Receipt 显式区分 `inventory` / `targeted` 并由服务端 HMAC 签名；`prepare_semantic_markdown` 确定性拒绝缺失、空查询或纯标点、结果未完整、目标存量定义未返回、字段篡改、跨 Session、错误 kind、过期或 Catalog 已变化的 receipt。
+
+### 10.2 五类对象共用两个写工具
 
 | 工具 | 作用 |
 | --- | --- |
-| `prepare_semantic_markdown` | 接收完整 Measure Markdown 候选；补齐目标路径唯一确定的字段，校验正文/frontmatter/Brief，冻结候选和基线，返回正文预览、机器效果摘要、技术 Diff 与 `plan_digest`；不写 active definition |
+| `discover_semantic_definitions` | 分页列举或检索五类 Registry；返回候选、匹配原因、模型反向引用和 discovery receipt；不修改 active definition |
+| `prepare_semantic_markdown` | 接收完整 Measure、Grain、普通 Dimension、Relation 或 Analytics Model Markdown 候选；补齐目标路径唯一确定的字段，校验正文/frontmatter/Brief/引用，冻结候选和基线，返回正文预览、机器效果摘要、技术 Diff 与 `plan_digest`；不写 active definition |
 | `publish_semantic_markdown` | 只接受已准备的 `plan_id + plan_digest`；校验 Session、TTL、候选 digest 和 active 基线，执行单文件 atomic replace、Registry refresh 与失败恢复 |
 
-这两个工具形成稳定的 Agent 协议；扩展 Grain、Dimension、Relation 和 Analytics Model 时优先扩展同一参数契约和 kind-specific validator，不为每类对象新增一套工具。
+三个工具形成“发现 → 准备 → 发布”的稳定 Agent 协议；五类对象使用同一参数契约和 kind-specific validator，不为每类对象新增一套工具。
 
 ### 10.3 后置能力
 
-跨 Session 草稿、多个文件的拓扑发布、显式历史回滚、反向依赖索引和 Trace 健康建议进入后续阶段。出现需求时可以在两工具协议内部引入 ChangeSet/Prepared Plan 服务，但不扩张 Agent 的工具数量。
+跨 Session 草稿、多个文件的拓扑发布、显式历史回滚、通用依赖图和 Trace 健康建议进入后续阶段。出现需求时可以在 prepare/publish 协议内部引入 ChangeSet 服务，但不为每类对象复制工具。
 
 复杂 `entity_lookup` 维度继续使用现有 `semantic_dimension_build` Toolset。Steward 只负责正确编排，不复制构建脚本。
 
@@ -680,6 +686,7 @@ P0 的目标是给 Agent Toolset 提供单 Backend、单定义文件的安全发
 本 P0 不新增完整 Control Plane REST 产品。Toolset 只需要复用或补充以下内部能力：
 
 - 按逻辑 ID 读取 Markdown、Schema、Profile、依赖和使用证据；
+- 五类 Registry 的统一发现、分页、匹配依据、模型反向引用和 Session-bound receipt；
 - 查询 Frontmatter Effect Registry，并在预览前修缮/验证 frontmatter 机器投影；
 - session-bound Prepared Plan 存储、TTL、候选 digest 与 definition CAS；
 - 完整候选 Markdown 的 Schema/引用验证、Diff 和风险摘要；
@@ -830,20 +837,31 @@ P0 的主体就是 **Semantic Steward Skill + Toolset**。Backend 只补 Toolset
 
 验收：创建与修改 Measure 都必须经过“prepare → 用户审核准确 plan digest → publish”；人工并发编辑返回 `baseline_changed`；发布后 Registry 能读取该 Measure；失败不留下半发布文件。
 
-当前验证记录（2026-08-13）：76 个 Steward/Toolset/Dimension 目标测试与 401 个 Tool Execution、Registry、Dimension Builder、DeepAgents 相关回归测试通过；静态检查通过。Luna 黑盒审查提出的审批、Brief、legacy chat 和路径泄漏四项阻断均已进入后端门禁并复核。
+当前验证记录（2026-08-13）：首个 Measure 纵切的审批、Brief、legacy chat 和路径泄漏阻断已关闭；横向扩展与 Discovery 门禁加入后，39 个 Semantic Authoring 定向测试及 563 个 Steward、Tool Execution、Registry、Analytics Model、Dimension Builder、Runtime、Project Export、Toolset、DeepAgents 组合回归通过，Ruff、compileall 与 diff check 通过。Luna 对抗复核提出的正文嵌套值审计、Relation key mapping 一致性、缺失 `table_asset:`、语义空查询和 receipt 篡改阻断均已关闭。
 
-### P0-2：在同一协议上扩展五类对象
+### P0-2：在同一协议上扩展五类对象（已实现）
 
-按收益顺序扩展 Grain → Dimension → Relation → Analytics Model。每个类型只增加：
+已按 Grain → Dimension → Relation → Analytics Model 扩展。每个类型只增加：
 
 - 对应 Skill reference 与完整 Markdown 示例；
 - kind-specific frontmatter validator 和正文审核主题；
 - 引用/依赖/数据探测适配器；
 - 该类型的 Registry refresh/发布后断言。
 
+实现边界：普通 Dimension 支持 `source_field`、`derived`、`calendar_lookup`；`entity_lookup` 被 prepare 确定性拒绝并路由到专用 Builder。Analytics Model 校验已选语义资产、Relation 连通图、Guardrail ID、模型包 references/templates，并在发布后加载完整 Model Context；Grain 继续以正文承载唯一键、去重和上卷规则，不新增伪结构化 DSL。
+
 复杂 `entity_lookup` Dimension 继续编排 `build-semantic-dimension`，SQL Guardrail 继续编排专业 Skill。不得复制构建链路，也不得增加每类型专属 prepare/publish 工具。
 
 验收：每类至少一条“自然语言 → 引导决策 → 完整正文 → prepare → 显式批准 → publish”路径；普通用户只审核正文和自然语言机器效果。
+
+### P0-3：Discovery 决策闭环（已实现）
+
+- `discover_semantic_definitions` 支持五类清单、目标检索、分页、匹配原因和模型反向引用；
+- Semantic Steward 强制“发现 → 读取候选正文 → 解释复用/修改/新增 → 写作”；
+- prepare 必须验证服务端签名的完整 targeted discovery receipt；修改存量定义时目标必须在候选中；Catalog 或 Session 改变时重新发现；
+- Discovery 只产生可过期控制凭证，不成为语义事实源，运行时仍只消费发布后的 Markdown。
+
+验收：用户询问“我有哪些度量值”可直接得到 Registry 清单；用户提出新增概念时，没有有效 targeted receipt 无法 prepare。
 
 ### P1：真实需求驱动的治理增强
 
@@ -887,25 +905,29 @@ frontend/src/components/analytics/
 
 ### 16.1 单元测试
 
-- Measure 必需业务主题、H1、frontmatter 类型和占位文本检查；
-- 缺失 `formatter`/`type` 可以按显式 Measure 路径补齐，冲突值必须拒绝；
+- 五类对象各自必需业务主题、H1、frontmatter 类型和占位文本检查；
+- 缺失 `formatter`/`type` 可以按显式目标路径补齐；Model `id` 可以按目录补齐；冲突值必须拒绝；
 - Frontmatter Effect Registry 不把 `type`、`aliases`、`description` 误标为安全格式字段；
 - 未决 Authoring Brief 阻止 prepare；Brief 不参与 Runtime；
+- 空查询可分页列出五类定义；目标检索返回匹配依据和 Analytics Model 反向引用；
+- 缺失、inventory/语义空查询、结果未完整、目标未返回、签名篡改、跨 Session、错误 kind、过期或 stale discovery receipt 阻止 prepare；
 - prepare 不写 active definition，候选大小与公开预览有界；
 - plan/session/TTL/candidate digest/definition baseline 任一不匹配均阻止发布；
 - 单文件发布幂等，Registry refresh 失败时恢复旧文件；
+- Dimension resolution、Relation endpoints/keys/cardinality、Model 依赖图/Guardrail/包资源使用真实 Registry 契约校验；
+- `entity_lookup` Dimension 必须路由到专用 Builder；
 - Dimension Publisher 能为存量/新建包结构化补齐 `id`、reference 和 adapter，同时保留正文；
 - 所有路径写入临时 `PUDDINGCLAW_HOME`，Tool 输出不返回宿主绝对路径。
 
 ### 16.2 Agent 场景测试
 
-- 用户一句话创建简单 Measure，Agent 主动读取可用证据并只追问业务歧义。
+- 用户一句话创建任一普通语义对象，Agent 先搜索并比较已有定义，再读取证据并只追问业务歧义。
 - 用户全程不接触 Schema/frontmatter，Agent 生成完整正文和提案字段。
 - Agent 在 prepare 后停止；只有用户批准准确的 plan digest 后才 publish。
 - 并发修改导致 baseline digest 变化，发布返回 `baseline_changed` 而不是覆盖。
 - 人工通过 Monaco 修改同一 Markdown 后，Agent 重新读取并生成新 Diff。
-- Agent 修改存量 Measure 时保留原正文，只对本次已确认口径做可见 Patch。
-- Grain、Dimension、Relation 和 Model 场景在各自扩展阶段加入，不计入 Measure 纵切的发布门槛。
+- Agent 修改存量定义时保留无关正文，只对本次已确认口径做可见 Patch。
+- Grain、普通 Dimension、Relation 和 Model 各有 prepare/publish 场景；复杂 Dimension 使用专用 Builder。
 
 ### 16.3 安全回归
 
@@ -930,8 +952,8 @@ frontend/src/components/analytics/
 
 ### 五类对象 P0 完成
 
-1. Measure、Grain、Dimension、Relation、Analytics Model 都复用相同两工具协议和各自 Skill reference/validator。
-2. Agent 会先读取真实 Markdown、Profile、现有资产和依赖，再逐步引导，而不是输出待填模板。
+1. Measure、Grain、Dimension、Relation、Analytics Model 都复用相同 discovery/prepare/publish 协议和各自 Skill reference/validator。
+2. Agent 会先通过 Registry Discovery 查找并读取真实 Markdown、Profile、现有资产和依赖，解释复用/修改/新增后再逐步引导，而不是输出待填模板。
 3. 普通用户审核渲染正文、业务摘要和风险；原始 Markdown/frontmatter Diff 只是高级详情。
 4. 复杂维度和 Guardrail 由 Steward 编排现有专业 Skill，不复制实现。
 5. SQL、Pandas 和 Analysis Project 导出继续只消费发布后的 Markdown 定义。

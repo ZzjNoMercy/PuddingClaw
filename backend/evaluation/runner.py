@@ -37,7 +37,7 @@ from .langsmith_backend import (
     langsmith_client_kwargs,
 )
 from .official_swebench import run_official_swebench_harness
-from .repository import EvaluationRepository
+from .repository import ConflictError, EvaluationRepository
 from .settings import LangSmithSettings
 from .swebench_adapter import swebench_prediction_manifest
 
@@ -197,12 +197,46 @@ class EvaluationRunner:
             else "not_started"
         )
         capability_profile, offered_tools = capability_for_profile(experiment.profile_id)
-        deadline = asyncio.get_running_loop().time() + experiment.execution.timeout_seconds
+        candidate_workspace_backend: Any | None = None
+        workspace: Path | None = None
+        deadline = 0.0
+        turn_outcome: str | None = None
         try:
             async with asyncio.timeout(experiment.execution.timeout_seconds):
                 workspace, project_id = await self._daemon_call(
                     lambda: self._prepare_workspace(runtime_root, case, repetition)
                 )
+            if (
+                case.code is not None
+                and case.code.repository.swebench is not None
+            ):
+                from .swebench_agent_backend import prepare_swebench_agent_backend
+
+                self._update_progress(
+                    experiment.experiment_id,
+                    stage="candidate_environment",
+                    message="正在准备与官方 TestSpec 一致的 Agent 依赖环境",
+                    current_case_id=case.case_id,
+                    current_case_name=case.name,
+                )
+                scratch_path = runtime_root / "agent-scratch" / case.case_id / f"attempt-{repetition}"
+                candidate_workspace_backend = await prepare_swebench_agent_backend(
+                    case,
+                    workspace_path=workspace,
+                    scratch_path=scratch_path,
+                    experiment_id=experiment.experiment_id,
+                )
+                self._update_progress(
+                    experiment.experiment_id,
+                    stage="agent_running",
+                    message="Agent 正在官方依赖环境中处理 Case",
+                    current_case_id=case.case_id,
+                    current_case_name=case.name,
+                )
+            # Environment/materialization time is platform setup, not Agent
+            # reasoning time.  Start the Case budget only after the exact
+            # candidate runtime is ready.
+            deadline = asyncio.get_running_loop().time() + experiment.execution.timeout_seconds
             session_manager.create_session(
                 session_id,
                 metadata={
@@ -271,7 +305,7 @@ class EvaluationRunner:
                     )
                 response = ""
                 done_seen = False
-                turn_outcome: str | None = None
+                turn_outcome = None
                 stream_error: str | None = None
                 remaining = deadline - asyncio.get_running_loop().time()
                 if remaining <= 0:
@@ -291,6 +325,8 @@ class EvaluationRunner:
                         evaluation_tool_allowlist=set(experiment.candidate.config.get("tool_allowlist") or []),
                         disable_mcp=True,
                         evaluation_builtin_tool_allowlist=set(offered_tools),
+                        evaluation_required_toolset=set(offered_tools),
+                        evaluation_workspace_backend=candidate_workspace_backend,
                     ):
                         payload = self._event_payload(event)
                         if event.get("event") == "tool_start":
@@ -453,10 +489,134 @@ class EvaluationRunner:
             else:
                 trace_refs = []
                 trace_export_error = trace_errors[-1] if trace_errors else None
+            # SWE-bench scores the candidate repository at the Agent boundary.
+            # If the Agent already produced a patch, submit that exact bounded
+            # workspace when either the wall-clock budget or the configured
+            # model-call budget ends.  A missing final prose response is not a
+            # reason to discard a benchmark prediction.
+            budget_ended = isinstance(exc, TimeoutError) or turn_outcome == "budget_exceeded"
+            if (
+                budget_ended
+                and workspace is not None
+                and case.code is not None
+                and case.code.repository.swebench is not None
+            ):
+                try:
+                    verification_root = (
+                        runtime_root / "verification" / case.case_id / f"attempt-{repetition}"
+                    )
+                    verification_root.mkdir(parents=True, exist_ok=True)
+                    async with asyncio.timeout(180):
+                        timeout_verification = await self._daemon_call(
+                            lambda: verify_code_case(workspace, verification_root, case.code)
+                        )
+                except Exception:
+                    timeout_verification = None
+                if timeout_verification is not None and str(
+                    timeout_verification.get("patch") or ""
+                ).strip():
+                    last_tool = event_calls[-1].name if event_calls else None
+                    run = AgentRunEnvelope(
+                        eval_run_id=eval_run_id,
+                        case_id=case.case_id,
+                        experiment_id=experiment.experiment_id,
+                        candidate_id=experiment.candidate.candidate_id,
+                        repetition=repetition,
+                        input=case.input,
+                        session_id=session_id,
+                        run_id=run_id,
+                        response=response,
+                        tool_calls=event_calls,
+                        started_at=started,
+                        finished_at=utc_now(),
+                        timing={"latency_ms": (utc_now() - started).total_seconds() * 1000},
+                        outcome="completed",
+                        trace_refs=trace_refs,
+                        artifacts=[
+                            {
+                                "kind": "code_patch",
+                                "sha256": timeout_verification.get("patch_sha256"),
+                                "changed_paths": timeout_verification.get("changed_paths") or [],
+                            }
+                        ],
+                        metadata={
+                            **({"query_id": query_id} if query_id else {}),
+                            "code_verification": timeout_verification,
+                            "agent_budget": {
+                                "exhausted": True,
+                                "reason": "timeout" if isinstance(exc, TimeoutError) else "model_call_limit",
+                                "timeout_seconds": experiment.execution.timeout_seconds,
+                                "tool_events": len(event_calls),
+                                "last_tool": last_tool,
+                                "submission": "workspace_patch_at_budget_boundary",
+                            },
+                        },
+                    )
+                    sequence_complete = not event_calls or event_calls[-1].succeeded is not None
+                    evidence = TraceEvidence(
+                        available_kinds={
+                            "final_output",
+                            "tool_name",
+                            "tool_order",
+                            "tool_status",
+                            "code_patch",
+                            "code_verification",
+                        },
+                        tool_calls=event_calls,
+                        trajectory=[call.name for call in event_calls],
+                        artifacts=[
+                            {
+                                "kind": "code_patch",
+                                "summary": (
+                                    "budget-boundary submission; "
+                                    f"sha256={timeout_verification.get('patch_sha256')}; "
+                                    f"changed={timeout_verification.get('changed_paths') or []}"
+                                )[:500],
+                            }
+                        ],
+                        metadata={
+                            "capture_complete": sequence_complete,
+                            "tool_sequence_complete": sequence_complete,
+                            "offered_tools": list(offered_tools),
+                            "capability_profile": capability_profile,
+                            "agent_budget_exhausted": True,
+                        },
+                    )
+                    results = evaluator_registry.run_profile(experiment.profile_id, case, run, evidence)
+                    for result in results:
+                        self.repository.save_result(experiment.experiment_id, attempt_id, result)
+                    self.repository.finish_attempt(attempt_id, status="completed", run=run)
+                    return {
+                        "case_id": case.case_id,
+                        "attempt_id": attempt_id,
+                        "response": _redact(response)[:8_000],
+                        "results": _redact([result.model_dump(mode="json") for result in results]),
+                        "summary": evaluator_registry.summarize(case, results),
+                        "attempt_status": "completed",
+                        "agent_budget_exhausted": True,
+                        "agent_trace_export": trace_export_status,
+                        "agent_trace_error": trace_export_error,
+                        "trace_refs": [item.model_dump(mode="json") for item in trace_refs],
+                    }
+            if isinstance(exc, TimeoutError):
+                last_tool = event_calls[-1].name if event_calls else "none"
+                error_message = (
+                    f"Case exceeded the {experiment.execution.timeout_seconds}s Agent budget "
+                    f"after {len(event_calls)} tool events; last tool={last_tool}; "
+                    "no non-empty patch was available for budget-boundary submission"
+                )
+            else:
+                error_message = f"{type(exc).__name__}: {str(exc)[:1000]}"
             error = EvalError(
                 code="case_execution_failed",
-                message=f"{type(exc).__name__}: {str(exc)[:1000]}",
+                message=error_message,
                 retryable=isinstance(exc, (TimeoutError, ConnectionError)),
+                details={
+                    "stage": "agent_running" if deadline else "candidate_environment",
+                    "timeout_seconds": experiment.execution.timeout_seconds,
+                    "tool_events": len(event_calls),
+                    "last_tool": event_calls[-1].name if event_calls else None,
+                },
             )
             run = AgentRunEnvelope(
                 eval_run_id=eval_run_id,
@@ -508,6 +668,9 @@ class EvaluationRunner:
                 "agent_trace_error": trace_export_error,
                 "trace_refs": [item.model_dump(mode="json") for item in trace_refs],
             }
+        finally:
+            if candidate_workspace_backend is not None:
+                await self._daemon_call(candidate_workspace_backend.close)
 
     async def _project_langsmith(
         self,
@@ -609,6 +772,12 @@ class EvaluationRunner:
                 update={
                     "summary": {
                         **latest.summary,
+                        "progress": {
+                            **dict(latest.summary.get("progress") or {}),
+                            "stage": "official_verifier",
+                            "message": "Agent patch 已生成，正在使用官方 Docker Harness 判卷",
+                            "updated_at": utc_now().isoformat(),
+                        },
                         "swebench_official_harness": {
                             "status": "running",
                             "total": len(prediction_manifest["predictions"]),
@@ -748,9 +917,44 @@ class EvaluationRunner:
         )
         return self.repository.complete_experiment_projection(updated, outbox_id)
 
+    def _update_progress(self, experiment_id: str, **changes: Any) -> EvalExperiment:
+        """Durably expose coarse-grained progress without weakening cancellation CAS."""
+
+        latest = self.repository.get_experiment(experiment_id)
+        if latest.status != ExperimentStatus.RUNNING:
+            return latest
+        progress = {
+            **dict(latest.summary.get("progress") or {}),
+            **changes,
+            "updated_at": utc_now().isoformat(),
+        }
+        try:
+            return self.repository.update_experiment(
+                latest.model_copy(update={"summary": {**latest.summary, "progress": progress}}),
+                expected_status=ExperimentStatus.RUNNING,
+            )
+        except ConflictError:
+            return self.repository.get_experiment(experiment_id)
+
     async def run(self, experiment_id: str) -> EvalExperiment:
         experiment = self.repository.get_experiment(experiment_id)
-        experiment = experiment.model_copy(update={"status": ExperimentStatus.RUNNING, "started_at": utc_now()})
+        experiment = experiment.model_copy(
+            update={
+                "status": ExperimentStatus.RUNNING,
+                "started_at": utc_now(),
+                "summary": {
+                    **experiment.summary,
+                    "progress": {
+                        **dict(experiment.summary.get("progress") or {}),
+                        "stage": "preparing",
+                        "message": "正在初始化隔离 Worker 和 Workspace",
+                        "completed": 0,
+                        "failed": 0,
+                        "updated_at": utc_now().isoformat(),
+                    },
+                },
+            }
+        )
         self.repository.update_experiment(experiment, expected_status=ExperimentStatus.QUEUED)
         runtime_root = self._runtime_root(experiment_id)
         try:
@@ -771,6 +975,16 @@ class EvaluationRunner:
                 dataset_data_classification = "restricted"
             outputs: dict[str, list[dict[str, Any]]] = defaultdict(list)
             all_attempts: list[dict[str, Any]] = []
+            enabled_cases = [case for case in dataset.cases if case.enabled]
+            total_attempts = len(enabled_cases) * experiment.execution.repetitions
+            self._update_progress(
+                experiment_id,
+                stage="preparing",
+                message="Dataset 已加载，正在准备第一个 Case",
+                total=total_attempts,
+                completed=0,
+                failed=0,
+            )
             # Phase 1 deliberately serializes execution. Resource-group-aware
             # concurrency comes only after durable locking exists.
             for repetition in range(experiment.execution.repetitions):
@@ -786,6 +1000,18 @@ class EvaluationRunner:
                         return self.repository.update_experiment(
                             cancelled, expected_status=ExperimentStatus.CANCEL_REQUESTED
                         )
+                    self._update_progress(
+                        experiment_id,
+                        stage="agent_running",
+                        message="Agent 正在处理 Case",
+                        total=total_attempts,
+                        completed=len(all_attempts),
+                        failed=sum(item.get("attempt_status") == "failed" for item in all_attempts),
+                        current_index=len(all_attempts) + 1,
+                        current_case_id=case.case_id,
+                        current_case_name=case.name,
+                        current_repetition=repetition + 1,
+                    )
                     result = await self._run_case(
                         experiment,
                         case,
@@ -797,6 +1023,18 @@ class EvaluationRunner:
                     # LangSmith Example identity is per Case. For repetitions,
                     # retain the last public output and keep aggregate locally.
                     outputs[case.case_id].append(result)
+                    self._update_progress(
+                        experiment_id,
+                        stage="case_completed",
+                        message="Case 执行完成，正在准备下一项",
+                        total=total_attempts,
+                        completed=len(all_attempts),
+                        failed=sum(item.get("attempt_status") == "failed" for item in all_attempts),
+                        current_index=len(all_attempts),
+                        current_case_id=case.case_id,
+                        current_case_name=case.name,
+                        current_repetition=repetition + 1,
+                    )
 
             swebench_official_harness: dict[str, Any] | None = None
             if any(
@@ -816,6 +1054,15 @@ class EvaluationRunner:
                         "reason": f"{type(exc).__name__}: {str(exc)[:1_000]}",
                     }
 
+            self._update_progress(
+                experiment_id,
+                stage="scoring",
+                message="正在汇总七维评分和执行证据",
+                total=total_attempts,
+                completed=len(all_attempts),
+                failed=sum(item.get("attempt_status") == "failed" for item in all_attempts),
+            )
+
             summary = {
                 "case_attempts": len(all_attempts),
                 "completed_attempts": sum(item.get("attempt_status") == "completed" for item in all_attempts),
@@ -828,6 +1075,14 @@ class EvaluationRunner:
                 "indeterminate": sum(item["summary"].get("verdict") == "indeterminate" for item in all_attempts),
                 "effective_max_concurrency": 1,
                 "requested_max_concurrency": experiment.execution.max_concurrency,
+                "progress": {
+                    "stage": "scoring",
+                    "message": "正在汇总七维评分和执行证据",
+                    "total": total_attempts,
+                    "completed": len(all_attempts),
+                    "failed": sum(item.get("attempt_status") == "failed" for item in all_attempts),
+                    "updated_at": utc_now().isoformat(),
+                },
             }
             if swebench_official_harness is not None:
                 summary["swebench_official_harness"] = swebench_official_harness
@@ -913,6 +1168,13 @@ class EvaluationRunner:
                 summary["dataset_projection"] = "blocked_by_data_policy"
                 summary["experiment_projection"] = "blocked_by_data_policy"
             else:
+                self._update_progress(
+                    experiment_id,
+                    stage="langsmith_projection",
+                    message="本地评分已完成，正在投影到 LangSmith",
+                    total=total_attempts,
+                    completed=len(all_attempts),
+                )
                 try:
                     bundle = self.repository.export_bundle(experiment.dataset_id, experiment.dataset_version)
                     mapping = LangSmithDatasetAdapter(self.repository, self.settings).sync_dataset(bundle)
@@ -971,7 +1233,17 @@ class EvaluationRunner:
                     "finished_at": utc_now(),
                     "remote_experiment_id": remote_id,
                     "remote_url": remote_url,
-                    "summary": summary,
+                    "summary": {
+                        **summary,
+                        "progress": {
+                            **dict(summary.get("progress") or {}),
+                            "stage": "completed",
+                            "message": "评测完成",
+                            "total": total_attempts,
+                            "completed": len(all_attempts),
+                            "updated_at": utc_now().isoformat(),
+                        },
+                    },
                 }
             )
             return self.repository.update_experiment(completed, expected_status=ExperimentStatus.RUNNING)
@@ -986,6 +1258,15 @@ class EvaluationRunner:
                 update={
                     "status": ExperimentStatus.FAILED,
                     "finished_at": utc_now(),
+                    "summary": {
+                        **latest.summary,
+                        "progress": {
+                            **dict(latest.summary.get("progress") or {}),
+                            "stage": "failed",
+                            "message": "评测执行失败",
+                            "updated_at": utc_now().isoformat(),
+                        },
+                    },
                     "error": EvalError(
                         code="experiment_failed",
                         message=f"{type(exc).__name__}: {str(exc)[:1000]}",

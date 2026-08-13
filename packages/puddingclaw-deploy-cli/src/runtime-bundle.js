@@ -161,6 +161,32 @@ async function listBundleFiles(root, directory = root) {
   return files;
 }
 
+async function mapConcurrent(items, concurrency, worker) {
+  const results = new Array(items.length);
+  let cursor = 0;
+  const runners = Array.from({ length: Math.min(concurrency, items.length) }, async () => {
+    while (cursor < items.length) {
+      const index = cursor;
+      cursor += 1;
+      results[index] = await worker(items[index], index);
+    }
+  });
+  await Promise.all(runners);
+  return results;
+}
+
+async function cleanupAbandonedInstalls(releases, { minimumAgeMs = 60 * 60 * 1000 } = {}) {
+  const now = Date.now();
+  for (const entry of await fs.readdir(releases, { withFileTypes: true })) {
+    if (!entry.isDirectory() || !entry.name.startsWith(".install-")) continue;
+    const target = path.join(releases, entry.name);
+    const stat = await fs.stat(target).catch(() => null);
+    if (stat && now - stat.mtimeMs >= minimumAgeMs) {
+      await fs.rm(target, { recursive: true, force: true }).catch(() => {});
+    }
+  }
+}
+
 export async function verifyRuntimeBundle(bundleRoot, manifest) {
   validateRuntimeManifest(manifest, bundleRoot);
   const actualFiles = await listBundleFiles(bundleRoot);
@@ -172,8 +198,8 @@ export async function verifyRuntimeBundle(bundleRoot, manifest) {
       details: { files: unlisted },
     });
   }
-  const checked = [];
-  for (const [relative, expected] of Object.entries(manifest.files)) {
+  const entries = Object.entries(manifest.files);
+  const checked = await mapConcurrent(entries, 8, async ([relative, expected]) => {
     const file = resolveInside(bundleRoot, relative, `files.${relative}`);
     let actual;
     try {
@@ -192,8 +218,8 @@ export async function verifyRuntimeBundle(bundleRoot, manifest) {
         details: { relative, expected: expected.toLowerCase(), actual },
       });
     }
-    checked.push(relative);
-  }
+    return relative;
+  });
   return { status: "verified", release_version: manifest.release_version, files: checked };
 }
 
@@ -201,7 +227,7 @@ export async function installRuntimeBundle(bundleRoot, paths) {
   const source = path.resolve(bundleRoot);
   const manifest = await readJson(path.join(source, "manifest.json"), null);
   if (!manifest) throw new CliError("runtime bundle manifest.json is missing", { code: "runtime_manifest_missing" });
-  await verifyRuntimeBundle(source, manifest);
+  validateRuntimeManifest(manifest, source);
   const releases = path.join(paths.runtime, "releases");
   const target = path.join(releases, manifest.release_version);
   try {
@@ -215,6 +241,7 @@ export async function installRuntimeBundle(bundleRoot, paths) {
     if (error?.code !== "ENOENT") throw error;
   }
   await fs.mkdir(releases, { recursive: true, mode: 0o700 });
+  await cleanupAbandonedInstalls(releases);
   const staging = path.join(releases, `.install-${manifest.release_version}-${randomUUID()}`);
   try {
     await fs.cp(source, staging, { recursive: true, errorOnExist: true, force: false });

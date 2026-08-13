@@ -13,14 +13,14 @@ pytestmark = pytest.mark.httpx_mock(assert_all_responses_were_requested=False)
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from capabilities import (
+from capabilities import (  # noqa: E402
     Capabilities,
     CapabilityStatus,
+    _check_http_get,
+    _check_http_get_sync,
     detect_capabilities,
     detect_capabilities_sync,
     invalidate_capabilities,
-    _check_http_get,
-    _check_http_get_sync,
 )
 
 
@@ -28,7 +28,15 @@ from capabilities import (
 def _clear_cache_and_env():
     """每个测试前清除缓存和相关环境变量。"""
     invalidate_capabilities()
-    for key in ("DATABASE_URL", "PUDDINGCLAW_DATABASE_URL", "POSTGRES_URL", "MILVUS_URL", "MINERU_URL"):
+    for key in (
+        "DATABASE_URL",
+        "PUDDINGCLAW_DATABASE_URL",
+        "PUDDINGCLAW_DATABASE_MODE",
+        "PUDDINGCLAW_DATABASE_SOURCE",
+        "POSTGRES_URL",
+        "MILVUS_URL",
+        "MINERU_URL",
+    ):
         os.environ.pop(key, None)
     yield
     invalidate_capabilities()
@@ -77,6 +85,24 @@ async def test_detect_capabilities_no_services(httpx_mock):
     assert caps.docker.available is False
     assert caps.milvus.available is False
     assert caps.mineru.available is False
+
+
+@pytest.mark.asyncio
+async def test_harness_profile_does_not_probe_knowledge_infrastructure(monkeypatch):
+    monkeypatch.setenv("PUDDINGCLAW_EXTENSION_KNOWLEDGE", "0")
+    with (
+        mock.patch("capabilities._check_pgvector") as pgvector,
+        mock.patch("capabilities._check_milvus") as milvus,
+        mock.patch("capabilities._check_http_get") as mineru,
+    ):
+        caps = await detect_capabilities(force=True)
+
+    pgvector.assert_not_awaited()
+    milvus.assert_not_awaited()
+    mineru.assert_not_awaited()
+    assert caps.pgvector.reason == "pgvector is disabled by the current Runtime Profile"
+    assert caps.milvus.reason == "Milvus is disabled by the current Runtime Profile"
+    assert caps.mineru.reason == "MinerU is disabled by the current Runtime Profile"
 
 
 @pytest.mark.asyncio

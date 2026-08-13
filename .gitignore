@@ -66,6 +66,7 @@ iterm2_workspace.iterm2arrangement
 
 # Logs
 *.log
+backend/logs/
 
 # Build outputs
 dist/

@@ -35,25 +35,34 @@ for (const key of [
 }
 
 fs.mkdirSync(controlPath, { recursive: true, mode: 0o700 });
-const requestPath = path.join(controlPath, "request.json");
-const responsePath = path.join(controlPath, "response.json");
 const controlTimer = setInterval(() => {
+  let requests = [];
   try {
-    const request = JSON.parse(fs.readFileSync(requestPath, "utf8"));
-    if (request.action !== "identify" || request.token !== controlToken
-      || !/^[a-f0-9-]{36}$/i.test(String(request.nonce || ""))) return;
-    const temporary = path.join(controlPath, `.response-${process.pid}.tmp`);
-    fs.writeFileSync(temporary, `${JSON.stringify({
-      ok: true,
-      nonce: request.nonce,
-      instance_id: instanceId,
-      role,
-      pid: process.pid,
-    })}\n`, { mode: 0o600 });
-    fs.renameSync(temporary, responsePath);
+    requests = fs.readdirSync(controlPath).filter((name) => /^request-[a-f0-9-]{36}\.json$/i.test(name));
   } catch (error) {
-    if (error?.code !== "ENOENT") {
-      process.stderr.write(`runtime control check failed: ${error.message}\n`);
+    if (error?.code !== "ENOENT") process.stderr.write(`runtime control scan failed: ${error.message}\n`);
+  }
+  for (const fileName of requests) {
+    const requestPath = path.join(controlPath, fileName);
+    try {
+      const request = JSON.parse(fs.readFileSync(requestPath, "utf8"));
+      const nonce = fileName.slice("request-".length, -".json".length);
+      if (request.action !== "identify" || request.token !== controlToken || request.nonce !== nonce) continue;
+      const responsePath = path.join(controlPath, `response-${nonce}.json`);
+      const temporary = path.join(controlPath, `.response-${nonce}-${process.pid}.tmp`);
+      fs.writeFileSync(temporary, `${JSON.stringify({
+        ok: true,
+        nonce,
+        instance_id: instanceId,
+        role,
+        pid: process.pid,
+      })}\n`, { mode: 0o600 });
+      fs.renameSync(temporary, responsePath);
+      fs.rmSync(requestPath, { force: true });
+    } catch (error) {
+      if (error?.code !== "ENOENT") {
+        process.stderr.write(`runtime control check failed: ${error.message}\n`);
+      }
     }
   }
 }, 100);
@@ -79,5 +88,5 @@ child.once("error", (error) => {
 
 child.once("exit", (code, signal) => {
   clearInterval(controlTimer);
-  process.exit(code ?? (signal ? 1 : 1));
+  process.exit(code ?? 1);
 });

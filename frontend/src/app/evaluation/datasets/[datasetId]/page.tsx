@@ -1,8 +1,9 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
+import Link from "next/link";
 import { useParams } from "next/navigation";
-import { CheckCircle2, Copy, Loader2, Plus, Save, Trash2 } from "lucide-react";
+import { ArrowLeft, CheckCircle2, Copy, Loader2, Plus, Save, Trash2 } from "lucide-react";
 import {
   addEvaluationCase,
   deleteEvaluationCase,
@@ -151,7 +152,7 @@ export default function DatasetDetailPage() {
   if (!dataset) return <div className="p-8 text-sm text-red-700">{error || "Dataset 不存在"}</div>;
 
   return <div className="grid min-h-full grid-cols-[280px_minmax(0,1fr)]">
-    <aside className="border-r bg-gray-50/70 p-4"><div className="mb-3"><h1 className="font-semibold">{dataset.name}</h1><p className="text-xs text-gray-500">{dataset.status} · v{dataset.current_version} · revision {dataset.revision}</p></div>
+    <aside className="border-r bg-gray-50/70 p-4"><Link href="/evaluation/datasets" onClick={(event) => { if (dirty && !window.confirm("当前 Case 有未保存修改，确定返回评测集吗？")) event.preventDefault(); }} className="mb-4 inline-flex items-center gap-1.5 text-xs font-medium text-[#002fa7] hover:underline"><ArrowLeft className="h-3.5 w-3.5" />返回评测集</Link><div className="mb-3"><h1 className="font-semibold">{dataset.name}</h1><p className="text-xs text-gray-500">{dataset.status} · v{dataset.current_version} · revision {dataset.revision}</p></div>
       {editable && <div className="mb-3 grid grid-cols-2 gap-2"><button disabled={busy} onClick={() => choose(dataset.default_profile === "coding_agent@1" ? newCodeCase() : newCase())} className="flex items-center justify-center gap-1 rounded-lg border bg-white py-2 text-xs"><Plus className="h-3.5 w-3.5" />{dataset.default_profile === "coding_agent@1" ? "新增代码题" : "新增空白"}</button><button disabled={busy || !selected} onClick={() => selected && choose(copyCase(selected))} className="flex items-center justify-center gap-1 rounded-lg border bg-white py-2 text-xs disabled:opacity-40"><Copy className="h-3.5 w-3.5" />复制当前</button></div>}
       <div className="space-y-1">{dataset.cases.map((item) => <button key={item.case_id} onClick={() => choose(item)} className={`w-full rounded-lg px-3 py-2 text-left text-sm ${selected?.case_id === item.case_id ? "bg-[#002fa7] text-white" : "hover:bg-white"}`}><div className="truncate">{item.name}</div><div className="truncate text-[11px] opacity-60">{item.criticality} · {item.data_classification}</div></button>)}</div>
     </aside>

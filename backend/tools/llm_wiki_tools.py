@@ -68,14 +68,42 @@ class NoInput(BaseModel):
     pass
 
 
+class WikiConversationDocumentsInput(BaseModel):
+    document_ids: list[str] = Field(
+        default_factory=list,
+        max_length=32,
+        description=(
+            "Optional exact ids from the catalog. Empty lists metadata only; selected ids return their full "
+            "server-owned content so the Agent can synthesize the corrected Raw Markdown."
+        ),
+    )
+
+
 class WikiCreateRawInput(BaseModel):
     source: Literal["current_message", "conversation", "attachments", "knowledge_file"] = Field(
         description=(
-            "Authoritative input to snapshot. Use conversation when the user refers to material already established "
-            "in recent visible chat context; the server resolves it without copying text into arguments."
+            "Authoritative input to snapshot. For conversation, first inspect llm_wiki_conversation_documents and pass "
+            "the exact Agent-selected conversation_document_ids; no implicit recent-message range is allowed."
         )
     )
     title: str = Field(default="", max_length=200)
+    conversation_document_ids: list[str] = Field(
+        default_factory=list,
+        max_length=32,
+        description=(
+            "For source=conversation, the exact document_id values selected by the Agent from "
+            "llm_wiki_conversation_documents. The server never selects a recent-message window automatically."
+        ),
+    )
+    raw_markdown: str = Field(
+        default="",
+        max_length=200_000,
+        description=(
+            "For source=conversation, the final clean Markdown synthesized by the main Agent from the selected "
+            "documents plus the user's current corrections. The server snapshots these exact bytes and never "
+            "concatenates Session history."
+        ),
+    )
     attachment_ids: list[str] = Field(
         default_factory=list,
         description="For attachments, selected current-turn Markdown attachment ids. Empty means every current Markdown attachment.",
@@ -265,20 +293,74 @@ class LlmWikiCompileTool(_WikiTool):
             return self.error(exc)
 
 
+class LlmWikiConversationDocumentsTool(_WikiTool):
+    name: str = "llm_wiki_conversation_documents"
+    description: str = (
+        "List the current Session's selectable conversation documents. Each completed user/assistant exchange and the "
+        "current user instruction has a stable document_id plus a short preview. Call with no ids to inspect the catalog; "
+        "then call with selected ids to read their exact content. The main Agent uses those sources and the user's current "
+        "corrections to synthesize final Raw Markdown."
+    )
+    args_schema: type[BaseModel] = WikiConversationDocumentsInput
+    risk_level: str = "safe"
+    current_conversation_documents: list[dict[str, Any]] = Field(
+        default_factory=list,
+        exclude=True,
+        repr=False,
+    )
+
+    def _run(self, document_ids: list[str] | None = None) -> str:
+        requested = list(
+            dict.fromkeys(str(item).strip() for item in document_ids or [] if str(item).strip())
+        )
+        available = {
+            str(item.get("document_id") or ""): item
+            for item in self.current_conversation_documents
+            if isinstance(item, dict) and str(item.get("document_id") or "")
+        }
+        unknown = [item for item in requested if item not in available]
+        if unknown:
+            return self.error(LlmWikiError(f"会话文档不属于当前 Session：{', '.join(unknown)}"))
+        selected = [available[item] for item in requested] if requested else list(available.values())
+        documents = []
+        for item in selected:
+            if not isinstance(item, dict):
+                continue
+            document = {
+                "document_id": str(item.get("document_id") or ""),
+                "kind": str(item.get("kind") or "exchange"),
+                "title": str(item.get("title") or ""),
+                "preview": str(item.get("preview") or ""),
+                "character_count": int(item.get("character_count") or 0),
+            }
+            if requested:
+                document["content"] = str(item.get("content") or "")
+            documents.append(document)
+        return self.encode({"ok": True, "documents": documents})
+
+
 class LlmWikiCreateRawTool(_WikiTool):
     name: str = "llm_wiki_create_raw"
     description: str = (
-        "Create immutable LLM Wiki Raw snapshots from the exact current chat message, recent user-visible conversation, "
+        "Create immutable LLM Wiki Raw snapshots from the exact current chat message, explicitly selected conversation "
+        "documents, "
         "current Markdown attachments, or one existing /knowledge/ Markdown file. Use source=conversation when the user "
-        "says to compile material discussed earlier in this Session. The server reads authoritative bytes; never paste "
-        "document content into tool arguments. After success, pass returned raw_paths to llm_wiki_start_ingest."
+        "refers to earlier Session material: inspect and read the selected documents, then synthesize a clean final "
+        "raw_markdown that incorporates the user's current corrections. Pass both the selected document ids and that "
+        "Markdown. The server snapshots the Agent-authored Markdown exactly and never concatenates Session history. "
+        "The title labels provenance only; it does not constrain page type, slug, title, or page count. After success, "
+        "pass returned raw_paths to llm_wiki_start_ingest."
     )
     args_schema: type[BaseModel] = WikiCreateRawInput
     risk_level: str = "moderate"
     session_id: str = Field(default="", exclude=True, repr=False)
     query_id: str = Field(default="", exclude=True, repr=False)
     current_message: str = Field(default="", exclude=True, repr=False)
-    current_conversation: str = Field(default="", exclude=True, repr=False)
+    current_conversation_documents: list[dict[str, Any]] = Field(
+        default_factory=list,
+        exclude=True,
+        repr=False,
+    )
     current_attachments: list[dict[str, Any]] = Field(default_factory=list, exclude=True, repr=False)
 
     def _run(self, **kwargs: Any) -> str:
@@ -288,6 +370,8 @@ class LlmWikiCreateRawTool(_WikiTool):
         self,
         source: str,
         title: str = "",
+        conversation_document_ids: list[str] | None = None,
+        raw_markdown: str = "",
         attachment_ids: list[str] | None = None,
         virtual_path: str = "",
     ) -> str:
@@ -310,18 +394,46 @@ class LlmWikiCreateRawTool(_WikiTool):
                     )
                 )
             elif source == "conversation":
-                content = self.current_conversation
-                if not content.strip():
-                    raise LlmWikiError("当前会话没有可写入 Raw 的可见对话内容")
+                available = {
+                    str(item.get("document_id") or ""): item
+                    for item in self.current_conversation_documents
+                    if isinstance(item, dict) and str(item.get("document_id") or "")
+                }
+                selected_ids = list(
+                    dict.fromkeys(
+                        str(item).strip()
+                        for item in conversation_document_ids or []
+                        if str(item).strip()
+                    )
+                )
+                if not selected_ids:
+                    raise LlmWikiError(
+                        "source=conversation 必须显式传 conversation_document_ids；"
+                        "请先调用 llm_wiki_conversation_documents，由 Agent 选择相关会话文档"
+                    )
+                unauthorized = [item for item in selected_ids if item not in available]
+                if unauthorized:
+                    raise LlmWikiError(f"会话文档不属于当前 Session：{', '.join(unauthorized)}")
+                content = str(raw_markdown or "").strip()
+                if not content:
+                    raise LlmWikiError(
+                        "source=conversation 必须传入 Agent 根据所选文档和用户修正实时生成的 raw_markdown"
+                    )
                 asset_id = self.query_id or hashlib.sha256(content.encode("utf-8")).hexdigest()
+                provenance_digest = hashlib.sha256(
+                    json.dumps(selected_ids, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+                ).hexdigest()[:16]
                 records.append(
                     await asyncio.to_thread(
                         self.service.snapshot_raw,
-                        source_id=f"conversation:{self.session_id or 'unknown'}",
+                        source_id=f"conversation-synthesis:{self.session_id or 'unknown'}",
                         asset_id=asset_id,
                         title=clean_title or "会话整理材料",
                         content=content,
-                        source_path=f"conversation://{self.session_id or 'unknown'}/{asset_id}",
+                        source_path=(
+                            f"conversation-synthesis://{self.session_id or 'unknown'}/{asset_id}"
+                            f"?documents_sha256={provenance_digest}"
+                        ),
                     )
                 )
             elif source == "attachments":
@@ -400,6 +512,9 @@ class LlmWikiCreateRawTool(_WikiTool):
                     "ok": True,
                     "raw_paths": [str(record["snapshot_path"]) for record in records],
                     "snapshots": records,
+                    "conversation_document_ids": (
+                        selected_ids if source == "conversation" else []
+                    ),
                     "intake_id": _intake_id(
                         session_id=self.session_id,
                         query_id=self.query_id,
@@ -418,7 +533,8 @@ class LlmWikiStartIngestTool(_WikiTool):
         "Queue the existing durable LLM Wiki compiler pipeline for exact immutable raw_paths. Returns immediately with "
         "a task id. By default the dedicated compiler Agent stops after context → publish → lint (Wiki only). Set "
         "import_gbrain=true only when the user explicitly requests gbrain; that adds the validated gbrain PostgreSQL "
-        "import as a second stage."
+        "import as a second stage. The queue request does not prescribe or reveal final page types, slugs, titles, or "
+        "page count; do not claim those outputs until the Compiler has completed."
     )
     args_schema: type[BaseModel] = WikiStartIngestInput
     risk_level: str = "moderate"
@@ -522,6 +638,7 @@ def create_llm_wiki_tools(base_dir: Path) -> list[BaseTool]:
         LlmWikiLintTool(base_dir=resolved),
         LlmWikiQueryTool(base_dir=resolved),
         LlmWikiCompileTool(base_dir=resolved),
+        LlmWikiConversationDocumentsTool(base_dir=resolved),
         LlmWikiCreateRawTool(base_dir=resolved),
         LlmWikiStartIngestTool(base_dir=resolved),
         LlmWikiRetirePagesTool(base_dir=resolved),

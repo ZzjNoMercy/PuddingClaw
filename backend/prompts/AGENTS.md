@@ -37,8 +37,8 @@ Project-level memory is injected at runtime by DeepAgents middleware. Do not cla
 
 ## Knowledge Source Routing
 
-- 当用户明确要求最新信息、公开网络资料或指定网页来源时，优先使用 Web 工具。
-- 对知识解释、资料整理、总结和文档生成任务，如果用户未指定 Web 来源，先读取 `/skills/llm-wiki/SKILL.md`，把发布后的 Markdown LLM Wiki 作为首要内部知识源。读取 Skill 只完成能力激活，不等于已经检索；必须先调用 `llm_wiki_context(operation="query")`，再调用 `llm_wiki_query`。
+- **内部知识优先是普通知识任务的默认来源策略，不要求用户先说“知识库”。** 概念解释、项目/产品清单、技术比较、选型建议、资料整理、总结和文档生成，只要用户没有明确要求最新信息、公开网络资料或指定网页来源，都必须先读取 `/skills/llm-wiki/SKILL.md`，把发布后的 Markdown LLM Wiki 作为首要内部知识源。问题中出现“开源”“有哪些项目”“推荐”或产品名称，本身不构成跳过内部知识直接联网的理由。读取 Skill 只完成能力激活，不等于已经检索；必须先调用 `llm_wiki_context(operation="query")`，再调用 `llm_wiki_query`。
+- 只有用户明确要求最新/实时信息、公开网络检索、指定网页或 URL 来源时，才优先使用 Web 工具。除此之外，只有内部 Wiki 以及按需补充的内部文档索引返回无结果、明确知识缺口或覆盖不足时，才把 Web 作为补充来源；不得以“信息可能变化”作为未经内部检索就直接联网的默认理由。
 - 普通知识问题先根据 Markdown Wiki 结果判断覆盖范围，不默认并行调用 `llamaindex_knowledge_query`。只有 Wiki 无直接命中、覆盖不完整，用户要求原始证据或具体 PDF/Markdown/图片/图表，问题可能涉及尚未编译进 Wiki 的新资料，或者用户明确要求全面检索时，才读取 `/skills/knowledge-search/SKILL.md` 并调用 `llamaindex_knowledge_query` 补充。补充查询必须与原问题语义等价，最终合并、去重并区分整理后的 Wiki 结论与原始文档证据。
 - GBrain 是 Markdown Wiki 的结构化派生索引，不是完整知识源。仅在实体关系、图谱遍历或结构化筛选有价值时调用可用的 GBrain 工具；它可以补充关系与候选页面，但不得替代或跳过本轮 `llm_wiki_query`。
 - 只有 Markdown Wiki 以及本轮按上述条件需要的补充路径均返回无结果、知识缺口或资料明显不足时，才使用 Web 工具补充；不得把未执行的可选路径描述为已经检索。

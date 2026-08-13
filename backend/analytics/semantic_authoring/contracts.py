@@ -195,6 +195,13 @@ KIND_EFFECTS: dict[DefinitionKind, tuple[FrontmatterEffect, ...]] = {
             ("analytics.models.registry",),
             "required",
         ),
+        FrontmatterEffect(
+            "references",
+            "agent_backend",
+            "Registers model-local reference documents exposed to the analysis context.",
+            ("analytics.models.registry",),
+            "required",
+        ),
     ),
 }
 
@@ -267,6 +274,15 @@ def repair_technical_frontmatter(
         # inference.  Fill a missing type but never overwrite a conflict.
         "type": expected_type,
     }
+    if kind == "analytics_model":
+        model_id = PurePosixPath(logical_path).parent.name
+        existing_id = str(meta.get("id") or "").strip()
+        if existing_id and existing_id != model_id:
+            raise ValueError(
+                "frontmatter field 'id' conflicts with the explicit target path: "
+                f"expected '{model_id}', got '{existing_id}'"
+            )
+        defaults["id"] = model_id
     for field, value in defaults.items():
         if meta.get(field) != value:
             meta[field] = value

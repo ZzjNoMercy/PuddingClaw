@@ -31,9 +31,9 @@ async function verifyOwnedProcess(item, home) {
   const expectedRoot = path.resolve(item.control_path);
   const controlRoot = path.resolve(home, "control");
   if (!expectedRoot.startsWith(`${controlRoot}${path.sep}`)) return false;
-  const requestPath = path.join(expectedRoot, "request.json");
-  const responsePath = path.join(expectedRoot, "response.json");
   const nonce = randomUUID();
+  const requestPath = path.join(expectedRoot, `request-${nonce}.json`);
+  const responsePath = path.join(expectedRoot, `response-${nonce}.json`);
   try {
     await fs.rm(responsePath, { force: true });
     await writeJsonAtomic(requestPath, { action: "identify", token: item.control_token, nonce });
@@ -152,12 +152,31 @@ export async function startRuntime(paths, { automaticPorts = false, timeoutMs = 
   if (existingStatus.status === "running") {
     return { status: "already_running", runtime: publicRuntimeState(existing) };
   }
-  if (existing) {
-    throw new CliError("stale runtime state exists; inspect it before starting another instance", {
-      code: "stale_runtime_state",
-      exitCode: 1,
-      details: existingStatus,
-    });
+  if (
+    existing
+    && existingStatus.status === "stale"
+    && existingStatus.alive_pids?.length === 0
+    && path.resolve(String(existing.home || "")) === path.resolve(paths.home)
+  ) {
+    await Promise.all(Object.values(existing.processes || {}).map((item) => cleanupControlPath(item, paths.home)));
+    await fs.rm(paths.runtimeState, { force: true });
+  } else if (existing) {
+    throw new CliError(
+      "runtime ownership cannot be verified; run `puddingclaw status --json` and do not kill unknown PIDs. "
+      + `After confirming they are unrelated, delete ${paths.runtimeState} and retry`,
+      {
+        code: "stale_runtime_state",
+        exitCode: 1,
+        details: {
+          ...existingStatus,
+          recovery: {
+            inspect: "puddingclaw status --json",
+            state_file: paths.runtimeState,
+            warning: "Never terminate a PID unless you have independently confirmed that you own it.",
+          },
+        },
+      },
+    );
   }
   const active = await loadActiveRuntime(paths);
   if (!active) {
@@ -170,6 +189,10 @@ export async function startRuntime(paths, { automaticPorts = false, timeoutMs = 
   const initialProviderApiKey = config.provider?.status === "unconfigured"
     ? ""
     : await readSecret(paths.providerApiKey);
+  const initialMultimodalProviderApiKey = config.multimodal_provider?.status === "unconfigured"
+    || config.multimodal_provider?.reuse_primary_credential
+    ? ""
+    : await readSecret(paths.multimodalProviderApiKey);
   const embeddingApiKey = config.infrastructure?.embedding?.status === "disabled"
     ? ""
     : await readSecret(paths.embeddingApiKey);
@@ -231,8 +254,15 @@ export async function startRuntime(paths, { automaticPorts = false, timeoutMs = 
           ...(name === "backend" ? {
             PUDDINGCLAW_HEADLESS_TOKEN: localWorkerToken,
             PUDDINGCLAW_INITIAL_PROVIDER: JSON.stringify(config.provider || {}),
+            PUDDINGCLAW_INITIAL_PROVIDER_BOOTSTRAP_ID: config.initialized_at || "legacy",
             ...(initialProviderApiKey ? { PUDDINGCLAW_INITIAL_PROVIDER_API_KEY: initialProviderApiKey } : {}),
+            PUDDINGCLAW_INITIAL_MULTIMODAL_PROVIDER: JSON.stringify(config.multimodal_provider || {}),
+            ...(initialMultimodalProviderApiKey
+              ? { PUDDINGCLAW_INITIAL_MULTIMODAL_PROVIDER_API_KEY: initialMultimodalProviderApiKey }
+              : {}),
             ...(embeddingApiKey ? { DASHSCOPE_API_KEY: embeddingApiKey } : {}),
+            PUDDINGCLAW_DATABASE_MODE: config.infrastructure?.catalog?.mode || "sqlite",
+            PUDDINGCLAW_DATABASE_SOURCE: config.infrastructure?.catalog?.source || "fallback",
             ...(databaseUrl ? { PUDDINGCLAW_DATABASE_URL: databaseUrl } : {}),
             ...(config.infrastructure?.milvus?.enabled
               ? {
@@ -334,10 +364,22 @@ export async function stopRuntime(paths, { force = false } = {}) {
   })));
   const unverified = verification.filter(({ verified }) => !verified).map(({ item }) => item);
   if (unverified.length) {
-    throw new CliError("refusing to stop a process whose ownership cannot be verified", {
-      code: "runtime_ownership_mismatch",
-      details: { pids: unverified.map((item) => item.pid) },
-    });
+    throw new CliError(
+      "refusing to stop a process whose ownership cannot be verified; the PID may have been reused. "
+      + `Run \`puddingclaw status --json\`; after confirming the PID is unrelated, delete ${paths.runtimeState} `
+      + "without terminating that process",
+      {
+        code: "runtime_ownership_mismatch",
+        details: {
+          pids: unverified.map((item) => item.pid),
+          recovery: {
+            inspect: "puddingclaw status --json",
+            state_file: paths.runtimeState,
+            warning: "Never terminate a PID unless you have independently confirmed that you own it.",
+          },
+        },
+      },
+    );
   }
   for (const item of alive) terminateProcessGroup(item.pid, "SIGTERM");
   const stopped = await waitUntilStopped(alive.map((item) => item.pid), 5000);
