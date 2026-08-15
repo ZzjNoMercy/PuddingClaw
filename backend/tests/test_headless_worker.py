@@ -406,6 +406,7 @@ async def test_new_headless_run_returns_session_retention_metadata(tmp_path: Pat
     assert response["session_ttl_seconds"] == 86_400
     assert response["session_expires_at"] > time.time()
     assert session_manager.get_metadata(response["session_id"])["analytics_model_id"] == "analysis"
+    assert session_manager.get_metadata(response["session_id"])["session_source"] == "cli"
     assert logged["key_name"] == "puddingteams"
     assert logged["query"] == "新任务"
 

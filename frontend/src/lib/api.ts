@@ -3919,6 +3919,7 @@ export async function listSessions(): Promise<
     project_path?: string | null;
     workspace_type?: string;
     workspace_path?: string;
+    session_source?: string;
     analytics_model_id?: string | null;
     llm_model_id?: string | null;
     thinking_level?: "low" | "high" | "max" | null;

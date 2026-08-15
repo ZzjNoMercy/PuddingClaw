@@ -10,6 +10,7 @@ from typing import Any
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
+from graph.host_read_policy import is_sensitive_host_read_path
 from graph.session_manager import session_manager
 from projects.project_agents import read_project_agents
 from projects.registry import project_registry
@@ -148,17 +149,30 @@ async def open_project(project_id: str):
 
 @router.post("/local-files/open")
 async def open_local_file(request: OpenLocalFileRequest):
-    """Open a file generated inside the current Agent workspace."""
+    """Open a local file using the Session's filesystem authority.
+
+    Smart local execution intentionally treats ordinary host paths as usable
+    filesystem locations.  A file surfaced by a SubAgent may therefore live
+    outside the parent Session workspace.  Keep Strict workspace-confined and
+    keep credential-shaped host paths outside Smart's ordinary-file path.
+    """
 
     metadata = session_manager.get_metadata(request.session_id)
     workspace_path = metadata.get("workspace_path")
-    if not workspace_path:
-        raise HTTPException(status_code=400, detail="Session has no workspace_path")
-
-    workspace = Path(str(workspace_path)).expanduser().resolve()
     target = Path(request.path.removeprefix("file://")).expanduser().resolve()
-    if not _is_relative_to(target, workspace):
-        raise HTTPException(status_code=403, detail="File is outside the session workspace")
+    workspace = Path(str(workspace_path)).expanduser().resolve() if workspace_path else None
+    inside_workspace = workspace is not None and _is_relative_to(target, workspace)
+
+    if not inside_workspace:
+        if str(metadata.get("approval_mode") or "strict") != "smart":
+            if workspace is None:
+                raise HTTPException(status_code=400, detail="Session has no workspace_path")
+            raise HTTPException(status_code=403, detail="File is outside the session workspace")
+        if is_sensitive_host_read_path(target):
+            raise HTTPException(
+                status_code=403,
+                detail="Sensitive host files cannot be opened from a generated file link",
+            )
     if not target.exists():
         raise HTTPException(status_code=404, detail=f"File not found: {target}")
 

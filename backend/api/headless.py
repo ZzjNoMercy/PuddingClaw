@@ -1080,6 +1080,14 @@ async def create_headless_run(
                         detail="Headless Session expired after its configured inactivity TTL",
                     )
                 raise HTTPException(status_code=409, detail="Headless Session changed while expiry was checked")
+            session_manager.update_metadata(
+                session_id,
+                {
+                    "workspace_path": str(workspace_path),
+                    "project_id": project_id,
+                    "session_source": "cli",
+                },
+            )
             approval_mode = str(metadata.get("approval_mode") or approval_mode)
             selected = str(metadata.get("analytics_model_id") or "").strip()
             allowed_ids = {str(item.get("id") or "") for item in models}
@@ -1121,11 +1129,6 @@ async def create_headless_run(
                             idempotency_finished = True
                         return response
                     session_manager.update_metadata(session_id, {"analytics_model_id": selected})
-            if metadata.get("workspace_path") != str(workspace_path) or metadata.get("project_id") != project_id:
-                session_manager.update_metadata(
-                    session_id,
-                    {"workspace_path": str(workspace_path), "project_id": project_id},
-                )
         else:
             project_id, workspace_path = _resolve_worker_project(request.workspace_path)
             model_route = await _route_analytics_model(request.message, principal)
@@ -1150,6 +1153,7 @@ async def create_headless_run(
                     "analytics_model_id": selected,
                     "workspace_path": str(workspace_path),
                     "project_id": project_id,
+                    "session_source": "cli",
                 },
                 approval_mode=approval_mode,
             )
