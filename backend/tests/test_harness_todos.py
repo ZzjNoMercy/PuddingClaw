@@ -1,4 +1,5 @@
 import pytest
+from pydantic import ValidationError
 from langchain_core.messages import AIMessage, ToolMessage
 from langgraph.graph import END, START, StateGraph
 from langgraph.prebuilt import ToolNode
@@ -10,9 +11,33 @@ from graph.middlewares.harness_todos import (
     HarnessTodoMiddleware,
     HarnessTodoState,
     TodoPatchOperation,
+    UpdateTodosInput,
     _apply_operations,
     _available_todo_evidence,
 )
+
+
+def test_update_todos_tool_schema_makes_create_completed_unrepresentable():
+    schema = UpdateTodosInput.model_json_schema()
+
+    assert "discriminator" in str(schema)
+    create_schema = schema["$defs"]["CreateTodoOperation"]
+    assert create_schema["properties"]["status"]["enum"] == [
+        "pending",
+        "in_progress",
+    ]
+    with pytest.raises(ValidationError):
+        UpdateTodosInput.model_validate(
+            {
+                "operations": [
+                    {
+                        "action": "create",
+                        "content": "已经完成的伪任务",
+                        "status": "completed",
+                    }
+                ]
+            }
+        )
 
 
 def test_harness_todo_ledger_remains_in_compiled_agent_input_schema():
@@ -99,7 +124,7 @@ def test_todo_create_is_idempotent_for_replayed_tool_call_and_cannot_replace_pen
 
 
 def test_todo_create_cannot_bypass_lifecycle_as_already_completed():
-    with pytest.raises(ValueError, match="cannot start in completed status"):
+    with pytest.raises(ValueError, match="create status must be pending or in_progress"):
         _apply_operations(
             [],
             [

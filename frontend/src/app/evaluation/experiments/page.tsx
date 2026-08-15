@@ -8,6 +8,8 @@ import {
   deleteEvaluationExperiment,
   getEvaluationExperimentResults,
   listEvaluationExperiments,
+  rerunSWEbenchVerifier,
+  resumeMissingSWEbenchCases,
   retryEvaluationExperiment,
   swebenchPredictionExportUrl,
   syncEvaluationExperiment,
@@ -17,14 +19,14 @@ import {
 import { experimentIsTerminal, safeRemoteUrl } from "@/lib/evaluationState";
 
 const actionClass =
-  "inline-flex h-8 items-center gap-1.5 rounded-lg border border-gray-200 bg-white px-3 text-xs font-medium text-gray-700 transition hover:border-gray-300 hover:bg-gray-50 disabled:cursor-not-allowed disabled:opacity-40";
+  "inline-flex h-8 shrink-0 items-center gap-1.5 whitespace-nowrap rounded-lg border border-gray-200 bg-white px-3 text-xs font-medium text-gray-700 transition hover:border-gray-300 hover:bg-gray-50 disabled:cursor-not-allowed disabled:opacity-40";
 
 const progressStageLabels: Record<string, string> = {
-  queued: "等待 Worker",
+  queued: "等待执行进程",
   preparing: "准备隔离环境",
-  candidate_environment: "准备 Agent 依赖环境",
-  agent_running: "Agent 执行中",
-  case_completed: "Case 已完成",
+  candidate_environment: "准备智能体依赖环境",
+  agent_running: "智能体执行中",
+  case_completed: "用例已完成",
   official_verifier: "Docker 判卷中",
   scoring: "汇总评分",
   langsmith_projection: "投影 LangSmith",
@@ -32,6 +34,67 @@ const progressStageLabels: Record<string, string> = {
   completed: "评测完成",
   failed: "执行失败",
 };
+
+const experimentStatusLabels: Record<string, string> = {
+  queued: "排队中",
+  running: "运行中",
+  completed: "已完成",
+  failed: "失败",
+  cancel_requested: "正在取消",
+  cancelled: "已取消",
+};
+
+const integrationStatusLabels: Record<string, string> = {
+  disabled: "已禁用",
+  pending: "待投影",
+  synced: "已投影",
+  completed: "已完成",
+  failed: "失败",
+  error: "异常",
+  not_started: "未开始",
+  not_configured: "未配置",
+};
+
+const outcomeLabels: Record<string, string> = {
+  pass: "通过",
+  fail: "未通过",
+  error: "异常",
+  not_evaluated: "未评估",
+  not_applicable: "不适用",
+};
+
+function statusLabel(value: unknown, fallback = "未配置"): string {
+  const status = String(value || "");
+  return experimentStatusLabels[status] || integrationStatusLabels[status] || status || fallback;
+}
+
+function harnessStatusLabel(value: unknown): string {
+  const status = String(value || "");
+  return ({
+    pending: "等待中",
+    not_started: "未开始",
+    running: "判卷中",
+    completed: "判卷完成",
+    failed: "判卷失败",
+    error: "判卷异常",
+    cancelled: "已取消",
+  } as Record<string, string>)[status] || status || "等待中";
+}
+
+function outcomeLabel(value: string): string {
+  return outcomeLabels[value] || value;
+}
+
+function candidateLabel(value: string): string {
+  if (value === "当前 Agent") return "当前智能体";
+  return value.replace(/Agent/g, "智能体");
+}
+
+function profileLabel(value: string): string {
+  if (value === "coding_agent@1") return "代码智能体";
+  if (value === "general_agent@1") return "通用智能体";
+  return value;
+}
 
 function numberValue(value: unknown): number {
   const parsed = Number(value);
@@ -94,11 +157,21 @@ function attemptDuration(attempt: AttemptView): string {
   );
   if (!Number.isFinite(milliseconds) || milliseconds <= 0) return "";
   const seconds = Math.max(1, Math.round(milliseconds / 1000));
-  return seconds < 60 ? `${seconds}s` : `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
+  return seconds < 60 ? `${seconds} 秒` : `${Math.floor(seconds / 60)} 分 ${seconds % 60} 秒`;
 }
 
-function LiveAttemptResults({ rows }: { rows: EvalExperimentResultRow[] }) {
-  const attempts = attemptViews(rows);
+function LiveAttemptResults({
+  rows,
+  effectiveAttemptIds,
+}: {
+  rows: EvalExperimentResultRow[];
+  effectiveAttemptIds?: string[];
+}) {
+  const effectiveSet = new Set(effectiveAttemptIds || []);
+  const visibleRows = effectiveSet.size > 0
+    ? rows.filter((row) => effectiveSet.has(row.attempt_id))
+    : rows;
+  const attempts = attemptViews(visibleRows);
   const [open, setOpen] = useState(false);
   if (attempts.length === 0) return null;
   const failures = attempts.filter((attempt) => attempt.status === "failed").length;
@@ -112,7 +185,7 @@ function LiveAttemptResults({ rows }: { rows: EvalExperimentResultRow[] }) {
         <span className="inline-flex items-center gap-2 text-xs font-semibold text-slate-700">
           {open ? <ChevronDown className="h-3.5 w-3.5" /> : <ChevronRight className="h-3.5 w-3.5" />}
           实时结果
-          <span className="font-normal tabular-nums text-slate-400">{attempts.length} 个 Case</span>
+          <span className="whitespace-nowrap font-normal tabular-nums text-slate-400">{attempts.length} 个用例</span>
         </span>
         {failures > 0 ? <span className="text-xs font-medium text-rose-600">{failures} 个执行失败</span> : null}
       </button>
@@ -132,7 +205,7 @@ function LiveAttemptResults({ rows }: { rows: EvalExperimentResultRow[] }) {
                   <CheckCircle2 className="mt-0.5 h-3.5 w-3.5 shrink-0 text-emerald-500" />
                 )}
                 <div className="min-w-0 flex-1">
-                  <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5">
+                  <div className="flex flex-nowrap items-center gap-x-2 overflow-hidden">
                     <span className="min-w-0 truncate font-medium text-slate-700">{attempt.caseId}</span>
                     <span className={`shrink-0 font-medium ${failed ? "text-rose-600" : running ? "text-[#002fa7]" : "text-emerald-600"}`}>
                       {failed ? "执行失败" : running ? "执行中" : "已完成"}
@@ -143,7 +216,7 @@ function LiveAttemptResults({ rows }: { rows: EvalExperimentResultRow[] }) {
                   {attempt.error?.message ? (
                     <p className="mt-1 break-words leading-5 text-rose-600">{attempt.error.message}</p>
                   ) : attempt.outcomes.length > 0 ? (
-                    <p className="mt-1 text-slate-500">判定：{attempt.outcomes.join(" / ")}</p>
+                    <p className="mt-1 whitespace-nowrap text-slate-500">判定：{attempt.outcomes.map(outcomeLabel).join(" / ")}</p>
                   ) : null}
                 </div>
               </div>
@@ -164,7 +237,7 @@ function ExperimentProgress({ item }: { item: EvalExperiment }) {
   const failed = numberValue(progress.failed);
   const percent = total > 0 ? Math.min(100, Math.round((completed / total) * 100)) : 0;
   const currentCase = String(progress.current_case_name || "");
-  const message = String(progress.message || "Worker 已启动，等待首个进度事件");
+  const message = String(progress.message || "执行进程已启动，等待首个进度事件");
   const elapsed = elapsedLabel(item.started_at);
 
   return (
@@ -193,7 +266,7 @@ function ExperimentProgress({ item }: { item: EvalExperiment }) {
       </div>
       <div className="mt-2 flex flex-wrap items-center justify-between gap-x-4 gap-y-1 text-xs text-slate-500">
         <span className="min-w-0 truncate">
-          {currentCase ? `当前：${currentCase}` : "正在建立独立 session、workspace 与 memory"}
+          {currentCase ? `当前：${currentCase}` : "正在建立独立会话、工作区与记忆空间"}
         </span>
         <div className="flex shrink-0 gap-4 tabular-nums">
           {elapsed && <span>{elapsed}</span>}
@@ -280,8 +353,8 @@ export default function ExperimentsPage() {
     <div className="workspace-page-container">
       <div className="mb-5 flex flex-wrap items-start justify-between gap-4">
         <div className="min-w-0">
-          <h1 className="text-xl font-semibold">Experiments</h1>
-          <p className="mt-1 text-sm text-gray-500">本地先落盘评分，再选择性投影到 LangSmith Comparison。</p>
+          <h1 className="text-xl font-semibold">评测实验</h1>
+          <p className="mt-1 text-sm text-gray-500">评分结果先保存到本地，再按需投影到 LangSmith 对比实验。</p>
         </div>
         <div className="flex shrink-0 items-center gap-2">
           <button
@@ -312,13 +385,26 @@ export default function ExperimentsPage() {
             const projection = String(item.summary.langsmith_projection || "");
             const busy = busyId === item.experiment_id;
             const liveProgress = (item.summary.progress || {}) as Record<string, unknown>;
-            const visibleAttempts = experimentIsTerminal(item.status)
+            const verifierReplay = item.summary.execution_mode === "official_verifier_replay";
+            const caseResume = item.summary.execution_mode === "swebench_missing_case_resume";
+            const visibleAttempts = experimentIsTerminal(item.status) || verifierReplay || caseResume
               ? numberValue(item.summary.case_attempts)
               : numberValue(liveProgress.completed);
-            const visibleFailures = experimentIsTerminal(item.status)
+            const visibleFailures = experimentIsTerminal(item.status) || verifierReplay || caseResume
               ? numberValue(item.summary.failed_attempts)
               : numberValue(liveProgress.failed);
             const terminal = experimentIsTerminal(item.status);
+            const officialHarness = item.summary.swebench_official_harness as Record<string, unknown> | undefined;
+            const dockerArchitecture = String(officialHarness?.docker_architecture || "");
+            const missingPredictions = numberValue(item.summary.swebench_missing_predictions);
+            const persistedPredictions = item.summary.swebench_predictions_available === true
+              ? numberValue(item.summary.case_attempts)
+              : Math.max(0, numberValue(item.summary.case_attempts) - missingPredictions);
+            const canRerunVerifier = item.summary.swebench_predictions_available === true
+              || (missingPredictions > 0 && persistedPredictions > 0);
+            const effectiveAttemptIds = Array.isArray(item.summary.effective_attempt_ids)
+              ? item.summary.effective_attempt_ids.map(String)
+              : undefined;
             const showSecondaryActions = Boolean(
               url
               || (item.status === "completed" && item.summary.swebench_predictions_available === true)
@@ -326,32 +412,50 @@ export default function ExperimentsPage() {
               || item.error,
             );
             return (
-              <div key={item.experiment_id} className="rounded-xl border bg-white p-4">
+              <div key={item.experiment_id} className="overflow-hidden rounded-xl border bg-white p-4">
                 <div className="flex items-start justify-between gap-4">
                   <div className="min-w-0">
-                    <div className="font-medium">{displayExperimentName(item.name)}</div>
-                    <div className="mt-1 text-xs text-gray-500">
-                      Dataset {item.dataset_id} @ v{item.dataset_version} · {item.candidate.name} · {item.profile_id}
-                    </div>
-                    <div className="mt-2 text-xs text-gray-500">
-                      fingerprint {item.candidate.fingerprint || "pending"} · {visibleAttempts} attempts · {visibleFailures} execution failures · {String(item.summary.critical_failures || 0)} critical failures · Comparison {projection || "未配置"} · Agent trace {String(item.summary.agent_trace_export || "未配置")}
-                    </div>
-                    {Boolean(item.summary.swebench_official_harness) && (
-                      <div className="mt-1 text-xs text-emerald-700">
-                        SWE-bench Docker: {String((item.summary.swebench_official_harness as Record<string, unknown>).status || "pending")} · {String((item.summary.swebench_official_harness as Record<string, unknown>).resolved || 0)}/{String((item.summary.swebench_official_harness as Record<string, unknown>).total || 0)} resolved
-                      </div>
-                    )}
+                    <div className="truncate whitespace-nowrap font-medium" title={displayExperimentName(item.name)}>{displayExperimentName(item.name)}</div>
                   </div>
-                  <div className="flex shrink-0 flex-wrap items-center justify-end gap-2">
-                    <span className="rounded-full bg-gray-100 px-2.5 py-1 text-xs">{item.status}</span>
+                  <div className="flex shrink-0 flex-nowrap items-center justify-end gap-2 whitespace-nowrap">
+                    <span className="rounded-full bg-gray-100 px-2.5 py-1 text-xs">{statusLabel(item.status)}</span>
                     {terminal ? (
-                      <button
-                        disabled={busy}
-                        onClick={() => act(item.experiment_id, () => retryEvaluationExperiment(item.experiment_id))}
-                        className={`${actionClass} border-blue-200 text-[#002fa7] hover:border-blue-300 hover:bg-blue-50`}
-                      >
-                        <RefreshCw className="h-3.5 w-3.5" />重新评测
-                      </button>
+                      <>
+                        {missingPredictions > 0 && (
+                          <button
+                            disabled={busy}
+                            onClick={() => act(item.experiment_id, () => resumeMissingSWEbenchCases(item.experiment_id))}
+                            title={`只让智能体补跑缺少补丁的 ${missingPredictions} 个用例；已有 ${persistedPredictions} 个补丁保留，随后自动统一判卷`}
+                            className={`${actionClass} !border-[#002fa7] !bg-[#002fa7] !text-white hover:!border-[#00247f] hover:!bg-[#00247f]`}
+                          >
+                            <RefreshCw className="h-3.5 w-3.5" />
+                            补跑失败用例 ({missingPredictions})
+                          </button>
+                        )}
+                        {canRerunVerifier && (
+                          <button
+                            disabled={busy}
+                            onClick={() => act(item.experiment_id, () => rerunSWEbenchVerifier(item.experiment_id))}
+                            title={missingPredictions > 0
+                              ? `复用已有 ${persistedPredictions} 份补丁判卷；缺失 ${missingPredictions} 份保持未评估`
+                              : "复用已有智能体补丁，只重新执行官方 Docker 判卷"}
+                            className={`${actionClass} border-slate-200 text-slate-600 hover:border-slate-300 hover:bg-slate-50`}
+                          >
+                            <RefreshCw className="h-3.5 w-3.5" />
+                            {missingPredictions > 0
+                              ? `判卷已有补丁 (${persistedPredictions}/${persistedPredictions + missingPredictions})`
+                              : "重新判卷"}
+                          </button>
+                        )}
+                        <button
+                          disabled={busy}
+                          onClick={() => act(item.experiment_id, () => retryEvaluationExperiment(item.experiment_id))}
+                          title="重新运行智能体并生成新的补丁"
+                          className={`${actionClass} border-blue-200 text-[#002fa7] hover:border-blue-300 hover:bg-blue-50`}
+                        >
+                          <RefreshCw className="h-3.5 w-3.5" />重新评测
+                        </button>
+                      </>
                     ) : (
                       <button
                         disabled={busy}
@@ -376,8 +480,25 @@ export default function ExperimentsPage() {
                   </div>
                 </div>
 
+                <div className="mt-2 overflow-x-auto pb-0.5 text-xs text-gray-500">
+                  <div className="whitespace-nowrap">
+                    评测集 {item.dataset_id} · v{item.dataset_version} · {candidateLabel(item.candidate.name)} · {profileLabel(item.profile_id)}
+                  </div>
+                  <div className="mt-1 whitespace-nowrap">
+                    指纹 {item.candidate.fingerprint || "待生成"} · {visibleAttempts} 次执行 · {visibleFailures} 个执行失败 · {String(item.summary.critical_failures || 0)} 个严重失败 · 对比投影 {statusLabel(projection)} · 智能体追踪 {statusLabel(item.summary.agent_trace_export)}
+                  </div>
+                  {officialHarness && (
+                    <div className="mt-1 whitespace-nowrap text-emerald-700">
+                      SWE-bench Docker{dockerArchitecture ? `（${dockerArchitecture.toUpperCase()}）` : ""}：{harnessStatusLabel(officialHarness.status)} · 通过 {String(officialHarness.resolved || 0)}/{String(officialHarness.total || 0)}
+                    </div>
+                  )}
+                </div>
+
                 <ExperimentProgress item={item} />
-                <LiveAttemptResults rows={resultsByExperiment[item.experiment_id] || []} />
+                <LiveAttemptResults
+                  rows={resultsByExperiment[item.experiment_id] || []}
+                  effectiveAttemptIds={effectiveAttemptIds}
+                />
 
                 {showSecondaryActions && <div className="mt-3 flex flex-wrap items-center gap-2 border-t border-gray-100 pt-3">
                   {url && (
@@ -387,7 +508,7 @@ export default function ExperimentsPage() {
                   )}
                   {item.status === "completed" && item.summary.swebench_predictions_available === true && (
                     <a href={swebenchPredictionExportUrl(item.experiment_id)} className={actionClass}>
-                      SWE prediction<Download className="h-3.5 w-3.5" />
+                      下载 SWE 预测结果<Download className="h-3.5 w-3.5" />
                     </a>
                   )}
                   {item.status === "completed" && projection === "pending" && (
@@ -404,7 +525,7 @@ export default function ExperimentsPage() {
               </div>
             );
           })}
-          {!items.length && <div className="p-12 text-center text-sm text-gray-400">还没有 Experiment</div>}
+          {!items.length && <div className="p-12 text-center text-sm text-gray-400">还没有评测实验</div>}
         </div>
       )}
 
@@ -421,7 +542,7 @@ export default function ExperimentsPage() {
             </div>
             <h2 id="delete-experiment-title" className="text-lg font-semibold text-gray-900">删除这次评测？</h2>
             <p className="mt-2 text-sm leading-6 text-gray-600">
-              “{displayExperimentName(pendingDelete.name)}”的本地 attempts、评分结果和运行文件会被永久删除，无法恢复。
+              “{displayExperimentName(pendingDelete.name)}”的本地执行记录、评分结果和运行文件会被永久删除，无法恢复。
             </p>
             <p className="mt-2 rounded-lg bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-800">
               已投影到 LangSmith 的远端数据不会被删除。

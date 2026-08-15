@@ -51,6 +51,30 @@ def test_deleted_session_cannot_be_recreated_by_message_writes(tmp_path):
     assert not (tmp_path / "sessions" / "deleted.json").exists()
 
 
+def test_assistant_usage_summary_round_trips_in_session_json(tmp_path):
+    session_manager.initialize(tmp_path)
+    session_manager.create_session("usage-session")
+    usage_summary = {
+        "run_id": "run-1",
+        "rounds": 2,
+        "steps": 3,
+        "input_tokens": 48100,
+        "output_tokens": 2700,
+        "cache_hit_rate": 80.0,
+    }
+
+    session_manager.upsert_assistant_message(
+        "usage-session",
+        query_id="query-1",
+        content="done",
+        usage_summary=usage_summary,
+        status="completed",
+    )
+
+    message = session_manager.load_session("usage-session")[-1]
+    assert message["usage_summary"] == usage_summary
+
+
 def test_analytics_model_id_round_trips_in_session_metadata(tmp_path):
     session_manager.initialize(tmp_path)
     session_manager.create_session(

@@ -61,6 +61,7 @@ const TOOL_META: Record<string, { icon: React.ElementType; color: string; bg: st
   edit_file: { icon: Pencil, color: "#0891b2", bg: "#ecfeff" },
   glob: { icon: FolderOpen, color: "#ea580c", bg: "#fff7ed" },
   execute_skill: { icon: Play, color: "#16a34a", bg: "#f0fdf4" },
+  load_skill_context: { icon: PackageCheck, color: "#2563eb", bg: "#eff6ff" },
 };
 
 function getToolMeta(tool: string) {
@@ -74,7 +75,7 @@ function getToolLabel(toolCall: ToolCall): string {
     return getSubagentToolLabel(toolCall.status, Boolean(toolCall.is_error));
   }
   if (tool === "load_skill_context") {
-    return "加载 Skill 上下文";
+    return toolCall.status === "running" ? "加载 Skill 上下文" : "已加载 Skill 上下文";
   }
   if (tool === "database_sql_generate" && toolCall.progress?.label) {
     return toolCall.progress.label;
@@ -129,6 +130,13 @@ function toolDurationMs(toolCall: ToolCall, now: number): number | null {
   const end = toolCall.endedAt || (toolCall.status === "running" ? now : undefined);
   if (!end) return null;
   return Math.max(0, end - toolCall.startedAt);
+}
+
+function getToolOutput(toolCall: ToolCall): string {
+  if (toolCall.tool === "load_skill_context" && toolCall.status !== "running") {
+    return "已加载所需 Skill。系统将根据新指令重新判断并继续处理。";
+  }
+  return toolCall.output || "";
 }
 
 export default function ThoughtChain({ timeline, isStreaming = false }: Props) {
@@ -293,10 +301,13 @@ export default function ThoughtChain({ timeline, isStreaming = false }: Props) {
               const meta = getToolMeta(tc.tool);
               const Icon = meta.icon;
               const isOpen = expandedTools[item.id] ?? false;
-                const isRunning = tc.status === "running";
-                const isFailed = Boolean(tc.is_error || tc.progress?.status === "failed");
+              const isRunning = tc.status === "running";
+              const isSkillContextLoad = tc.tool === "load_skill_context";
+              const isFailed =
+                !isSkillContextLoad && Boolean(tc.is_error || tc.progress?.status === "failed");
               const duration = toolDurationMs(tc, now);
               const durationText = duration === null ? "" : formatDuration(duration);
+              const toolOutput = getToolOutput(tc);
 
               return (
                 <div key={item.id} className="relative flex items-start gap-3">
@@ -323,6 +334,8 @@ export default function ThoughtChain({ timeline, isStreaming = false }: Props) {
                           <Loader2 className="h-3.5 w-3.5 animate-spin text-amber-500" />
                         ) : isFailed ? (
                           <XCircle className="h-3.5 w-3.5 text-red-500" />
+                        ) : isSkillContextLoad ? (
+                          <CheckCircle2 className="h-3.5 w-3.5 text-blue-500" />
                         ) : (
                           <CheckCircle2 className="h-3.5 w-3.5 text-emerald-500" />
                         )}
@@ -373,19 +386,21 @@ export default function ThoughtChain({ timeline, isStreaming = false }: Props) {
                             </pre>
                           </div>
                         )}
-                        {tc.output && (
+                        {toolOutput && (
                           <div>
                             <span className="text-[10px] font-semibold uppercase tracking-wider text-gray-400">
-                              Output
+                              {isSkillContextLoad ? "状态" : "Output"}
                             </span>
                             <pre
                               className={`mt-1 max-h-36 overflow-y-auto overflow-x-auto whitespace-pre-wrap rounded-lg p-2 font-mono text-[11px] leading-relaxed ${
-                                tc.is_error
+                                isFailed
                                   ? "bg-red-50 text-red-700"
-                                  : "bg-white/58 text-gray-600"
+                                  : isSkillContextLoad
+                                    ? "bg-blue-50 text-blue-700"
+                                    : "bg-white/58 text-gray-600"
                               }`}
                             >
-                              {tc.output}
+                              {toolOutput}
                             </pre>
                           </div>
                         )}

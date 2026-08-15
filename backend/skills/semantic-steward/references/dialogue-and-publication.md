@@ -50,11 +50,11 @@ Call `prepare_semantic_markdown` only when unresolved decisions are empty. Pass 
 - returns the rendered body, machine effects, technical diff, and plan digest;
 - does not write the active definition.
 
-Summarize the prepared result and wait. A request such as “create this Measure” authorizes drafting and preparation, but never pre-approves an unseen candidate. Publication also passes through the Harness's one-call permission gate, bound to the exact `plan_id + plan_digest`.
+Summarize the prepared result, then issue `publish_semantic_markdown` in the same assistant turn so the Harness can display its HITL card. Do not stop and ask the user to type “approve” in chat: that would duplicate the real permission step. A request such as “create this Measure” authorizes drafting and preparation, but never pre-approves an unseen candidate. The Harness card is the single approval boundary and is bound to the exact `plan_id + plan_digest`.
 
 ## Publish boundary
 
-Call `publish_semantic_markdown` only with the exact approved plan id and digest. It rejects:
+Call `publish_semantic_markdown` with the exact prepared plan id and digest after surfacing the review summary. The call pauses at the Harness HITL boundary and executes only if the user approves that bound request. It rejects:
 
 - a modified or expired plan;
 - a different Session;

@@ -282,7 +282,7 @@ async def lifespan(app: FastAPI):
             await knowledge_catalog_watcher.stop()
 
 
-app = FastAPI(title="PuddingClaw", version="0.1.16", lifespan=lifespan)
+app = FastAPI(title="PuddingClaw", version="0.1.17", lifespan=lifespan)
 
 cors_origins = [
     origin.strip()
@@ -398,4 +398,4 @@ if extension_enabled("headless_worker"):
 
 @app.get("/")
 async def root():
-    return {"name": "PuddingClaw", "version": "0.1.16", "status": "running"}
+    return {"name": "PuddingClaw", "version": "0.1.17", "status": "running"}

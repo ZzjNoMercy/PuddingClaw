@@ -38,6 +38,7 @@ class ToolResultAdapter:
         tool_name: str = "",
         tool_input: str = "",
         tool_call_id: str = "",
+        is_error: bool = False,
     ) -> AdaptedToolResult:
         # A real browser may contain private, authenticated, or user-entered
         # material. Never promote its output into public citation sources,
@@ -46,6 +47,14 @@ class ToolResultAdapter:
         if tool_name == "browser":
             answer_context, _sources = parse_tool_result(raw_output, tool_call_id)
             return AdaptedToolResult(answer_context or raw_output, [], "browser_private")
+
+        # Provenance describes material actually retrieved by a successful
+        # tool call. A rejected/failed network command may still contain a URL
+        # in its input, but that URL was not observed and must not become a
+        # source merely because the adapter can parse the command text.
+        if is_error:
+            answer_context, _sources = parse_tool_result(raw_output, tool_call_id)
+            return AdaptedToolResult(answer_context or raw_output, [], "error")
 
         # 1. Explicit PuddingClaw envelope: highest-trust contract.
         answer_context, sources = parse_tool_result(raw_output, tool_call_id)

@@ -1,3 +1,4 @@
+import hashlib
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -5,6 +6,7 @@ from fastapi.testclient import TestClient
 
 import api.evaluation as evaluation_api
 from evaluation.contracts import (
+    AgentRunEnvelope,
     EvalCase,
     EvalDataset,
     EvalError,
@@ -176,7 +178,7 @@ def test_manual_swebench_result_import_is_retired(tmp_path: Path, monkeypatch):
                     "test_patch": "diff --git a/testing/test_x.py b/testing/test_x.py",
                     "FAIL_TO_PASS": "[]",
                     "PASS_TO_PASS": "[]",
-                }
+                },
             ],
             name="SWE score",
         )
@@ -339,3 +341,245 @@ def test_completed_experiment_can_be_retried(tmp_path: Path, monkeypatch):
     assert second_retry["name"] == "Completed run"
     assert second_retry["summary"]["retry_root_experiment_id"] == completed.experiment_id
     assert second_retry["summary"]["retry_generation"] == 2
+
+
+def test_swebench_verifier_can_rerun_persisted_patch_without_new_experiment(
+    tmp_path: Path,
+    monkeypatch,
+):
+    repository = EvaluationRepository(tmp_path / "evaluation.db")
+    draft = repository.create_dataset(
+        swebench_dataset_from_rows(
+            [
+                {
+                    "instance_id": "pytest-dev__pytest-1234",
+                    "repo": "pytest-dev/pytest",
+                    "base_commit": "b" * 40,
+                    "problem_statement": "Fix collection",
+                    "version": "8.0",
+                    "test_patch": "diff --git a/testing/test_x.py b/testing/test_x.py",
+                    "FAIL_TO_PASS": "[]",
+                    "PASS_TO_PASS": "[]",
+                },
+                {
+                    "instance_id": "pytest-dev__pytest-5678",
+                    "repo": "pytest-dev/pytest",
+                    "base_commit": "c" * 40,
+                    "problem_statement": "Fix another collection issue",
+                    "version": "8.0",
+                    "test_patch": "diff --git a/testing/test_y.py b/testing/test_y.py",
+                    "FAIL_TO_PASS": "[]",
+                    "PASS_TO_PASS": "[]",
+                },
+            ],
+            name="Replay verifier",
+        )
+    )
+    bundle = repository.publish_dataset(draft.dataset_id, draft.revision)
+    experiment = repository.create_experiment(
+        EvalExperiment(
+            name="Completed SWE run",
+            dataset_id=draft.dataset_id,
+            dataset_version=1,
+            dataset_version_id=bundle.version_id,
+            dataset_content_hash=bundle.checksum,
+            candidate=ExperimentCandidate(name="agent"),
+            profile_id="coding_agent@1",
+            status="completed",
+            verdict="indeterminate",
+            summary={
+                "case_attempts": 1,
+                "failed_attempts": 0,
+                "swebench_predictions_available": True,
+            },
+        )
+    )
+    case = bundle.dataset.cases[0]
+    attempt_id = repository.create_attempt(experiment.experiment_id, case.case_id, 0)
+    patch = "diff --git a/a.py b/a.py\n+fixed = True\n"
+    run = AgentRunEnvelope(
+        case_id=case.case_id,
+        experiment_id=experiment.experiment_id,
+        candidate_id=experiment.candidate.candidate_id,
+        session_id="session",
+        response="patched",
+        metadata={
+            "code_verification": {
+                "mode": "swebench",
+                "status": "not_evaluated",
+                "patch": patch,
+                "patch_sha256": "patch-hash",
+                "changed_paths": ["a.py"],
+            }
+        },
+    )
+    repository.finish_attempt(attempt_id, status="completed", run=run)
+    started: list[str] = []
+
+    class WorkerManager:
+        async def start(self, started_experiment_id: str):
+            started.append(started_experiment_id)
+
+    async def verifier_probe():
+        return {"available": True, "docker_architecture": "arm64"}
+
+    monkeypatch.setattr(evaluation_api, "get_evaluation_repository", lambda: repository)
+    monkeypatch.setattr(evaluation_api, "evaluation_worker_manager", WorkerManager())
+    monkeypatch.setattr(evaluation_api, "probe_official_swebench_runtime", verifier_probe)
+    app = FastAPI()
+    app.include_router(evaluation_api.router, prefix="/api")
+
+    response = TestClient(app).post(
+        f"/api/evaluation/experiments/{experiment.experiment_id}/verify/swebench"
+    )
+
+    assert response.status_code == 202
+    queued = response.json()
+    assert queued["experiment_id"] == experiment.experiment_id
+    assert queued["candidate"]["candidate_id"] == experiment.candidate.candidate_id
+    assert queued["status"] == "queued"
+    assert queued["summary"]["execution_mode"] == "official_verifier_replay"
+    assert queued["summary"]["swebench_verifier_replay"]["source_attempt_ids"] == [
+        attempt_id
+    ]
+    assert queued["summary"]["swebench_verifier_replay"]["total"] == 1
+    assert queued["summary"]["swebench_verifier_replay"]["dataset_total"] == 2
+    assert queued["summary"]["swebench_verifier_replay"]["missing_instance_ids"] == [
+        "pytest-dev__pytest-5678"
+    ]
+    assert queued["summary"]["swebench_verifier_replay"]["patch_sha256"][
+        "pytest-dev__pytest-1234"
+    ] == hashlib.sha256(patch.encode()).hexdigest()
+    assert queued["summary"]["swebench_verifier_replay"]["previous_instance_results"][
+        "pytest-dev__pytest-1234"
+    ]["status"] == "not_evaluated"
+    assert started == [experiment.experiment_id]
+    saved_envelope = repository.load_run_envelopes(experiment.experiment_id)[case.case_id][0]
+    assert saved_envelope["metadata"]["code_verification"]["patch"] == patch
+    assert len(repository.list_results(experiment.experiment_id)) == 1
+
+
+def test_swebench_missing_case_resume_preserves_existing_patch_and_queues_only_missing(
+    tmp_path: Path,
+    monkeypatch,
+):
+    repository = EvaluationRepository(tmp_path / "evaluation.db")
+    draft = repository.create_dataset(
+        swebench_dataset_from_rows(
+            [
+                {
+                    "instance_id": "pytest-dev__pytest-1234",
+                    "repo": "pytest-dev/pytest",
+                    "base_commit": "b" * 40,
+                    "problem_statement": "Fix collection",
+                    "version": "8.0",
+                    "test_patch": "diff --git a/testing/test_x.py b/testing/test_x.py",
+                    "FAIL_TO_PASS": "[]",
+                    "PASS_TO_PASS": "[]",
+                },
+                {
+                    "instance_id": "pytest-dev__pytest-5678",
+                    "repo": "pytest-dev/pytest",
+                    "base_commit": "c" * 40,
+                    "problem_statement": "Fix another collection issue",
+                    "version": "8.0",
+                    "test_patch": "diff --git a/testing/test_y.py b/testing/test_y.py",
+                    "FAIL_TO_PASS": "[]",
+                    "PASS_TO_PASS": "[]",
+                },
+            ],
+            name="Resume missing Case",
+        )
+    )
+    bundle = repository.publish_dataset(draft.dataset_id, draft.revision)
+    experiment = repository.create_experiment(
+        EvalExperiment(
+            name="Partial SWE run",
+            dataset_id=draft.dataset_id,
+            dataset_version=1,
+            dataset_version_id=bundle.version_id,
+            dataset_content_hash=bundle.checksum,
+            candidate=ExperimentCandidate(name="agent"),
+            profile_id="coding_agent@1",
+            status="completed",
+            verdict="fail",
+            summary={
+                "case_attempts": 2,
+                "failed_attempts": 1,
+                "swebench_predictions_available": False,
+                "swebench_missing_predictions": 1,
+            },
+        )
+    )
+    completed_case, failed_case = bundle.dataset.cases
+    completed_attempt_id = repository.create_attempt(
+        experiment.experiment_id,
+        completed_case.case_id,
+        0,
+    )
+    patch = "diff --git a/a.py b/a.py\n+fixed = True\n"
+    repository.finish_attempt(
+        completed_attempt_id,
+        status="completed",
+        run=AgentRunEnvelope(
+            case_id=completed_case.case_id,
+            experiment_id=experiment.experiment_id,
+            candidate_id=experiment.candidate.candidate_id,
+            session_id="session",
+            response="patched",
+            metadata={
+                "code_verification": {
+                    "mode": "swebench",
+                    "status": "not_evaluated",
+                    "patch": patch,
+                    "patch_sha256": "patch-hash",
+                    "changed_paths": ["a.py"],
+                }
+            },
+        ),
+    )
+    failed_attempt_id = repository.create_attempt(
+        experiment.experiment_id,
+        failed_case.case_id,
+        0,
+    )
+    repository.finish_attempt(
+        failed_attempt_id,
+        status="failed",
+        error=EvalError(
+            code="case_execution_failed",
+            message="Agent failed before producing a patch",
+        ),
+    )
+    started: list[str] = []
+
+    class WorkerManager:
+        async def start(self, started_experiment_id: str):
+            started.append(started_experiment_id)
+
+    monkeypatch.setattr(evaluation_api, "get_evaluation_repository", lambda: repository)
+    monkeypatch.setattr(evaluation_api, "evaluation_worker_manager", WorkerManager())
+    app = FastAPI()
+    app.include_router(evaluation_api.router, prefix="/api")
+
+    response = TestClient(app).post(
+        f"/api/evaluation/experiments/{experiment.experiment_id}/resume/swebench"
+    )
+
+    assert response.status_code == 202
+    queued = response.json()
+    assert queued["experiment_id"] == experiment.experiment_id
+    assert queued["status"] == "queued"
+    assert queued["summary"]["execution_mode"] == "swebench_missing_case_resume"
+    assert queued["summary"]["swebench_case_resume"]["missing_instance_ids"] == [
+        "pytest-dev__pytest-5678"
+    ]
+    assert queued["summary"]["swebench_case_resume"]["source_attempt_ids"] == [
+        completed_attempt_id
+    ]
+    assert queued["summary"]["progress"]["total"] == 1
+    assert queued["candidate"]["candidate_id"] != experiment.candidate.candidate_id
+    assert started == [experiment.experiment_id]
+    assert len(repository.list_results(experiment.experiment_id)) == 2
+    saved = repository.load_run_envelopes(experiment.experiment_id)
+    assert saved[completed_case.case_id][0]["metadata"]["code_verification"]["patch"] == patch

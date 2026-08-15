@@ -753,6 +753,8 @@ class EvaluationRunner:
         dataset: Any,
         runtime_root: Path,
         all_attempts: list[dict[str, Any]],
+        *,
+        allow_partial_predictions: bool = False,
     ) -> dict[str, Any]:
         envelopes = self.repository.load_run_envelopes(experiment.experiment_id)
         prediction_manifest = swebench_prediction_manifest(
@@ -760,7 +762,7 @@ class EvaluationRunner:
             envelopes,
             model_name_or_path=(experiment.candidate.llm_model_id or experiment.candidate.name),
         )
-        if prediction_manifest["missing_instance_ids"]:
+        if prediction_manifest["missing_instance_ids"] and not allow_partial_predictions:
             return {
                 "status": "not_started",
                 "reason": "Agent did not produce a valid patch for every enabled SWE-bench Case",
@@ -776,6 +778,12 @@ class EvaluationRunner:
                             **dict(latest.summary.get("progress") or {}),
                             "stage": "official_verifier",
                             "message": "Agent patch 已生成，正在使用官方 Docker Harness 判卷",
+                            "completed": 0,
+                            "current_index": 0,
+                            "failed": 0,
+                            "total": len(prediction_manifest["predictions"]),
+                            "current_case_id": None,
+                            "current_case_name": None,
                             "updated_at": utc_now().isoformat(),
                         },
                         "swebench_official_harness": {
@@ -792,6 +800,7 @@ class EvaluationRunner:
             dataset,
             envelopes,
             runtime_root,
+            allow_partial_predictions=allow_partial_predictions,
         )
         case_by_instance = {
             case.code.repository.swebench.instance_id: case
@@ -862,6 +871,13 @@ class EvaluationRunner:
             "resolved": len(aggregate.get("resolved_ids") or []),
             "unresolved": len(aggregate.get("unresolved_ids") or []),
             "errors": sum(item["status"] == "error" for item in official["results"].values()),
+            "instance_results": {
+                instance_id: {
+                    "status": item.get("status"),
+                    "resolved": item.get("resolved"),
+                }
+                for instance_id, item in official["results"].items()
+            },
             "resolve_rate": (
                 len(aggregate.get("resolved_ids") or []) / len(official["results"])
                 if official["results"]
@@ -871,7 +887,9 @@ class EvaluationRunner:
             "report_sha256": receipt.get("report_sha256"),
             "predictions_sha256": receipt.get("predictions_sha256"),
             "source_snapshot_sha256": receipt.get("source_snapshot_sha256"),
+            "missing_instance_ids": list(receipt.get("missing_instance_ids") or []),
             "docker_server_version": receipt.get("docker_server_version"),
+            "docker_architecture": receipt.get("docker_architecture"),
             "container_policy": receipt.get("container_policy"),
             "output_tail": str(receipt.get("output_tail") or "")[-4_000:],
         }
@@ -936,8 +954,710 @@ class EvaluationRunner:
         except ConflictError:
             return self.repository.get_experiment(experiment_id)
 
+    def _load_persisted_attempts_for_scoring(
+        self,
+        experiment_id: str,
+        dataset: Any,
+    ) -> list[dict[str, Any]]:
+        case_by_id = {case.case_id: case for case in dataset.cases}
+        grouped: dict[str, dict[str, Any]] = {}
+        for row in self.repository.list_results(experiment_id):
+            attempt_id = str(row["attempt_id"])
+            attempt = grouped.setdefault(
+                attempt_id,
+                {
+                    "case_id": str(row["case_id"]),
+                    "attempt_id": attempt_id,
+                    "attempt_status": str(row["attempt_status"]),
+                    "results": [],
+                },
+            )
+            if row.get("result") is not None:
+                attempt["results"].append(row["result"])
+        attempts = list(grouped.values())
+        for attempt in attempts:
+            case = case_by_id.get(attempt["case_id"])
+            if case is None:
+                raise ValueError(f"Persisted Attempt references unknown Case: {attempt['case_id']}")
+            typed_results = [EvaluationResult.model_validate(item) for item in attempt["results"]]
+            attempt["summary"] = evaluator_registry.summarize(case, typed_results)
+        return attempts
+
+    def _effective_swebench_attempts_for_scoring(
+        self,
+        experiment: EvalExperiment,
+        dataset: Any,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
+        """Select one effective Attempt per Case while retaining full history.
+
+        A missing-Case resume appends a new Attempt instead of deleting the
+        failed one. For SWE-bench Cases, the Attempt selected by the immutable
+        prediction manifest is authoritative; Cases still lacking a patch use
+        their latest Attempt so execution failures remain visible.
+        """
+
+        history = self._load_persisted_attempts_for_scoring(
+            experiment.experiment_id,
+            dataset,
+        )
+        manifest = swebench_prediction_manifest(
+            dataset,
+            self.repository.load_run_envelopes(experiment.experiment_id),
+            model_name_or_path=(experiment.candidate.llm_model_id or experiment.candidate.name),
+        )
+        selected_by_case_id: dict[str, str] = {}
+        case_by_instance = {
+            case.code.repository.swebench.instance_id: case.case_id
+            for case in dataset.cases
+            if case.enabled
+            and case.code is not None
+            and case.code.repository.swebench is not None
+        }
+        for prediction in manifest["predictions"]:
+            case_id = case_by_instance.get(str(prediction["instance_id"]))
+            if case_id is not None:
+                selected_by_case_id[case_id] = str(prediction["attempt_id"])
+
+        attempts_by_case: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for attempt in history:
+            attempts_by_case[str(attempt["case_id"])].append(attempt)
+        effective: list[dict[str, Any]] = []
+        for case in dataset.cases:
+            if not case.enabled:
+                continue
+            candidates = attempts_by_case.get(case.case_id) or []
+            if not candidates:
+                continue
+            selected_attempt_id = selected_by_case_id.get(case.case_id)
+            selected = next(
+                (
+                    item
+                    for item in candidates
+                    if str(item["attempt_id"]) == selected_attempt_id
+                ),
+                candidates[-1],
+            )
+            effective.append(selected)
+        return effective, history, manifest
+
+    @staticmethod
+    def _refresh_attempt_scoring_summary(
+        base_summary: dict[str, Any],
+        all_attempts: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Recompute score-bearing aggregates without touching Agent evidence."""
+
+        summary = dict(base_summary)
+        summary.update(
+            {
+                "case_attempts": len(all_attempts),
+                "completed_attempts": sum(
+                    item.get("attempt_status") == "completed" for item in all_attempts
+                ),
+                "failed_attempts": sum(
+                    item.get("attempt_status") == "failed" for item in all_attempts
+                ),
+                "cancelled_attempts": sum(
+                    item.get("attempt_status") == "cancelled" for item in all_attempts
+                ),
+                "determinate": sum(
+                    item["summary"].get("verdict") != "indeterminate" for item in all_attempts
+                ),
+                "passed": sum(
+                    item["summary"].get("verdict") == "pass" for item in all_attempts
+                ),
+                "failed": sum(
+                    item["summary"].get("verdict") == "fail" for item in all_attempts
+                ),
+                "critical_failures": sum(
+                    bool(item["summary"].get("critical_failure")) for item in all_attempts
+                ),
+                "indeterminate": sum(
+                    item["summary"].get("verdict") == "indeterminate" for item in all_attempts
+                ),
+            }
+        )
+        dimension_buckets: dict[str, dict[str, Any]] = {}
+        for attempt in all_attempts:
+            for result in attempt.get("results", []):
+                dimension = str(result.get("dimension") or "unknown")
+                bucket = dimension_buckets.setdefault(
+                    dimension,
+                    {
+                        "sample_count": 0,
+                        "applicable_count": 0,
+                        "pass_count": 0,
+                        "fail_count": 0,
+                        "not_applicable_count": 0,
+                        "not_evaluated_count": 0,
+                        "error_count": 0,
+                        "scores": [],
+                        "evaluator_versions": set(),
+                    },
+                )
+                outcome = str(result.get("outcome") or "error")
+                bucket["sample_count"] += 1
+                count_key = f"{outcome}_count"
+                if count_key in bucket:
+                    bucket[count_key] += 1
+                if outcome in {"pass", "fail"}:
+                    bucket["applicable_count"] += 1
+                if result.get("score") is not None:
+                    bucket["scores"].append(float(result["score"]))
+                bucket["evaluator_versions"].add(
+                    f"{result.get('evaluator_id')}@{result.get('evaluator_version')}"
+                )
+        dimensions: dict[str, Any] = {}
+        for dimension, bucket in dimension_buckets.items():
+            scores = bucket.pop("scores")
+            versions = sorted(bucket.pop("evaluator_versions"))
+            expected = bucket["sample_count"] - bucket["not_applicable_count"]
+            dimensions[dimension] = {
+                **bucket,
+                "score": sum(scores) / len(scores) if scores else None,
+                "coverage": bucket["applicable_count"] / expected if expected else None,
+                "evaluator_versions": versions,
+            }
+        summary["dimensions"] = dimensions
+        summary["applicable_count"] = sum(
+            item["applicable_count"] for item in dimensions.values()
+        )
+        expected_metrics = sum(
+            item["sample_count"] - item["not_applicable_count"]
+            for item in dimensions.values()
+        )
+        summary["coverage"] = (
+            summary["applicable_count"] / expected_metrics if expected_metrics else None
+        )
+        return summary
+
+    @staticmethod
+    def _verdict_from_summary(summary: dict[str, Any]) -> str:
+        if summary.get("failed") or summary.get("critical_failures") or summary.get("failed_attempts"):
+            return "fail"
+        if summary.get("indeterminate"):
+            return "indeterminate"
+        return "pass"
+
+    async def run_official_verifier_replay(self, experiment_id: str) -> EvalExperiment:
+        """Re-score persisted SWE-bench patches without executing the Agent."""
+
+        experiment = self.repository.get_experiment(experiment_id)
+        replay = dict(experiment.summary.get("swebench_verifier_replay") or {})
+        total = int(replay.get("total") or 0)
+        running = experiment.model_copy(
+            update={
+                "status": ExperimentStatus.RUNNING,
+                "started_at": utc_now(),
+                "finished_at": None,
+                "error": None,
+                "summary": {
+                    **experiment.summary,
+                    "swebench_verifier_replay": {
+                        **replay,
+                        "status": "running",
+                        "started_at": utc_now().isoformat(),
+                    },
+                    "progress": {
+                        "stage": "official_verifier",
+                        "message": "正在复用已保存的 Agent patch 重新判卷",
+                        "total": total,
+                        "completed": 0,
+                        "failed": 0,
+                        "updated_at": utc_now().isoformat(),
+                    },
+                },
+            }
+        )
+        self.repository.update_experiment(
+            running,
+            expected_status=ExperimentStatus.QUEUED,
+        )
+        runtime_root = self._runtime_root(experiment_id)
+        try:
+            dataset = self.repository.get_dataset(
+                running.dataset_id,
+                running.dataset_version,
+            )
+            if dataset.current_version_id != running.dataset_version_id:
+                raise ValueError("Pinned Dataset version identity mismatch")
+            envelopes = self.repository.load_run_envelopes(experiment_id)
+            manifest = swebench_prediction_manifest(
+                dataset,
+                envelopes,
+                model_name_or_path=(running.candidate.llm_model_id or running.candidate.name),
+            )
+            if not manifest["predictions"]:
+                raise ValueError("Experiment has no persisted SWE-bench patch to verify")
+            selected_attempt_ids = {
+                str(item["attempt_id"]) for item in manifest["predictions"]
+            }
+            all_attempts = self._load_persisted_attempts_for_scoring(
+                experiment_id,
+                dataset,
+            )
+            completed_attempt_ids = {
+                str(item["attempt_id"])
+                for item in all_attempts
+                if item.get("attempt_status") == "completed"
+            }
+            if not selected_attempt_ids <= completed_attempt_ids:
+                raise ValueError("Persisted SWE-bench patches do not belong to completed Attempts")
+            self._initialize_isolated_runtime(runtime_root)
+            official = await self._run_and_apply_official_swebench(
+                running,
+                dataset,
+                runtime_root,
+                all_attempts,
+                allow_partial_predictions=True,
+            )
+            latest = self.repository.get_experiment(experiment_id)
+            if latest.status == ExperimentStatus.CANCEL_REQUESTED:
+                cancelled = latest.model_copy(
+                    update={"status": ExperimentStatus.CANCELLED, "finished_at": utc_now()}
+                )
+                return self.repository.update_experiment(
+                    cancelled,
+                    expected_status=ExperimentStatus.CANCEL_REQUESTED,
+                )
+            summary = self._refresh_attempt_scoring_summary(latest.summary, all_attempts)
+            completed_at = utc_now()
+            replay_result = {
+                **dict(summary.get("swebench_verifier_replay") or {}),
+                "status": official["status"],
+                "completed_at": completed_at.isoformat(),
+                "docker_architecture": official.get("docker_architecture"),
+                "resolved": official.get("resolved"),
+                "total": official.get("total", total),
+                "report_sha256": official.get("report_sha256"),
+                "predictions_sha256": official.get("predictions_sha256"),
+                "instance_results": official.get("instance_results"),
+                "missing_instance_ids": list(manifest["missing_instance_ids"]),
+            }
+            history = list(summary.get("swebench_verifier_replay_history") or [])
+            history.append(replay_result)
+            summary.update(
+                {
+                    "swebench_official_harness": official,
+                    "swebench_predictions_available": not manifest["missing_instance_ids"],
+                    "swebench_predictions_count": len(manifest["predictions"]),
+                    "swebench_missing_predictions": len(manifest["missing_instance_ids"]),
+                    "swebench_verifier_partial": bool(manifest["missing_instance_ids"]),
+                    "swebench_verifier_replay": replay_result,
+                    "swebench_verifier_replay_history": history,
+                    "progress": {
+                        "stage": "completed",
+                        "message": (
+                            f"已有 {len(manifest['predictions'])} 份 patch 判卷完成；"
+                            f"{len(manifest['missing_instance_ids'])} 个 Case 缺少 patch"
+                            if manifest["missing_instance_ids"]
+                            else "已复用 Agent patch 完成 Docker 重新判卷"
+                        ),
+                        "total": total,
+                        "completed": total,
+                        "failed": official.get("errors", 0),
+                        "updated_at": completed_at.isoformat(),
+                    },
+                }
+            )
+            projection_was_published = bool(replay.get("langsmith_projection_was_published"))
+            projection_pending = (
+                projection_was_published and self.settings.enabled and bool(self.settings.api_key)
+            )
+            if projection_was_published:
+                summary["experiment_projection"] = (
+                    "pending" if projection_pending else "stale_after_verifier_replay"
+                )
+                summary["langsmith_projection"] = (
+                    "pending" if projection_pending else "stale_after_verifier_replay"
+                )
+            completed = latest.model_copy(
+                update={
+                    "status": ExperimentStatus.COMPLETED,
+                    "verdict": self._verdict_from_summary(summary),
+                    "finished_at": completed_at,
+                    "summary": summary,
+                    "error": None,
+                }
+            )
+            completed = self.repository.update_experiment(
+                completed,
+                expected_status=ExperimentStatus.RUNNING,
+            )
+            if projection_pending:
+                self.repository.enqueue_outbox(
+                    "langsmith",
+                    "experiment_projection",
+                    experiment_id,
+                    {
+                        "experiment_id": experiment_id,
+                        "reason": "official_verifier_replay_updated_scores",
+                    },
+                )
+            return completed
+        except Exception as exc:
+            latest = self.repository.get_experiment(experiment_id)
+            if latest.status in {ExperimentStatus.CANCEL_REQUESTED, ExperimentStatus.CANCELLED}:
+                if latest.status == ExperimentStatus.CANCEL_REQUESTED:
+                    cancelled = latest.model_copy(
+                        update={"status": ExperimentStatus.CANCELLED, "finished_at": utc_now()}
+                    )
+                    return self.repository.update_experiment(
+                        cancelled,
+                        expected_status=ExperimentStatus.CANCEL_REQUESTED,
+                    )
+                return latest
+            failed_at = utc_now()
+            failed_replay = {
+                **dict(latest.summary.get("swebench_verifier_replay") or replay),
+                "status": "failed",
+                "completed_at": failed_at.isoformat(),
+                "error": f"{type(exc).__name__}: {str(exc)[:500]}",
+            }
+            failed = latest.model_copy(
+                update={
+                    "status": ExperimentStatus.FAILED,
+                    "finished_at": failed_at,
+                    "summary": {
+                        **latest.summary,
+                        "swebench_verifier_replay": failed_replay,
+                        "progress": {
+                            **dict(latest.summary.get("progress") or {}),
+                            "stage": "failed",
+                            "message": "Docker 重新判卷失败；Agent patch 已保留",
+                            "updated_at": failed_at.isoformat(),
+                        },
+                    },
+                    "error": EvalError(
+                        code="swebench_verifier_replay_failed",
+                        message=f"{type(exc).__name__}: {str(exc)[:1000]}",
+                        retryable=isinstance(exc, (TimeoutError, ConnectionError)),
+                    ),
+                }
+            )
+            return self.repository.update_experiment(
+                failed,
+                expected_status=ExperimentStatus.RUNNING,
+            )
+        finally:
+            if not experiment.execution.preserve_workspaces:
+                shutil.rmtree(runtime_root, ignore_errors=True)
+
+    async def run_swebench_missing_case_resume(self, experiment_id: str) -> EvalExperiment:
+        """Append Attempts only for missing patches, then judge the merged set."""
+
+        experiment = self.repository.get_experiment(experiment_id)
+        resume = dict(experiment.summary.get("swebench_case_resume") or {})
+        requested_instance_ids = {
+            str(item) for item in resume.get("missing_instance_ids") or []
+        }
+        started_at = utc_now()
+        running = experiment.model_copy(
+            update={
+                "status": ExperimentStatus.RUNNING,
+                "started_at": started_at,
+                "finished_at": None,
+                "error": None,
+                "summary": {
+                    **experiment.summary,
+                    "swebench_case_resume": {
+                        **resume,
+                        "status": "running",
+                        "started_at": started_at.isoformat(),
+                    },
+                    "progress": {
+                        "stage": "preparing",
+                        "message": "正在准备补跑缺失 Patch 的 Case",
+                        "total": len(requested_instance_ids),
+                        "completed": 0,
+                        "failed": 0,
+                        "updated_at": started_at.isoformat(),
+                    },
+                },
+            }
+        )
+        self.repository.update_experiment(
+            running,
+            expected_status=ExperimentStatus.QUEUED,
+        )
+        runtime_root = self._runtime_root(experiment_id)
+        try:
+            dataset = self.repository.get_dataset(
+                running.dataset_id,
+                running.dataset_version,
+            )
+            if dataset.current_version_id != running.dataset_version_id:
+                raise ValueError("Pinned Dataset version identity mismatch")
+            drifted = verify_candidate_snapshot(self.backend_dir, running.candidate)
+            if drifted:
+                raise ValueError(
+                    f"Candidate snapshot changed before execution: {', '.join(drifted)}"
+                )
+            self._initialize_isolated_runtime(runtime_root)
+            dataset_data_classification = str(
+                dataset.metadata.get("data_classification") or "internal"
+            ).lower()
+            if dataset_data_classification not in {
+                "public",
+                "internal",
+                "sensitive",
+                "restricted",
+            }:
+                dataset_data_classification = "restricted"
+
+            current_manifest = swebench_prediction_manifest(
+                dataset,
+                self.repository.load_run_envelopes(experiment_id),
+                model_name_or_path=(running.candidate.llm_model_id or running.candidate.name),
+            )
+            still_missing = set(current_manifest["missing_instance_ids"])
+            target_instances = requested_instance_ids & still_missing
+            target_cases = [
+                case
+                for case in dataset.cases
+                if case.enabled
+                and case.code is not None
+                and case.code.repository.swebench is not None
+                and case.code.repository.swebench.instance_id in target_instances
+            ]
+            result_rows = self.repository.list_results(experiment_id)
+            next_repetition_by_case: dict[str, int] = {}
+            for row in result_rows:
+                case_id = str(row["case_id"])
+                next_repetition_by_case[case_id] = max(
+                    next_repetition_by_case.get(case_id, 0),
+                    int(row["repetition"]) + 1,
+                )
+
+            new_attempts: list[dict[str, Any]] = []
+            for index, case in enumerate(target_cases, start=1):
+                latest = self.repository.get_experiment(experiment_id)
+                if latest.status == ExperimentStatus.CANCEL_REQUESTED:
+                    self.repository.cancel_running_attempts(
+                        experiment_id,
+                        "Experiment cancellation requested",
+                    )
+                    cancelled = latest.model_copy(
+                        update={
+                            "status": ExperimentStatus.CANCELLED,
+                            "finished_at": utc_now(),
+                        }
+                    )
+                    return self.repository.update_experiment(
+                        cancelled,
+                        expected_status=ExperimentStatus.CANCEL_REQUESTED,
+                    )
+                self._update_progress(
+                    experiment_id,
+                    stage="agent_running",
+                    message="只补跑缺失 Patch 的 Case",
+                    total=len(target_cases),
+                    completed=len(new_attempts),
+                    failed=sum(
+                        item.get("attempt_status") == "failed" for item in new_attempts
+                    ),
+                    current_index=index,
+                    current_case_id=case.case_id,
+                    current_case_name=case.name,
+                )
+                result = await self._run_case(
+                    running,
+                    case,
+                    next_repetition_by_case.get(case.case_id, 0),
+                    runtime_root,
+                    dataset_data_classification,
+                )
+                new_attempts.append(result)
+
+            effective_attempts, attempt_history, manifest = (
+                self._effective_swebench_attempts_for_scoring(
+                    running,
+                    dataset,
+                )
+            )
+            official: dict[str, Any]
+            if manifest["predictions"]:
+                try:
+                    official = await self._run_and_apply_official_swebench(
+                        running,
+                        dataset,
+                        runtime_root,
+                        effective_attempts,
+                        allow_partial_predictions=True,
+                    )
+                except Exception as exc:
+                    official = {
+                        "status": "error",
+                        "reason": f"{type(exc).__name__}: {str(exc)[:1_000]}",
+                        "total": len(manifest["predictions"]),
+                        "resolved": 0,
+                    }
+            else:
+                official = {
+                    "status": "not_started",
+                    "reason": "No persisted SWE-bench patch is available",
+                    "total": 0,
+                    "resolved": 0,
+                }
+
+            latest = self.repository.get_experiment(experiment_id)
+            if latest.status == ExperimentStatus.CANCEL_REQUESTED:
+                cancelled = latest.model_copy(
+                    update={
+                        "status": ExperimentStatus.CANCELLED,
+                        "finished_at": utc_now(),
+                    }
+                )
+                return self.repository.update_experiment(
+                    cancelled,
+                    expected_status=ExperimentStatus.CANCEL_REQUESTED,
+                )
+            # Official scoring may have updated persisted result rows. Reload
+            # the effective set so aggregates exactly match durable evidence.
+            effective_attempts, attempt_history, manifest = (
+                self._effective_swebench_attempts_for_scoring(
+                    latest,
+                    dataset,
+                )
+            )
+            summary = self._refresh_attempt_scoring_summary(
+                latest.summary,
+                effective_attempts,
+            )
+            completed_at = utc_now()
+            resume_result = {
+                **dict(summary.get("swebench_case_resume") or resume),
+                "status": "completed",
+                "completed_at": completed_at.isoformat(),
+                "new_attempt_ids": [item["attempt_id"] for item in new_attempts],
+                "new_attempt_count": len(new_attempts),
+                "new_failed_attempt_count": sum(
+                    item.get("attempt_status") == "failed" for item in new_attempts
+                ),
+                "remaining_missing_instance_ids": list(manifest["missing_instance_ids"]),
+                "persisted_patch_count": len(manifest["predictions"]),
+            }
+            resume_history = list(summary.get("swebench_case_resume_history") or [])
+            resume_history.append(resume_result)
+            effective_attempt_ids = [
+                str(item["attempt_id"]) for item in effective_attempts
+            ]
+            effective_attempt_id_set = set(effective_attempt_ids)
+            superseded_attempt_ids = [
+                str(item["attempt_id"])
+                for item in attempt_history
+                if str(item["attempt_id"]) not in effective_attempt_id_set
+            ]
+            summary.update(
+                {
+                    "swebench_case_resume": resume_result,
+                    "swebench_case_resume_history": resume_history,
+                    "swebench_official_harness": official,
+                    "swebench_predictions_available": not manifest["missing_instance_ids"],
+                    "swebench_predictions_count": len(manifest["predictions"]),
+                    "swebench_missing_predictions": len(manifest["missing_instance_ids"]),
+                    "attempt_history_count": len(attempt_history),
+                    "effective_attempt_ids": effective_attempt_ids,
+                    "superseded_attempt_ids": superseded_attempt_ids,
+                    "superseded_attempt_count": len(superseded_attempt_ids),
+                    "progress": {
+                        "stage": "completed",
+                        "message": (
+                            "缺失 Case 已补跑并完成全部 Patch 判卷"
+                            if not manifest["missing_instance_ids"]
+                            else (
+                                f"补跑结束，仍有 {len(manifest['missing_instance_ids'])} "
+                                "个 Case 缺少 Patch；已有 Patch 已完成判卷"
+                            )
+                        ),
+                        "total": len(target_cases),
+                        "completed": len(new_attempts),
+                        "failed": sum(
+                            item.get("attempt_status") == "failed"
+                            for item in new_attempts
+                        ),
+                        "updated_at": completed_at.isoformat(),
+                    },
+                }
+            )
+            projection_was_published = bool(
+                resume.get("langsmith_projection_was_published")
+            )
+            if projection_was_published:
+                summary["experiment_projection"] = "stale_after_case_resume"
+                summary["langsmith_projection"] = "stale_after_case_resume"
+            completed = latest.model_copy(
+                update={
+                    "status": ExperimentStatus.COMPLETED,
+                    "verdict": self._verdict_from_summary(summary),
+                    "finished_at": completed_at,
+                    "summary": summary,
+                    "error": None,
+                }
+            )
+            return self.repository.update_experiment(
+                completed,
+                expected_status=ExperimentStatus.RUNNING,
+            )
+        except Exception as exc:
+            latest = self.repository.get_experiment(experiment_id)
+            if latest.status in {
+                ExperimentStatus.CANCEL_REQUESTED,
+                ExperimentStatus.CANCELLED,
+            }:
+                if latest.status == ExperimentStatus.CANCEL_REQUESTED:
+                    latest = latest.model_copy(
+                        update={
+                            "status": ExperimentStatus.CANCELLED,
+                            "finished_at": utc_now(),
+                        }
+                    )
+                    return self.repository.update_experiment(
+                        latest,
+                        expected_status=ExperimentStatus.CANCEL_REQUESTED,
+                    )
+                return latest
+            failed_at = utc_now()
+            failed = latest.model_copy(
+                update={
+                    "status": ExperimentStatus.FAILED,
+                    "finished_at": failed_at,
+                    "summary": {
+                        **latest.summary,
+                        "swebench_case_resume": {
+                            **dict(latest.summary.get("swebench_case_resume") or resume),
+                            "status": "failed",
+                            "completed_at": failed_at.isoformat(),
+                            "error": f"{type(exc).__name__}: {str(exc)[:500]}",
+                        },
+                        "progress": {
+                            **dict(latest.summary.get("progress") or {}),
+                            "stage": "failed",
+                            "message": "缺失 Case 补跑失败；已有 Patch 和 Attempt 均已保留",
+                            "updated_at": failed_at.isoformat(),
+                        },
+                    },
+                    "error": EvalError(
+                        code="swebench_case_resume_failed",
+                        message=f"{type(exc).__name__}: {str(exc)[:1000]}",
+                        retryable=isinstance(exc, (TimeoutError, ConnectionError)),
+                    ),
+                }
+            )
+            return self.repository.update_experiment(
+                failed,
+                expected_status=ExperimentStatus.RUNNING,
+            )
+        finally:
+            if not experiment.execution.preserve_workspaces:
+                shutil.rmtree(runtime_root, ignore_errors=True)
+
     async def run(self, experiment_id: str) -> EvalExperiment:
         experiment = self.repository.get_experiment(experiment_id)
+        if experiment.summary.get("execution_mode") == "official_verifier_replay":
+            return await self.run_official_verifier_replay(experiment_id)
+        if experiment.summary.get("execution_mode") == "swebench_missing_case_resume":
+            return await self.run_swebench_missing_case_resume(experiment_id)
         experiment = experiment.model_copy(
             update={
                 "status": ExperimentStatus.RUNNING,

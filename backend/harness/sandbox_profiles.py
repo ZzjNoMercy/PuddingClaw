@@ -51,6 +51,10 @@ class SandboxGrantProfile:
     timeout_seconds: int = 120
     max_output_bytes: int = 100_000
     max_processes: int = 128
+    # ``unrestricted`` is an explicit trusted-local profile.  It keeps the
+    # runner's process/network controls but deliberately does not compile a
+    # project-root filesystem view.
+    filesystem: str = "restricted"
     profile_schema: str = "sandbox-grant-profile-v1"
 
     @classmethod
@@ -68,29 +72,38 @@ class SandboxGrantProfile:
         timeout_seconds: int = 120,
         max_output_bytes: int = 100_000,
         max_processes: int = 128,
+        filesystem: str = "restricted",
     ) -> SandboxGrantProfile:
         workspace = _canonical_directory(workspace_root)
         scratch = _canonical_directory(scratch_root)
-        reads = tuple(
-            dict.fromkeys(
-                (
-                    workspace,
-                    scratch,
-                    *(_canonical_directory(path) for path in external_read_roots),
+        if filesystem not in {"restricted", "unrestricted"}:
+            raise ValueError("filesystem must be restricted or unrestricted")
+        if filesystem == "unrestricted":
+            # The roots remain part of the profile identity as cwd/runtime
+            # anchors, but they are not authority inputs in trusted-local
+            # mode.  The OS user owns the ordinary host filesystem boundary.
+            reads = writes = deletes = denies = ()
+        else:
+            reads = tuple(
+                dict.fromkeys(
+                    (
+                        workspace,
+                        scratch,
+                        *(_canonical_directory(path) for path in external_read_roots),
+                    )
                 )
             )
-        )
-        writes = tuple(
-            dict.fromkeys(
-                (
-                    *((workspace,) if workspace_writable else ()),
-                    scratch,
-                    *(_canonical_directory(path) for path in external_write_roots),
+            writes = tuple(
+                dict.fromkeys(
+                    (
+                        *((workspace,) if workspace_writable else ()),
+                        scratch,
+                        *(_canonical_directory(path) for path in external_write_roots),
+                    )
                 )
             )
-        )
-        deletes = tuple(dict.fromkeys(_canonical_directory(path) for path in external_delete_roots))
-        denies = tuple(dict.fromkeys(_canonical_directory(path) for path in external_deny_roots))
+            deletes = tuple(dict.fromkeys(_canonical_directory(path) for path in external_delete_roots))
+            denies = tuple(dict.fromkeys(_canonical_directory(path) for path in external_deny_roots))
         if any(not _covered(root, reads) for root in writes):
             raise ValueError("Every shell write root must be covered by explicit read authority")
         if any(not _covered(root, writes) for root in deletes):
@@ -109,6 +122,7 @@ class SandboxGrantProfile:
             timeout_seconds=timeout_seconds,
             max_output_bytes=max_output_bytes,
             max_processes=max_processes,
+            filesystem=filesystem,
         )
 
     @property
@@ -126,6 +140,7 @@ class SandboxGrantProfile:
             "timeout_seconds": self.timeout_seconds,
             "max_output_bytes": self.max_output_bytes,
             "max_processes": self.max_processes,
+            "filesystem": self.filesystem,
         }
         encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
         return "sha256:" + hashlib.sha256(encoded).hexdigest()

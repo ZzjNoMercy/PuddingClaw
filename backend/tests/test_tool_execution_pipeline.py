@@ -78,6 +78,128 @@ def test_simple_cp_produces_external_read_write_requirements(tmp_path: Path) -> 
     )
 
 
+@pytest.mark.parametrize("backend_mode", ["spawn", "kernel"])
+def test_smart_execution_copies_managed_resource_into_project_without_hitl(
+    tmp_path: Path,
+    backend_mode: str,
+) -> None:
+    workspace = tmp_path / "workspace"
+    scratch = tmp_path / "scratch"
+    analytics = tmp_path / "analytics-models"
+    workspace.mkdir()
+    scratch.mkdir()
+    analytics.mkdir()
+    execution_backend = SimpleNamespace(
+        scratch_path=scratch.resolve(),
+        managed_readonly_host_roots=(analytics.resolve(),),
+        kernel_runner_mode="kernel_macos_seatbelt",
+        kernel_runner_binding_digest="test-kernel-runner-binding",
+        filesystem_read_roots=(workspace.resolve(), scratch.resolve(), analytics.resolve()),
+        filesystem_write_roots=(workspace.resolve(), scratch.resolve()),
+        filesystem_delete_roots=(workspace.resolve(), scratch.resolve()),
+        resolve_execution_path=lambda raw: (
+            str(analytics.resolve()) + raw.removeprefix("/analytics-models")
+            if raw == "/analytics-models" or raw.startswith("/analytics-models/")
+            else raw
+        ),
+    )
+    context = RunPermissionContext.from_config_snapshot(
+        {
+            "permissions": {"approval_mode": "smart", "policy_epoch": 1},
+            "execution": {
+                "backend_mode": backend_mode,
+                "backend_id": f"{backend_mode}:project:test",
+                "workspace_id": "sha256:workspace",
+            },
+        }
+    )
+    pipeline = ToolExecutionPipeline(
+        known_tools={"execute"},
+        backend_mode=backend_mode,
+        permission_context=context,
+        workspace_backend=execution_backend,
+    )
+    command = (
+        "cp /analytics-models/model/templates/topic/index.html "
+        "/workspace/reports/topic/index.html"
+    )
+    request = ToolCallRequest(
+        tool_call={
+            "id": f"managed-copy-{backend_mode}",
+            "name": "execute",
+            "args": {"command": command},
+        },
+        tool=None,
+        state={},
+        runtime=SimpleNamespace(context={"workspace_path": str(workspace)}),
+    )
+
+    assert pipeline._require_external_shell_authority(request) is None
+    result = pipeline._preflight(request)
+    assert result.decision is PolicyDecision.ALLOW
+    assert result.reason == "smart_sandbox_workspace_write"
+    if backend_mode == "kernel":
+        authorized = pipeline._compile_kernel_execution(request)
+        assert authorized is not None
+        assert authorized.execution_command == command
+        assert authorized.profile.filesystem == "unrestricted"
+        assert authorized.profile.read_roots == ()
+        assert authorized.profile.write_roots == ()
+
+
+def test_managed_shell_projection_is_host_authority_in_smart_spawn(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    scratch = tmp_path / "scratch"
+    analytics = tmp_path / "analytics-models"
+    workspace.mkdir()
+    scratch.mkdir()
+    analytics.mkdir()
+    (analytics / "template.html").write_text("template", encoding="utf-8")
+    backend = SpawnWorkspaceBackend(
+        root_dir=workspace,
+        scratch_path=scratch,
+        managed_readonly_path_aliases=(("/analytics-models", analytics.resolve()),),
+    )
+
+    copied = backend.execute(
+        "cp /analytics-models/template.html /workspace/copied.html"
+    )
+    context = RunPermissionContext.from_config_snapshot(
+        {
+            "permissions": {"approval_mode": "smart", "policy_epoch": 1},
+            "execution": {
+                "backend_mode": "spawn",
+                "backend_id": backend.id,
+                "workspace_id": "sha256:workspace",
+            },
+        }
+    )
+    pipeline = ToolExecutionPipeline(
+        known_tools={"execute"},
+        backend_mode="spawn",
+        permission_context=context,
+        workspace_backend=backend,
+    )
+    allowed = pipeline._preflight(
+        ToolCallRequest(
+            tool_call={
+                "id": "managed-write-denied",
+                "name": "execute",
+                "args": {
+                    "command": "cp /workspace/copied.html /analytics-models/changed.html"
+                },
+            },
+            tool=None,
+            state={},
+            runtime=SimpleNamespace(context={"workspace_path": str(workspace)}),
+        )
+    )
+
+    assert copied.exit_code == 0
+    assert (workspace / "copied.html").read_text(encoding="utf-8") == "template"
+    assert allowed.decision is PolicyDecision.ALLOW
+    assert allowed.reason == "smart_sandbox_workspace_write"
+
 @pytest.mark.parametrize(
     ("command", "reason"),
     [
@@ -274,6 +396,114 @@ async def test_tool_action_request_is_idempotent_across_graph_replay():
     assert second["id"] == first["id"]
     assert len(registry._pending) == 1
     assert registry.resolve(first["id"], {"type": "reject"})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("reason", "capabilities"),
+    [
+        ("persistence_write", ["execute", "managed_write"]),
+        ("sensitive_host_read", ["execute"]),
+        (
+            "destructive_workspace_delete:rm_recursive",
+            ["execute", "managed_write", "destructive_write"],
+        ),
+        (
+            "package_management:python3",
+            ["execute", "network_access", "managed_write", "package_install"],
+        ),
+    ],
+)
+async def test_high_risk_effect_requests_only_offer_one_time_approval(
+    reason,
+    capabilities,
+):
+    registry = PermissionResumeRegistry()
+
+    request = registry.create_tool_action_request(
+        session_id="session-risk",
+        query_id="query-risk",
+        run_id="run-risk",
+        tool_call_id=f"call-{reason}",
+        tool_name="execute",
+        command="effect probe",
+        reason=reason,
+        risk="high",
+        session_target_kind="command_pattern",
+        session_target="effect *",
+        required_capabilities=capabilities,
+    )
+
+    assert request["options"] == ["once"]
+    assert "session_target_kind" not in request
+    assert "session_target" not in request
+    assert registry.resolve(request["id"], {"type": "reject"})
+
+
+@pytest.mark.asyncio
+async def test_network_effect_can_be_session_scoped_but_not_project_scoped():
+    registry = PermissionResumeRegistry()
+
+    request = registry.create_tool_action_request(
+        session_id="session-network",
+        query_id="query-network",
+        run_id="run-network",
+        tool_call_id="call-network",
+        tool_name="execute",
+        command="curl -X POST https://example.invalid --data probe=1",
+        reason="network_access:curl",
+        risk="network",
+        session_target_kind="capability",
+        session_target="session_network_access",
+        required_capabilities=["execute", "network_access"],
+    )
+
+    assert request["options"] == ["once", "session"]
+    assert request["session_target"] == "session_network_access"
+    assert registry.resolve(request["id"], {"type": "reject"})
+
+
+@pytest.mark.asyncio
+async def test_tool_action_resolution_persists_approval_and_rejection_audit(tmp_path):
+    from graph.session_manager import session_manager
+
+    session_manager.initialize(tmp_path)
+    session_manager.create_session("session-audit")
+    registry = PermissionResumeRegistry()
+    approved = registry.create_tool_action_request(
+        session_id="session-audit",
+        query_id="query-audit",
+        run_id="run-audit",
+        tool_call_id="call-approved",
+        tool_name="execute",
+        command="rm -rf /tmp/test-only",
+        reason="destructive_workspace_delete:rm_recursive",
+        risk="high",
+    )
+    rejected = registry.create_tool_action_request(
+        session_id="session-audit",
+        query_id="query-audit",
+        run_id="run-audit",
+        tool_call_id="call-rejected",
+        tool_name="execute",
+        command="curl https://example.invalid",
+        reason="network_access",
+        risk="high",
+    )
+
+    assert registry.resolve(approved["id"], {"type": "approve", "scope": "once"})
+    assert registry.resolve(rejected["id"], {"type": "reject", "scope": "none"})
+
+    decisions = session_manager.list_permission_decisions(
+        "session-audit",
+        run_id="run-audit",
+    )
+    assert [item["outcome"] for item in decisions] == ["approved", "rejected"]
+    assert [item["scope"] for item in decisions] == ["once", "none"]
+    assert [item["reason"] for item in decisions] == [
+        "destructive_workspace_delete:rm_recursive",
+        "network_access",
+    ]
 
 
 @pytest.mark.asyncio
@@ -877,7 +1107,7 @@ def test_spawn_backend_maps_quoted_and_assigned_scratch_paths(tmp_path):
     assert (scratch / "assigned.txt").read_text() == "assigned"
 
 
-def test_spawn_backend_maps_tmp_to_current_run_scratch(tmp_path):
+def test_spawn_backend_preserves_real_tmp_and_uses_scratch_for_tmpdir(tmp_path):
     workspace = tmp_path / "workspace"
     first_scratch = tmp_path / "harness-scratch" / "session-a" / "query-a"
     second_scratch = tmp_path / "harness-scratch" / "session-b" / "query-b"
@@ -887,15 +1117,22 @@ def test_spawn_backend_maps_tmp_to_current_run_scratch(tmp_path):
     first = SpawnWorkspaceBackend(root_dir=workspace, scratch_path=first_scratch)
     second = SpawnWorkspaceBackend(root_dir=workspace, scratch_path=second_scratch)
 
-    first_result = first.execute("printf first > /tmp/result.txt")
-    second_result = second.execute("printf second > /tmp/result.txt")
+    real_tmp_target = Path("/tmp") / f"puddingclaw-real-tmp-{tmp_path.name}.txt"
+    real_tmp_target.unlink(missing_ok=True)
 
-    assert first_result.exit_code == 0
-    assert second_result.exit_code == 0
-    assert (first_scratch / "tmp" / "result.txt").read_text() == "first"
-    assert (second_scratch / "tmp" / "result.txt").read_text() == "second"
-    assert first._env["TMPDIR"] == str(first_scratch / "tmp")
-    assert second._env["TMPDIR"] == str(second_scratch / "tmp")
+    first_result = first.execute(f"printf first > {shlex.quote(str(real_tmp_target))}")
+    second_result = second.execute(f"printf second > {shlex.quote(str(real_tmp_target))}")
+
+    try:
+        assert first_result.exit_code == 0
+        assert second_result.exit_code == 0
+        assert real_tmp_target.read_text() == "second"
+        assert not (first_scratch / "tmp" / real_tmp_target.name).exists()
+        assert not (second_scratch / "tmp" / real_tmp_target.name).exists()
+        assert first._env["TMPDIR"] == str(first_scratch / "tmp")
+        assert second._env["TMPDIR"] == str(second_scratch / "tmp")
+    finally:
+        real_tmp_target.unlink(missing_ok=True)
 
 
 def test_shell_chain_uses_strictest_segment(tmp_path):
@@ -2287,6 +2524,12 @@ def test_opaque_external_shell_command_derives_conservative_directory_authority(
     pipeline = ToolExecutionPipeline(
         known_tools={"execute"},
         backend_mode="kernel",
+        permission_context=RunPermissionContext.from_config_snapshot(
+            {
+                "permissions": {"approval_mode": "strict", "policy_epoch": 1},
+                "execution": {"backend_mode": "kernel", "backend_id": "kernel:test"},
+            }
+        ),
     )
     requirements = ShellPolicyAnalyzer.requirements(
         f"find {external} -name '*.txt'",
@@ -2530,7 +2773,7 @@ def test_spawn_smart_allows_pdf_extract_with_tmp_output_and_local_fallback(tmp_p
     result = pipeline._preflight(request)
 
     assert result.decision is PolicyDecision.ALLOW
-    assert result.reason == "smart_spawn_external_local_execute"
+    assert result.reason == "smart_sandbox_execute"
     assert pipeline._require_external_shell_authority(request) is None
 
     strict_pipeline = ToolExecutionPipeline(
@@ -2566,11 +2809,12 @@ def test_spawn_smart_allows_pdf_extract_with_tmp_output_and_local_fallback(tmp_p
     )
     kernel_result = kernel_pipeline._preflight(request)
     assert kernel_result.decision is PolicyDecision.ALLOW
-    assert kernel_result.reason == "smart_kernel_external_local_execute"
+    assert kernel_result.reason == "smart_sandbox_execute"
     assert kernel_pipeline._require_external_shell_authority(request) is None
     authorized = kernel_pipeline._compile_kernel_execution(request)
     assert authorized is not None
-    assert downloads.resolve() in authorized.profile.read_roots
+    assert authorized.profile.filesystem == "unrestricted"
+    assert authorized.profile.read_roots == ()
 
 
 @pytest.mark.asyncio
@@ -2621,7 +2865,7 @@ async def test_smart_pdf_stdout_read_never_reaches_probabilistic_reviewer(
     result = await pipeline._apreflight(request)
 
     assert result.decision is PolicyDecision.ALLOW
-    assert result.reason == f"smart_{backend_mode}_external_local_execute"
+    assert result.reason == "smart_sandbox_execute"
     assert result.source == "deterministic"
     assert reviewer.calls == []
     assert pipeline._require_external_shell_authority(request) is None
@@ -2745,7 +2989,7 @@ def test_spawn_dynamic_python_cannot_masquerade_as_external_read(tmp_path, progr
     ) == ()
     result = pipeline._preflight(request)
     assert result.decision is PolicyDecision.ASK
-    assert result.reason == "spawn_external_dynamic_effect_unprovable"
+    assert result.reason == "local_dynamic_effect_unprovable"
     assert pipeline._require_external_shell_authority(request) is None
 
 
@@ -2971,6 +3215,12 @@ def test_kernel_backend_projects_managed_skills_namespace_read_only(tmp_path, mo
         known_tools={"execute"},
         backend_mode="kernel",
         workspace_backend=backend,
+        permission_context=RunPermissionContext.from_config_snapshot(
+            {
+                "permissions": {"approval_mode": "strict", "policy_epoch": 1},
+                "execution": {"backend_mode": "kernel", "backend_id": backend.id},
+            }
+        ),
     )
     command = "python3 '/skills/get-date/scripts/get_datetime.py'"
     request = ToolCallRequest(

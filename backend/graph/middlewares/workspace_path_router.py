@@ -76,17 +76,11 @@ class WorkspacePathRouterMiddleware(AgentMiddleware):
 
     @property
     def _spawn_host_reads_enabled(self) -> bool:
-        return (
-            str(getattr(self.backend, "execution_mode", "")) == "spawn"
-            and self.approval_mode != "smart"
-        )
+        return str(getattr(self.backend, "execution_mode", "")) == "spawn" and self.approval_mode != "smart"
 
     @property
     def _smart_host_reads_enabled(self) -> bool:
-        return (
-            self.approval_mode == "smart"
-            and str(getattr(self.backend, "execution_mode", "")) in {"spawn", "kernel"}
-        )
+        return self.approval_mode == "smart" and str(getattr(self.backend, "execution_mode", "")) in {"spawn", "kernel"}
 
     @classmethod
     def _default_search_scope(
@@ -157,10 +151,7 @@ class WorkspacePathRouterMiddleware(AgentMiddleware):
             raw_path,
             workspace_root=workspace_path or None,
         )
-        routed = (
-            classified.virtual_path
-            or str(classified.canonical_host_path or classified.normalized_path)
-        )
+        routed = classified.virtual_path or str(classified.canonical_host_path or classified.normalized_path)
         if classified.authority is PathAuthority.WORKSPACE:
             return "workspace", routed
         if classified.authority in {PathAuthority.SCRATCH, PathAuthority.MANAGED}:
@@ -168,6 +159,43 @@ class WorkspacePathRouterMiddleware(AgentMiddleware):
         if classified.authority is PathAuthority.ESCAPE:
             return "escape", routed
         return "external", routed
+
+    def _trace_path_projection(
+        self,
+        *,
+        raw_path: str,
+        routed_path: str,
+        kind: str,
+    ) -> None:
+        collector = get_current_trace_collector()
+        if collector is None:
+            return
+        input_kind = (
+            "virtual"
+            if raw_path.startswith("/")
+            and raw_path.split("/", 2)[1:2]
+            and raw_path.split("/", 2)[1]
+            in {
+                "workspace",
+                "scratch",
+                "skills",
+                "knowledge",
+                "analytics-models",
+            }
+            else "relative"
+            if not Path(raw_path).expanduser().is_absolute()
+            else "real"
+        )
+        collector.add_custom_span(
+            "filesystem.path_projection",
+            {
+                "input_path_kind": input_kind,
+                "authority_kind": kind,
+                "real_path_digest": hashlib.sha256(str(routed_path).encode("utf-8")).hexdigest()[:16],
+            },
+            span_type="filesystem",
+            metadata={"filesystem": {"mode": getattr(self.backend, "filesystem_mode", "restricted")}},
+        )
 
     def _managed_virtual_path(self, raw_path: str) -> tuple[str | None, bool]:
         """Map a configured managed host path back to its model-visible mount.
@@ -197,9 +225,7 @@ class WorkspacePathRouterMiddleware(AgentMiddleware):
                 continue
             relative = canonical.relative_to(host_root).as_posix()
             return (
-                virtual_root
-                if relative == "."
-                else f"{virtual_root}/{relative}",
+                virtual_root if relative == "." else f"{virtual_root}/{relative}",
                 False,
             )
         return None, False
@@ -240,15 +266,16 @@ class WorkspacePathRouterMiddleware(AgentMiddleware):
             f"Underlying error: {error}"
         )
 
-    @classmethod
     def _normalize_managed_execute_result(
-        cls,
+        self,
         request: ToolCallRequest,
         result: ToolMessage | Command[Any],
     ) -> ToolMessage | Command[Any]:
         """Turn raw EPERM/EACCES from managed mounts into a stable contract."""
 
         if not isinstance(result, ToolMessage):
+            return result
+        if self.approval_mode == "smart":
             return result
         # A successful file may legitimately document strings such as
         # "permission denied" or "operation not permitted".  Those strings
@@ -259,21 +286,20 @@ class WorkspacePathRouterMiddleware(AgentMiddleware):
         if result.status != "error":
             return result
         tool_name = str(request.tool_call.get("name") or "")
-        path_arg = cls._PATH_ARGS.get(tool_name)
+        path_arg = self._PATH_ARGS.get(tool_name)
         args = dict(request.tool_call.get("args") or {})
         virtual_path = str(args.get(path_arg) or "") if path_arg else ""
         if not any(
-            virtual_path == root or virtual_path.startswith(f"{root}/")
-            for root in MANAGED_VIRTUAL_NAMESPACE_ROOTS
+            virtual_path == root or virtual_path.startswith(f"{root}/") for root in MANAGED_VIRTUAL_NAMESPACE_ROOTS
         ):
             return result
         content = str(result.content or "")
         lowered = content.lower()
-        if not any(marker in lowered for marker in cls._MANAGED_OS_PERMISSION_MARKERS):
+        if not any(marker in lowered for marker in self._MANAGED_OS_PERMISSION_MARKERS):
             return result
         return result.model_copy(
             update={
-                "content": cls._managed_access_error(virtual_path, content),
+                "content": self._managed_access_error(virtual_path, content),
                 "status": "error",
             }
         )
@@ -395,9 +421,7 @@ class WorkspacePathRouterMiddleware(AgentMiddleware):
                 probe = self.backend.ls(staged_dir)
                 if not probe.error:
                     return (
-                        staged_dir
-                        if relative == "."
-                        else f"{staged_dir}/{relative}",
+                        staged_dir if relative == "." else f"{staged_dir}/{relative}",
                         None,
                     )
         if collector is not None:
@@ -521,27 +545,21 @@ class WorkspacePathRouterMiddleware(AgentMiddleware):
             workspace_path,
         )
         if args != original_args:
-            request = request.override(
-                tool_call={**request.tool_call, "args": args}
-            )
+            request = request.override(tool_call={**request.tool_call, "args": args})
         raw_path = str(args.get(path_arg) or "")
         managed_virtual_path, managed_escape = self._managed_virtual_path(raw_path)
         if managed_escape:
             return "result", self._tool_message(
                 request,
-                (
-                    "❌ Path escapes its managed read-only authority through a symlink: "
-                    f"{raw_path!r}."
-                ),
+                (f"❌ Path escapes its managed read-only authority through a symlink: {raw_path!r}."),
                 name=tool_name,
             )
         if managed_virtual_path is not None:
             args[path_arg] = managed_virtual_path
-            request = request.override(
-                tool_call={**request.tool_call, "args": args}
-            )
+            request = request.override(tool_call={**request.tool_call, "args": args})
             raw_path = managed_virtual_path
         kind, routed_path = self._classify_path(raw_path, workspace_path)
+        self._trace_path_projection(raw_path=raw_path, routed_path=routed_path, kind=kind)
 
         if kind == "escape":
             return "result", self._tool_message(
@@ -597,53 +615,15 @@ class WorkspacePathRouterMiddleware(AgentMiddleware):
                     name=tool_name,
                 )
 
-        # `/scratch` is a Backend/Docker virtual namespace, not a host path.
-        # Models occasionally choose read_resource merely because it is not
-        # under `/workspace`; adapt that mistake at the execution boundary so
-        # a valid staged artifact does not appear to be missing.
-        if (
-            tool_name == "read_resource"
-            and kind == "virtual"
-            and routed_path.startswith("/scratch/")
-        ):
-            if self.backend is None:
-                return "result", self._tool_message(
-                    request,
-                    "❌ `/scratch/...` is a Docker/Backend virtual path. Use read_file, not read_resource.",
-                    name="read_resource",
-                )
-            return "backend_read", (request, routed_path, args)  # type: ignore[return-value]
-
-        # Managed filesystem mounts are regular Backend files. If the model
-        # chose read_resource only because the user supplied the physical host
-        # spelling, normalize the call to read_file semantics at the execution
-        # boundary. Images remain resources because they need the image marker
-        # consumed by the visual-analysis path.
-        if (
-            tool_name == "read_resource"
-            and kind == "virtual"
-            and any(
-                routed_path == root or routed_path.startswith(f"{root}/")
-                for root in MANAGED_VIRTUAL_NAMESPACE_ROOTS
-            )
-            and Path(routed_path).suffix.lower() not in {
-                ".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff"
-            }
-        ):
-            if self.backend is None:
-                return "result", self._tool_message(
-                    request,
-                    "❌ Managed filesystem path requires the Agent Backend read_file route.",
-                    name="read_resource",
-                )
-            return "backend_read", (request, routed_path, args)  # type: ignore[return-value]
-
-        # Spawn exposes ordinary host reads directly. Bind a local resource
-        # reader with the selected mode so images and text retain their typed
-        # result formats without manufacturing an external-file Grant.
+        # Local images remain typed resources because successful reads inject
+        # visual content into the image-analysis path. Ordinary text paths are
+        # never adapted here; read_resource rejects them and read_file owns all
+        # real/virtual filesystem text reads.
         if (
             tool_name == "read_resource"
             and kind == "external"
+            and Path(routed_path).suffix.lower()
+            in {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff"}
             and (self._spawn_host_reads_enabled or self._smart_host_reads_enabled)
         ):
             resource_tool = ReadResourceTool(
@@ -653,14 +633,17 @@ class WorkspacePathRouterMiddleware(AgentMiddleware):
                 backend_mode=str(getattr(self.backend, "execution_mode", "") or "kernel"),
                 approval_mode=self.approval_mode,
             )
-            return "resource", (request, resource_tool, {"resource": routed_path, **{
-                key: args[key] for key in ("offset", "limit") if key in args
-            }})  # type: ignore[return-value]
+            return "resource", (
+                request,
+                resource_tool,
+                {"resource": routed_path, **{key: args[key] for key in ("offset", "limit") if key in args}},
+            )  # type: ignore[return-value]
 
-        # Exact host-side resources in Kernel remain the responsibility of
-        # ReadResourceTool and ExternalFilePermissionMiddleware. Only scratch
-        # needs adaptation above; treating every external read_resource call as
-        # a directory search would incorrectly force directory staging.
+        # Attachment refs and local images remain the responsibility of
+        # ReadResourceTool and ExternalFilePermissionMiddleware. Unsupported
+        # text paths pass through unchanged so the tool can return its stable
+        # "use read_file" contract; they are never converted into a directory
+        # search or staged copy.
         if tool_name == "read_resource":
             return "execute", request
 
@@ -682,27 +665,26 @@ class WorkspacePathRouterMiddleware(AgentMiddleware):
             # fall through to a host absolute path.
             if routed_path != raw_path:
                 args[path_arg] = routed_path
-                request = request.override(
-                    tool_call={**request.tool_call, "args": args}
-                )
+                request = request.override(tool_call={**request.tool_call, "args": args})
             return "execute", request
 
         if self._spawn_host_reads_enabled or (
             self._smart_host_reads_enabled
-            and str(getattr(self.backend, "execution_mode", "")) == "spawn"
             and not is_sensitive_host_read_path(routed_path)
         ):
             emit_harness_metric(
                 logger,
                 "external_search_route",
                 session_id=str(context.get("session_id") or ""),
-                route="spawn_host_read",
+                route=(
+                    "smart_host_read"
+                    if self._smart_host_reads_enabled
+                    else "spawn_host_read"
+                ),
                 tool=tool_name,
             )
             args[path_arg] = routed_path
-            return "execute", request.override(
-                tool_call={**request.tool_call, "args": args}
-            )
+            return "execute", request.override(tool_call={**request.tool_call, "args": args})
 
         # Session Workspace Roots are direct host-file capabilities. Once the
         # exact file or containing exact-directory grant is active, keep the
@@ -719,9 +701,7 @@ class WorkspacePathRouterMiddleware(AgentMiddleware):
                 tool=tool_name,
             )
             args[path_arg] = routed_path
-            return "execute", request.override(
-                tool_call={**request.tool_call, "args": args}
-            )
+            return "execute", request.override(tool_call={**request.tool_call, "args": args})
 
         if tool_name != "read_file":
             return self._route_external_search(
@@ -733,19 +713,13 @@ class WorkspacePathRouterMiddleware(AgentMiddleware):
                 context=context,
             )
 
-        resource_args: dict[str, Any] = {"resource": routed_path}
-        if "offset" in args:
-            resource_args["offset"] = args["offset"]
-        if "limit" in args:
-            resource_args["limit"] = args["limit"]
-        resource_tool = ReadResourceTool(
-            session_id=str(context.get("session_id") or ""),
-            run_id=str(context.get("run_id") or ""),
-            workspace_path=workspace_path,
-            backend_mode=str(getattr(self.backend, "execution_mode", "") or "kernel"),
-            approval_mode=self.approval_mode,
-        )
-        return "resource", (request, resource_tool, resource_args)  # type: ignore[return-value]
+        # External read_file remains a native filesystem operation. In Strict,
+        # ExternalFilePermissionMiddleware interrupts before this boundary;
+        # after approval the Backend consumes the exact Grant. In Smart, the
+        # unrestricted Backend executes directly. Never translate the call to
+        # the attachment/visual resource tool.
+        args[path_arg] = routed_path
+        return "execute", request.override(tool_call={**request.tool_call, "args": args})
 
     def wrap_tool_call(
         self,
@@ -758,26 +732,6 @@ class WorkspacePathRouterMiddleware(AgentMiddleware):
             return self._normalize_managed_execute_result(routed, result)  # type: ignore[arg-type]
         if action == "result":
             return routed  # type: ignore[return-value]
-        if action == "backend_read":
-            original, routed_path, args = routed  # type: ignore[misc]
-            result = self.backend.read(
-                routed_path,
-                offset=int(args.get("offset") or 0),
-                limit=int(args.get("limit") or 2000),
-            )
-            if result.error:
-                lowered = str(result.error).lower()
-                if any(marker in lowered for marker in self._MANAGED_OS_PERMISSION_MARKERS):
-                    content = self._managed_access_error(routed_path, str(result.error))
-                else:
-                    content = f"❌ Error reading staged artifact: {result.error}"
-            else:
-                data = result.file_data or {}
-                if data.get("encoding") != "utf-8":
-                    content = f"❌ Staged artifact is not UTF-8 text: {routed_path}"
-                else:
-                    content = str(data.get("content") or "")
-            return self._tool_message(original, content, name="read_file")
         original, resource_tool, resource_args = routed  # type: ignore[misc]
         content = str(resource_tool.invoke(resource_args))
         return self._tool_message(original, content, name="read_resource")
@@ -795,26 +749,6 @@ class WorkspacePathRouterMiddleware(AgentMiddleware):
             return self._normalize_managed_execute_result(routed, result)  # type: ignore[arg-type]
         if action == "result":
             return routed  # type: ignore[return-value]
-        if action == "backend_read":
-            original, routed_path, args = routed  # type: ignore[misc]
-            result = await self.backend.aread(
-                routed_path,
-                offset=int(args.get("offset") or 0),
-                limit=int(args.get("limit") or 2000),
-            )
-            if result.error:
-                lowered = str(result.error).lower()
-                if any(marker in lowered for marker in self._MANAGED_OS_PERMISSION_MARKERS):
-                    content = self._managed_access_error(routed_path, str(result.error))
-                else:
-                    content = f"❌ Error reading staged artifact: {result.error}"
-            else:
-                data = result.file_data or {}
-                if data.get("encoding") != "utf-8":
-                    content = f"❌ Staged artifact is not UTF-8 text: {routed_path}"
-                else:
-                    content = str(data.get("content") or "")
-            return self._tool_message(original, content, name="read_file")
         original, resource_tool, resource_args = routed  # type: ignore[misc]
         content = str(await resource_tool.ainvoke(resource_args))
         return self._tool_message(original, content, name="read_resource")

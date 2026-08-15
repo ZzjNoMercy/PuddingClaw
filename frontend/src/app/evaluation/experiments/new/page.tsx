@@ -17,7 +17,7 @@ export default function NewExperimentPage() {
   const [providerRegistry, setProviderRegistry] = useState<ProviderRegistry | null>(null);
   const [datasetKey, setDatasetKey] = useState("");
   const [name, setName] = useState("");
-  const [candidate, setCandidate] = useState("当前 Agent");
+  const [candidate, setCandidate] = useState("当前智能体");
   const [model, setModel] = useState("");
   const [credentialName, setCredentialName] = useState("");
   const [repetitions, setRepetitions] = useState(1);
@@ -104,20 +104,20 @@ export default function NewExperimentPage() {
   const inputClass = "mt-1 w-full rounded-lg border px-3 py-2 text-sm text-gray-900";
   return (
     <div className="mx-auto max-w-2xl p-6">
-      <h1 className="mb-1 text-xl font-semibold">发起 Experiment</h1>
-      <p className="mb-6 text-sm text-gray-500">固定串行执行；Worker 使用独立 session、workspace、memory，并禁用 MCP。Coding Profile 额外开放 kernel 隔离的 execute。</p>
+      <h1 className="mb-1 text-xl font-semibold">发起评测</h1>
+      <p className="mb-6 text-sm text-gray-500">固定串行执行；执行进程使用独立会话、工作区和记忆空间，并禁用 MCP。代码评测额外开放内核隔离的执行工具。</p>
       {error && <div className="mb-4 rounded-lg bg-red-50 p-3 text-sm text-red-700">{error}</div>}
       <div className="space-y-4 rounded-xl border bg-white p-5">
-        <label className="block text-xs text-gray-500">Experiment 名称<input value={name} onChange={(event) => setName(event.target.value)} className={inputClass} /></label>
-        <label className="block text-xs text-gray-500">Published Dataset Version<select value={datasetKey} onChange={(event) => setDatasetKey(event.target.value)} className={inputClass}>{datasets.map((item) => <option key={`${item.dataset_id}@${item.current_version}`} value={`${item.dataset_id}@${item.current_version}`}>{item.name} · v{item.current_version}</option>)}</select></label>
-        <label className="block text-xs text-gray-500">Candidate 名称<input value={candidate} onChange={(event) => setCandidate(event.target.value)} className={inputClass} /></label>
+        <label className="block text-xs text-gray-500">评测名称<input value={name} onChange={(event) => setName(event.target.value)} className={inputClass} /></label>
+        <label className="block text-xs text-gray-500">已发布评测集版本<select value={datasetKey} onChange={(event) => setDatasetKey(event.target.value)} className={inputClass}>{datasets.map((item) => <option key={`${item.dataset_id}@${item.current_version}`} value={`${item.dataset_id}@${item.current_version}`}>{item.name} · v{item.current_version}</option>)}</select></label>
+        <label className="block text-xs text-gray-500">候选智能体名称<input value={candidate} onChange={(event) => setCandidate(event.target.value)} className={inputClass} /></label>
         <label className="block text-xs text-gray-500">LLM 模型（留空使用当前默认）<select value={model} onChange={(event) => { setModel(event.target.value); setCredentialName(""); }} className={inputClass}><option value="">当前默认模型</option>{models.map(({ provider, model: item }) => <option key={item.id} value={item.id}>{provider.name} · {item.name}</option>)}</select></label>
-        {selectableKeys.length > 1 && <label className="block text-xs text-gray-500">评测 API Key（不选使用 default）<select value={credentialName} onChange={(event) => setCredentialName(event.target.value)} className={inputClass}><option value="">default</option>{selectableKeys.filter((item) => !item.is_default).map((item) => <option key={item.name} value={item.name}>{item.name}</option>)}</select></label>}
+        {selectableKeys.length > 1 && <label className="block text-xs text-gray-500">评测 API 密钥（不选则使用默认密钥）<select value={credentialName} onChange={(event) => setCredentialName(event.target.value)} className={inputClass}><option value="">默认密钥</option>{selectableKeys.filter((item) => !item.is_default).map((item) => <option key={item.name} value={item.name}>{item.name}</option>)}</select></label>}
         <div className="grid grid-cols-2 gap-4">
           <label className="text-xs text-gray-500">重复次数<input disabled={isSWEbench} type="number" min={1} max={20} value={repetitions} onChange={(event) => setRepetitions(Number(event.target.value))} className={`${inputClass} disabled:bg-gray-50`} /></label>
-          <label className="text-xs text-gray-500">单 Case Agent 预算（秒）{isSWEbench && <span className="ml-1 text-amber-600">默认 900</span>}<input type="number" min={1} max={3600} value={timeout} onChange={(event) => setTimeoutSeconds(Number(event.target.value))} className={inputClass} /></label>
+          <label className="text-xs text-gray-500">单用例智能体预算（秒）{isSWEbench && <span className="ml-1 text-amber-600">默认 900</span>}<input type="number" min={1} max={3600} value={timeout} onChange={(event) => setTimeoutSeconds(Number(event.target.value))} className={inputClass} /></label>
         </div>
-        <div className="rounded-lg bg-amber-50 p-3 text-xs text-amber-800">预计执行 {estimateCaseRuns(selected?.cases.length || 0, repetitions)} 个 Case Run。评测消息走生产 PuddingClaw Harness；业务 Tool 与 MCP 默认禁用。{isSWEbench ? "平台先准备与官方 TestSpec 一致的 Agent 依赖环境，Agent 产出 patch 后再启动干净的官方 Docker Verifier。首次运行需要拉取/构建镜像，耗时和磁盘占用明显高于普通评测。" : selected?.default_profile === "coding_agent@1" ? "代码题使用生产 Harness 的文件与 execute 协议，评分以可信隐藏验证结果为准。" : "workspace 内建文件工具仍可用于 fixture 场景。"}</div>
+        <div className="rounded-lg bg-amber-50 p-3 text-xs text-amber-800">预计执行 {estimateCaseRuns(selected?.cases.length || 0, repetitions)} 次用例。评测消息走生产 PuddingClaw 执行框架；业务工具与 MCP 默认禁用。{isSWEbench ? "平台先准备与官方测试规格一致的智能体依赖环境，智能体产出补丁后再启动干净的官方 Docker 判卷器。首次运行需要拉取或构建镜像，耗时和磁盘占用明显高于普通评测。" : selected?.default_profile === "coding_agent@1" ? "代码题使用生产执行框架的文件与执行协议，评分以可信隐藏验证结果为准。" : "工作区内建文件工具仍可用于固定数据场景。"}</div>
         <button disabled={busy || !selected} onClick={submit} className="w-full rounded-lg bg-[#002fa7] py-2.5 text-sm text-white disabled:opacity-40">{busy ? "正在创建…" : "创建并运行"}</button>
       </div>
     </div>

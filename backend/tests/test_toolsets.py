@@ -200,6 +200,10 @@ def test_every_registered_agent_custom_tool_has_an_explicit_policy() -> None:
 def test_default_harness_file_toolset_is_registered_with_execution_pipeline() -> None:
     harness_file_tools = UNCONDITIONAL_EXTENSION_TOOLSETS["harness_files"]
 
+    assert "delete_file" not in harness_file_tools
+    assert "delete_file" not in ToolExecutionPipeline.BUILTIN_TOOLS
+    assert "delete_file" not in ToolExecutionPipeline.DECLARED_ALLOW_TOOLS
+    assert "delete_file" not in TOOL_CONTROL_DESCRIPTORS
     assert harness_file_tools <= ToolExecutionPipeline.BUILTIN_TOOLS
     assert (harness_file_tools - {"execute_external_directory"}) <= ToolExecutionPipeline.DECLARED_ALLOW_TOOLS
     assert "execute_external_directory" not in ToolExecutionPipeline.DECLARED_ALLOW_TOOLS
@@ -443,6 +447,162 @@ def test_permission_boundary_change_still_changes_model_visible_manifest(
     )
 
 
+def test_permission_manifest_exposes_current_run_approval_audit(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    middleware = ToolsetMiddleware(skills_dir=tmp_path, toolsets_by_skill={})
+    monkeypatch.setattr(
+        "graph.middlewares.toolset.session_manager.get_run_state",
+        lambda _session_id, _run_id: {
+            "config_snapshot": {
+                "permissions": {"approval_mode": "smart", "policy_epoch": 1},
+                "execution": {"backend_mode": "spawn", "filesystem_mode": "unrestricted"},
+            }
+        },
+    )
+    monkeypatch.setattr(
+        "graph.middlewares.toolset.session_manager.permission_grants_snapshot",
+        lambda _session_id: (
+            [
+                {
+                    "type": "tool_action",
+                    "scope": "once",
+                    "capabilities": ["execute", "destructive_write"],
+                    "created_at": 2.0,
+                    "consumed_at": 3.0,
+                    "metadata": {
+                        "run_id": "run-audit",
+                        "tool_name": "execute",
+                        "command": "rm -rf /tmp/fixture",
+                        "reason": "destructive_workspace_delete:rm_recursive",
+                        "risk": "high",
+                    },
+                },
+                {
+                    "type": "tool_action",
+                    "scope": "once",
+                    "capabilities": ["execute"],
+                    "created_at": 1.0,
+                    "metadata": {
+                        "run_id": "another-run",
+                        "tool_name": "execute",
+                        "command": "cat /tmp/other",
+                        "reason": "sensitive_host_read",
+                        "risk": "high",
+                    },
+                },
+            ],
+            2,
+        ),
+    )
+    monkeypatch.setattr(
+        "graph.middlewares.toolset.session_manager.list_permission_decisions",
+        lambda _session_id, **_kwargs: [],
+    )
+    request = ModelRequest(
+        model=None,
+        messages=[HumanMessage(content="report")],
+        system_message=SystemMessage(content="base"),
+        tools=[{"name": "execute"}],
+        state={"messages": [], "active_skill_ids": [], "skill_activations": []},
+        runtime=SimpleNamespace(context={"session_id": "session-audit", "run_id": "run-audit"}),
+    )
+
+    manifest = middleware._permission_manifest(request, middleware._visible_tools(request))
+
+    assert manifest.approval_mode == "smart"
+    assert manifest.backend_mode == "spawn"
+    assert manifest.filesystem_mode == "unrestricted"
+    assert manifest.recent_decisions == [
+        {
+            "outcome": "approved",
+            "tool": "execute",
+            "reason": "destructive_workspace_delete:rm_recursive",
+            "risk": "high",
+            "scope": "once",
+            "capabilities": ["execute", "destructive_write"],
+            "action_preview": "rm -rf /tmp/fixture",
+        }
+    ]
+    prompt = str(middleware._request_with_capability_manifest(request).system_message.content)
+    assert '"recent_decisions"' in prompt
+    assert "destructive_workspace_delete:rm_recursive" in prompt
+
+
+def test_permission_manifest_deduplicates_durable_decision_and_active_grant(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    middleware = ToolsetMiddleware(skills_dir=tmp_path, toolsets_by_skill={})
+    monkeypatch.setattr(
+        "graph.middlewares.toolset.session_manager.get_run_state",
+        lambda _session_id, _run_id: {
+            "config_snapshot": {
+                "permissions": {"approval_mode": "smart"},
+                "execution": {
+                    "backend_mode": "spawn",
+                    "filesystem_mode": "unrestricted",
+                },
+            }
+        },
+    )
+    durable = {
+        "request_id": "perm-persistence",
+        "run_id": "run-audit",
+        "resolved_at": 2.0,
+        "outcome": "approved",
+        "tool": "execute",
+        "reason": "persistence_write",
+        "risk": "high",
+        "scope": "session",
+        "capabilities": ["execute", "managed_write"],
+        "action_preview": "printf x >> ~/.zshrc",
+    }
+    monkeypatch.setattr(
+        "graph.middlewares.toolset.session_manager.list_permission_decisions",
+        lambda _session_id, **_kwargs: [durable],
+    )
+    monkeypatch.setattr(
+        "graph.middlewares.toolset.session_manager.permission_grants_snapshot",
+        lambda _session_id: (
+            [
+                {
+                    "type": "tool_action",
+                    "scope": "session",
+                    "capabilities": ["execute", "managed_write"],
+                    "created_at": 2.0,
+                    "metadata": {
+                        "run_id": "run-audit",
+                        "tool_name": "execute",
+                        "command": "printf x >> ~/.zshrc",
+                        "reason": "persistence_write",
+                        "risk": "high",
+                    },
+                }
+            ],
+            1,
+        ),
+    )
+    request = ModelRequest(
+        model=None,
+        messages=[HumanMessage(content="report")],
+        system_message=SystemMessage(content="base"),
+        tools=[{"name": "execute"}],
+        state={"messages": [], "active_skill_ids": [], "skill_activations": []},
+        runtime=SimpleNamespace(
+            context={"session_id": "session-audit", "run_id": "run-audit"}
+        ),
+    )
+
+    manifest = middleware._permission_manifest(
+        request,
+        middleware._visible_tools(request),
+    )
+
+    assert manifest.recent_decisions == [durable]
+
+
 def test_run_scoped_grant_still_changes_permission_manifest_without_run_id(
     tmp_path,
     monkeypatch,
@@ -635,9 +795,7 @@ def test_smart_permission_manifest_marks_host_reads_runtime_evaluated(
         messages=[],
         tools=[{"name": "read_file"}, {"name": "write_file"}, {"name": "execute"}],
         state={"messages": []},
-        runtime=SimpleNamespace(
-            context={"session_id": "spawn-manifest-session", "run_id": "spawn-manifest-run"}
-        ),
+        runtime=SimpleNamespace(context={"session_id": "spawn-manifest-session", "run_id": "spawn-manifest-run"}),
     )
 
     manifest = middleware._permission_manifest(request, middleware._visible_tools(request))
@@ -645,8 +803,7 @@ def test_smart_permission_manifest_marks_host_reads_runtime_evaluated(
     assert not any(item.get("tool") == "read_file" for item in manifest.allowed)
     assert any(
         item.get("tool") == "read_file"
-        and item.get("reason")
-        == "ordinary_local_reads_auto_allow_while_sensitive_or_expansive_reads_use_the_gate"
+        and item.get("reason") == "ordinary_local_reads_auto_allow_while_sensitive_or_expansive_reads_use_the_gate"
         for item in manifest.runtime_evaluated
     )
     assert not any(item.get("tool") == "read_file" for item in manifest.hitl_required)
@@ -984,10 +1141,13 @@ def test_execute_cannot_use_skill_entrypoint_before_current_skill_activation(tmp
 
     result = middleware.wrap_tool_call(
         request,
-        lambda _request: executed.append("executed") or ToolMessage(
-            content="unexpected",
-            tool_call_id="call-stale-entrypoint",
-            name="execute",
+        lambda _request: (
+            executed.append("executed")
+            or ToolMessage(
+                content="unexpected",
+                tool_call_id="call-stale-entrypoint",
+                name="execute",
+            )
         ),
     )
 
@@ -999,6 +1159,81 @@ def test_execute_cannot_use_skill_entrypoint_before_current_skill_activation(tmp
         "skill_id": "aihot",
         "original_tool_executed": False,
     }
+    assert executed == []
+
+
+def test_execute_can_copy_inactive_skill_resource_without_activation(tmp_path) -> None:
+    _install_test_skill(tmp_path, "aihot", set())
+    middleware = ToolsetMiddleware(
+        skills_dir=tmp_path,
+        toolsets_by_skill={"aihot": set()},
+    )
+    executed: list[str] = []
+    request = ToolCallRequest(
+        tool_call={
+            "name": "execute",
+            "args": {
+                "command": "cp /skills/aihot/SKILL.md /tmp/aihot-SKILL.md",
+            },
+            "id": "call-copy-skill-resource",
+            "type": "tool_call",
+        },
+        tool=None,
+        state={"messages": [], "active_skill_ids": [], "skill_activations": []},
+        runtime=SimpleNamespace(context={"run_id": "run-new"}),
+    )
+
+    result = middleware.wrap_tool_call(
+        request,
+        lambda _request: (
+            executed.append("executed")
+            or ToolMessage(
+                content="copied",
+                tool_call_id="call-copy-skill-resource",
+                name="execute",
+            )
+        ),
+    )
+
+    assert isinstance(result, ToolMessage)
+    assert str(result.content) == "copied"
+    assert executed == ["executed"]
+
+
+def test_execute_cannot_source_inactive_skill_entrypoint(tmp_path) -> None:
+    _install_test_skill(tmp_path, "aihot", set())
+    middleware = ToolsetMiddleware(
+        skills_dir=tmp_path,
+        toolsets_by_skill={"aihot": set()},
+    )
+    executed: list[str] = []
+    request = ToolCallRequest(
+        tool_call={
+            "name": "execute",
+            "args": {"command": "source /skills/aihot/scripts/bootstrap.sh"},
+            "id": "call-source-skill-entrypoint",
+            "type": "tool_call",
+        },
+        tool=None,
+        state={"messages": [], "active_skill_ids": [], "skill_activations": []},
+        runtime=SimpleNamespace(context={"run_id": "run-new"}),
+    )
+
+    result = middleware.wrap_tool_call(
+        request,
+        lambda _request: (
+            executed.append("executed")
+            or ToolMessage(
+                content="unexpected",
+                tool_call_id="call-source-skill-entrypoint",
+                name="execute",
+            )
+        ),
+    )
+
+    assert isinstance(result, ToolMessage)
+    assert result.status == "error"
+    assert result.additional_kwargs["puddingclaw_control_plane"]["type"] == "skill_context_required"
     assert executed == []
 
 
@@ -1374,9 +1609,7 @@ def test_restored_session_tool_loads_instructions_on_first_use_then_rechecks(
     assert executed == []
     assert isinstance(result, ToolMessage)
     assert result.name == "load_skill_context"
-    assert result.additional_kwargs["puddingclaw_control_plane"]["type"] == (
-        "skill_context_loaded_on_demand"
-    )
+    assert result.additional_kwargs["puddingclaw_control_plane"]["type"] == ("skill_context_loaded_on_demand")
     assert "重新判断它是否仍与当前任务相关" in str(result.content)
     refreshed = middleware.before_model(
         {"messages": [], "task_profile": run.task_profile.model_dump(mode="json"), **update},
@@ -2189,7 +2422,10 @@ def test_explicit_skill_token_is_removed_from_model_task_text() -> None:
     assert routed.messages[0] is original
     assert routed.messages[0].content == original.content
     routing_hint = str(routed.messages[-1].content)
-    assert "规范化任务文本（仅供路由参考）：重新设计byd_sales_launch_correlation.html的样式，并重新补充比亚迪每个月上市车系和款型明细" in routing_hint
+    assert (
+        "规范化任务文本（仅供路由参考）：重新设计byd_sales_launch_correlation.html的样式，并重新补充比亚迪每个月上市车系和款型明细"
+        in routing_hint
+    )
     assert "/baoyu-design 重新设计byd_sales_launch_correlation.html" not in routing_hint
     assert "/baoyu-design 是 Skill 调用标记" in routing_hint
     assert "该建议不决定工具可用性" in routing_hint

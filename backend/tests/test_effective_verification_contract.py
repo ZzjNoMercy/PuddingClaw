@@ -412,6 +412,8 @@ def test_slash_skill_parser_ignores_prose_and_unknown_slash_hints():
     assert TaskProfileClassifier.extract_explicit_skill_requests("/baoyu-design，继续设计") == ["baoyu-design"]
     assert TaskProfileClassifier.extract_explicit_skill_requests("请用 /baoyu-design 继续设计") == ["baoyu-design"]
     assert TaskProfileClassifier.extract_explicit_skill_requests("不要使用 /baoyu-design") == []
+    assert TaskProfileClassifier.extract_explicit_skill_requests('printf "$HOME"') == []
+    assert TaskProfileClassifier.extract_explicit_skill_requests("请使用 $baoyu-design skill") == ["baoyu-design"]
 
     profile = TaskProfileClassifier.classify(
         message="/not-installed 继续完成任务",

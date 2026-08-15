@@ -36,6 +36,16 @@ _LARK_CONFIG_URL = re.compile(
     r"https://(?:open\.feishu\.cn|open\.larksuite\.com)/page/cli\?[^\s\x1b<>\"']+",
     re.IGNORECASE,
 )
+_MANAGED_READONLY_VIRTUAL_ROOTS = frozenset(
+    {
+        "/skills",
+        "/knowledge",
+        "/semantic-assets",
+        "/sql-guardrails",
+        "/analytics-models",
+        "/large_tool_results",
+    }
+)
 
 
 def _shared_runtime_executable(
@@ -76,11 +86,7 @@ def _shared_runtime_executable(
             raise ValueError("managed runtime executable target is invalid")
         targets.append(target)
     launcher = release / "bin" / requested_executable
-    if (
-        len(targets) != 1
-        or not launcher.is_symlink()
-        or launcher.resolve(strict=True) != targets[0]
-    ):
+    if len(targets) != 1 or not launcher.is_symlink() or launcher.resolve(strict=True) != targets[0]:
         raise ValueError("managed runtime executable projection is invalid")
     return requested_executable
 
@@ -99,9 +105,7 @@ def _managed_readonly_path_aliases(
         if not isinstance(item, dict):
             continue
         virtual_root = str(item.get("target") or "").rstrip("/")
-        # Managed shell resources are intentionally allow-listed.  Other
-        # CompositeBackend namespaces remain file-tool-only.
-        if virtual_root != "/skills":
+        if virtual_root not in _MANAGED_READONLY_VIRTUAL_ROOTS:
             continue
         source = Path(str(item.get("source") or "")).expanduser()
         if source.is_symlink() or not source.is_dir():
@@ -152,6 +156,39 @@ def _rewrite_managed_virtual_paths(
             mapped,
         )
     return mapped
+
+
+def _resolve_execution_path_alias(
+    raw_path: str,
+    *,
+    workspace_path: Path,
+    scratch_path: Path | None,
+    managed_readonly_path_aliases: tuple[tuple[str, Path], ...],
+) -> str:
+    """Resolve a model-facing locator to its host identity.
+
+    This function does not grant access.  Tool policy compares the returned
+    host path with the runner's read/write roots; runners may still execute
+    the original virtual spelling (notably Docker bind-mount targets).
+    """
+
+    normalized = str(raw_path or "").replace("\\", "/")
+    aliases: list[tuple[str, Path]] = [("/workspace", workspace_path)]
+    if scratch_path is not None:
+        aliases.append(("/scratch", scratch_path))
+    aliases.extend(managed_readonly_path_aliases)
+    for virtual_root, host_root in sorted(
+        aliases,
+        key=lambda item: len(item[0]),
+        reverse=True,
+    ):
+        if normalized != virtual_root and not normalized.startswith(f"{virtual_root}/"):
+            continue
+        relative = PurePosixPath(normalized.removeprefix(virtual_root).lstrip("/") or ".")
+        if ".." in relative.parts:
+            return normalized
+        return str((host_root / relative.as_posix()).resolve(strict=False))
+    return normalized
 
 
 def _macos_seatbelt_available() -> bool:
@@ -330,7 +367,11 @@ def _bounded_output(
     if stdout:
         parts.append(stdout)
     if stderr:
-        parts.extend(f"[stderr] {line}" for line in stderr.strip().splitlines())
+        parts.extend(
+            f"[stderr] {line}"
+            for line in stderr.strip().splitlines()
+            if "ev_poll_posix.cc" not in line or "FD from fork parent still in poll list" not in line
+        )
     output = "\n".join(parts) if parts else "<no output>"
     encoded = output.encode("utf-8", errors="replace")
     if len(encoded) <= max_output_bytes:
@@ -343,6 +384,7 @@ class SpawnWorkspaceBackend(FilesystemBackend, SandboxBackendProtocol):
     """Host-spawn backend whose commands still require Tool policy."""
 
     mode = "spawn"
+    filesystem_mode = "restricted"
     _workspace_locks: dict[str, threading.RLock] = {}
     _workspace_locks_guard = threading.Lock()
 
@@ -368,11 +410,7 @@ class SpawnWorkspaceBackend(FilesystemBackend, SandboxBackendProtocol):
         self._id = f"spawn:{workspace_digest}"
         runtime_dir = self.workspace_path / ".puddingclaw" / "runtime"
         runtime_dir.mkdir(parents=True, exist_ok=True)
-        run_tmp = (
-            self.scratch_path / "tmp"
-            if self.scratch_path is not None
-            else runtime_dir / "tmp"
-        )
+        run_tmp = self.scratch_path / "tmp" if self.scratch_path is not None else runtime_dir / "tmp"
         self._env = {
             "PATH": os.environ.get(
                 "PATH",
@@ -386,9 +424,53 @@ class SpawnWorkspaceBackend(FilesystemBackend, SandboxBackendProtocol):
         Path(self._env["HOME"]).mkdir(parents=True, exist_ok=True)
         Path(self._env["TMPDIR"]).mkdir(parents=True, exist_ok=True)
 
+    def _execution_environment(self) -> dict[str, str]:
+        """Return the runner environment for the current filesystem mode.
+
+        Restricted execution keeps an isolated HOME.  Smart trusted-local is
+        intentionally the host user's filesystem environment, so ``~`` and
+        programs that resolve files through HOME must address the real user
+        home just like an absolute host path does.
+        """
+
+        environment = {key: value for key, value in self._env.items() if value}
+        if self.filesystem_mode == "unrestricted":
+            environment["HOME"] = str(Path(os.environ.get("HOME") or Path.home()).expanduser().resolve())
+        return environment
+
     @property
     def id(self) -> str:
         return self._id
+
+    @property
+    def filesystem_read_roots(self) -> tuple[Path, ...]:
+        if self.filesystem_mode == "unrestricted":
+            return ()
+        return tuple(
+            dict.fromkeys(
+                (
+                    self.workspace_path,
+                    *((self.scratch_path,) if self.scratch_path is not None else ()),
+                    *self.managed_readonly_host_roots,
+                )
+            )
+        )
+
+    @property
+    def filesystem_write_roots(self) -> tuple[Path, ...]:
+        if self.filesystem_mode == "unrestricted":
+            return ()
+        return tuple(root for root in (self.workspace_path, self.scratch_path) if root is not None)
+
+    filesystem_delete_roots = filesystem_write_roots
+
+    def resolve_execution_path(self, raw_path: str) -> str:
+        return _resolve_execution_path_alias(
+            raw_path,
+            workspace_path=self.workspace_path,
+            scratch_path=self.scratch_path,
+            managed_readonly_path_aliases=self.managed_readonly_path_aliases,
+        )
 
     def execute(
         self,
@@ -415,11 +497,6 @@ class SpawnWorkspaceBackend(FilesystemBackend, SandboxBackendProtocol):
                 shlex.quote(str(self.scratch_path)),
                 command,
             )
-            command = re.sub(
-                r"(?<![A-Za-z0-9_./-])/tmp(?=(?:/|\s|$|[\"']))",
-                shlex.quote(str(self.scratch_path / "tmp")),
-                command,
-            )
         command = _rewrite_managed_virtual_paths(
             command,
             self.managed_readonly_path_aliases,
@@ -434,7 +511,7 @@ class SpawnWorkspaceBackend(FilesystemBackend, SandboxBackendProtocol):
                     check=False,
                     shell=True,
                     cwd=self.workspace_path,
-                    env={key: value for key, value in self._env.items() if value},
+                    env=self._execution_environment(),
                     capture_output=True,
                     text=True,
                     stdin=subprocess.DEVNULL,
@@ -497,7 +574,7 @@ class SpawnWorkspaceBackend(FilesystemBackend, SandboxBackendProtocol):
                     check=False,
                     shell=True,
                     cwd=directory,
-                    env={key: value for key, value in self._env.items() if value},
+                    env=self._execution_environment(),
                     capture_output=True,
                     text=True,
                     stdin=subprocess.DEVNULL,
@@ -533,6 +610,7 @@ class KernelWorkspaceBackend(FilesystemBackend, SandboxBackendProtocol):
     """Workspace filesystem whose shell is always backed by an OS sandbox."""
 
     mode = "kernel"
+    filesystem_mode = "restricted"
 
     def __init__(
         self,
@@ -557,14 +635,42 @@ class KernelWorkspaceBackend(FilesystemBackend, SandboxBackendProtocol):
         self._host_runtime: Any | None = None
         self._host_runtime_lock = threading.RLock()
         workspace_digest = hashlib.sha256(str(self.workspace_path).encode("utf-8")).hexdigest()[:16]
-        self._kernel_runner_mode = (
-            "kernel_macos_seatbelt" if sys.platform == "darwin" else "kernel_linux_bwrap_seccomp"
-        )
+        self._kernel_runner_mode = "kernel_macos_seatbelt" if sys.platform == "darwin" else "kernel_linux_bwrap_seccomp"
         self._id = f"kernel:{self._kernel_runner_mode.removeprefix('kernel_')}:{workspace_digest}"
 
     @property
     def id(self) -> str:
         return self._id
+
+    @property
+    def filesystem_read_roots(self) -> tuple[Path, ...]:
+        if self.filesystem_mode == "unrestricted":
+            return ()
+        return tuple(
+            dict.fromkeys(
+                (
+                    self.workspace_path,
+                    self.scratch_path,
+                    *self.managed_readonly_host_roots,
+                )
+            )
+        )
+
+    @property
+    def filesystem_write_roots(self) -> tuple[Path, ...]:
+        if self.filesystem_mode == "unrestricted":
+            return ()
+        return (self.workspace_path, self.scratch_path)
+
+    filesystem_delete_roots = filesystem_write_roots
+
+    def resolve_execution_path(self, raw_path: str) -> str:
+        return _resolve_execution_path_alias(
+            raw_path,
+            workspace_path=self.workspace_path,
+            scratch_path=self.scratch_path,
+            managed_readonly_path_aliases=self.managed_readonly_path_aliases,
+        )
 
     @property
     def kernel_runner_mode(self) -> str:
@@ -721,7 +827,6 @@ class KernelWorkspaceBackend(FilesystemBackend, SandboxBackendProtocol):
                 Path("/opt/homebrew/bin/chromium-browser"),
                 Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
             )
-
 
             browser = next(
                 (
@@ -881,6 +986,32 @@ class DeferredKernelWorkspaceBackend(FilesystemBackend, SandboxBackendProtocol):
         return "spawn" if self._delegate is not None else "kernel"
 
     @property
+    def filesystem_read_roots(self) -> tuple[Path, ...]:
+        return tuple(
+            dict.fromkeys(
+                (
+                    self.workspace_path,
+                    self.scratch_path,
+                    *self.managed_readonly_host_roots,
+                )
+            )
+        )
+
+    @property
+    def filesystem_write_roots(self) -> tuple[Path, ...]:
+        return (self.workspace_path, self.scratch_path)
+
+    filesystem_delete_roots = filesystem_write_roots
+
+    def resolve_execution_path(self, raw_path: str) -> str:
+        return _resolve_execution_path_alias(
+            raw_path,
+            workspace_path=self.workspace_path,
+            scratch_path=self.scratch_path,
+            managed_readonly_path_aliases=self.managed_readonly_path_aliases,
+        )
+
+    @property
     def kernel_runner_mode(self) -> str:
         return "kernel_macos_seatbelt" if sys.platform == "darwin" else "kernel_linux_bwrap_seccomp"
 
@@ -906,9 +1037,13 @@ class DeferredKernelWorkspaceBackend(FilesystemBackend, SandboxBackendProtocol):
             exit_code=126,
         )
 
-    def execute_external_directory(self, directory_path: str, command: str, *, timeout: int | None = None, writable: bool = False) -> ExecuteResponse:
+    def execute_external_directory(
+        self, directory_path: str, command: str, *, timeout: int | None = None, writable: bool = False
+    ) -> ExecuteResponse:
         if self._delegate is not None:
-            return self._delegate.execute_external_directory(directory_path, command, timeout=timeout, writable=writable)
+            return self._delegate.execute_external_directory(
+                directory_path, command, timeout=timeout, writable=writable
+            )
         return ExecuteResponse(
             output="Error: Kernel execution is unavailable; external directory execution is blocked until an explicit Run fallback.",
             exit_code=126,
@@ -1345,7 +1480,10 @@ class ProjectSandboxManager:
                 continue
             source = Path(str(item.get("source") or "")).expanduser().resolve()
             target = str(item.get("target") or "")
-            if source.is_dir() and target in {"/skills", "/opt/puddingclaw/toolchain/node"}:
+            if source.is_dir() and target in {
+                *_MANAGED_READONLY_VIRTUAL_ROOTS,
+                "/opt/puddingclaw/toolchain/node",
+            }:
                 workspace_target = None
                 try:
                     relative = source.relative_to(workspace.expanduser().resolve())
@@ -2132,10 +2270,7 @@ class ProjectSandboxManager:
         runtime_mount = (
             [
                 "--mount",
-                (
-                    f"type=bind,src={runtime_path},"
-                    "dst=/opt/puddingclaw/runtime/python-skill,readonly"
-                ),
+                (f"type=bind,src={runtime_path},dst=/opt/puddingclaw/runtime/python-skill,readonly"),
             ]
             if runtime_path is not None
             else []
@@ -2181,11 +2316,7 @@ class ProjectSandboxManager:
             f"SKILL_USER_QUERY={user_query}",
             *_managed_credential_state_tmpfs_args(),
             "--entrypoint",
-            (
-                "/opt/puddingclaw/runtime/python-skill/.venv/bin/python"
-                if runtime_path is not None
-                else "python3"
-            ),
+            ("/opt/puddingclaw/runtime/python-skill/.venv/bin/python" if runtime_path is not None else "python3"),
         ]
         if spec["uid"] is not None and spec["gid"] is not None:
             args.extend(["--user", f"{spec['uid']}:{spec['gid']}"])
@@ -2320,8 +2451,7 @@ class ProjectSandboxManager:
         """Reject the removed single-package incremental installer."""
 
         raise RuntimeError(
-            "single-package managed CLI installation is disabled; "
-            "use the declarative shared Node runtime transaction"
+            "single-package managed CLI installation is disabled; use the declarative shared Node runtime transaction"
         )
 
     @staticmethod
@@ -3113,10 +3243,7 @@ class ProjectSandboxManager:
             "--env",
             "HOME=/home/puddingclaw",
             "--env",
-            (
-                "PATH=/home/puddingclaw/.local/bin:/home/puddingclaw/.npm-global/bin:"
-                "/usr/local/bin:/usr/bin:/bin"
-            ),
+            ("PATH=/home/puddingclaw/.local/bin:/home/puddingclaw/.npm-global/bin:/usr/local/bin:/usr/bin:/bin"),
             *_managed_credential_state_tmpfs_args(),
             "--entrypoint",
             "sh",
@@ -3217,10 +3344,7 @@ class ProjectSandboxManager:
             "--env",
             "HOME=/home/puddingclaw",
             "--env",
-            (
-                "PATH=/home/puddingclaw/.local/bin:/home/puddingclaw/.npm-global/bin:"
-                "/usr/local/bin:/usr/bin:/bin"
-            ),
+            ("PATH=/home/puddingclaw/.local/bin:/home/puddingclaw/.npm-global/bin:/usr/local/bin:/usr/bin:/bin"),
             *_managed_credential_state_tmpfs_args(),
             "--entrypoint",
             "sh",
@@ -3391,11 +3515,41 @@ class DockerWorkspaceBackend(FilesystemBackend, SandboxBackendProtocol):
             if scratch_relative
             else "/harness-scratch"
         )
+        self.managed_readonly_path_aliases = _managed_readonly_path_aliases(self.manager.config)
+        self.managed_readonly_host_roots = tuple(
+            host_root for _virtual_root, host_root in self.managed_readonly_path_aliases
+        )
         self.container_name, self.spec_hash = manager.ensure_container(self.workspace_path)
 
     @property
     def id(self) -> str:
         return f"docker:{self.container_name}:{self.spec_hash[:12]}"
+
+    @property
+    def filesystem_read_roots(self) -> tuple[Path, ...]:
+        return tuple(
+            dict.fromkeys(
+                (
+                    self.workspace_path,
+                    *((self.scratch_path,) if self.scratch_path is not None else ()),
+                    *self.managed_readonly_host_roots,
+                )
+            )
+        )
+
+    @property
+    def filesystem_write_roots(self) -> tuple[Path, ...]:
+        return tuple(root for root in (self.workspace_path, self.scratch_path) if root is not None)
+
+    filesystem_delete_roots = filesystem_write_roots
+
+    def resolve_execution_path(self, raw_path: str) -> str:
+        return _resolve_execution_path_alias(
+            raw_path,
+            workspace_path=self.workspace_path,
+            scratch_path=self.scratch_path,
+            managed_readonly_path_aliases=self.managed_readonly_path_aliases,
+        )
 
     def _python_skill_invocation(
         self,
@@ -3536,9 +3690,7 @@ class DockerWorkspaceBackend(FilesystemBackend, SandboxBackendProtocol):
                     )
 
                     skill_id, skill_root, script_relative, interpreter_args, script_args = skill_invocation
-                    image_id = self.manager.ensure_image(
-                        str(self.manager.config.get("image") or DEFAULT_SANDBOX_IMAGE)
-                    )
+                    image_id = self.manager.ensure_image(str(self.manager.config.get("image") or DEFAULT_SANDBOX_IMAGE))
                     runtime = SoftwareRuntimeManager(
                         PuddingClawPaths.from_environment(),
                         self.manager.runtime_contract,
@@ -3833,6 +3985,21 @@ class AdaptiveWorkspaceBackend(FilesystemBackend, SandboxBackendProtocol):
     def kernel_runner_binding_digest(self) -> str:
         return self.kernel.kernel_runner_binding_digest
 
+    @property
+    def filesystem_read_roots(self) -> tuple[Path, ...]:
+        return self.kernel.filesystem_read_roots
+
+    @property
+    def filesystem_write_roots(self) -> tuple[Path, ...]:
+        return self.kernel.filesystem_write_roots
+
+    @property
+    def filesystem_delete_roots(self) -> tuple[Path, ...]:
+        return self.kernel.filesystem_delete_roots
+
+    def resolve_execution_path(self, raw_path: str) -> str:
+        return self.kernel.resolve_execution_path(raw_path)
+
     def _docker_backend(self) -> DockerWorkspaceBackend:
         with self._docker_lock:
             if self._docker is not None:
@@ -3954,15 +4121,12 @@ class AdaptiveWorkspaceBackend(FilesystemBackend, SandboxBackendProtocol):
             return HostExecutionProjection(command, environment_binding_digest="docker-node-empty")
         path = ":".join((str(release / "bin"), "/usr/local/bin", "/usr/bin", "/bin"))
         projected = (
-            f"export PATH={shlex.quote(path)}; "
-            f"export NODE_PATH={shlex.quote(str(release / 'node_modules'))}; {command}"
+            f"export PATH={shlex.quote(path)}; export NODE_PATH={shlex.quote(str(release / 'node_modules'))}; {command}"
         )
         return HostExecutionProjection(
             projected,
             (release,),
-            environment_binding_digest=hashlib.sha256(
-                f"docker-node\0{digest}\0{release.name}".encode()
-            ).hexdigest(),
+            environment_binding_digest=hashlib.sha256(f"docker-node\0{digest}\0{release.name}".encode()).hexdigest(),
         )
 
     def install_packages(
@@ -4000,9 +4164,7 @@ class AdaptiveWorkspaceBackend(FilesystemBackend, SandboxBackendProtocol):
                     owner=f"skill:{skill_id}",
                     owner_revision=skill_version,
                     distributions=packages,
-                    declared_bins={
-                        package: tuple(bins) for package, bins in (executables or {}).items()
-                    },
+                    declared_bins={package: tuple(bins) for package, bins in (executables or {}).items()},
                     merge_owner=True,
                 )
             else:
@@ -4077,7 +4239,13 @@ class AdaptiveWorkspaceBackend(FilesystemBackend, SandboxBackendProtocol):
 
 @dataclass(frozen=True)
 class WorkspaceBackendSelection:
-    backend: SpawnWorkspaceBackend | KernelWorkspaceBackend | DeferredKernelWorkspaceBackend | AdaptiveWorkspaceBackend | DockerWorkspaceBackend
+    backend: (
+        SpawnWorkspaceBackend
+        | KernelWorkspaceBackend
+        | DeferredKernelWorkspaceBackend
+        | AdaptiveWorkspaceBackend
+        | DockerWorkspaceBackend
+    )
     mode: str
     fallback_reason: str | None = None
     dependency_plan: WorkspaceDependencyPlan | None = None

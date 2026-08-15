@@ -672,6 +672,8 @@ function ExternalFilePermissionCard({
   const isDirectory = request.type.startsWith("external_directory_");
   const isWrite = request.type === "external_file_write" || request.type === "external_directory_write";
   const isDelete = request.type === "external_file_delete";
+  const isSensitiveRead = request.reason === "sensitive_host_read";
+  const isPersistenceWrite = request.reason === "persistence_write";
 
   const grant = async (
     targetKind: "exact_file" | "exact_directory" | "all_external_files",
@@ -725,6 +727,10 @@ function ExternalFilePermissionCard({
             <h3 className="text-[15px] font-bold text-slate-950">
               {isDelete
                 ? "允许删除此外部文件"
+                : isPersistenceWrite
+                  ? "允许修改敏感配置文件"
+                  : isSensitiveRead
+                    ? `允许读取敏感${isDirectory ? "目录" : "文件"}`
                 : isWrite
                   ? `允许修改外部${isDirectory ? "目录" : "文件"}`
                   : `允许读取外部${isDirectory ? "目录" : "文件"}`}
@@ -735,6 +741,13 @@ function ExternalFilePermissionCard({
               </span>
             ) : null}
           </div>
+          {isSensitiveRead || isPersistenceWrite ? (
+            <div className="mt-2 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-[11px] leading-relaxed text-amber-900">
+              {isSensitiveRead
+                ? `该路径可能包含凭证或私钥。授权只适用于这个精确${isDirectory ? "目录" : "文件"}，不会扩大到其他外部路径。`
+                : "该路径属于凭证、Shell 启动项或持久化配置。请确认本次精确文件修改。"}
+            </div>
+          ) : null}
           <div className="mt-2 flex items-start gap-2 rounded-xl bg-slate-50 px-3 py-2">
             {isDirectory
               ? <FolderOpen className="mt-0.5 h-4 w-4 shrink-0 text-slate-400" />
@@ -795,7 +808,7 @@ function ExternalFilePermissionCard({
                   {isDelete ? "确认删除此文件" : isWrite ? "允许修改此文件" : "允许此文件"}
                 </button>
               )}
-              {!isWrite && !isDelete && !isDirectory ? (
+              {!isWrite && !isDelete && !isDirectory && !isSensitiveRead ? (
                 <button
                   type="button"
                   disabled={status === "loading"}
@@ -943,7 +956,7 @@ function ToolActionPermissionCard({
   const needsTemporaryNetwork = (request.capabilities || []).includes("temporary_network");
   const needsNetwork = needsTemporaryNetwork || (request.capabilities || []).includes("network_access");
   const installsPackages = (request.capabilities || []).includes("package_install");
-  const writesWorkspace = (request.capabilities || []).includes("managed_write");
+  const writesFiles = (request.capabilities || []).includes("managed_write");
   const writesSkills = (request.capabilities || []).includes("managed_skill_write");
   const opensSessionScope = (request.options || []).includes("session")
     && Boolean(request.session_target_kind && request.session_target);
@@ -963,7 +976,7 @@ function ToolActionPermissionCard({
     high: "脚本执行 · 需确认",
     network: "联网 · 需确认",
     package_install: "安装依赖 · 需确认",
-    managed_write: "写入项目 · 需确认",
+    managed_write: "写入文件 · 需确认",
     destructive_write: "破坏性写入 · 需确认",
     managed_skill_write: "安装或更新 Skill · 需确认",
     critical: "禁止级风险",
@@ -979,7 +992,7 @@ function ToolActionPermissionCard({
         : reason.startsWith("managed_skill_write")
           ? "该操作会提交已校验的不可变计划到受管 Skill 目录。授权仅对本次计划有效。"
           : reason.startsWith("managed_workspace_write")
-            ? "该命令会修改项目目录。"
+            ? "该命令会修改本地文件。"
           : `Harness 规则：${reason}`);
   const reviewedBySmartPolicy = request.policy_source === "codex_grok_smart_reviewer";
   const title = isFetchUrl
@@ -1062,11 +1075,11 @@ function ToolActionPermissionCard({
               </span>
             </div>
           ) : null}
-          {writesWorkspace || writesSkills || installsPackages ? (
+          {writesFiles || writesSkills || installsPackages ? (
             <div className="mt-2 flex flex-wrap gap-1.5">
-              {writesWorkspace ? (
+              {writesFiles ? (
                 <span className="rounded-full bg-amber-100 px-2 py-0.5 text-[10px] font-semibold text-amber-800">
-                  写入项目
+                  写入文件
                 </span>
               ) : null}
               {writesSkills ? (

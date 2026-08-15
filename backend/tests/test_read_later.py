@@ -77,6 +77,37 @@ def test_wechat_article_extraction_keeps_structure_and_lazy_images_without_page_
     assert "隐藏提示" not in markdown
 
 
+def test_x_article_extraction_recovers_relay_images_without_duplicating_cover():
+    html = r"""
+    <html><head>
+      <meta property="og:title" content="X Article">
+      <meta property="og:image" content="https://pbs.twimg.com/media/cover.jpg">
+    </head><body>
+      <article>
+        <h1>X Article</h1>
+        <img alt="Article cover image" src="https://pbs.twimg.com/media/cover.jpg">
+        <p>This article contains enough visible text to represent a real server-rendered X Article body.</p>
+      </article>
+      <script>
+        original_img_url:"https://pbs.twimg.com/media/cover.jpg",
+        original_img_url:"https:\/\/pbs.twimg.com\/media\/detail-one.jpg",
+        original_img_url:"https://pbs.twimg.com/media/detail-two.jpg",
+        original_img_url:"https://pbs.twimg.com/media/detail-one.jpg",
+        avatar_url:"https://pbs.twimg.com/profile_images/avatar.jpg"
+      </script>
+    </body></html>
+    """
+
+    _metadata, markdown = _extract_markdown(html, "https://x.com/example/status/123")
+
+    assert markdown.count("https://pbs.twimg.com/media/cover.jpg") == 1
+    assert "## 原文图片" in markdown
+    assert "![原文图片 1](https://pbs.twimg.com/media/detail-one.jpg)" in markdown
+    assert "![原文图片 2](https://pbs.twimg.com/media/detail-two.jpg)" in markdown
+    assert markdown.count("detail-one.jpg") == 1
+    assert "profile_images" not in markdown
+
+
 def test_read_later_capture_extracts_article_and_registers_markdown(tmp_path: Path, monkeypatch):
     monkeypatch.setenv("PUDDINGCLAW_KNOWLEDGE_DIR", str(tmp_path / "knowledge"))
     async def run() -> None:

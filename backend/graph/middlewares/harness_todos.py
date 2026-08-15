@@ -2,7 +2,7 @@
 
 import hashlib
 import time
-from typing import Any, Literal, NotRequired
+from typing import Annotated, Any, Literal, NotRequired
 
 from deepagents.middleware._utils import append_to_system_message
 from langchain.agents.middleware.types import AgentMiddleware, AgentState
@@ -10,7 +10,7 @@ from langchain.tools import ToolRuntime
 from langchain_core.messages import ToolMessage
 from langchain_core.tools import StructuredTool
 from langgraph.types import Command
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from graph.prompt_cache import reorder_system_prompt_sections
 from graph.session_manager import session_manager
@@ -52,6 +52,11 @@ class TodoPatchOperation(BaseModel):
     def validate_action_fields(self) -> "TodoPatchOperation":
         if self.action == "create" and not str(self.content or "").strip():
             raise ValueError("create requires non-empty content")
+        if self.action == "create" and self.status in {"completed", "cancelled"}:
+            raise ValueError(
+                "create status must be pending or in_progress; use the stable todo_id "
+                "with complete or cancel after creation"
+            )
         if self.action in {"update", "start", "complete", "cancel", "reopen"} and not self.todo_id:
             raise ValueError(f"{self.action} requires todo_id")
         if self.action == "update" and self.content is None and self.status is None:
@@ -61,8 +66,88 @@ class TodoPatchOperation(BaseModel):
         return self
 
 
+class _ToolTodoOperation(BaseModel):
+    """Strict model-facing operation base; illegal action fields are absent."""
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class CreateTodoOperation(_ToolTodoOperation):
+    action: Literal["create"]
+    content: str = Field(min_length=1)
+    status: Literal["pending", "in_progress"] = "pending"
+    completion_contract: Literal[
+        "validation_receipt",
+        "artifact_receipt",
+        "query_result",
+        "delivery_bundle",
+    ] | None = None
+    evidence_refs: list[str] = Field(default_factory=list)
+
+
+class UpdateTodoOperation(_ToolTodoOperation):
+    action: Literal["update"]
+    todo_id: str = Field(min_length=1)
+    content: str | None = None
+    completion_contract: Literal[
+        "validation_receipt",
+        "artifact_receipt",
+        "query_result",
+        "delivery_bundle",
+    ] | None = None
+    evidence_refs: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def require_update(self) -> "UpdateTodoOperation":
+        if (
+            self.content is None
+            and self.completion_contract is None
+            and not self.evidence_refs
+        ):
+            raise ValueError("update requires content, completion_contract, or evidence_refs")
+        return self
+
+
+class StartTodoOperation(_ToolTodoOperation):
+    action: Literal["start"]
+    todo_id: str = Field(min_length=1)
+
+
+class CompleteTodoOperation(_ToolTodoOperation):
+    action: Literal["complete"]
+    todo_id: str = Field(min_length=1)
+    evidence_refs: list[str] = Field(default_factory=list)
+
+
+class CancelTodoOperation(_ToolTodoOperation):
+    action: Literal["cancel"]
+    todo_id: str = Field(min_length=1)
+
+
+class ReopenTodoOperation(_ToolTodoOperation):
+    action: Literal["reopen"]
+    todo_id: str = Field(min_length=1)
+
+
+class ReorderTodoOperation(_ToolTodoOperation):
+    action: Literal["reorder"]
+    ordered_ids: list[str] = Field(min_length=1)
+
+
+ToolTodoPatchOperation = Annotated[
+    CreateTodoOperation
+    | UpdateTodoOperation
+    | StartTodoOperation
+    | CompleteTodoOperation
+    | CancelTodoOperation
+    | ReopenTodoOperation
+    | ReorderTodoOperation,
+    Field(discriminator="action"),
+]
+
+
 class UpdateTodosInput(BaseModel):
-    operations: list[TodoPatchOperation] = Field(min_length=1, max_length=50)
+    operations: list[ToolTodoPatchOperation] = Field(min_length=1, max_length=50)
     expected_revision: int | None = Field(default=None, ge=0)
 
 
@@ -100,7 +185,8 @@ Never cancel and duplicate an existing Todo merely to bypass its evidence contra
 TODO_PATCH_DESCRIPTION = """Incrementally update the current Harness Todo ledger.
 Use stable todo_id values returned by earlier calls. This tool never replaces the
 entire list, so renaming, reordering, splitting, or adding work cannot silently
-erase an unfinished Todo."""
+erase an unfinished Todo. Create accepts only pending or in_progress; completion
+is a separate action that must reference the created stable todo_id."""
 
 
 def _stable_created_id(tool_call_id: str, operation_index: int) -> str:
@@ -148,7 +234,7 @@ def _completion_evidence_error(
 
 def _apply_operations(
     todos: list[dict[str, Any]],
-    operations: list[TodoPatchOperation],
+    operations: list[Any],
     *,
     tool_call_id: str,
     run_id: str,
@@ -167,8 +253,11 @@ def _apply_operations(
     applied: list[dict[str, Any]] = []
 
     for index, operation in enumerate(operations):
+        operation_status = getattr(operation, "status", None)
+        operation_contract = getattr(operation, "completion_contract", None)
+        operation_evidence_refs = list(getattr(operation, "evidence_refs", []) or [])
         if operation.action == "create":
-            if operation.status == "completed":
+            if operation_status == "completed":
                 raise ValueError(
                     "create cannot start in completed status; complete an existing "
                     "stable Todo after producing its evidence"
@@ -187,11 +276,11 @@ def _apply_operations(
             todo_id = _stable_created_id(tool_call_id, index)
             existing = by_id.get(todo_id)
             if existing is None:
-                if operation.status == "completed" and operation.completion_contract:
+                if operation_status == "completed" and operation_contract:
                     evidence_error = _completion_evidence_error(
                         todo_id=todo_id,
-                        contract=operation.completion_contract,
-                        refs=list(operation.evidence_refs),
+                        contract=operation_contract,
+                        refs=operation_evidence_refs,
                         available_evidence=available_evidence,
                     )
                     if evidence_error:
@@ -199,14 +288,14 @@ def _apply_operations(
                 item = {
                     "id": todo_id,
                     "content": str(operation.content or "").strip(),
-                    "status": operation.status or "pending",
+                    "status": operation_status or "pending",
                     "created_at": now,
                     "updated_at": now,
                     "created_run_id": run_id or None,
                     "last_changed_run_id": run_id or None,
                     "last_changed_query_id": query_id or None,
-                    "completion_contract": operation.completion_contract,
-                    "evidence_refs": list(dict.fromkeys(operation.evidence_refs)),
+                    "completion_contract": operation_contract,
+                    "evidence_refs": list(dict.fromkeys(operation_evidence_refs)),
                 }
                 result.append(item)
                 by_id[todo_id] = item
@@ -215,7 +304,7 @@ def _apply_operations(
             continue
 
         if operation.action == "reorder":
-            ordered_ids = list(dict.fromkeys(operation.ordered_ids))
+            ordered_ids = list(dict.fromkeys(getattr(operation, "ordered_ids", []) or []))
             unknown = [todo_id for todo_id in ordered_ids if todo_id not in by_id]
             if unknown:
                 raise ValueError(f"Unknown todo_id(s) in reorder: {', '.join(unknown)}")
@@ -237,15 +326,15 @@ def _apply_operations(
         if operation.action == "update":
             if operation.content is not None:
                 item["content"] = operation.content.strip()
-            if operation.status is not None:
-                item["status"] = operation.status
-            if operation.completion_contract is not None:
-                item["completion_contract"] = operation.completion_contract
-            if operation.evidence_refs:
+            if operation_status is not None:
+                item["status"] = operation_status
+            if operation_contract is not None:
+                item["completion_contract"] = operation_contract
+            if operation_evidence_refs:
                 item["evidence_refs"] = list(
-                    dict.fromkeys([*(item.get("evidence_refs") or []), *operation.evidence_refs])
+                    dict.fromkeys([*(item.get("evidence_refs") or []), *operation_evidence_refs])
                 )
-            if operation.status == "completed" and item.get("completion_contract"):
+            if operation_status == "completed" and item.get("completion_contract"):
                 contract = str(item["completion_contract"])
                 refs = list(item.get("evidence_refs") or [])
                 evidence_error = _completion_evidence_error(
@@ -259,7 +348,9 @@ def _apply_operations(
         else:
             if operation.action == "complete":
                 contract = str(item.get("completion_contract") or "")
-                refs = list(dict.fromkeys([*(item.get("evidence_refs") or []), *operation.evidence_refs]))
+                refs = list(
+                    dict.fromkeys([*(item.get("evidence_refs") or []), *operation_evidence_refs])
+                )
                 if contract:
                     evidence_error = _completion_evidence_error(
                         todo_id=todo_id,

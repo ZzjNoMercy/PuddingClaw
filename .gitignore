@@ -63,6 +63,12 @@ iterm2_workspace.iterm2arrangement
 /docs/plans/*
 !/docs/plans/2026-08-11-user-home-sessions-and-skills-migration.md
 !/docs/plans/2026-08-12-ai-native-semantic-steward-and-model-authoring.md
+!/docs/plans/2026-08-14-core-sqlite-default-and-server-postgresql-boundary.md
+!/docs/plans/2026-08-14-spawn-kernel-filesystem-authority-alignment.md
+!/docs/plans/2026-08-15-smart-action-authorization-middleware-todo.md
+!/docs/runbooks/
+/docs/runbooks/*
+!/docs/runbooks/smart-filesystem-blackbox-e2e-prompt.md
 
 # Logs
 *.log

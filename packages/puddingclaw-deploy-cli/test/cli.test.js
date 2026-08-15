@@ -24,6 +24,7 @@ import { probePort } from "../src/probes.js";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const cli = path.join(root, "src", "cli.js");
+const legacyControlProcess = path.join(root, "test", "legacy-control-process.js");
 const packageVersion = createRequire(import.meta.url)("../package.json").version;
 
 async function runCli(args, { home, env = {} } = {}) {
@@ -758,6 +759,57 @@ test("start, restart, and stop manage only authenticated processes under the iso
         try { process.kill(-pid, "SIGKILL"); } catch {}
       }
     } catch {}
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("new CLI safely stops a Runtime launched with the legacy control protocol", async () => {
+  const home = await tempHome();
+  const instanceId = "legacy-upgrade-instance";
+  const role = "backend";
+  const token = "legacy-control-token";
+  const control = path.join(home, "control", "legacy-upgrade-test");
+  const legacy = spawn(process.execPath, [legacyControlProcess, control, token, instanceId, role], {
+    detached: process.platform !== "win32",
+    stdio: "ignore",
+  });
+  await once(legacy, "spawn");
+  try {
+    const started = Date.now();
+    while (Date.now() - started < 2000) {
+      try {
+        await stat(path.join(control, "ready"));
+        break;
+      } catch {
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+    }
+    await stat(path.join(control, "ready"));
+    await writeFile(path.join(home, "runtime.json"), `${JSON.stringify({
+      schema_version: 1,
+      instance_id: instanceId,
+      home,
+      release_version: "0.1.16",
+      backend_pid: legacy.pid,
+      frontend_pid: legacy.pid,
+      processes: {
+        backend: {
+          pid: legacy.pid,
+          launcher: "legacy-runtime-launcher",
+          instance_id: instanceId,
+          role,
+          control_path: control,
+          control_token: token,
+        },
+      },
+    })}\n`, { mode: 0o600 });
+
+    const stopped = await runCli(["stop", "--json"], { home });
+    assert.equal(stopped.code, 0, `${stopped.stderr}\n${stopped.stdout}`);
+    assert.equal(JSON.parse(stopped.stdout).status, "stopped");
+    await assert.rejects(readFile(path.join(home, "runtime.json")), { code: "ENOENT" });
+  } finally {
+    try { process.kill(legacy.pid, "SIGKILL"); } catch {}
     await rm(home, { recursive: true, force: true });
   }
 });

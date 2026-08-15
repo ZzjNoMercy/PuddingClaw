@@ -1,6 +1,6 @@
 # PuddingClaw CLI-first 部署工具与初始化方案
 
-> 状态：0.1.16 实现基线；无参数交互 init、核心数据库独立配置与重配、Agent/图片分析 SubAgent Provider bootstrap、条件依赖探测与 Runtime 裁剪已落地
+> 状态：0.1.17 实现基线；无参数交互 init、核心数据库独立配置与重配、Agent/图片分析 SubAgent Provider bootstrap、条件依赖探测与 Runtime 裁剪已落地
 > 日期：2026-08-13
 
 当前实现位于 `packages/puddingclaw-deploy-cli`，唯一命令为 `puddingclaw`，默认 Home 为
@@ -11,11 +11,11 @@
 `run/respond/cancel/models/capabilities` 已合并到产品 CLI 开发包，并保持 JSON、JSONL、Session、HITL
 和 artifact export 协议兼容。
 `init --plan --json` 会输出按 Profile 裁剪、含 `depends_on` 和 `execution_order` 的 Settings/Probe 计划。
-0.1.16 已接入首次可用所需的 Agent Provider、图片分析 SubAgent Provider、Catalog、PostgreSQL/pgvector、Milvus、Embedding 与 MinerU
+0.1.17 已接入首次可用所需的 Agent Provider、图片分析 SubAgent Provider、Catalog、PostgreSQL/pgvector、Milvus、Embedding 与 MinerU
 分支；Harness 高级调优项仍使用产品默认值，后续由共享 Settings Schema 驱动高级向导，避免 Node CLI
 复制一套会漂移的字段校验。
 
-### 0.1.16 已落地的初始化顺序
+### 0.1.17 已落地的初始化顺序
 
 ```text
 Profile

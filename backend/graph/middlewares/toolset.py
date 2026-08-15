@@ -12,6 +12,7 @@ import hashlib
 import json
 import logging
 import re
+import shlex
 import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -50,6 +51,22 @@ from tools.toolsets import (
 
 _SKILL_PATH_RE = re.compile(r"^/skills/([^/]+)/SKILL\.md$")
 _SKILL_COMMAND_PATH_RE = re.compile(r"(?<![A-Za-z0-9_.-])/skills/([^/\s\"']+)/")
+_SKILL_ENTRYPOINT_INTERPRETERS = frozenset(
+    {
+        ".",
+        "source",
+        "python",
+        "python3",
+        "node",
+        "deno",
+        "bash",
+        "sh",
+        "zsh",
+        "ruby",
+        "perl",
+        "php",
+    }
+)
 _LEGACY_EXTERNAL_LEASE_TOOLS = frozenset(
     {
         "stage_external_artifact",
@@ -86,6 +103,65 @@ _GOAL_INSPECTION_ALLOWED_TOOLS = frozenset(
 _CAPABILITY_RECOMMENDATION_MARKER = "[系统 Capability 建议]"
 logger = logging.getLogger(__name__)
 
+
+def _skill_entrypoint_reference(command: str) -> re.Match[str] | None:
+    """Return a Skill path only when the shell would execute it.
+
+    ``/skills`` is a locator backed by ordinary files. Reading, hashing or
+    copying those files must not require Skill activation. Activation is
+    needed only when an inactive Skill script becomes executable code.
+    """
+
+    try:
+        lexer = shlex.shlex(str(command or ""), posix=True, punctuation_chars="|&;")
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        raw_segments: list[list[str]] = [[]]
+        for token in lexer:
+            if token in {"&&", "||", ";", "|", "&"}:
+                if raw_segments[-1]:
+                    raw_segments.append([])
+                continue
+            raw_segments[-1].append(token)
+    except ValueError:
+        # The Tool Gate handles malformed shell. Do not reinterpret an
+        # unparseable resource path as a proven Skill entrypoint here.
+        return None
+
+    wrappers = {"command", "env", "timeout", "gtimeout", "nice", "nohup", "time"}
+    for raw_tokens in raw_segments:
+        tokens = list(raw_tokens)
+        while tokens and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", tokens[0], re.DOTALL):
+            tokens.pop(0)
+        while tokens and Path(tokens[0]).name.lower() in wrappers:
+            wrapper = Path(tokens.pop(0)).name.lower()
+            while tokens and tokens[0].startswith("-"):
+                option = tokens.pop(0)
+                if wrapper == "nice" and option in {"-n", "--adjustment"} and tokens:
+                    tokens.pop(0)
+            if wrapper == "env":
+                while tokens and "=" in tokens[0] and not tokens[0].startswith("="):
+                    tokens.pop(0)
+        if not tokens:
+            continue
+        executable = tokens[0]
+        direct = _SKILL_COMMAND_PATH_RE.search(executable)
+        if direct is not None:
+            return direct
+        executable_name = Path(executable).name.lower()
+        if executable_name in _SKILL_ENTRYPOINT_INTERPRETERS:
+            for argument in tokens[1:]:
+                referenced = _SKILL_COMMAND_PATH_RE.search(argument)
+                if referenced is not None:
+                    return referenced
+        if executable_name == "uv" and "run" in tokens[1:]:
+            for argument in tokens[1:]:
+                referenced = _SKILL_COMMAND_PATH_RE.search(argument)
+                if referenced is not None:
+                    return referenced
+    return None
+
+
 # The order is semantic rather than discovery-order.  The explicit prefix
 # keeps the long-lived native/harness schemas in front of Skill/MCP schemas;
 # the remaining names sort lexicographically for deterministic extension.
@@ -118,7 +194,6 @@ _ARGUMENT_DEPENDENT_PERMISSION_TOOLS = frozenset(
         "replace_file",
         "patch_file",
         "patch_files",
-        "delete_file",
     }
 )
 
@@ -534,12 +609,7 @@ class ToolsetMiddleware(AgentMiddleware):
     ) -> list[dict[str, Any]]:
         """Restore capability schemas without eagerly injecting Skill text."""
 
-        if (
-            not self.restore_session_skills
-            or run_kind != "standalone"
-            or not session_id
-            or not run_id
-        ):
+        if not self.restore_session_skills or run_kind != "standalone" or not session_id or not run_id:
             return []
         restored: list[dict[str, Any]] = []
         for entry in self._valid_session_cache_entries(
@@ -602,10 +672,7 @@ class ToolsetMiddleware(AgentMiddleware):
             policy_epoch=policy_epoch,
         )
         active_ids = {str(item.get("skill_id")) for item in activations if item.get("skill_id")}
-        standard_session = (
-            self.restore_session_skills
-            and str(context.get("run_kind") or "") == "standalone"
-        )
+        standard_session = self.restore_session_skills and str(context.get("run_kind") or "") == "standalone"
         cached = (
             []
             if standard_session
@@ -664,10 +731,7 @@ class ToolsetMiddleware(AgentMiddleware):
             policy_epoch=policy_epoch,
         )
         active_ids = {str(item.get("skill_id")) for item in activations if item.get("skill_id")}
-        standard_session = (
-            self.restore_session_skills
-            and str(context.get("run_kind") or "") == "standalone"
-        )
+        standard_session = self.restore_session_skills and str(context.get("run_kind") or "") == "standalone"
         cached = (
             []
             if standard_session
@@ -822,11 +886,7 @@ class ToolsetMiddleware(AgentMiddleware):
             policy_epoch=policy_epoch,
         ):
             enabled_toolsets.update(self.toolsets_by_skill.get(skill_id, ()))
-        return (
-            set(UNCONDITIONAL_TOOL_NAMES)
-            | set(tools_for_toolsets(enabled_toolsets))
-            | set(self.mcp_tool_names)
-        )
+        return set(UNCONDITIONAL_TOOL_NAMES) | set(tools_for_toolsets(enabled_toolsets)) | set(self.mcp_tool_names)
 
     def _activate_cached_tool_provider(
         self,
@@ -964,9 +1024,7 @@ class ToolsetMiddleware(AgentMiddleware):
         if not providers:
             return None
         context = (
-            request.runtime.context
-            if request.runtime is not None and isinstance(request.runtime.context, dict)
-            else {}
+            request.runtime.context if request.runtime is not None and isinstance(request.runtime.context, dict) else {}
         )
         session_id = str(context.get("session_id") or "")
         run_id = str(context.get("run_id") or "")
@@ -978,9 +1036,7 @@ class ToolsetMiddleware(AgentMiddleware):
         routed_order = {skill_id: index for index, skill_id in enumerate(routed)}
         cache_order = {
             entry.skill_id: index
-            for index, entry in enumerate(
-                self._valid_session_cache_entries(session_id, policy_epoch=policy_epoch)
-            )
+            for index, entry in enumerate(self._valid_session_cache_entries(session_id, policy_epoch=policy_epoch))
         }
         selected = min(
             providers,
@@ -1028,9 +1084,7 @@ class ToolsetMiddleware(AgentMiddleware):
         if skill_id in set(self._loaded_skill_ids(list(request.state.get("messages") or []))):
             return True
         context = (
-            request.runtime.context
-            if request.runtime is not None and isinstance(request.runtime.context, dict)
-            else {}
+            request.runtime.context if request.runtime is not None and isinstance(request.runtime.context, dict) else {}
         )
         session_id = str(context.get("session_id") or "")
         run_id = str(context.get("run_id") or "")
@@ -1079,9 +1133,7 @@ class ToolsetMiddleware(AgentMiddleware):
         ):
             return None
         context = (
-            request.runtime.context
-            if request.runtime is not None and isinstance(request.runtime.context, dict)
-            else {}
+            request.runtime.context if request.runtime is not None and isinstance(request.runtime.context, dict) else {}
         )
         session_id = str(context.get("session_id") or "")
         run_id = str(context.get("run_id") or "")
@@ -1159,7 +1211,7 @@ class ToolsetMiddleware(AgentMiddleware):
         if tool_name == "execute":
             args = request.tool_call.get("args") or {}
             command = str(args.get("command") or args.get("cmd") or "") if isinstance(args, dict) else ""
-            referenced = _SKILL_COMMAND_PATH_RE.search(command)
+            referenced = _skill_entrypoint_reference(command)
             if referenced is not None:
                 skill_id = referenced.group(1)
                 active = set(self._active_skill_ids(request.state, policy_epoch=policy_epoch))
@@ -1526,17 +1578,14 @@ class ToolsetMiddleware(AgentMiddleware):
             request.state,
             policy_epoch=self._context_policy_epoch(str(context.get("session_id") or "")),
         )
-        allowed = sorted(
-            self._tool_name(tool)
-            for tool in visible_tools
-            if self._tool_name(tool) in allowed_names
+        allowed = sorted(self._tool_name(tool) for tool in visible_tools if self._tool_name(tool) in allowed_names)
+        mounted = sorted(
+            {
+                self._tool_name(tool)
+                for tool in request.tools
+                if self._tool_name(tool) and self._tool_name(tool) not in _LEGACY_DATABASE_AGENT_TOOLS
+            }
         )
-        mounted = sorted({
-            self._tool_name(tool)
-            for tool in request.tools
-            if self._tool_name(tool)
-            and self._tool_name(tool) not in _LEGACY_DATABASE_AGENT_TOOLS
-        })
         unavailable: list[dict[str, Any]] = []
         for name in mounted:
             if name in set(allowed):
@@ -1740,9 +1789,7 @@ class ToolsetMiddleware(AgentMiddleware):
                     continue
             elif not (cache_bound or inherited or activation.skill_id not in currently_loaded):
                 continue
-            sections.append(
-                f"### {activation.skill_id} ({entry.skill_content_sha256})\n\n{entry.content.rstrip()}"
-            )
+            sections.append(f"### {activation.skill_id} ({entry.skill_content_sha256})\n\n{entry.content.rstrip()}")
         if not sections and not stubs:
             return ""
         full_section = (
@@ -1811,6 +1858,8 @@ class ToolsetMiddleware(AgentMiddleware):
             "\n\n## Current Permission Manifest (authoritative)\n\n"
             "This describes authorization for the current Run only. Historical grants and Evidence "
             "do not grant permission; the Tool Gate makes the final per-call decision. "
+            "`recent_decisions` is an audit trail of approvals already resolved in this Run, not reusable authority; "
+            "use it when reporting whether a completed action crossed HITL. "
             "runtime_evaluated tools are not predeclared HITL: low-risk effects execute directly, "
             "while material effects are decided from the concrete arguments.\n\n"
             f"```json\n{json.dumps(permission_model_payload, ensure_ascii=False, sort_keys=True)}\n```"
@@ -1864,9 +1913,7 @@ class ToolsetMiddleware(AgentMiddleware):
             )
             for item in missing
         )
-        if bool(
-            config.load_config().get("harness", {}).get("prompt_cache", {}).get("tail_routing_message", True)
-        ):
+        if bool(config.load_config().get("harness", {}).get("prompt_cache", {}).get("tail_routing_message", True)):
             return request.override(
                 messages=append_control_message(
                     messages,
@@ -1905,10 +1952,11 @@ class ToolsetMiddleware(AgentMiddleware):
             else {}
         )
         backend_mode = str(execution.get("backend_mode") or "")
+        filesystem_mode = str(execution.get("filesystem_mode") or "restricted")
+        if filesystem_mode not in {"restricted", "unrestricted"}:
+            filesystem_mode = "restricted"
         spawn_host_reads = backend_mode == "spawn"
-        smart_local_reads = (
-            approval_mode == "smart" and backend_mode in {"spawn", "kernel"}
-        )
+        smart_local_reads = approval_mode == "smart" and backend_mode in {"spawn", "kernel"}
         active_tool_names = self._allowed_tool_names(
             request.state,
             policy_epoch=self._context_policy_epoch(session_id),
@@ -1980,11 +2028,7 @@ class ToolsetMiddleware(AgentMiddleware):
         current_bindings = RunPermissionContext.from_config_snapshot(
             config_snapshot if isinstance(config_snapshot, dict) else {}
         ).grant_bindings()
-        grants, grants_revision = (
-            session_manager.permission_grants_snapshot(session_id)
-            if session_id
-            else ([], 0)
-        )
+        grants, grants_revision = session_manager.permission_grants_snapshot(session_id) if session_id else ([], 0)
         effective_grants = EffectiveGrantSet.resolve(
             grants,
             run_id=run_id,
@@ -1994,6 +2038,70 @@ class ToolsetMiddleware(AgentMiddleware):
             ).shell_grant_bindings(),
             permission_revision=grants_revision,
         )
+        recent_decisions = (
+            session_manager.list_permission_decisions(
+                session_id,
+                run_id=run_id,
+                limit=8,
+            )
+            if session_id
+            else []
+        )
+        current_run_grants = sorted(
+            (
+                grant
+                for grant in grants
+                if isinstance(grant, dict)
+                and isinstance(grant.get("metadata"), dict)
+                and str(grant["metadata"].get("run_id") or "") == run_id
+            ),
+            key=lambda grant: float(grant.get("created_at") or 0),
+        )[-8:]
+        audited_request_ids = {
+            str(item.get("request_id") or "")
+            for item in recent_decisions
+            if isinstance(item, dict)
+        }
+        def decision_signature(item: dict[str, Any]) -> tuple[Any, ...]:
+            return (
+                str(item.get("outcome") or ""),
+                str(item.get("tool") or ""),
+                str(item.get("reason") or ""),
+                str(item.get("risk") or ""),
+                str(item.get("scope") or ""),
+                tuple(sorted(str(value) for value in item.get("capabilities") or [])),
+                str(item.get("action_preview") or "")[:1000],
+            )
+
+        audited_signatures = {
+            decision_signature(item)
+            for item in recent_decisions
+            if isinstance(item, dict)
+        }
+        for grant in current_run_grants:
+            metadata = grant["metadata"]
+            request_id = str(metadata.get("permission_request_id") or "")
+            if request_id and request_id in audited_request_ids:
+                continue
+            legacy_decision = {
+                "outcome": "approved",
+                "tool": str(metadata.get("tool_name") or ""),
+                "reason": str(metadata.get("reason") or ""),
+                "risk": str(metadata.get("risk") or ""),
+                "scope": str(grant.get("scope") or ""),
+                "capabilities": [str(item) for item in grant.get("capabilities") or []],
+                "action_preview": str(
+                    metadata.get("command") or metadata.get("operation") or metadata.get("path") or ""
+                )[:1000],
+            }
+            if decision_signature(legacy_decision) in audited_signatures:
+                continue
+            recent_decisions.append(legacy_decision)
+            audited_signatures.add(decision_signature(legacy_decision))
+        recent_decisions = sorted(
+            recent_decisions,
+            key=lambda item: float(item.get("resolved_at") or item.get("created_at") or 0),
+        )[-8:]
         allowed.extend(effective_grants.manifest_entries())
         allowed = sorted(
             allowed,
@@ -2024,10 +2132,13 @@ class ToolsetMiddleware(AgentMiddleware):
         )
         boundary = {
             "approval_mode": approval_mode,
+            "backend_mode": backend_mode,
+            "filesystem_mode": filesystem_mode,
             "allowed": allowed,
             "runtime_evaluated": runtime_evaluated,
             "hitl_required": hitl_required,
             "blocked": [],
+            "recent_decisions": recent_decisions,
             "policy_epoch": int(permissions.get("policy_epoch") or 1),
             "policy_version": str(permissions.get("policy_version") or ""),
         }

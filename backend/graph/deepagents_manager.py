@@ -130,6 +130,7 @@ from graph.permission_policy import RunPermissionContext
 from graph.permission_resume import permission_resume_registry
 from graph.permissioned_filesystem_backend import PermissionedCompositeBackend
 from graph.prompt_cache import CONTROL_SOURCE, is_prompt_control_message
+from graph.run_usage import RunUsageAccumulator
 from graph.session_manager import session_manager
 from graph.skill_plan_resume import skill_plan_resume_registry
 from graph.skill_secret_resume import skill_secret_resume_registry
@@ -913,9 +914,7 @@ def _restore_session_summary_projection(
         return None
     try:
         restored_recent = [
-            message
-            for message in messages_from_dict(recent_payload)
-            if not _is_internal_control_message(message)
+            message for message in messages_from_dict(recent_payload) if not _is_internal_control_message(message)
         ]
     except Exception:
         return None
@@ -1372,8 +1371,7 @@ class EvaluationToolBoundaryMiddleware(AgentMiddleware):
         missing = sorted(self.required_tools - mounted)
         if missing:
             raise RuntimeError(
-                "Evaluation Harness capability drift: required production tools are missing: "
-                + ", ".join(missing)
+                "Evaluation Harness capability drift: required production tools are missing: " + ", ".join(missing)
             )
         return request.override(tools=[tool for tool in request.tools if self._tool_name(tool) in self.allowed_tools])
 
@@ -2538,7 +2536,6 @@ IMAGE_PATH_RE = re.compile(
 VIRTUAL_RESOURCE_PREFIXES = (
     "/workspace/",
     "/scratch/",
-    "/tmp/",
     "/knowledge/",
     "/semantic-assets/",
     "/sql-guardrails/",
@@ -2771,7 +2768,9 @@ def _build_subagent_item(
     model = (
         _resolve_subagent_model(model_name, binding="image_analyzer")
         if is_image_analyzer
-        else _resolve_subagent_model(model_name) if model_name else None
+        else _resolve_subagent_model(model_name)
+        if model_name
+        else None
     )
     description = item.get("description") or f"Subagent `{name}`."
     route_trigger = str(item.get("route_trigger") or "").strip()
@@ -2875,7 +2874,7 @@ def _build_subagents(
             "description": "General-purpose subagent for isolated multi-step work.",
             "system_prompt": (
                 "Complete the delegated task concisely. Read an applicable project Skill before using its business tools. "
-                "Use standard shell cp/mv/mkdir for directory-authorized filesystem operations, "
+                "Use standard shell cp/mv/mkdir/rm for ordinary filesystem operations, "
                 "write_file for full writes, patch_file for anchored local edits, and "
                 "materialize_source_ref for server data references. Harness permissions are inherited from the "
                 "parent Run, so never ask the user for a separate subagent permission. Return registered Evidence IDs, "
@@ -2965,9 +2964,7 @@ class DeepAgentsAgentManager:
 
     def initialize(self, base_dir: Path, *, user_root: Path | None = None) -> None:
         self._base_dir = base_dir
-        self._user_root = (
-            user_root or PuddingClawPaths.from_environment().root
-        ).expanduser().resolve()
+        self._user_root = (user_root or PuddingClawPaths.from_environment().root).expanduser().resolve()
 
     def _skills_runtime_root(self) -> Path:
         assert self._base_dir is not None
@@ -3019,11 +3016,7 @@ class DeepAgentsAgentManager:
         if self._user_root is None:
             raise RuntimeError("DeepAgentsAgentManager must be initialized with a user Home")
         evaluation_root = os.getenv("PUDDINGCLAW_EVALUATION_RUNTIME_ROOT")
-        return (
-            Path(evaluation_root).resolve() / "memory"
-            if evaluation_root
-            else self._user_root / "memory"
-        )
+        return Path(evaluation_root).resolve() / "memory" if evaluation_root else self._user_root / "memory"
 
     @staticmethod
     def _validate_memory_scope(memory_root: Path, target: Path) -> None:
@@ -3094,7 +3087,9 @@ class DeepAgentsAgentManager:
         evaluation_root_raw = os.getenv("PUDDINGCLAW_EVALUATION_RUNTIME_ROOT")
         reference_root = Path(evaluation_root_raw).resolve() / "reference" if evaluation_root_raw else None
         skills_dir = reference_root / "skills" if reference_root else self._skills_runtime_root()
-        semantic_assets_dir = reference_root / "semantic-assets" if reference_root else user_root / "definitions" / "semantic-assets"
+        semantic_assets_dir = (
+            reference_root / "semantic-assets" if reference_root else user_root / "definitions" / "semantic-assets"
+        )
         sql_guardrails_dir = (
             reference_root / "sql-guardrails" if reference_root else user_root / "definitions" / "sql-guardrails"
         )
@@ -3142,7 +3137,27 @@ class DeepAgentsAgentManager:
             {
                 "source": str(skills_dir.resolve()),
                 "target": "/skills",
-            }
+            },
+            {
+                "source": str(knowledge_dir.resolve()),
+                "target": "/knowledge",
+            },
+            {
+                "source": str(semantic_assets_dir.resolve()),
+                "target": "/semantic-assets",
+            },
+            {
+                "source": str(sql_guardrails_dir.resolve()),
+                "target": "/sql-guardrails",
+            },
+            {
+                "source": str(analytics_models_dir.resolve()),
+                "target": "/analytics-models",
+            },
+            {
+                "source": str(large_tool_results_dir.resolve()),
+                "target": "/large_tool_results",
+            },
         ]
         terminal_config = {
             **terminal_config,
@@ -3200,8 +3215,6 @@ class DeepAgentsAgentManager:
                 virtual_mode=True,
             ),
             "/scratch/": FilesystemBackend(root_dir=scratch_scope_dir, virtual_mode=True),
-            # `/tmp` is a second spelling of `/scratch/tmp`, not a host mount.
-            "/tmp/": FilesystemBackend(root_dir=scratch_tmp_dir, virtual_mode=True),
         }
         workspace_host_prefix = f"{workspace_path.resolve().as_posix().rstrip('/')}/"
         routes[workspace_host_prefix] = workspace_backend
@@ -3217,6 +3230,7 @@ class DeepAgentsAgentManager:
                 sql_guardrails_dir,
                 analytics_models_dir,
                 skills_dir,
+                large_tool_results_dir,
             ),
             workspace_root=workspace_path,
             run_id=run_id,
@@ -3305,19 +3319,11 @@ class DeepAgentsAgentManager:
             ),
             ExternalFilePermissionMiddleware(
                 backend_mode=backend_mode,
-                approval_mode=(
-                    permission_context.approval_mode.value
-                    if permission_context is not None
-                    else "strict"
-                ),
+                approval_mode=(permission_context.approval_mode.value if permission_context is not None else "strict"),
             ),
             WorkspacePathRouterMiddleware(
                 workspace_backend,
-                approval_mode=(
-                    permission_context.approval_mode.value
-                    if permission_context is not None
-                    else "strict"
-                ),
+                approval_mode=(permission_context.approval_mode.value if permission_context is not None else "strict"),
             ),
             VerificationActivationMiddleware(),
             *(
@@ -3437,9 +3443,7 @@ class DeepAgentsAgentManager:
             "type": "memory",
             "scope": "active_sse_run",
         }
-        logger.info(
-            "Initialized live DeepAgents checkpointer: type=memory scope=active_sse_run"
-        )
+        logger.info("Initialized live DeepAgents checkpointer: type=memory scope=active_sse_run")
         return self._checkpointer
 
     async def _delete_checkpoint_thread(self, thread_id: str) -> None:
@@ -3539,9 +3543,7 @@ class DeepAgentsAgentManager:
                         setattr(tool, key, value)
             elif getattr(tool, "name", "") == "update_memory":
                 memory_updates = {
-                    "memory_file": str(
-                        self._ensure_memory_md(self._memory_dir_for(project_id))
-                    ),
+                    "memory_file": str(self._ensure_memory_md(self._memory_dir_for(project_id))),
                     "memory_root": str(self._memory_root()),
                 }
                 try:
@@ -3603,11 +3605,7 @@ class DeepAgentsAgentManager:
             elif getattr(tool, "name", "") == "llm_wiki_conversation_documents":
                 try:
                     tool = tool.model_copy(
-                        update={
-                            "current_conversation_documents": list(
-                                current_conversation_documents or []
-                            )
-                        }
+                        update={"current_conversation_documents": list(current_conversation_documents or [])}
                     )
                 except Exception:
                     setattr(
@@ -3620,9 +3618,7 @@ class DeepAgentsAgentManager:
                     "session_id": session_id,
                     "query_id": query_id,
                     "current_message": current_message,
-                    "current_conversation_documents": list(
-                        current_conversation_documents or []
-                    ),
+                    "current_conversation_documents": list(current_conversation_documents or []),
                     "current_attachments": list(current_attachments or []),
                 }
                 try:
@@ -3689,17 +3685,13 @@ class DeepAgentsAgentManager:
                 goal_id=goal_id,
                 goal_revision=goal_revision,
                 skills_dir=self._skills_runtime_root(),
-                paths=PuddingClawPaths(
-                    self._user_root or PuddingClawPaths.from_environment().root
-                ),
+                paths=PuddingClawPaths(self._user_root or PuddingClawPaths.from_environment().root),
             )
         )
         tools.append(
             create_request_skill_runtime_tool(
                 skills_dir=self._skills_runtime_root(),
-                paths=PuddingClawPaths(
-                    self._user_root or PuddingClawPaths.from_environment().root
-                ),
+                paths=PuddingClawPaths(self._user_root or PuddingClawPaths.from_environment().root),
             )
         )
         return tools
@@ -3854,7 +3846,6 @@ class DeepAgentsAgentManager:
                 "description": "将不可变 SourceReference 直接物化为文件或类型化 Slot",
             },
             {"name": "patch_file", "source": "puddingclaw.harness", "description": "按文件版本原子应用补丁"},
-            {"name": "delete_file", "source": "puddingclaw.harness", "description": "删除精确授权的文件"},
             {
                 "name": "validate_html_report",
                 "source": "puddingclaw.harness",
@@ -4259,9 +4250,7 @@ class DeepAgentsAgentManager:
                     external_directory_paths.append(str(path))
             for raw_path in local_resource_paths:
                 try:
-                    path = Path(
-                        raw_path.replace("\\ ", " ").strip().strip("'\"")
-                    ).expanduser().resolve()
+                    path = Path(raw_path.replace("\\ ", " ").strip().strip("'\"")).expanduser().resolve()
                 except (OSError, RuntimeError, ValueError):
                     # User text is untrusted input. A malformed/overlong path
                     # candidate is not allowed to abort the Agent turn.
@@ -4289,18 +4278,12 @@ class DeepAgentsAgentManager:
                 for path in non_image_resource_paths
                 if Path(path.replace("\\ ", " ").strip().strip("'\"")).suffix.lower() == ".pdf"
             ]
-            generic_resource_paths = [
-                path for path in non_image_resource_paths if path not in set(pdf_resource_paths)
-            ]
+            generic_resource_paths = [path for path in non_image_resource_paths if path not in set(pdf_resource_paths)]
             external_pdf_paths: set[str] = set()
             for path in pdf_resource_paths:
                 try:
                     external_pdf_paths.add(
-                        str(
-                            Path(path.replace("\\ ", " ").strip().strip("'\""))
-                            .expanduser()
-                            .resolve()
-                        )
+                        str(Path(path.replace("\\ ", " ").strip().strip("'\"")).expanduser().resolve())
                     )
                 except (OSError, RuntimeError, ValueError):
                     continue
@@ -4366,13 +4349,14 @@ class DeepAgentsAgentManager:
             if generic_external_resource_paths and not external_paths_needing_permission:
                 paths = "\n".join(f"- {path}" for path in generic_external_resource_paths)
                 notes.append(
-                    "[外部文件授权] 检测到 workspace 外的本地文件路径。直接对原始绝对路径使用 "
+                    "[外部文件路径] 检测到 workspace 外的本地文件路径。直接对原始绝对路径使用 "
                     f"read_file/write_file/materialize_source_ref/patch_file：\n{paths}\n"
                     "只提交一次原始操作，不要预判授权实现；Harness 会按当前 Profile 自动执行或中断。"
                     "若确认必须发现同目录依赖，"
-                    "对直接父目录调用 ls/glob/grep；系统只请求该 exact directory，不得猜测兄弟路径或提升到更高祖先目录。"
-                    "精确写入由 HostFileBroker 原子落到正式路径；不要创建 /workspace 或 /scratch 影子副本。"
-                    "文件工具与 execute 分别由各自执行边界强制约束，模型无需编排 Grant。"
+                    "对直接父目录调用 ls/glob/grep，不得猜测兄弟路径或提升到更高祖先目录。"
+                    "Smart trusted-local Spawn/Kernel 的普通读写不需要 project、目录或 exact-file HITL；"
+                    "HostFileBroker 仅可作为原子落盘与回执实现，模型无需编排 Grant。"
+                    "不要创建 /workspace 或 /scratch 影子副本。"
                 )
             if external_paths_needing_permission:
                 paths = "\n".join(f"- {path}" for path in external_paths_needing_permission)
@@ -4383,11 +4367,11 @@ class DeepAgentsAgentManager:
             if external_directory_paths:
                 paths = "\n".join(f"- {path}" for path in external_directory_paths)
                 notes.append(
-                    "[外部目录授权] 检测到 workspace 外的本地目录。读取可直接使用 "
+                    "[外部目录路径] 检测到 workspace 外的本地目录。读取可直接使用 "
                     f"ls/glob/grep/read_file；复制、移动、建目录直接使用 execute 中的标准 cp/mv/mkdir：\n{paths}\n"
                     "直接提交一次原始操作，不要在调用前推测是否需要审批。Harness 按当前 Profile 决定自动执行"
-                    "或中断；Kernel 仅是底层隔离实现。write_file/patch_file 的精确或事务写入仍由内部 "
-                    "HostFileBroker 原子提交，模型无需处理 Grant、lease、staged path 或 hash 编排。"
+                    "或中断；Smart trusted-local Spawn/Kernel 不以项目或目录归属触发 HITL，Kernel 仅增加底层隔离。"
+                    "write_file/patch_file 可由内部 HostFileBroker 原子提交，但模型无需处理 Grant、lease、staged path 或 hash 编排。"
                 )
             return f"{message}\n\n" + "\n\n".join(notes)
 
@@ -4416,9 +4400,7 @@ class DeepAgentsAgentManager:
                     content.append(block)
                 continue
             try:
-                path = Path(
-                    raw_path.replace("\\ ", " ").strip().strip("'\"")
-                ).expanduser().resolve()
+                path = Path(raw_path.replace("\\ ", " ").strip().strip("'\"")).expanduser().resolve()
             except (OSError, RuntimeError, ValueError):
                 continue
             workspace = Path(workspace_path).expanduser().resolve() if workspace_path else None
@@ -4458,8 +4440,7 @@ class DeepAgentsAgentManager:
         """
 
         has_image = any(
-            isinstance(item, dict) and str(item.get("type") or "") == "image"
-            for item in attachments or []
+            isinstance(item, dict) and str(item.get("type") or "") == "image" for item in attachments or []
         ) or bool(IMAGE_PATH_RE.search(str(message or "")))
         if not has_image:
             return False
@@ -4501,9 +4482,7 @@ class DeepAgentsAgentManager:
         """Audit explicit trusted-user authorization to act on attachment content."""
 
         image_refs = [
-            item
-            for item in attachments or []
-            if isinstance(item, dict) and str(item.get("type") or "") == "image"
+            item for item in attachments or [] if isinstance(item, dict) and str(item.get("type") or "") == "image"
         ]
         if not image_refs:
             return None
@@ -4519,13 +4498,9 @@ class DeepAgentsAgentManager:
         if not explicitly_authorized:
             return None
         attachment_refs = [
-            str(item.get("id") or item.get("attachment_id") or item.get("path") or "")
-            for item in image_refs
+            str(item.get("id") or item.get("attachment_id") or item.get("path") or "") for item in image_refs
         ]
-        attachment_hashes = [
-            str(item.get("sha256") or item.get("content_sha256") or "")
-            for item in image_refs
-        ]
+        attachment_hashes = [str(item.get("sha256") or item.get("content_sha256") or "") for item in image_refs]
         digest = hashlib.sha256(
             json.dumps(
                 {
@@ -4932,9 +4907,7 @@ class DeepAgentsAgentManager:
                 continue
             exchange_query_id = str(item.get("query_id") or "").strip()
             if not exchange_query_id:
-                exchange_query_id = hashlib.sha256(
-                    f"{pending_user}\n{assistant}".encode("utf-8")
-                ).hexdigest()[:20]
+                exchange_query_id = hashlib.sha256(f"{pending_user}\n{assistant}".encode("utf-8")).hexdigest()[:20]
             content = f"## 用户\n\n{pending_user}\n\n## Agent\n\n{assistant}"
             documents.append(
                 {
@@ -4950,9 +4923,7 @@ class DeepAgentsAgentManager:
 
         clean_current = str(current_message or "").strip()
         if clean_current:
-            current_id = str(query_id or "").strip() or hashlib.sha256(
-                clean_current.encode("utf-8")
-            ).hexdigest()[:20]
+            current_id = str(query_id or "").strip() or hashlib.sha256(clean_current.encode("utf-8")).hexdigest()[:20]
             content = f"## 用户\n\n{clean_current}"
             documents.append(
                 {
@@ -5114,11 +5085,7 @@ class DeepAgentsAgentManager:
         append_current_message: bool = True,
     ) -> list[Any]:
         messages: list[Any] = []
-        omitted_history_count = (
-            max(0, len(history) - history_message_limit)
-            if history_message_limit is not None
-            else 0
-        )
+        omitted_history_count = max(0, len(history) - history_message_limit) if history_message_limit is not None else 0
         if omitted_history_count:
             history = history[-history_message_limit:]
             messages.append(
@@ -5266,9 +5233,7 @@ class DeepAgentsAgentManager:
                     tool_input = tc.get("input") or tc.get("args") or {}
                     historical_skill_id = ""
                     if bool(tc.get("historical")) and tool_name == "read_file" and isinstance(tool_input, dict):
-                        skill_path = str(tool_input.get("file_path") or tool_input.get("path") or "").replace(
-                            "\\", "/"
-                        )
+                        skill_path = str(tool_input.get("file_path") or tool_input.get("path") or "").replace("\\", "/")
                         matched_skill = HISTORICAL_SKILL_READ_RE.fullmatch(skill_path)
                         if matched_skill is not None:
                             historical_skill_id = matched_skill.group(1)
@@ -5353,6 +5318,7 @@ class DeepAgentsAgentManager:
                             tool_name=tool_name,
                             tool_input=str(tc.get("input", tc.get("args", ""))),
                             tool_call_id=tc_id,
+                            is_error=bool(tc.get("is_error")),
                         )
                         model_output = adapted.answer_context
                         model_sources = adapted.sources or list(tc.get("sources", []) or [])
@@ -5730,9 +5696,7 @@ class DeepAgentsAgentManager:
                             (
                                 index,
                                 asyncio.create_task(
-                                    permission_resume_registry.wait(
-                                        str(interrupted_request.get("id") or "")
-                                    )
+                                    permission_resume_registry.wait(str(interrupted_request.get("id") or ""))
                                 ),
                             )
                         )
@@ -5755,9 +5719,7 @@ class DeepAgentsAgentManager:
                             or int(authoritative_goal.get("objective_revision") or 1)
                             != int(context.get("goal_revision") or 1)
                         ):
-                            raise asyncio.CancelledError(
-                                "Goal control changed while waiting for user input"
-                            )
+                            raise asyncio.CancelledError("Goal control changed while waiting for user input")
                     for index, task in decision_tasks:
                         decisions[index] = task.result()
                 finally:
@@ -5768,10 +5730,7 @@ class DeepAgentsAgentManager:
                         *(task for _, task in decision_tasks),
                         return_exceptions=True,
                     )
-                decisions = [
-                    decision if isinstance(decision, dict) else {"type": "reject"}
-                    for decision in decisions
-                ]
+                decisions = [decision if isinstance(decision, dict) else {"type": "reject"} for decision in decisions]
             else:
                 decision_tasks = [
                     asyncio.create_task(
@@ -6045,6 +6004,19 @@ class DeepAgentsAgentManager:
 
     @staticmethod
     def _is_tool_error(tool_msg: Any, output: str) -> bool:
+        additional_kwargs = getattr(tool_msg, "additional_kwargs", None)
+        control_plane = (
+            additional_kwargs.get("puddingclaw_control_plane") if isinstance(additional_kwargs, dict) else None
+        )
+        if isinstance(control_plane, dict) and control_plane.get("type") in {
+            "skill_cache_loaded",
+            "skill_context_loaded_on_demand",
+        }:
+            # The model still receives the error-status ToolMessage so it knows
+            # the requested business tool did not run. For persistence, traces,
+            # and the UI, however, loading context is a successful control-plane
+            # operation rather than a failed tool execution.
+            return False
         status = getattr(tool_msg, "status", None)
         if status == "error":
             return True
@@ -6457,6 +6429,7 @@ class DeepAgentsAgentManager:
         accumulated_reasoning: str,
         turn_sources: list[dict[str, Any]],
         output_attachments: list[dict[str, Any]] | None = None,
+        usage_summary: dict[str, Any] | None = None,
         user_message_persisted: bool = False,
         status: str = "cancelled",
         interruption_notice: str | None = None,
@@ -6499,6 +6472,7 @@ class DeepAgentsAgentManager:
             accumulated_reasoning=accumulated_reasoning,
             turn_sources=turn_sources,
             output_attachments=output_attachments,
+            usage_summary=usage_summary,
             interrupted=status == "cancelled",
             interruption_notice=interruption_notice,
             error_notice=error_notice,
@@ -6515,6 +6489,7 @@ class DeepAgentsAgentManager:
         turn_sources: list[dict[str, Any]],
         output_attachments: list[dict[str, Any]] | None = None,
         session_sources: list[dict[str, Any]] | None = None,
+        usage_summary: dict[str, Any] | None = None,
         interrupted: bool = False,
         interruption_notice: str | None = None,
         error_notice: str | None = None,
@@ -6554,6 +6529,7 @@ class DeepAgentsAgentManager:
             interruption_notice=interruption_notice,
             error_notice=error_notice,
             output_attachments=output_attachments,
+            usage_summary=usage_summary,
             status=status,
         )
         return True
@@ -6791,6 +6767,7 @@ class DeepAgentsAgentManager:
         goal_control_action: str | None = None,
         interaction_mode: str = "interactive",
         authority_profile: str = "smart",
+        filesystem_mode: str | None = None,
         authority_directories: list[str] | None = None,
         authority_network_origins: list[str] | None = None,
         analytics_model_snapshot: dict[str, Any] | None = None,
@@ -6942,12 +6919,7 @@ class DeepAgentsAgentManager:
                 revised_objective = str(turn_decision.revised_objective or "")
                 revised_profile: RunTaskProfile | None = None
                 if str(existing_goal.get("completion_policy") or "") == GoalCompletionPolicy.RUBRIC.value:
-                    live_rubric = (
-                        config.load_config()
-                        .get("harness", {})
-                        .get("completion", {})
-                        .get("rubric", {})
-                    )
+                    live_rubric = config.load_config().get("harness", {}).get("completion", {}).get("rubric", {})
                     frozen_rubric = self._frozen_goal_rubric_config(
                         session_id=session_id,
                         goal=existing_goal,
@@ -6978,13 +6950,11 @@ class DeepAgentsAgentManager:
                             "timeout_seconds": _RUBRIC_PROFILE_TIMEOUT_SECONDS,
                         },
                     )
-                    revised_profile, precomputed_rubric_profile_result = (
-                        await self._resolve_rubric_task_profile(
-                            baseline=baseline,
-                            objective=revised_objective,
-                            analytics_model_id=analytics_model_id,
-                            model_override=revision_model_name or None,
-                        )
+                    revised_profile, precomputed_rubric_profile_result = await self._resolve_rubric_task_profile(
+                        baseline=baseline,
+                        objective=revised_objective,
+                        analytics_model_id=analytics_model_id,
+                        model_override=revision_model_name or None,
                     )
                     yield self._sse(
                         "rubric_profile_completed",
@@ -7073,6 +7043,7 @@ class DeepAgentsAgentManager:
                 goal_turn_decision=turn_decision,
                 interaction_mode=interaction_mode,
                 authority_profile=authority_profile,
+                filesystem_mode=filesystem_mode,
                 authority_directories=authority_directories,
                 authority_network_origins=authority_network_origins,
                 analytics_model_snapshot=analytics_model_snapshot,
@@ -7237,6 +7208,7 @@ class DeepAgentsAgentManager:
         goal_turn_decision: GoalTurnDecision | None = None,
         interaction_mode: str = "interactive",
         authority_profile: str = "smart",
+        filesystem_mode: str | None = None,
         authority_directories: list[str] | None = None,
         authority_network_origins: list[str] | None = None,
         analytics_model_snapshot: dict[str, Any] | None = None,
@@ -7254,9 +7226,32 @@ class DeepAgentsAgentManager:
         query_created_at = float(query_created_at) if query_created_at is not None else time.time()
         query_id = f"query-{uuid.uuid4().hex[:12]}"
         run_record: RunRecord | None = None
+        run_usage: RunUsageAccumulator | None = None
         goal_record: GoalRecord | None = None
         trace_collector: TraceCollector | None = None
         trace_context_active = False
+        session_approval_mode = "strict"
+        try:
+            session_approval_mode = str(
+                session_manager.get_permission_policy(session_id).get("approval_mode") or "strict"
+            )
+        except (FileNotFoundError, ValueError):
+            # The durable Run snapshot remains fail-closed if a legacy or
+            # concurrently removed Session cannot provide its policy.
+            session_approval_mode = "strict"
+        resolved_filesystem_mode = (
+            "restricted"
+            if interaction_mode == "interactive" and session_approval_mode != "smart"
+            else (
+                filesystem_mode
+                if filesystem_mode in {"restricted", "unrestricted"}
+                else (
+                    "unrestricted"
+                    if authority_profile == "smart" and session_approval_mode == "smart"
+                    else "restricted"
+                )
+            )
+        )
         segments: list[dict[str, Any]] = []
         active_segment: dict[str, Any] = {}
         pending_tool_starts: dict[str, dict[str, str]] = {}
@@ -7379,10 +7374,8 @@ class DeepAgentsAgentManager:
             required_file_type_hints = self._required_attachment_file_type_hints(attachments)
             profile_objective = run_objective or message
             if required_file_type_hints:
-                profile_objective = (
-                    f"{profile_objective}\n"
-                    "[服务端可信附件类型] "
-                    + ", ".join(dict.fromkeys(required_file_type_hints))
+                profile_objective = f"{profile_objective}\n[服务端可信附件类型] " + ", ".join(
+                    dict.fromkeys(required_file_type_hints)
                 )
             reused_task_profile = self._reusable_task_profile(
                 session_id=session_id,
@@ -7418,11 +7411,7 @@ class DeepAgentsAgentManager:
                 for reason in task_profile.reasons
                 if reason.startswith("missing_required_skill:") and reason.split(":", 1)[1]
             ]
-            missing_skills = list(
-                dict.fromkeys(
-                    [*task_profile.missing_explicit_skill_ids, *missing_required_skills]
-                )
-            )
+            missing_skills = list(dict.fromkeys([*task_profile.missing_explicit_skill_ids, *missing_required_skills]))
             yield self._sse(
                 "task_preflight_completed",
                 {
@@ -7518,6 +7507,7 @@ class DeepAgentsAgentManager:
                     "interaction": {
                         "mode": interaction_mode,
                         "authority_profile": authority_profile,
+                        "filesystem_mode": resolved_filesystem_mode,
                     },
                     "worker": {
                         "analytics_model": dict(analytics_model_snapshot or {}),
@@ -7542,6 +7532,7 @@ class DeepAgentsAgentManager:
                 goal_turn_confidence=(goal_turn_decision.confidence if goal_turn_decision else None),
                 goal_turn_classifier=(goal_turn_decision.classifier if goal_turn_decision else None),
             )
+            run_usage = RunUsageAccumulator()
             if attachment_promotion:
                 run_record.attachment_instruction_promotions = [attachment_promotion]
                 session_manager.upsert_run_state(session_id, run_record.model_dump(mode="json"))
@@ -7671,9 +7662,7 @@ class DeepAgentsAgentManager:
                 context_items = list(attachments or [])
                 if goal_record is None:
                     return context_items
-                known_attachment_ids = {
-                    str(item.get("id") or "") for item in context_items if isinstance(item, dict)
-                }
+                known_attachment_ids = {str(item.get("id") or "") for item in context_items if isinstance(item, dict)}
                 for historical_message in raw_history:
                     for item in historical_message.get("attachments") or []:
                         if not isinstance(item, dict):
@@ -7749,9 +7738,7 @@ class DeepAgentsAgentManager:
                         workspace_path=workspace_path,
                         query_id=query_id,
                     )
-                    messages, protocol_report = repair_tool_message_protocol(
-                        [*restored_projection, *delta_and_current]
-                    )
+                    messages, protocol_report = repair_tool_message_protocol([*restored_projection, *delta_and_current])
                     if pending_executable_tool_call_ids(messages):
                         logger.warning(
                             "Session Summary projection left pending tool calls for session=%s; "
@@ -7779,9 +7766,9 @@ class DeepAgentsAgentManager:
                             {
                                 "phase": "restored",
                                 "source_run_id": session_summary_projection.get("source_run_id"),
-                                "source_query_id": (
-                                    session_summary_projection.get("transcript_boundary") or {}
-                                ).get("source_query_id"),
+                                "source_query_id": (session_summary_projection.get("transcript_boundary") or {}).get(
+                                    "source_query_id"
+                                ),
                                 "recent_message_count": len(restored_projection) - 1,
                                 "delta_message_count": len(delta_history),
                             },
@@ -7890,9 +7877,7 @@ class DeepAgentsAgentManager:
             )
             if evaluation_tool_allowlist is not None:
                 agent_tools = [
-                    tool
-                    for tool in agent_tools
-                    if str(getattr(tool, "name", "")) in evaluation_tool_allowlist
+                    tool for tool in agent_tools if str(getattr(tool, "name", "")) in evaluation_tool_allowlist
                 ]
             mcp_config = config.load_config().get("mcp", {})
             from mcp_clients.servers import effective_mcp_server_names
@@ -7905,11 +7890,7 @@ class DeepAgentsAgentManager:
 
                     mcp_tools = await load_filtered_mcp_tools(enabled_mcp)
                     agent_tools.extend(mcp_tools)
-                    mcp_tool_names = {
-                        str(getattr(tool, "name", ""))
-                        for tool in mcp_tools
-                        if getattr(tool, "name", "")
-                    }
+                    mcp_tool_names = {str(getattr(tool, "name", "")) for tool in mcp_tools if getattr(tool, "name", "")}
                 except Exception:
                     logger.warning(
                         "Failed to load filtered MCP tools for DeepAgents; continuing with local tools",
@@ -7924,6 +7905,28 @@ class DeepAgentsAgentManager:
                 {
                     "backend_mode": backend_mode,
                     "backend_id": str(getattr(agent_backend, "execution_backend_id", "")),
+                    "filesystem_mode": (
+                        str(
+                            (run_record.config_snapshot.get("interaction") or {}).get("filesystem_mode")
+                            or (run_record.config_snapshot.get("execution") or {}).get("filesystem_mode")
+                            or ""
+                        )
+                        if str(
+                            (run_record.config_snapshot.get("interaction") or {}).get("filesystem_mode")
+                            or (run_record.config_snapshot.get("execution") or {}).get("filesystem_mode")
+                            or ""
+                        )
+                        in {"restricted", "unrestricted"}
+                        else (
+                            "unrestricted"
+                            if str(
+                                (run_record.config_snapshot.get("permissions") or {}).get("approval_mode") or "smart"
+                            )
+                            == "smart"
+                            and backend_mode in {"spawn", "kernel"}
+                            else "restricted"
+                        )
+                    ),
                     "workspace_id": workspace_id,
                     "scratch_host_path": str(getattr(agent_backend, "execution_scratch_host_path", "")),
                     "fallback_reason": getattr(
@@ -7934,14 +7937,21 @@ class DeepAgentsAgentManager:
                 },
             )
             permission_context = RunPermissionContext.from_config_snapshot(run_record.config_snapshot)
+            filesystem_mode = permission_context.filesystem_mode
+            if backend_mode not in {"spawn", "kernel"}:
+                filesystem_mode = "restricted"
+            # One explicit mode is shared by file tools, the runner, and
+            # subagents. It is never inferred from Kernel availability.
+            agent_backend.filesystem_mode = filesystem_mode
+            execution_backend = getattr(agent_backend, "execution_backend", None)
+            if execution_backend is not None:
+                execution_backend.filesystem_mode = filesystem_mode
             # Managed integration CLIs are a separate control plane from the
             # project Spawn/Kernel runner.  The lazy handle preserves that
             # boundary while the control plane itself uses Host Toolchain +
             # kernel sandboxing rather than Docker.
             managed_cli_service = (
-                None
-                if evaluation_builtin_tool_allowlist is not None
-                else lazy_managed_cli_service(workspace_path)
+                None if evaluation_builtin_tool_allowlist is not None else lazy_managed_cli_service(workspace_path)
             )
             agent_middlewares = self._build_middlewares(
                 project_id,
@@ -7956,11 +7966,7 @@ class DeepAgentsAgentManager:
                 permission_reviewer=permission_reviewer,
                 evaluation_builtin_tool_allowlist=evaluation_builtin_tool_allowlist,
                 evaluation_required_toolset=evaluation_required_toolset,
-                rubric_config=(
-                    effective_rubric_config
-                    if run_record.requires_goal_verification
-                    else None
-                ),
+                rubric_config=(effective_rubric_config if run_record.requires_goal_verification else None),
                 attachment_observation_only=self._attachment_observation_only(
                     message,
                     attachments,
@@ -7969,8 +7975,7 @@ class DeepAgentsAgentManager:
                 session_id=session_id,
                 query_id=query_id,
                 restore_session_skills=(
-                    interaction_mode == "interactive"
-                    and evaluation_builtin_tool_allowlist is None
+                    interaction_mode == "interactive" and evaluation_builtin_tool_allowlist is None
                 ),
             )
             main_summarization = _build_deepagents_summarization(model, agent_backend)
@@ -8013,8 +8018,7 @@ class DeepAgentsAgentManager:
             subagent_tools = [
                 tool
                 for tool in agent_tools
-                if str(getattr(tool, "name", ""))
-                not in {"update_goal", "update_memory", "request_user_input"}
+                if str(getattr(tool, "name", "")) not in {"update_goal", "update_memory", "request_user_input"}
             ]
 
             def build_subagent_middlewares() -> list[Any]:
@@ -8034,8 +8038,14 @@ class DeepAgentsAgentManager:
                         if extension_enabled("analytics")
                         else []
                     ),
-                    ExternalFilePermissionMiddleware(backend_mode=backend_mode),
-                    WorkspacePathRouterMiddleware(agent_backend),
+                    ExternalFilePermissionMiddleware(
+                        backend_mode=backend_mode,
+                        approval_mode=permission_context.approval_mode.value,
+                    ),
+                    WorkspacePathRouterMiddleware(
+                        agent_backend,
+                        approval_mode=permission_context.approval_mode.value,
+                    ),
                     VerificationActivationMiddleware(),
                     VersionedPatchMiddleware(agent_backend, compact_model_surface=True),
                     SkillIntentRouterMiddleware(),
@@ -8166,6 +8176,17 @@ class DeepAgentsAgentManager:
             active_llm_span: str | None = None
             model_call_index = 0
             active_graph_node: str | None = None
+            active_provider_call_started_at: float | None = None
+
+            def current_usage_summary(*, final_rounds: int | None = None) -> dict[str, Any]:
+                assert run_record is not None
+                assert run_usage is not None
+                return run_usage.summary(
+                    run_id=run_record.run_id,
+                    query_id=query_id,
+                    rounds=final_rounds,
+                    tool_calls=len(emitted_tool_starts),
+                )
 
             def new_segment() -> dict[str, Any]:
                 return {
@@ -8235,6 +8256,7 @@ class DeepAgentsAgentManager:
                         "interrupted": interrupted,
                         "interruption_notice": interruption_notice,
                         "error_notice": error_notice,
+                        "usage": current_usage_summary(),
                     },
                     ensure_ascii=False,
                     sort_keys=True,
@@ -8265,6 +8287,7 @@ class DeepAgentsAgentManager:
                     interrupted=interrupted,
                     interruption_notice=interruption_notice,
                     error_notice=error_notice,
+                    usage_summary=current_usage_summary(),
                     status=status,
                 ):
                     last_snapshot_at = now
@@ -8384,6 +8407,28 @@ class DeepAgentsAgentManager:
                             additional_kwargs[INTERNAL_CALL_MARKER],
                         )
                         continue
+                    node = self._metadata_node(metadata)
+                    is_model_node = not node or node == "model"
+                    if is_model_node and active_provider_call_started_at is None:
+                        active_provider_call_started_at = time.perf_counter()
+
+                    provider_usage = getattr(message_payload, "usage_metadata", None) or {}
+                    if is_model_node and provider_usage:
+                        message_id = str(getattr(message_payload, "id", "") or "").strip()
+                        stream_step = str(
+                            metadata.get("langgraph_step") or metadata.get("checkpoint_ns") or model_call_index
+                        )
+                        duration_ms = round((time.perf_counter() - active_provider_call_started_at) * 1000)
+                        if run_usage.add_langchain_usage(
+                            provider_usage,
+                            call_id=f"agent-message:{message_id or stream_step}",
+                            role="agent",
+                            duration_ms=duration_ms,
+                        ):
+                            usage_summary = current_usage_summary()
+                            yield self._sse("usage_summary", usage_summary)
+                            persist_assistant_snapshot(force=True)
+                        active_provider_call_started_at = None
                     text = self._extract_content_text(payload)
                     reasoning_text = self._extract_reasoning_text(payload)
                     text, model_limit_text_buffer, suppressing_model_limit_notice = (
@@ -8395,7 +8440,6 @@ class DeepAgentsAgentManager:
                     )
 
                     # Track active LangGraph node for frontend graph highlight.
-                    node = self._metadata_node(metadata)
                     if node and node != active_graph_node:
                         active_graph_node = node
                         trace_collector.add_graph_node_span(node)
@@ -8407,7 +8451,6 @@ class DeepAgentsAgentManager:
                     # Lifecycle of an LLM span: start on the first model or
                     # reasoning chunk, finish when the model node changes or a
                     # tool-call follows.
-                    is_model_node = not node or node == "model"
                     if verification_retry_pending_segment and is_model_node and (text or reasoning_text):
                         # Completion-gate and rubric retries jump straight back
                         # to the model without passing through the tools node.
@@ -8488,6 +8531,10 @@ class DeepAgentsAgentManager:
                             continue
 
                         if node_name == "tools":
+                            # A provider that omits usage has no completion
+                            # boundary to close the timer. Do not let tool time
+                            # leak into the next model call's latency.
+                            active_provider_call_started_at = None
                             for tool_msg in node_messages:
                                 tc_id = str(getattr(tool_msg, "tool_call_id", "") or "")
                                 tool_extra = getattr(tool_msg, "additional_kwargs", None)
@@ -8523,6 +8570,7 @@ class DeepAgentsAgentManager:
                                     tool_name=tool_name,
                                     tool_input=pending_tool.get("input", ""),
                                     tool_call_id=tc_id,
+                                    is_error=self._is_tool_error(tool_msg, original_output),
                                 )
                                 raw_output = adapted.answer_context
                                 sources = adapted.sources
@@ -8592,19 +8640,6 @@ class DeepAgentsAgentManager:
                                             },
                                         )
                                 is_error = self._is_tool_error(tool_msg, raw_output)
-                                control_plane = tool_extra.get("puddingclaw_control_plane")
-                                if (
-                                    isinstance(control_plane, dict)
-                                    and control_plane.get("type") == "skill_cache_loaded"
-                                ):
-                                    # The requested business tool did not run,
-                                    # but the control-plane recovery succeeded.
-                                    # Keep the ToolMessage error semantics for
-                                    # the model/verifier while presenting the
-                                    # internal lazy-load as a completed context
-                                    # operation instead of a user-facing tool
-                                    # failure.
-                                    is_error = False
                                 self._update_tool_end_in_timeline(active_segment, tc_id or "", raw_output, is_error)
                                 pending_tool_starts.pop(tc_id, None)
 
@@ -8620,9 +8655,8 @@ class DeepAgentsAgentManager:
                                 if tc_id:
                                     for tc in active_segment["tool_calls"]:
                                         if tc.get("id") == tc_id and "output" not in tc:
-                                            # Execution middleware may route a model-selected
-                                            # tool to a safer effective tool (for example,
-                                            # external read_file -> read_resource).
+                                            # Execution middleware may normalize a model-selected
+                                            # path or effective tool before dispatch.
                                             tc["tool"] = tool_name
                                             tc["output"] = raw_output
                                             if original_output != raw_output:
@@ -8761,6 +8795,16 @@ class DeepAgentsAgentManager:
                 elif mode == "custom" and isinstance(payload, dict):
                     event_type = str(payload.get("type") or "")
                     if event_type:
+                        if event_type == "model_usage":
+                            trace_collector.add_custom_span(event_type, payload)
+                            if str(payload.get("role") or "") != "agent" and run_usage.add_model_event(payload):
+                                usage_summary = current_usage_summary()
+                                yield self._sse("usage_summary", usage_summary)
+                                persist_assistant_snapshot(force=True)
+                            # Raw per-call payloads are internal telemetry.  The
+                            # frontend and Session JSON only receive the stable
+                            # per-Run aggregate contract.
+                            continue
                         lifecycle_label = ""
                         lifecycle_detail = ""
                         lifecycle_display_status = ""
@@ -8933,9 +8977,7 @@ class DeepAgentsAgentManager:
                         current_context_usage = last_context_usage
                     summary_event = payload.get("_summarization_event")
                     compact_context_active = (
-                        using_saved_agent_context
-                        or using_session_summary_projection
-                        or isinstance(summary_event, dict)
+                        using_saved_agent_context or using_session_summary_projection or isinstance(summary_event, dict)
                     )
                     try:
                         if compact_context_active:
@@ -8982,10 +9024,7 @@ class DeepAgentsAgentManager:
                             session_id,
                             exc_info=True,
                         )
-                    if (
-                        not received_context_usage_event
-                        and current_context_usage != last_fallback_context_usage
-                    ):
+                    if not received_context_usage_event and current_context_usage != last_fallback_context_usage:
                         # ToolProtocolIntegrityMiddleware normally publishes a
                         # complete model-boundary estimate including tool schemas.
                         # Graph values are a reliable
@@ -9167,6 +9206,7 @@ class DeepAgentsAgentManager:
                 int(verification_state.get("run_model_call_count") or 0),
                 model_call_index,
             )
+            final_usage_summary = current_usage_summary(final_rounds=run_record.model_call_count)
             verification_state["_harness_context"] = {
                 # Session-scoped ledger is authoritative. It includes
                 # tombstones for omitted pending Todos, which raw graph state
@@ -9353,6 +9393,7 @@ class DeepAgentsAgentManager:
                     segments=segments or None,
                     output_attachments=published_attachments or None,
                     verification_summary=verification_summary or None,
+                    usage_summary=final_usage_summary,
                 )
             elif (
                 self._segment_has_payload({"content": full_content, "tool_calls": all_tool_calls})
@@ -9370,12 +9411,15 @@ class DeepAgentsAgentManager:
                     segments=segments or None,
                     output_attachments=published_attachments or None,
                     verification_summary=verification_summary or None,
+                    usage_summary=final_usage_summary,
                     status=(run_record.outcome.value if run_record.outcome else "failed"),
                 )
             # From this point on cancellation/error handling must not overwrite
             # the authoritative terminal Session transaction above.
             run_messages_persisted = True
             terminal_authority_committed = True
+
+            yield self._sse("usage_summary", final_usage_summary)
 
             if run_record.run_kind != RunKind.GOAL_INSPECTION and verification_report is not None:
                 yield self._sse(
@@ -9466,8 +9510,7 @@ class DeepAgentsAgentManager:
                         serialized_recent = _serialize_protocol_closed_agent_context(recent_messages)
                         transcript = session_manager.load_session(session_id)
                         boundary_exists = any(
-                            item.get("role") == "assistant"
-                            and str(item.get("query_id") or "") == run_record.query_id
+                            item.get("role") == "assistant" and str(item.get("query_id") or "") == run_record.query_id
                             for item in transcript
                             if isinstance(item, dict)
                         )
@@ -9520,9 +9563,7 @@ class DeepAgentsAgentManager:
             trace: dict[str, Any] | None = None
             try:
                 record_rubric_profile_trace(trace_collector)
-                trace = trace_collector.finish(
-                    status=run_record.outcome.value if run_record.outcome else "completed"
-                )
+                trace = trace_collector.finish(status=run_record.outcome.value if run_record.outcome else "completed")
                 await asyncio.to_thread(
                     session_manager.update_trace,
                     session_id,
@@ -9636,13 +9677,13 @@ class DeepAgentsAgentManager:
             if completion_accepted:
                 if defer_final_publication:
                     for attachment in published_attachments:
-                                yield self._sse(
-                                    "attachment_published",
-                                    {
-                                        "tool_call_id": attachment.get("created_by_tool_call_id"),
-                                        "query_id": query_id,
-                                        "attachment": attachment,
-                                    },
+                        yield self._sse(
+                            "attachment_published",
+                            {
+                                "tool_call_id": attachment.get("created_by_tool_call_id"),
+                                "query_id": query_id,
+                                "attachment": attachment,
+                            },
                         )
                 yield self._sse(
                     "final_response",
@@ -9654,6 +9695,7 @@ class DeepAgentsAgentManager:
                         "run_id": run_record.run_id,
                         "goal_id": run_record.goal_id,
                         "verification_summary": verification_summary,
+                        "usage_summary": final_usage_summary,
                     },
                 )
             yield self._sse(
@@ -9669,6 +9711,7 @@ class DeepAgentsAgentManager:
                     "run_outcome": (run_record.outcome.value if run_record.outcome else None),
                     "goal_id": run_record.goal_id,
                     "goal_status": goal_record.status.value if goal_record else None,
+                    "usage_summary": final_usage_summary,
                 },
             )
             logger.info("Stream finished for session=%s with %d chunks", session_id, chunk_count)
@@ -9751,6 +9794,16 @@ class DeepAgentsAgentManager:
                         accumulated_reasoning=accumulated_reasoning,
                         turn_sources=turn_sources,
                         output_attachments=published_attachments,
+                        usage_summary=(
+                            run_usage.summary(
+                                run_id=run_record.run_id,
+                                query_id=query_id,
+                                rounds=run_record.model_call_count,
+                                tool_calls=len(emitted_tool_starts),
+                            )
+                            if run_usage is not None and run_record is not None
+                            else None
+                        ),
                         user_message_persisted=user_message_persisted,
                         status="cancelled",
                         interruption_notice="本轮已被用户停止，以上为中断前已完成的部分结果。",
@@ -9826,9 +9879,7 @@ class DeepAgentsAgentManager:
                 trace_collector.__exit__(asyncio.CancelledError, None, None)
             raise
         except Exception as exc:
-            error_traceback = "".join(
-                traceback.format_exception(type(exc), exc, exc.__traceback__)
-            )
+            error_traceback = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
             if terminal_authority_committed:
                 # Post-commit maintenance is best-effort. Never turn a
                 # committed success into a user-visible Run error.
@@ -9990,6 +10041,16 @@ class DeepAgentsAgentManager:
                         turn_sources=turn_sources,
                         output_attachments=([] if defer_final_publication else published_attachments),
                         session_sources=session_sources,
+                        usage_summary=(
+                            run_usage.summary(
+                                run_id=run_record.run_id,
+                                query_id=query_id,
+                                rounds=run_record.model_call_count,
+                                tool_calls=len(emitted_tool_starts),
+                            )
+                            if run_usage is not None and run_record is not None
+                            else None
+                        ),
                         status="completed",
                     )
                     run_messages_persisted = True
@@ -10108,6 +10169,16 @@ class DeepAgentsAgentManager:
                         accumulated_reasoning=accumulated_reasoning,
                         turn_sources=turn_sources,
                         output_attachments=published_attachments,
+                        usage_summary=(
+                            run_usage.summary(
+                                run_id=run_record.run_id,
+                                query_id=query_id,
+                                rounds=run_record.model_call_count,
+                                tool_calls=len(emitted_tool_starts),
+                            )
+                            if run_usage is not None and run_record is not None
+                            else None
+                        ),
                         user_message_persisted=user_message_persisted,
                         status="error",
                         interruption_notice=None,
@@ -10289,6 +10360,7 @@ class DeepAgentsAgentManager:
                     query_id,
                     exc_info=True,
                 )
+
 
 def build_model_messages(
     session_json: dict[str, Any] | list[dict[str, Any]],

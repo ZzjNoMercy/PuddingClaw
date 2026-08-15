@@ -250,3 +250,69 @@ def test_application_shutdown_requeues_worker_and_clears_partial_attempts(
             "SELECT 1 FROM eval_outbox WHERE aggregate_id=?",
             (experiment.experiment_id,),
         ).fetchone() is None
+
+
+def test_application_shutdown_requeues_verifier_replay_without_deleting_attempts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    repository = EvaluationRepository(tmp_path / "evaluation.db")
+    experiment = repository.create_experiment(
+        EvalExperiment(
+            name="Verifier replay recovery",
+            dataset_id="ds-replay",
+            dataset_version=1,
+            dataset_version_id="version-replay",
+            dataset_content_hash="c" * 64,
+            candidate=ExperimentCandidate(name="agent"),
+            status="running",
+            started_at="2026-08-13T00:00:00Z",
+            summary={
+                "execution_mode": "official_verifier_replay",
+                "swebench_verifier_replay": {
+                    "generation": 1,
+                    "status": "running",
+                    "total": 1,
+                },
+                "progress": {"stage": "official_verifier", "total": 1},
+            },
+        )
+    )
+    attempt_id = repository.create_attempt(experiment.experiment_id, "case-replay", 0)
+    repository.finish_attempt(
+        attempt_id,
+        status="completed",
+        run={"outcome": "completed", "metadata": {"code_verification": {"patch": "diff"}}},
+    )
+    monkeypatch.setattr(
+        "evaluation.repository.get_evaluation_repository",
+        lambda: repository,
+    )
+
+    class Process:
+        returncode = None
+
+    process = Process()
+    manager = EvaluationWorkerManager()
+    manager._processes[experiment.experiment_id] = process  # noqa: SLF001
+
+    async def terminate(_process):
+        _process.returncode = -15
+
+    async def noop(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(manager, "_terminate_worker_group", terminate)
+    monkeypatch.setattr(manager, "_terminate_official_harness", noop)
+    monkeypatch.setattr(manager, "_terminate_swebench_image_preparation", noop)
+
+    asyncio.run(manager.stop())
+
+    recovered = repository.get_experiment(experiment.experiment_id)
+    assert recovered.status == "queued"
+    assert recovered.summary["execution_mode"] == "official_verifier_replay"
+    assert recovered.summary["swebench_verifier_replay"]["status"] == "queued"
+    assert recovered.summary["swebench_verifier_replay"]["restart_pending"] is True
+    rows = repository.list_results(experiment.experiment_id)
+    assert {row["attempt_id"] for row in rows} == {attempt_id}
+    assert rows[0]["attempt_status"] == "completed"

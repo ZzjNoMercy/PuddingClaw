@@ -460,6 +460,7 @@ class AgentManager:
                                 tool_name=tool_name,
                                 tool_input=str(tc.get("input", tc.get("args", ""))),
                                 tool_call_id=tc_id,
+                                is_error=bool(tc.get("is_error")),
                             )
                             model_output = adapted.answer_context
                             model_sources = adapted.sources or list(tc.get("sources", []) or [])
@@ -613,8 +614,6 @@ class AgentManager:
         full_response = ""
         tools_just_finished = False
         tool_outputs_tokens = 0
-        round_num = 0
-        stream_start_time = time.time()
         # Track tool_call ids already emitted as tool_start to avoid duplicates
         # when LangGraph replays model updates.
         _emitted_tool_starts: set[str] = set()
@@ -655,27 +654,6 @@ class AgentManager:
                                     tools_just_finished = False
                                 full_response += chunk_text
                                 yield {"type": "token", "content": chunk_text}
-                    # Token 统计：检查 usage_metadata（stream 最后一个 chunk）
-                    usage = getattr(msg, "usage_metadata", None)
-                    if usage:
-                        input_tok = usage.get("input_tokens", 0) or 0
-                        output_tok = usage.get("output_tokens", 0) or 0
-                        if input_tok or output_tok:
-                            round_num += 1
-                            try:
-                                from graph.token_usage_store import record_token_usage
-                                record_token_usage(
-                                    user_id=user_id,
-                                    session_id=session_id,
-                                    round_num=round_num,
-                                    input_tokens=input_tok,
-                                    output_tokens=output_tok,
-                                    total_tokens=input_tok + output_tok,
-                                    start_time=stream_start_time,
-                                )
-                            except Exception:
-                                pass
-
                 elif mode == "updates":
                     if isinstance(data, dict):
                         for node_name, node_data in data.items():
@@ -690,6 +668,9 @@ class AgentManager:
                                             tool_name=str(tool_msg.name or ""),
                                             tool_input=pending_tool.get("input", ""),
                                             tool_call_id=tc_id,
+                                            is_error=(
+                                                getattr(tool_msg, "status", "success") == "error"
+                                            ),
                                         )
                                         raw_output = adapted.answer_context
                                         sources = adapted.sources

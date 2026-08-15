@@ -1008,7 +1008,7 @@ export default function ChatInput() {
                   <div role="menu" className="absolute bottom-full left-0 z-50 mb-2 w-full max-w-[22rem] rounded-2xl border border-black/[0.10] bg-white p-2 shadow-2xl shadow-slate-900/15 animate-fade-in-scale">
                     <div className="px-3 pb-2 pt-1">
                       <p className="text-[11px] font-semibold text-gray-500">Agent 工作项目</p>
-                      <p className="mt-0.5 text-[11px] leading-relaxed text-gray-400">项目目录是工具读写边界，也会挂载到 Docker 的 /workspace。</p>
+                      <p className="mt-0.5 text-[11px] leading-relaxed text-gray-400">项目目录决定工作目录、相对路径和项目配置发现，不是智能模式的文件权限边界；Docker 模式会将其挂载到 /workspace。</p>
                     </div>
                     <div className="max-h-52 overflow-y-auto py-1">
                       {projects.map((project) => (
@@ -1078,14 +1078,20 @@ export default function ChatInput() {
                   <ChevronDown className="h-3.5 w-3.5" />
                 </button>
                 {openPopover === "approval" && (
-                  <div role="menu" className="absolute bottom-full left-0 z-50 mb-2 w-full max-w-[23rem] rounded-2xl border border-black/[0.10] bg-white p-2 shadow-2xl shadow-slate-900/15 animate-fade-in-scale">
+                  <div role="menu" className="absolute bottom-full left-0 z-50 mb-2 w-full max-w-[27rem] rounded-2xl border border-black/[0.10] bg-white p-2 shadow-2xl shadow-slate-900/15 animate-fade-in-scale">
                     <div className="px-3 pb-2 pt-1">
                       <p className="text-[12px] font-semibold text-gray-700">授权模式</p>
                       <p className="mt-1 text-[11px] leading-relaxed text-gray-400">模式属于当前 Session，并在 Run 开始时冻结；Run 进行中不可切换。</p>
                     </div>
+                    <div className="mx-1 mb-2 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2.5 text-amber-950">
+                      <p className="text-[12px] font-semibold">智能模式的本地文件范围</p>
+                      <p className="mt-1 text-[11px] leading-relaxed text-amber-900/80">
+                        普通本地文件按当前系统用户权限访问，不受项目目录限制。敏感读取、持久化写入、联网、安装、破坏性操作和无法证明效果的动态 Shell 仍会按风险单独提示。
+                      </p>
+                    </div>
                     {([
                       ["strict", "严格审批", "所有需要授权的操作都由你确认。"],
-                      ["smart", "智能审批", "受控网页读取与搜索自动联网；Shell、CLI、上传和依赖安装仍按影响授权。"],
+                      ["smart", "智能审批", "普通本地文件直接按 OS 权限处理；仅对高风险影响请求授权。"],
                     ] as Array<[ApprovalMode, string, string]>).map(([mode, label, description]) => (
                       <button
                         type="button"
@@ -1104,8 +1110,8 @@ export default function ChatInput() {
                           {approvalMode === mode && <span className="h-2 w-2 rounded-full bg-[#002fa7]" />}
                         </span>
                         <span className="min-w-0">
-                          <span className="block text-[13px] font-medium">{label}</span>
-                          <span className="mt-0.5 block text-[11px] leading-relaxed text-gray-400">{description}</span>
+                          <span className={`block text-[13px] font-semibold ${approvalMode === mode ? "text-[#002fa7]" : "text-gray-700"}`}>{label}</span>
+                          <span className="mt-0.5 block text-[11px] leading-relaxed text-gray-500">{description}</span>
                         </span>
                       </button>
                     ))}

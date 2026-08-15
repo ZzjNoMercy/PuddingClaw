@@ -109,15 +109,20 @@ def test_model_client_unknown_provider(mock_config):
 
 
 @pytest.mark.asyncio
-async def test_model_client_ainvoke_records_usage(mock_config):
-    """ainvoke 应记录 token 用量。"""
+async def test_model_client_ainvoke_emits_provider_usage_without_database(mock_config):
+    """ainvoke publishes provider facts to the Run instead of writing a usage DB."""
     from langchain_core.messages import AIMessage
 
-    fake_response = AIMessage(content="hi", usage_metadata={
-        "input_tokens": 10,
-        "output_tokens": 5,
-        "total_tokens": 15,
-    })
+    fake_response = AIMessage(
+        content="hi",
+        usage_metadata={
+            "input_tokens": 10,
+            "output_tokens": 5,
+            "total_tokens": 15,
+            "input_token_details": {"cache_read": 8},
+            "output_token_details": {"reasoning": 2},
+        },
+    )
 
     client = ModelClient(role="title", force_direct=True)
     with mock.patch.object(client, "get_chat_model") as mock_get_model:
@@ -125,17 +130,17 @@ async def test_model_client_ainvoke_records_usage(mock_config):
         mock_llm.ainvoke.return_value = fake_response
         mock_get_model.return_value = mock_llm
 
-        with mock.patch("llm.model_client.record_token_usage") as mock_record:
+        with mock.patch("llm.model_client._emit_model_stream_event") as emit:
             result = await client.ainvoke([], user_id="u1", session_id="s1", round_num=1)
             assert result == fake_response
-            mock_record.assert_called_once()
-            _, kwargs = mock_record.call_args
-            assert kwargs["role"] == "title"
-            assert kwargs["user_id"] == "u1"
-            assert kwargs["session_id"] == "s1"
-            assert kwargs["round_num"] == 1
-            assert kwargs["input_tokens"] == 10
-            assert kwargs["output_tokens"] == 5
+            usage_event = emit.call_args.args[0]
+            assert usage_event["type"] == "model_usage"
+            assert usage_event["role"] == "title"
+            assert usage_event["input_tokens"] == 10
+            assert usage_event["output_tokens"] == 5
+            assert usage_event["cache_read_tokens"] == 8
+            assert usage_event["reasoning_tokens"] == 2
+            assert usage_event["measured"] is True
 
 
 def test_model_client_patches_chatopenai_to_preserve_reasoning_content():

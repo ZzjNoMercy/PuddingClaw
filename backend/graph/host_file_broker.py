@@ -938,6 +938,64 @@ class HostFileBroker:
                 ),
                 "next_action": "request_exact_write_permission",
             }
+        return self._replace_authorized_target(
+            target,
+            content,
+            expected_sha256=expected_sha256,
+            operation=operation,
+        )
+
+    def replace_unrestricted(
+        self,
+        path: str,
+        content: bytes,
+        *,
+        expected_sha256: str,
+        operation: str = "replace",
+    ) -> dict[str, Any]:
+        """Use the atomic receipt pipeline without imposing a directory Grant.
+
+        Smart unrestricted mode decides authority before it reaches this
+        method. The broker remains responsible for compare-and-swap, atomic
+        replacement, candidate validation, backup, and mutation receipts.
+        """
+
+        try:
+            canonical = self._canonical(path)
+        except (OSError, ValueError) as exc:
+            return {
+                "status": "io_error",
+                "error_code": "host_replace_failed",
+                "error": _broker_error("io_error", str(exc)),
+            }
+        target = self._authorized_path(
+            canonical_path=canonical,
+            authority_root=canonical.parent,
+            grant_id="smart-unrestricted",
+            access="write",
+        )
+        if target is None:
+            return {
+                "status": "io_error",
+                "error_code": "host_replace_failed",
+                "error": _broker_error("io_error", f"cannot bind parent directory for {path}"),
+            }
+        return self._replace_authorized_target(
+            target,
+            content,
+            expected_sha256=expected_sha256,
+            operation=operation,
+        )
+
+    def _replace_authorized_target(
+        self,
+        target: AuthorizedHostPath,
+        content: bytes,
+        *,
+        expected_sha256: str,
+        operation: str,
+    ) -> dict[str, Any]:
+        path = str(target.canonical_path)
         try:
             before = self._read_bound_bytes(target)
         except OSError as exc:

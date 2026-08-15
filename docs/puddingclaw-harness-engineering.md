@@ -298,6 +298,8 @@ Tool visibility / Toolset
 
 `python3`、`node`、`bash` 不是天然安全或危险。分类必须结合 Backend、cwd、读写路径、网络、安装包、删除/覆盖、外部副作用和已有 grant。Shell script 必须读取实际脚本内容再分类，不能按解释器名称无脑放行。
 
+当前灰区 reviewer 仍是 `ToolExecutionPipeline` 内面向少量本地 Shell 场景的降噪器，不等同于完整的语义授权层。后续计划将“Toolset 管能力可见性”与“Auto Middleware 管具体动作授权”明确拆分，并在主模型提出一批 `tool_calls` 后生成可 checkpoint 的逐调用授权计划；该计划目前是非阻塞待办，不改变现有 Smart、Spawn 或 Kernel 验收结论。详见 [Smart 动作授权中间件待办方案](./plans/2026-08-15-smart-action-authorization-middleware-todo.md)。
+
 ### 7.3 Session Grant 与 Subagent
 
 权限 grant 按语义 capability、scope、Backend、workspace、policy epoch/version 去重，不按 command string 或 tool_call_id 重复弹窗。

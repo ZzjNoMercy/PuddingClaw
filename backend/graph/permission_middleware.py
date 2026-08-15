@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from langchain.agents.middleware.types import AgentMiddleware, AgentState, ContextT, ResponseT, StateT
 from langchain_core.messages import AIMessage
@@ -12,7 +13,7 @@ from langgraph.runtime import Runtime
 from langgraph.types import interrupt
 
 from graph.effective_grants import EffectiveGrantSet
-from graph.host_read_policy import is_sensitive_host_read_path
+from graph.host_read_policy import is_sensitive_host_read_path, is_sensitive_host_write_path
 from graph.managed_paths import is_managed_resource_path
 from graph.permission_policy import RunPermissionContext
 from graph.permission_resume import permission_resume_registry
@@ -45,10 +46,7 @@ class ExternalFilePermissionMiddleware(AgentMiddleware[StateT, ContextT, Respons
 
     @property
     def _smart_host_reads_enabled(self) -> bool:
-        return (
-            self.approval_mode == "smart"
-            and self.backend_mode in {"spawn", "kernel"}
-        )
+        return self.approval_mode == "smart" and self.backend_mode in {"spawn", "kernel"}
 
     @classmethod
     def _external_write_path(cls, raw_path: str, workspace_path: str) -> Path | None:
@@ -91,34 +89,19 @@ class ExternalFilePermissionMiddleware(AgentMiddleware[StateT, ContextT, Respons
                 "replacements": str(args.get("replacements") or ""),
             }
             if tool_name == "replace_file":
-                values["content_sha256"] = hashlib.sha256(
-                    str(args.get("content") or "").encode("utf-8")
-                ).hexdigest()
-        elif tool_name == "delete_file":
-            values = {
-                "expected_sha256": str(args.get("expected_sha256") or ""),
-                "risk": "Delete one exact file; directory and bulk deletion are not permitted.",
-            }
+                values["content_sha256"] = hashlib.sha256(str(args.get("content") or "").encode("utf-8")).hexdigest()
         elif tool_name == "commit_external_artifact":
             values = {
                 "lease_id": str(args.get("lease_id") or ""),
                 "expected_source_sha256": str(args.get("expected_source_sha256") or ""),
             }
         elif tool_name == "materialize_source_ref":
-            destination = (
-                args.get("destination")
-                if isinstance(args.get("destination"), dict)
-                else {}
-            )
+            destination = args.get("destination") if isinstance(args.get("destination"), dict) else {}
             values = {
                 "source_ref": str(args.get("source_ref") or ""),
                 "renderer": str(args.get("renderer") or ""),
                 "destination_kind": str(destination.get("kind") or ""),
-                "mode": str(
-                    destination.get("mode")
-                    or destination.get("output_mode")
-                    or ""
-                ),
+                "mode": str(destination.get("mode") or destination.get("output_mode") or ""),
             }
         else:
             values = {"content": str(args.get("content") or "")}
@@ -215,10 +198,7 @@ class ExternalFilePermissionMiddleware(AgentMiddleware[StateT, ContextT, Respons
         normalized = canonical.as_posix()
         if "/.codex/attachments/" in f"{normalized.rstrip('/')}/":
             return False
-        if (
-            normalized.startswith(("/private/var/folders/", "/var/folders/"))
-            and canonical.name == "T"
-        ):
+        if normalized.startswith(("/private/var/folders/", "/var/folders/")) and canonical.name == "T":
             return False
 
         # If this request broadens an existing exact-file grant, only the
@@ -272,11 +252,7 @@ class ExternalFilePermissionMiddleware(AgentMiddleware[StateT, ContextT, Respons
         requested: Path,
     ) -> bool:
         run = session_manager.get_run_state(session_id, run_id)
-        targets = (
-            run.get("declared_artifact_targets")
-            if isinstance(run, dict)
-            else None
-        )
+        targets = run.get("declared_artifact_targets") if isinstance(run, dict) else None
         for raw_target in targets or []:
             try:
                 candidate = Path(str(raw_target)).expanduser().resolve()
@@ -321,7 +297,6 @@ class ExternalFilePermissionMiddleware(AgentMiddleware[StateT, ContextT, Respons
                 "replace_file",
                 "patch_file",
                 "patch_files",
-                "delete_file",
                 "execute_external_directory",
                 "validate_html_report",
                 "stage_external_artifact",
@@ -342,13 +317,14 @@ class ExternalFilePermissionMiddleware(AgentMiddleware[StateT, ContextT, Respons
                     continue
                 source = self._external_read_path(source_raw, workspace_path)
                 target = self._external_write_path(target_raw, workspace_path)
-                source_granted = source is None or self._spawn_host_reads_enabled or (
-                    self._smart_host_reads_enabled
-                    and not is_sensitive_host_read_path(source)
-                ) or (
-                    session_manager.has_external_file_read_permission(session_id, source)
-                    or self._has_directory_permission_for_path(
-                        session_id, source, access="read", run_id=run_id
+                source_sensitive = source is not None and is_sensitive_host_read_path(source)
+                source_granted = (
+                    source is None
+                    or self._spawn_host_reads_enabled
+                    or (self._smart_host_reads_enabled and not source_sensitive)
+                    or (
+                        session_manager.has_external_file_read_permission(session_id, source)
+                        or self._has_directory_permission_for_path(session_id, source, access="read", run_id=run_id)
                     )
                 )
                 if not source_granted:
@@ -360,6 +336,8 @@ class ExternalFilePermissionMiddleware(AgentMiddleware[StateT, ContextT, Respons
                         path=source,
                         access="read",
                         operation=tool_name,
+                        effect_reason="sensitive_host_read" if source_sensitive else "",
+                        effect_risk="high" if source_sensitive else "",
                     )
                     interrupt(
                         {
@@ -369,6 +347,9 @@ class ExternalFilePermissionMiddleware(AgentMiddleware[StateT, ContextT, Respons
                         }
                     )
                     return None
+                target_sensitive = target is not None and is_sensitive_host_write_path(target)
+                if self._smart_host_reads_enabled and not target_sensitive:
+                    continue
                 if target is None or (
                     session_manager.has_external_file_write_permission(
                         session_id,
@@ -398,6 +379,8 @@ class ExternalFilePermissionMiddleware(AgentMiddleware[StateT, ContextT, Respons
                         "source_path": source_raw,
                         "mode": "atomic_create_only",
                     },
+                    effect_reason="persistence_write" if target_sensitive else "",
+                    effect_risk="high" if target_sensitive else "",
                 )
                 interrupt(
                     {
@@ -415,6 +398,9 @@ class ExternalFilePermissionMiddleware(AgentMiddleware[StateT, ContextT, Respons
                         str(item.get("file_path") or ""),
                         workspace_path,
                     )
+                    sensitive_write = requested is not None and is_sensitive_host_write_path(requested)
+                    if self._smart_host_reads_enabled and requested is not None and not sensitive_write:
+                        continue
                     if requested is None or (
                         session_manager.has_external_file_write_permission(
                             session_id,
@@ -441,6 +427,8 @@ class ExternalFilePermissionMiddleware(AgentMiddleware[StateT, ContextT, Respons
                         access="write",
                         operation=tool_name,
                         change_preview=self._change_preview(tool_name, item),
+                        effect_reason="persistence_write" if sensitive_write else "",
+                        effect_risk="high" if sensitive_write else "",
                     )
                     interrupt(
                         {
@@ -454,11 +442,7 @@ class ExternalFilePermissionMiddleware(AgentMiddleware[StateT, ContextT, Respons
                     )
                     return None
                 continue
-            destination = (
-                args.get("destination")
-                if isinstance(args.get("destination"), dict)
-                else {}
-            )
+            destination = args.get("destination") if isinstance(args.get("destination"), dict) else {}
             raw_path = str(
                 args.get("path")
                 or args.get("resource")
@@ -483,7 +467,84 @@ class ExternalFilePermissionMiddleware(AgentMiddleware[StateT, ContextT, Respons
                 continue
             if raw_path.startswith("att_"):
                 continue
+            if tool_name == "read_resource":
+                parsed_resource = urlsplit(raw_path)
+                is_web_resource = (
+                    parsed_resource.scheme.lower() in {"http", "https"}
+                    and bool(parsed_resource.netloc)
+                )
+                if is_web_resource or Path(raw_path).suffix.lower() not in {
+                    ".png",
+                    ".jpg",
+                    ".jpeg",
+                    ".webp",
+                    ".gif",
+                    ".bmp",
+                    ".tif",
+                    ".tiff",
+                }:
+                    # read_resource is an attachment/visual bridge, not an
+                    # alternate file or web permission surface. Let the tool
+                    # return its deterministic contract error without first
+                    # manufacturing an irrelevant host-path approval.
+                    continue
+            effect_reason = ""
+            if self._smart_host_reads_enabled and not is_virtual_path(raw_path):
+                # Smart trusted-local mode has no project/external directory
+                # authority split. Sensitive reads remain an effect-policy
+                # concern; ordinary reads and writes go to the OS/backend.
+                sensitive_read = tool_name in {
+                    "read_external_file",
+                    "read_resource",
+                    "read_file",
+                    "grep",
+                    "glob",
+                    "ls",
+                } and is_sensitive_host_read_path(
+                    Path(
+                        classify_path_authority(
+                            raw_path,
+                            workspace_root=workspace_path or None,
+                        ).canonical_host_path
+                        or raw_path
+                    )
+                )
+                sensitive_write = tool_name in {
+                    "edit_file",
+                    "write_file",
+                    "patch_file",
+                    "materialize_source_ref",
+                    "replace_file",
+                    "commit_external_artifact",
+                } and is_sensitive_host_write_path(
+                    Path(
+                        classify_path_authority(
+                            raw_path,
+                            workspace_root=workspace_path or None,
+                        ).canonical_host_path
+                        or raw_path
+                    )
+                )
+                effect_reason = (
+                    "sensitive_host_read" if sensitive_read else "persistence_write" if sensitive_write else ""
+                )
+                if not effect_reason:
+                    continue
             if is_virtual_path(raw_path):
+                continue
+
+            # A registered, active project is the Run's workspace authority.
+            # Models may use either the public ``/workspace`` spelling or the
+            # absolute host spelling exposed by user context and file pickers.
+            # Classify both forms before the external-directory branch below;
+            # otherwise absolute workspace paths used by ls/glob/grep are
+            # incorrectly turned into HostFileBroker HITL requests before
+            # WorkspacePathRouter can canonicalize them to ``/workspace``.
+            classified_path = classify_path_authority(
+                raw_path,
+                workspace_root=workspace_path or None,
+            )
+            if classified_path.authority is PathAuthority.WORKSPACE:
                 continue
 
             if tool_name in {
@@ -495,21 +556,17 @@ class ExternalFilePermissionMiddleware(AgentMiddleware[StateT, ContextT, Respons
                 "glob",
                 "ls",
             }:
-                requested = Path(raw_path).expanduser().resolve()
+                requested = classified_path.canonical_host_path or Path(raw_path).expanduser().resolve()
                 access = (
                     "write"
                     if tool_name == "commit_external_directory"
                     or (
                         tool_name == "execute_external_directory"
-                        and str(args.get("mode") or "read_only")
-                        == "writable_draft"
+                        and str(args.get("mode") or "read_only") == "writable_draft"
                     )
                     else "read"
                 )
-                if (
-                    access == "read"
-                    and self._spawn_host_reads_enabled
-                ):
+                if access == "read" and self._spawn_host_reads_enabled:
                     continue
                 if (
                     access == "read"
@@ -530,16 +587,8 @@ class ExternalFilePermissionMiddleware(AgentMiddleware[StateT, ContextT, Respons
                         session_id,
                         str(args.get("lease_id") or ""),
                     )
-                    plan = (
-                        lease.get("commit_plan")
-                        if isinstance(lease, dict)
-                        else None
-                    )
-                    deletion_required = bool(
-                        plan.get("deleted")
-                        if isinstance(plan, dict)
-                        else False
-                    )
+                    plan = lease.get("commit_plan") if isinstance(lease, dict) else None
+                    deletion_required = bool(plan.get("deleted") if isinstance(plan, dict) else False)
                 if (
                     tool_name == "grep"
                     and requested.is_file()
@@ -622,9 +671,7 @@ class ExternalFilePermissionMiddleware(AgentMiddleware[StateT, ContextT, Respons
                 )
                 run_state = session_manager.get_run_state(session_id, run_id)
                 grant_bindings = (
-                    RunPermissionContext.from_config_snapshot(
-                        run_state.get("config_snapshot")
-                    ).grant_bindings()
+                    RunPermissionContext.from_config_snapshot(run_state.get("config_snapshot")).grant_bindings()
                     if isinstance(run_state, dict)
                     else None
                 )
@@ -639,6 +686,8 @@ class ExternalFilePermissionMiddleware(AgentMiddleware[StateT, ContextT, Respons
                     require_delete=deletion_required,
                     grant_bindings=grant_bindings,
                     change_preview=change_preview,
+                    effect_reason=effect_reason,
+                    effect_risk="high" if effect_reason else "",
                 )
                 collector = get_current_trace_collector()
                 if collector is not None:
@@ -677,37 +726,28 @@ class ExternalFilePermissionMiddleware(AgentMiddleware[StateT, ContextT, Respons
                 "patch_file",
                 "materialize_source_ref",
                 "replace_file",
-                "delete_file",
                 "commit_external_artifact",
             }:
                 requested = self._external_write_path(raw_path, workspace_path)
                 if requested is None:
                     continue
-                access = "delete" if tool_name == "delete_file" else "write"
-                exact_granted = (
-                    session_manager.has_external_file_delete_permission(
-                        session_id,
-                        requested,
-                    )
-                    if access == "delete"
-                    else session_manager.has_external_file_write_permission(
-                        session_id,
-                        requested,
-                    )
+                access = "write"
+                exact_granted = session_manager.has_external_file_write_permission(
+                    session_id,
+                    requested,
                 )
                 directory_granted = self._has_directory_permission_for_path(
                     session_id,
                     requested,
                     access="write",
                     run_id=run_id,
-                    required_capability="delete" if access == "delete" else None,
+                    required_capability=None,
                 )
                 if (
                     exact_granted
                     or directory_granted
                     or (
-                        access == "write"
-                        and self._is_declared_artifact_target(
+                        self._is_declared_artifact_target(
                             session_id,
                             run_id,
                             requested,
@@ -722,18 +762,16 @@ class ExternalFilePermissionMiddleware(AgentMiddleware[StateT, ContextT, Respons
                     continue
                 access = "read"
                 if self._spawn_host_reads_enabled or (
-                    self._smart_host_reads_enabled
-                    and not is_sensitive_host_read_path(requested)
+                    self._smart_host_reads_enabled and not is_sensitive_host_read_path(requested)
                 ):
                     continue
-                if (
-                    session_manager.has_external_file_read_permission(session_id, requested)
-                    or self._has_directory_permission_for_path(
-                        session_id,
-                        requested,
-                        access="read",
-                        run_id=run_id,
-                    )
+                if session_manager.has_external_file_read_permission(
+                    session_id, requested
+                ) or self._has_directory_permission_for_path(
+                    session_id,
+                    requested,
+                    access="read",
+                    run_id=run_id,
                 ):
                     continue
                 change_preview = None
@@ -746,6 +784,8 @@ class ExternalFilePermissionMiddleware(AgentMiddleware[StateT, ContextT, Respons
                 access=access,
                 operation=tool_name,
                 change_preview=change_preview,
+                effect_reason=effect_reason,
+                effect_risk="high" if effect_reason else "",
             )
             collector = get_current_trace_collector()
             if collector is not None:

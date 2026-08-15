@@ -304,8 +304,8 @@ window.echarts = {
     assert [item["operation"] for item in receipts] == [
         "copy",
         "copy",
-        "edit",
-        "edit",
+        "patch",
+        "patch",
         "materialize_replace",
     ]
     assert all(item.get("validation_receipt_id") for item in receipts)

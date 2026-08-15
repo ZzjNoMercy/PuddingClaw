@@ -32,7 +32,6 @@ def test_compact_model_surface_hides_broker_orchestration_tools(tmp_path) -> Non
     assert [tool.name for tool in middleware.tools] == [
         "patch_file",
         "materialize_source_ref",
-        "delete_file",
         "validate_html_report",
         "validate_artifact_contract",
     ]
@@ -1885,3 +1884,56 @@ def test_patch_file_without_bound_receipts_emits_no_stale_warning(tmp_path) -> N
     payload = json.loads(patched.content)
     assert "invalidated_validation_receipt_ids" not in payload
     assert "validation_invalidation_warning" not in payload
+
+
+def test_smart_external_patch_uses_atomic_receipt_pipeline(tmp_path) -> None:
+    from graph.permissioned_filesystem_backend import PermissionedCompositeBackend
+    from graph.session_manager import session_manager
+
+    state = tmp_path / "state"
+    workspace = tmp_path / "workspace"
+    outside = tmp_path / "outside"
+    for directory in (state, workspace, outside):
+        directory.mkdir()
+    session_manager.initialize(state)
+    session_manager.create_session("smart-patch-session")
+    workspace_backend = FilesystemBackend(root_dir=workspace, virtual_mode=True)
+    backend = PermissionedCompositeBackend(
+        default=workspace_backend,
+        routes={"/workspace/": workspace_backend},
+        session_id="smart-patch-session",
+        run_id="smart-patch-run",
+        query_id="smart-patch-query",
+        workspace_root=workspace,
+    )
+    backend.filesystem_mode = "unrestricted"
+    target = outside / "notes.txt"
+    target.write_text("before\n", encoding="utf-8")
+    patch_tool = next(
+        tool
+        for tool in VersionedPatchMiddleware(backend, compact_model_surface=True).tools
+        if tool.name == "patch_file"
+    )
+
+    patched = patch_tool.func(
+        file_path=str(target),
+        replacements=[ReplacementHunk(old_string="before", new_string="after")],
+        runtime=_runtime(
+            "smart-patch-call",
+            session_id="smart-patch-session",
+            run_id="smart-patch-run",
+            query_id="smart-patch-query",
+        ),
+    )
+
+    assert patched.status == "success"
+    payload = json.loads(patched.content)
+    assert payload["mutation_receipt_id"].startswith("external-mutation-")
+    assert target.read_text(encoding="utf-8") == "after\n"
+    receipts = session_manager.list_external_mutation_receipts(
+        "smart-patch-session",
+        run_id="smart-patch-run",
+    )
+    assert [item["operation"] for item in receipts] == ["patch"]
+    assert receipts[0]["atomic"] is True
+    assert receipts[0]["permission_grant_id"] == "smart-unrestricted"

@@ -5,7 +5,6 @@ import { createPortal } from "react-dom";
 import Link from "next/link";
 import { useRouter, usePathname } from "next/navigation";
 import {
-  MessageSquare,
   Plus,
   MoreHorizontal,
   Pencil,
@@ -32,16 +31,11 @@ import {
 import { useApp } from "@/lib/store";
 import { openProject, type SessionSearchResult } from "@/lib/api";
 import { useProjectFolderPicker } from "@/components/projects/useProjectFolderPicker";
+import { useRuntimeProfile } from "@/lib/useRuntimeProfile";
 import SessionSearchDialog from "./SessionSearchDialog";
 
 const PROJECT_EXPANSION_STORAGE_KEY = "puddingclaw_sidebar_project_expansion";
 const useBrowserLayoutEffect = typeof window === "undefined" ? useEffect : useLayoutEffect;
-
-type RuntimeExtensions = {
-  knowledge: boolean;
-  analytics: boolean;
-  headless_worker: boolean;
-};
 
 export default function Sidebar() {
   const {
@@ -72,35 +66,8 @@ export default function Sidebar() {
   const [expandedProjects, setExpandedProjects] = useState<Set<string>>(() => new Set());
   const [projectExpansionRestored, setProjectExpansionRestored] = useState(false);
   const [searchOpen, setSearchOpen] = useState(false);
-  const [runtimeExtensions, setRuntimeExtensions] = useState<RuntimeExtensions>({
-    knowledge: false,
-    analytics: false,
-    headless_worker: false,
-  });
+  const runtimeExtensions = useRuntimeProfile();
   const hasSavedProjectExpansionRef = useRef(false);
-
-  useEffect(() => {
-    let cancelled = false;
-    fetch("/api/runtime-profile")
-      .then(async (response) => {
-        if (!response.ok) throw new Error(`runtime profile returned ${response.status}`);
-        return response.json() as Promise<{ extensions?: Partial<RuntimeExtensions> }>;
-      })
-      .then((payload) => {
-        if (cancelled || !payload.extensions) return;
-        setRuntimeExtensions((current) => ({ ...current, ...payload.extensions }));
-      })
-      .catch(() => {
-        // A source checkout without the profile endpoint keeps the historical
-        // full navigation surface. CLI-managed runtimes always expose it.
-        if (!cancelled) {
-          setRuntimeExtensions({ knowledge: true, analytics: true, headless_worker: true });
-        }
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, []);
 
   useEffect(() => {
     const handleSearchShortcut = (event: KeyboardEvent) => {
@@ -949,7 +916,7 @@ function SessionItem({
             : "text-gray-600 hover:bg-white/48 hover:text-gray-900"
         }`}
       >
-        <MessageSquare className={`h-3 w-3 shrink-0 ${isActive ? "text-white" : "text-gray-500"}`} />
+        <span className="w-4 shrink-0" aria-hidden="true" />
         <span className="truncate">{title}</span>
       </button>
 

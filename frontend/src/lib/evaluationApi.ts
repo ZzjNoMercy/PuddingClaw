@@ -233,6 +233,12 @@ export async function deleteEvaluationExperiment(id: string) {
 export async function retryEvaluationExperiment(id: string) {
   return request<EvalExperiment>(`/experiments/${encodeURIComponent(id)}/retry`, { method: "POST" });
 }
+export async function rerunSWEbenchVerifier(id: string) {
+  return request<EvalExperiment>(`/experiments/${encodeURIComponent(id)}/verify/swebench`, { method: "POST" });
+}
+export async function resumeMissingSWEbenchCases(id: string) {
+  return request<EvalExperiment>(`/experiments/${encodeURIComponent(id)}/resume/swebench`, { method: "POST" });
+}
 export async function syncEvaluationExperiment(id: string) {
   return request<EvalExperiment>(`/experiments/${encodeURIComponent(id)}/sync/langsmith`, { method: "POST" });
 }

@@ -1047,6 +1047,24 @@ def test_semantic_steward_tool_factory_exposes_discovery_prepare_and_publish() -
     }
 
 
+def test_semantic_steward_uses_harness_card_as_single_approval_boundary() -> None:
+    skill = (
+        Path(__file__).resolve().parents[1] / "skills" / "semantic-steward" / "SKILL.md"
+    ).read_text(encoding="utf-8")
+    publish_tool = next(
+        tool
+        for tool in create_semantic_steward_tools()
+        if tool.name == "publish_semantic_markdown"
+    )
+
+    assert "same assistant turn" in skill
+    assert "one and only approval boundary" in skill
+    assert "Do not stop and ask the user to type" in skill
+    assert "same assistant turn" in publish_tool.description
+    assert "single digest-bound HITL approval card" in publish_tool.description
+    assert "Do not ask the user for a separate chat approval" in publish_tool.description
+
+
 def test_prepare_tool_returns_digest_bound_plan(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("PUDDINGCLAW_HOME", str(tmp_path))
     discovery_tool = DiscoverSemanticDefinitionsTool(session_id="session-a")

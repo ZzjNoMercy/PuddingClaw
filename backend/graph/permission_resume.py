@@ -20,6 +20,28 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_ONE_TIME_ONLY_EFFECT_CAPABILITIES = frozenset(
+    {
+        "destructive_write",
+        "package_install",
+        "credential_access",
+        "sensitive_effect",
+        "persistence_write",
+    }
+)
+_ONE_TIME_ONLY_REASON_PREFIXES = (
+    "persistence_write",
+    "sensitive_host_read",
+    "credential_",
+    "destructive_",
+    "package_",
+    "package_management:",
+    "local_dynamic_effect_unprovable",
+    "spawn_external_dynamic_effect_unprovable",
+    "shell_effect_unprovable",
+    "webbridge_",
+)
+
 
 class PermissionResumeRegistry:
     """Bridge permission API decisions back into active LangGraph streams."""
@@ -63,6 +85,8 @@ class PermissionResumeRegistry:
         access: str = "read",
         operation: str = "",
         change_preview: dict[str, str] | None = None,
+        effect_reason: str = "",
+        effect_risk: str = "",
     ) -> dict[str, Any]:
         if access not in {"read", "write", "delete"}:
             raise ValueError(f"Unsupported external file access: {access}")
@@ -76,12 +100,12 @@ class PermissionResumeRegistry:
             "tool_call_id": tool_call_id,
             "path": str(path),
             "target_kind": "exact_file",
-            "capabilities": [access, "external_path"],
+            "capabilities": [access, "external_path", *(["sensitive_effect"] if effect_reason else [])],
             "status": "pending",
             "created_at": time.time(),
             "options": (
                 ["exact_file_session", "all_external_files_session"]
-                if access == "read"
+                if access == "read" and not effect_reason
                 else ["exact_file_session"]
             ),
         }
@@ -89,6 +113,9 @@ class PermissionResumeRegistry:
             request["operation"] = operation
         if change_preview:
             request["change_preview"] = change_preview
+        if effect_reason:
+            request["reason"] = effect_reason
+            request["risk"] = effect_risk or "high"
         self._requests[request_id] = request
         self._pending[request_id] = asyncio.get_running_loop().create_future()
         emit_harness_metric(
@@ -113,6 +140,8 @@ class PermissionResumeRegistry:
         require_delete: bool = False,
         grant_bindings: dict[str, Any] | None = None,
         change_preview: dict[str, str] | None = None,
+        effect_reason: str = "",
+        effect_risk: str = "",
     ) -> dict[str, Any]:
         """Create one exact-directory request, deduplicated within a Run."""
 
@@ -183,6 +212,9 @@ class PermissionResumeRegistry:
         }
         if grant_bindings:
             request["grant_bindings"] = dict(grant_bindings)
+        if effect_reason:
+            request["reason"] = effect_reason
+            request["risk"] = effect_risk or "high"
         if change_preview:
             request["change_preview"] = dict(change_preview)
         self._requests[request_id] = request
@@ -362,6 +394,20 @@ class PermissionResumeRegistry:
         policy_explanation: str = "",
         control_descriptor: dict[str, str] | None = None,
     ) -> dict[str, Any]:
+        requested_capabilities = list(required_capabilities or ["execute"])
+        reusable_scope_allowed = bool(session_target_kind and session_target) and not (
+            _ONE_TIME_ONLY_EFFECT_CAPABILITIES.intersection(requested_capabilities)
+            or str(reason or "").startswith(_ONE_TIME_ONLY_REASON_PREFIXES)
+        )
+        if not reusable_scope_allowed:
+            session_target_kind = None
+            session_target = None
+            session_scope_label = None
+        approval_options = ["once"]
+        if reusable_scope_allowed:
+            approval_options.append("session")
+            if "network_access" not in requested_capabilities:
+                approval_options.append("project")
         fingerprint = self.tool_action_fingerprint(
             tool_name=tool_name,
             command=fingerprint_command if fingerprint_command is not None else command,
@@ -408,10 +454,10 @@ class PermissionResumeRegistry:
             "risk": risk,
             "fingerprint": fingerprint,
             "target_kind": "fingerprint",
-            "capabilities": list(required_capabilities or ["execute"]),
+            "capabilities": requested_capabilities,
             "status": "pending",
             "created_at": time.time(),
-            "options": ["once", "session", "project"] if session_target_kind and session_target else ["once"],
+            "options": approval_options,
             "policy_source": policy_source,
         }
         if semantic_key:
@@ -465,6 +511,41 @@ class PermissionResumeRegistry:
             return False
         if not future.done():
             future.set_result(decision)
+        if isinstance(request, dict):
+            outcome = "approved" if str(decision.get("type") or "") == "approve" else "rejected"
+            action_preview = str(
+                request.get("command")
+                or request.get("operation")
+                or request.get("path")
+                or request.get("target")
+                or ""
+            )[:1000]
+            audit = {
+                "request_id": request_id,
+                "run_id": str(request.get("run_id") or ""),
+                "query_id": str(request.get("query_id") or ""),
+                "resolved_at": float(request.get("resolved_at") or time.time()),
+                "outcome": outcome,
+                "tool": str(request.get("tool_name") or request.get("type") or ""),
+                "reason": str(request.get("reason") or ""),
+                "risk": str(request.get("risk") or ""),
+                "scope": str(decision.get("scope") or ("none" if outcome == "rejected" else "")),
+                "capabilities": [str(item) for item in request.get("capabilities") or []],
+                "action_preview": action_preview,
+            }
+            try:
+                from graph.session_manager import session_manager
+
+                session_manager.append_permission_decision(
+                    str(request.get("session_id") or ""),
+                    audit,
+                )
+            except (FileNotFoundError, ValueError):
+                # Isolated policy tests legitimately use the in-memory
+                # registry without a persisted Session.
+                pass
+            except Exception:  # noqa: BLE001
+                logger.exception("Failed to persist permission decision audit")
         return True
 
     def resolve_compatible_session_tool_actions(

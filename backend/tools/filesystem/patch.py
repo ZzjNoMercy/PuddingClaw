@@ -210,33 +210,73 @@ def build_patch_tools(backend: Any) -> list[StructuredTool]:
                 status="error",
             )
         updated = _materialize_cited_content(file_path, updated, runtime)
-        result = backend.edit(file_path, original, updated, replace_all=False)
-        if result.error:
-            return ToolMessage(
-                content=json.dumps(
-                    {
-                        "status": "conflict",
-                        "error_code": "concurrent_patch_commit_conflict",
-                        "current_sha256": current_version,
-                        "expected_sha256": expected_sha256,
-                        "error": str(result.error),
-                        "next_action": "retry_once_with_latest_version",
-                    },
-                    ensure_ascii=False,
-                    sort_keys=True,
-                ),
-                name="patch_file",
-                tool_call_id=runtime.tool_call_id,
-                status="error",
-            )
-        target_path = str(result.path or file_path)
         target_sha256 = digest(updated)
         mutation_receipt_id = ""
         validation_receipt_ids: list[str] = []
+        replace = getattr(backend, "replace_external_file", None)
+        if callable(replace):
+            committed = replace(
+                file_path,
+                updated.encode("utf-8"),
+                expected_sha256=current_version,
+                operation="patch",
+            )
+            status = str(committed.get("status") or "io_error")
+            if status != "completed":
+                return ToolMessage(
+                    content=json.dumps(
+                        {
+                            **committed,
+                            "status": status,
+                            "expected_sha256": expected_sha256,
+                            "next_action": str(
+                                committed.get("next_action")
+                                or "retry_once_with_latest_version"
+                            ),
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ),
+                    name="patch_file",
+                    tool_call_id=runtime.tool_call_id,
+                    status="error",
+                )
+            target_path = str(committed.get("target_path") or file_path)
+            mutation_receipt_id = str(
+                committed.get("mutation_receipt_id")
+                or committed.get("receipt_id")
+                or ""
+            )
+            validation_receipt_ids = [
+                str(item)
+                for item in committed.get("validation_receipt_ids") or []
+                if str(item)
+            ]
+        else:
+            result = backend.edit(file_path, original, updated, replace_all=False)
+            if result.error:
+                return ToolMessage(
+                    content=json.dumps(
+                        {
+                            "status": "conflict",
+                            "error_code": "concurrent_patch_commit_conflict",
+                            "current_sha256": current_version,
+                            "expected_sha256": expected_sha256,
+                            "error": str(result.error),
+                            "next_action": "retry_once_with_latest_version",
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ),
+                    name="patch_file",
+                    tool_call_id=runtime.tool_call_id,
+                    status="error",
+                )
+            target_path = str(result.path or file_path)
         context = runtime.context if isinstance(runtime.context, dict) else {}
         session_id = str(context.get("session_id") or "")
         run_id = str(context.get("run_id") or "")
-        if session_id and run_id:
+        if not mutation_receipt_id and session_id and run_id:
             if Path(target_path).is_absolute():
                 from graph.session_manager import session_manager
 
@@ -413,7 +453,7 @@ def build_patch_tools(backend: Any) -> list[StructuredTool]:
             description=(
                 "Atomically replace one authorized UTF-8 file under expected_sha256. "
                 "Validation happens before commit and any conflict leaves the target unchanged. "
-                "Use this instead of delete_file followed by write_file."
+                "Use this for conflict-safe replacement instead of a shell delete followed by write_file."
             ),
             func=replace_file,
             args_schema=ReplaceFileInput,

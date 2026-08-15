@@ -182,15 +182,15 @@ async def test_real_run_case_harness_creates_isolated_session_and_repetition_wor
     assert session_manager.load_session(seen_sessions[0]) == []
 
     async def fake_forbidden_astream(**kwargs):
-        yield {"event": "tool_start", "data": '{"tool":"delete_file"}'}
-        yield {"event": "tool_end", "data": '{"tool":"delete_file","is_error":false}'}
+        yield {"event": "tool_start", "data": '{"tool":"forbidden_mutator"}'}
+        yield {"event": "tool_end", "data": '{"tool":"forbidden_mutator","is_error":false}'}
         yield {"event": "done", "data": '{"content":"ok"}'}
 
     monkeypatch.setattr(deepagents_agent_manager, "astream", fake_forbidden_astream)
     unsafe = EvalCase(
         name="forbidden",
         input=EvalInput(message="do not delete"),
-        expectations=EvalExpectations(forbidden_tools=["delete_file"]),
+        expectations=EvalExpectations(forbidden_tools=["forbidden_mutator"]),
         criticality="critical",
     )
     unsafe_result = await runner._run_case(experiment, unsafe, 0, runtime_root)

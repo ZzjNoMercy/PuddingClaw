@@ -54,6 +54,28 @@ def test_linux_mount_projection_is_minimal_and_read_only_by_default(tmp_path: Pa
     assert ("--tmpfs", str(profile.deny_roots[0])) in zip(args, args[1:])
 
 
+def test_linux_unrestricted_mount_does_not_restrict_workspace_or_scratch_again(tmp_path: Path):
+    workspace = (tmp_path / "workspace").resolve()
+    scratch = (tmp_path / "scratch").resolve()
+    workspace.mkdir()
+    scratch.mkdir()
+    profile = SandboxGrantProfile.build(
+        workspace_root=workspace,
+        scratch_root=scratch,
+        filesystem="unrestricted",
+    )
+    runner = object.__new__(LinuxBwrapSeccompRunner)
+    runner.profile = profile
+
+    args = runner._mount_args()
+
+    assert args[:3] == ["--bind", "/", "/"]
+    assert str(workspace) not in args
+    assert str(scratch) not in args
+    assert not any(arg in {"--bind", "--ro-bind"} for arg in args[3:])
+    assert ["--tmpfs", "/sys"] in [args[index : index + 2] for index in range(len(args) - 1)]
+
+
 def test_kernel_environment_rejects_interpreter_injection():
     with pytest.raises(ValueError, match="not allowed"):
         kernel_sandbox._safe_environment(
@@ -73,13 +95,11 @@ def test_mac_profile_projects_deny_carveout(tmp_path: Path):
     assert f'(deny file-read-metadata file-read* file-write* (subpath "{profile.deny_roots[0]}"))' in rendered
 
 
-def test_kernel_virtual_paths_share_workspace_scratch_and_tmp_surface(tmp_path: Path):
+def test_kernel_virtual_paths_preserve_real_tmp_and_project_explicit_locators(tmp_path: Path):
     workspace = (tmp_path / "workspace").resolve()
     scratch = (tmp_path / "scratch").resolve()
-    run_tmp = (scratch / "tmp").resolve()
     workspace.mkdir()
     scratch.mkdir()
-    run_tmp.mkdir(parents=True)
     profile = SandboxGrantProfile.build(
         workspace_root=workspace,
         scratch_root=scratch,
@@ -90,10 +110,10 @@ def test_kernel_virtual_paths_share_workspace_scratch_and_tmp_surface(tmp_path: 
         profile=profile,
     )
 
-    assert f"cd {run_tmp}" in mapped
+    assert "cd /tmp" in mapped
     assert str(workspace / "input.pdf") in mapped
     assert str(scratch / "output.pdf") in mapped
-    assert str(run_tmp / "result.txt") in mapped
+    assert "'/tmp/result.txt'" in mapped
 
 
 def test_kernel_external_directory_projects_exact_cwd_and_write_root(

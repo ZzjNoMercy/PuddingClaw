@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -57,7 +58,7 @@ def test_absolute_workspace_path_is_rewritten_before_read_file(tmp_path):
     assert captured["args"]["file_path"] == "/workspace/reports/dashboard.html"
 
 
-def test_tmp_alias_is_rewritten_to_run_scratch_before_read_file(tmp_path):
+def test_real_tmp_path_is_not_rewritten_to_run_scratch_before_read_file(tmp_path):
     from graph.middlewares.workspace_path_router import WorkspacePathRouterMiddleware
 
     workspace = tmp_path / "workspace"
@@ -73,31 +74,65 @@ def test_tmp_alias_is_rewritten_to_run_scratch_before_read_file(tmp_path):
             status="success",
         )
 
-    result = WorkspacePathRouterMiddleware().wrap_tool_call(
+    result = WorkspacePathRouterMiddleware(
+        SimpleNamespace(execution_mode="spawn"),
+        approval_mode="smart",
+    ).wrap_tool_call(
         _request("read_file", {"file_path": "/tmp/renmai_prd.txt"}, workspace),
         handler,
     )
 
     assert result.status == "success"
-    assert captured["args"]["file_path"] == "/scratch/tmp/renmai_prd.txt"
+    assert captured["args"]["file_path"] == str(Path("/tmp/renmai_prd.txt").resolve(strict=False))
 
 
-def test_tmp_read_uses_current_run_scratch_not_stale_host_file(tmp_path):
+def test_real_tmp_path_trace_is_recorded_as_real_not_virtual(tmp_path, monkeypatch):
+    import graph.middlewares.workspace_path_router as module
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    spans: list[tuple[str, dict]] = []
+    collector = SimpleNamespace(add_custom_span=lambda name, payload, **_kwargs: spans.append((name, payload)))
+    monkeypatch.setattr(module, "get_current_trace_collector", lambda: collector)
+    middleware = module.WorkspacePathRouterMiddleware(
+        SimpleNamespace(execution_mode="spawn", filesystem_mode="unrestricted"),
+        approval_mode="smart",
+    )
+
+    middleware.wrap_tool_call(
+        _request("read_file", {"file_path": "/tmp/trace-real.txt"}, workspace),
+        lambda request: ToolMessage(
+            content="ok",
+            name="read_file",
+            tool_call_id=request.tool_call["id"],
+            status="success",
+        ),
+    )
+
+    projection = next(payload for name, payload in spans if name == "filesystem.path_projection")
+    assert projection["input_path_kind"] == "real"
+    assert projection["authority_kind"] == "external"
+
+
+def test_explicit_scratch_tmp_read_uses_current_run_scratch(tmp_path, monkeypatch):
     from deepagents.backends import CompositeBackend, FilesystemBackend
 
     from graph.middlewares.workspace_path_router import WorkspacePathRouterMiddleware
+    from graph.session_manager import session_manager
 
     workspace = tmp_path / "workspace"
     scratch = tmp_path / "current-run-scratch"
-    host_tmp = tmp_path / "host-tmp"
     workspace.mkdir()
     (scratch / "tmp").mkdir(parents=True)
-    host_tmp.mkdir()
     (scratch / "tmp" / "renmai_prd.txt").write_text("current run", encoding="utf-8")
-    (host_tmp / "renmai_prd.txt").write_text("stale session", encoding="utf-8")
     backend = CompositeBackend(
         default=FilesystemBackend(root_dir=workspace, virtual_mode=True),
         routes={"/scratch/": FilesystemBackend(root_dir=scratch, virtual_mode=True)},
+    )
+    monkeypatch.setattr(
+        session_manager,
+        "resolve_terminal_scratch_reference",
+        lambda *_args, **_kwargs: None,
     )
 
     def handler(request):
@@ -111,7 +146,7 @@ def test_tmp_read_uses_current_run_scratch_not_stale_host_file(tmp_path):
         )
 
     result = WorkspacePathRouterMiddleware(backend).wrap_tool_call(
-        _request("read_file", {"file_path": "/tmp/renmai_prd.txt"}, workspace),
+        _request("read_file", {"file_path": "/scratch/tmp/renmai_prd.txt"}, workspace),
         handler,
     )
 
@@ -119,7 +154,7 @@ def test_tmp_read_uses_current_run_scratch_not_stale_host_file(tmp_path):
     assert result.content == "current run"
 
 
-def test_tmp_and_scratch_tmp_backend_routes_share_one_physical_file(tmp_path):
+def test_scratch_tmp_backend_route_uses_one_physical_file(tmp_path):
     from deepagents.backends import FilesystemBackend
 
     from graph.permissioned_filesystem_backend import PermissionedCompositeBackend
@@ -131,19 +166,17 @@ def test_tmp_and_scratch_tmp_backend_routes_share_one_physical_file(tmp_path):
     run_tmp.mkdir(parents=True)
     workspace_backend = FilesystemBackend(root_dir=workspace, virtual_mode=True)
     scratch_backend = FilesystemBackend(root_dir=scratch, virtual_mode=True)
-    tmp_backend = FilesystemBackend(root_dir=run_tmp, virtual_mode=True)
     backend = PermissionedCompositeBackend(
         default=workspace_backend,
         routes={
             "/workspace/": workspace_backend,
             "/scratch/": scratch_backend,
-            "/tmp/": tmp_backend,
         },
         session_id="",
         workspace_root=workspace,
     )
 
-    written = backend.write("/tmp/result.txt", "same file")
+    written = backend.write("/scratch/tmp/result.txt", "same file")
     read = backend.read("/scratch/tmp/result.txt")
 
     assert written.error is None
@@ -152,7 +185,20 @@ def test_tmp_and_scratch_tmp_backend_routes_share_one_physical_file(tmp_path):
     assert (read.file_data or {}).get("content") == "same file"
 
 
-def test_kernel_smart_reads_exact_ordinary_host_text_without_grant(tmp_path):
+@pytest.mark.parametrize(
+    ("tool_name", "args"),
+    [
+        ("read_file", {"file_path": "notes.txt"}),
+        ("ls", {"path": "external"}),
+        ("glob", {"path": "external", "pattern": "*.txt"}),
+        ("grep", {"path": "external", "pattern": "ordinary"}),
+    ],
+)
+def test_kernel_smart_routes_ordinary_host_file_tools_without_grant(
+    tmp_path,
+    tool_name,
+    args,
+):
     from graph.middlewares.workspace_path_router import WorkspacePathRouterMiddleware
 
     workspace = tmp_path / "workspace"
@@ -160,6 +206,13 @@ def test_kernel_smart_reads_exact_ordinary_host_text_without_grant(tmp_path):
     external = tmp_path / "Downloads" / "notes.txt"
     external.parent.mkdir()
     external.write_text("ordinary host text", encoding="utf-8")
+    routed_args = {
+        key: str(external if value == "notes.txt" else external.parent)
+        if key in {"file_path", "path"}
+        else value
+        for key, value in args.items()
+    }
+    captured = {}
 
     class Backend:
         execution_mode = "kernel"
@@ -168,14 +221,22 @@ def test_kernel_smart_reads_exact_ordinary_host_text_without_grant(tmp_path):
         Backend(),
         approval_mode="smart",
     ).wrap_tool_call(
-        _request("read_file", {"file_path": str(external)}, workspace),
-        lambda _request: (_ for _ in ()).throw(
-            AssertionError("Smart exact host read must use the bounded resource reader")
+        _request(tool_name, routed_args, workspace),
+        lambda routed: (
+            captured.update(routed.tool_call)
+            or ToolMessage(
+                content="ordinary host result",
+                name=tool_name,
+                tool_call_id="call-1",
+                status="success",
+            )
         ),
     )
 
     assert result.status == "success"
-    assert result.content == "ordinary host text"
+    assert result.content == "ordinary host result"
+    assert captured["name"] == tool_name
+    assert captured["args"] == routed_args
 
 
 def test_absolute_managed_knowledge_path_is_rewritten_before_read_file(tmp_path):
@@ -210,7 +271,7 @@ def test_absolute_managed_knowledge_path_is_rewritten_before_read_file(tmp_path)
     assert captured["args"]["file_path"] == "/knowledge/imported/note.md"
 
 
-def test_read_resource_for_managed_text_uses_backend_read_file_route(tmp_path):
+def test_read_resource_for_managed_text_is_not_adapted_to_backend_read(tmp_path):
     from graph.middlewares.workspace_path_router import WorkspacePathRouterMiddleware
 
     workspace = tmp_path / "workspace"
@@ -219,20 +280,19 @@ def test_read_resource_for_managed_text_uses_backend_read_file_route(tmp_path):
     target = knowledge / "imported" / "note.md"
     target.parent.mkdir(parents=True)
     target.write_text("managed note", encoding="utf-8")
-    captured = {}
-
     class Backend:
         managed_host_path_aliases = {"/knowledge": knowledge}
 
-        def read(self, path, *, offset, limit):
-            captured.update({"path": path, "offset": offset, "limit": limit})
-            return SimpleNamespace(
-                error=None,
-                file_data={"encoding": "utf-8", "content": "managed note"},
-            )
+    captured = {}
 
-    def unexpected_handler(_request):
-        raise AssertionError("managed text must bypass read_resource")
+    def handler(request):
+        captured.update(request.tool_call)
+        return ToolMessage(
+            content="❌ read_resource only accepts attachment refs and local image paths. Use read_file.",
+            name="read_resource",
+            tool_call_id="call-1",
+            status="error",
+        )
 
     result = WorkspacePathRouterMiddleware(Backend()).wrap_tool_call(
         _request(
@@ -240,14 +300,15 @@ def test_read_resource_for_managed_text_uses_backend_read_file_route(tmp_path):
             {"resource": str(target), "offset": 3, "limit": 20},
             workspace,
         ),
-        unexpected_handler,
+        handler,
     )
 
-    assert result.status == "success"
-    assert result.name == "read_file"
-    assert result.content == "managed note"
-    assert captured == {
-        "path": "/knowledge/imported/note.md",
+    assert result.status == "error"
+    assert result.name == "read_resource"
+    assert "Use read_file" in str(result.content)
+    assert captured["name"] == "read_resource"
+    assert captured["args"] == {
+        "resource": "/knowledge/imported/note.md",
         "offset": 3,
         "limit": 20,
     }
@@ -261,23 +322,20 @@ def test_managed_read_eperm_is_not_reported_as_session_permission_gap(tmp_path):
     knowledge = tmp_path / "knowledge"
     knowledge.mkdir()
 
-    class Backend:
-        managed_host_path_aliases = {"/knowledge": knowledge}
-
-        def read(self, _path, *, offset, limit):
-            del offset, limit
-            return SimpleNamespace(
-                error="[Errno 1] Operation not permitted: '/managed/note.md'",
-                file_data=None,
-            )
-
-    result = WorkspacePathRouterMiddleware(Backend()).wrap_tool_call(
+    result = WorkspacePathRouterMiddleware(
+        SimpleNamespace(managed_host_path_aliases={"/knowledge": knowledge})
+    ).wrap_tool_call(
         _request(
-            "read_resource",
-            {"resource": "/knowledge/imported/note.md"},
+            "read_file",
+            {"file_path": "/knowledge/imported/note.md"},
             workspace,
         ),
-        lambda _request: (_ for _ in ()).throw(AssertionError("managed read must use backend")),
+        lambda request: ToolMessage(
+            content="[Errno 1] Operation not permitted: '/managed/note.md'",
+            name="read_file",
+            tool_call_id=request.tool_call["id"],
+            status="error",
+        ),
     )
 
     assert result.status == "error"
@@ -719,8 +777,7 @@ def test_terminal_scratch_reference_resolves_to_formal_target_or_not_durable(tmp
     assert "artifact_not_durable" in abandoned.content
 
 
-def test_external_read_file_routes_to_read_resource_with_pagination(tmp_path, monkeypatch):
-    import graph.middlewares.workspace_path_router as module
+def test_external_read_file_keeps_native_route_with_pagination(tmp_path):
     from graph.middlewares.workspace_path_router import WorkspacePathRouterMiddleware
 
     workspace = tmp_path / "workspace"
@@ -730,24 +787,32 @@ def test_external_read_file_routes_to_read_resource_with_pagination(tmp_path, mo
     external.write_text("outside", encoding="utf-8")
     captured = {}
 
-    def fake_invoke(_tool, args):
-        captured.update(args)
-        return "routed content"
-
-    monkeypatch.setattr(module.ReadResourceTool, "invoke", fake_invoke)
     result = WorkspacePathRouterMiddleware().wrap_tool_call(
         _request(
             "read_file",
             {"file_path": str(external), "offset": 100, "limit": 200},
             workspace,
         ),
-        lambda _request: (_ for _ in ()).throw(AssertionError("read_file must not execute")),
+        lambda request: (
+            captured.update(request.tool_call)
+            or ToolMessage(
+                content="outside",
+                name="read_file",
+                tool_call_id=request.tool_call["id"],
+                status="success",
+            )
+        ),
     )
 
     assert isinstance(result, ToolMessage)
-    assert result.name == "read_resource"
+    assert result.name == "read_file"
     assert result.status == "success"
-    assert captured == {"resource": str(external.resolve()), "offset": 100, "limit": 200}
+    assert captured["name"] == "read_file"
+    assert captured["args"] == {
+        "file_path": str(external.resolve()),
+        "offset": 100,
+        "limit": 200,
+    }
 
 
 def test_spawn_external_reads_keep_direct_host_route_without_grant(tmp_path):
@@ -784,13 +849,18 @@ def test_spawn_external_reads_keep_direct_host_route_without_grant(tmp_path):
     )
     resource = middleware.wrap_tool_call(
         _request("read_resource", {"resource": str(external)}, workspace, call_id="call-2"),
-        lambda _request: (_ for _ in ()).throw(AssertionError("spawn resource read is bound directly")),
+        lambda request: ToolMessage(
+            content="❌ read_resource only accepts attachment refs and local image paths. Use read_file.",
+            name="read_resource",
+            tool_call_id=request.tool_call["id"],
+            status="error",
+        ),
     )
 
     assert result.status == "success"
     assert captured["args"]["file_path"] == str(external.resolve())
-    assert resource.status == "success"
-    assert "spawn direct host read" in str(resource.content)
+    assert resource.status == "error"
+    assert "Use read_file" in str(resource.content)
     assert session_manager.list_permission_grants("routing-session") == []
 
 
@@ -953,7 +1023,7 @@ def test_external_ls_without_directory_grant_returns_replayable_authorization_ga
     assert "Exact-file grants never expand" in str(result.content)
 
 
-def test_scratch_is_virtual_and_misrouted_read_resource_uses_backend(tmp_path):
+def test_scratch_text_read_resource_is_not_adapted_to_read_file(tmp_path):
     from deepagents.backends import CompositeBackend, FilesystemBackend
 
     from graph.middlewares.workspace_path_router import WorkspacePathRouterMiddleware
@@ -977,13 +1047,18 @@ def test_scratch_is_virtual_and_misrouted_read_resource_uses_backend(tmp_path):
             {"resource": "/scratch/external/lease-1/report.js"},
             workspace,
         ),
-        lambda _request: (_ for _ in ()).throw(AssertionError("read_resource must be adapted")),
+        lambda request: ToolMessage(
+            content="❌ read_resource only accepts attachment refs and local image paths. Use read_file.",
+            name="read_resource",
+            tool_call_id=request.tool_call["id"],
+            status="error",
+        ),
     )
 
     assert isinstance(result, ToolMessage)
-    assert result.status == "success"
-    assert result.name == "read_file"
-    assert result.content == "const ok = true;"
+    assert result.status == "error"
+    assert result.name == "read_resource"
+    assert "Use read_file" in str(result.content)
 
 
 def test_symlink_escape_is_rejected_by_shared_authority_classifier(tmp_path):
@@ -1003,9 +1078,7 @@ def test_symlink_escape_is_rejected_by_shared_authority_classifier(tmp_path):
 
     result = WorkspacePathRouterMiddleware().wrap_tool_call(
         _request("read_file", {"file_path": str(link)}, workspace),
-        lambda _request: (_ for _ in ()).throw(
-            AssertionError("workspace symlink escape must not execute")
-        ),
+        lambda _request: (_ for _ in ()).throw(AssertionError("workspace symlink escape must not execute")),
     )
 
     assert isinstance(result, ToolMessage)

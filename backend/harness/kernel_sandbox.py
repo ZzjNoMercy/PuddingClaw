@@ -44,12 +44,7 @@ def _trusted_bwrap_path() -> Path | None:
         except OSError:
             continue
         mode = stat.S_IMODE(metadata.st_mode)
-        if (
-            resolved.is_file()
-            and os.access(resolved, os.X_OK)
-            and metadata.st_uid == 0
-            and not mode & 0o022
-        ):
+        if resolved.is_file() and os.access(resolved, os.X_OK) and metadata.st_uid == 0 and not mode & 0o022:
             return resolved
     return None
 
@@ -64,12 +59,7 @@ def _trusted_python_path() -> Path | None:
         except OSError:
             continue
         mode = stat.S_IMODE(metadata.st_mode)
-        if (
-            candidate.is_file()
-            and os.access(candidate, os.X_OK)
-            and metadata.st_uid == 0
-            and not mode & 0o022
-        ):
+        if candidate.is_file() and os.access(candidate, os.X_OK) and metadata.st_uid == 0 and not mode & 0o022:
             return candidate
     return None
 
@@ -268,10 +258,7 @@ def _safe_environment(
         normalized_value = str(value)
         if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", normalized_key):
             raise ValueError("Kernel environment contains an invalid variable name")
-        if (
-            normalized_key in denied_names
-            or normalized_key.startswith(("LD_", "DYLD_"))
-        ):
+        if normalized_key in denied_names or normalized_key.startswith(("LD_", "DYLD_")):
             raise ValueError(f"Kernel environment variable is not allowed: {normalized_key}")
         if "\x00" in normalized_value:
             raise ValueError("Kernel environment contains a NUL byte")
@@ -279,10 +266,22 @@ def _safe_environment(
     return env
 
 
+def _kernel_home(profile: SandboxGrantProfile, runtime: Path) -> Path:
+    """Use the real user home only for explicit trusted-local filesystem mode."""
+
+    if profile.filesystem == "unrestricted":
+        return Path(os.environ.get("HOME") or Path.home()).expanduser().resolve()
+    return runtime / "home"
+
+
 def _bounded_output(stdout: str, stderr: str, *, limit: int) -> tuple[str, bool]:
     parts = [stdout] if stdout else []
     if stderr:
-        parts.extend(f"[stderr] {line}" for line in stderr.strip().splitlines())
+        parts.extend(
+            f"[stderr] {line}"
+            for line in stderr.strip().splitlines()
+            if "ev_poll_posix.cc" not in line or "FD from fork parent still in poll list" not in line
+        )
     output = "\n".join(parts) if parts else "<no output>"
     encoded = output.encode("utf-8", errors="replace")
     if len(encoded) <= limit:
@@ -307,14 +306,10 @@ def _validated_working_directory(
     canonical = candidate.resolve(strict=True)
     if canonical != candidate:
         raise ValueError("Kernel working directory must already be canonical")
-    if any(
-        canonical == denied or denied in canonical.parents
-        for denied in profile.deny_roots
-    ):
+    if any(canonical == denied or denied in canonical.parents for denied in profile.deny_roots):
         raise ValueError("Kernel working directory is explicitly denied")
-    if not any(
-        canonical == root or root in canonical.parents
-        for root in profile.read_roots
+    if profile.filesystem != "unrestricted" and not any(
+        canonical == root or root in canonical.parents for root in profile.read_roots
     ):
         raise ValueError("Kernel working directory is outside the execution profile")
     return canonical
@@ -325,14 +320,12 @@ def _map_kernel_virtual_paths(
     *,
     profile: SandboxGrantProfile,
 ) -> str:
-    """Give Kernel commands the same /workspace, /scratch, and /tmp surface."""
+    """Project the explicit /workspace and /scratch locators for Kernel."""
 
-    tmp = profile.scratch_root / "tmp"
     mapped = command
     for virtual, target in (
         ("workspace", profile.workspace_root),
         ("scratch", profile.scratch_root),
-        ("tmp", tmp),
     ):
         mapped = re.sub(
             rf"(?<![A-Za-z0-9_./-])/{virtual}(?=(?:/|\s|$|[\"']))",
@@ -381,7 +374,7 @@ class MacOSSeatbeltRunner:
         )
         if runtime.is_symlink():
             raise ValueError("Seatbelt runtime root must not be a symlink")
-        self.home = runtime / "home"
+        self.home = _kernel_home(profile, runtime)
         self.tmp = profile.scratch_root / "tmp"
         self.home.mkdir(parents=True, exist_ok=True)
         self.tmp.mkdir(parents=True, exist_ok=True)
@@ -394,9 +387,9 @@ class MacOSSeatbeltRunner:
             "executable_digest": _file_digest(cls.executable) if cls.executable.is_file() else "missing",
             "policy_schema": "macos-seatbelt-profile-v2",
         }
-        return "sha256:" + hashlib.sha256(
-            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
-        ).hexdigest()
+        return (
+            "sha256:" + hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        )
 
     @classmethod
     def probe(cls) -> tuple[bool, str]:
@@ -468,6 +461,20 @@ class MacOSSeatbeltRunner:
         return json.dumps(str(path))
 
     def render_profile(self) -> str:
+        if self.profile.filesystem == "unrestricted":
+            lines = [
+                "(version 1)",
+                "(deny default)",
+                '(import "system.sb")',
+                "(allow process*)",
+                "(allow file-read*)",
+                '(allow file-write* (regex #"^/"))',
+                '(allow file-write-data (literal "/dev/null"))',
+                '(allow file-write-data (literal "/dev/zero"))',
+            ]
+            if self.profile.network_allowed:
+                lines.append("(allow network*)")
+            return "\n".join(lines)
         read_roots = tuple(dict.fromkeys((*self._SYSTEM_READ_ROOTS, *self.profile.read_roots)))
         lines = [
             "(version 1)",
@@ -482,9 +489,7 @@ class MacOSSeatbeltRunner:
         for root in self.profile.write_roots:
             lines.append(f"(allow file-write* (subpath {self._literal(root)}))")
         for root in sorted(self.profile.deny_roots, key=lambda path: (-len(path.parts), str(path))):
-            lines.append(
-                f"(deny file-read-metadata file-read* file-write* (subpath {self._literal(root)}))"
-            )
+            lines.append(f"(deny file-read-metadata file-read* file-write* (subpath {self._literal(root)}))")
         lines.extend(
             (
                 '(allow file-write-data (literal "/dev/null"))',
@@ -524,11 +529,7 @@ class MacOSSeatbeltRunner:
     @staticmethod
     def _direct_argv(argv: list[str] | tuple[str, ...]) -> list[str]:
         values = [str(value) for value in argv]
-        if (
-            not values
-            or not Path(values[0]).is_absolute()
-            or any(not value or "\x00" in value for value in values)
-        ):
+        if not values or not Path(values[0]).is_absolute() or any(not value or "\x00" in value for value in values):
             raise ValueError("Seatbelt direct argv is invalid")
         return values
 
@@ -722,12 +723,9 @@ class MacOSSeatbeltRunner:
 class LinuxBwrapSeccompRunner:
     """Execute a command in a bubblewrap Linux kernel sandbox.
 
-    The host filesystem is not exposed wholesale: only the system runtime and
-    roots in the immutable Grant Profile are mounted.  Bubblewrap creates the
-    namespaces, then a classic seccomp filter and ``PR_SET_NO_NEW_PRIVS`` are
-    applied before the user's shell is exec'd. The current Python launcher is
-    deliberately treated as a development implementation; a native helper is
-    still required before claiming a hostile-code threat model.
+    Restricted profiles expose only the system runtime and Grant roots.  The
+    explicit trusted-local profile instead bind-mounts the host root while
+    retaining namespaces, seccomp and lifecycle controls.
     """
 
     mode = "kernel_linux_bwrap_seccomp"
@@ -760,7 +758,7 @@ class LinuxBwrapSeccompRunner:
         if runtime.is_symlink():
             raise ValueError("Linux sandbox runtime root must not be a symlink")
         runtime.mkdir(parents=True, exist_ok=True)
-        self.home = runtime / "home"
+        self.home = _kernel_home(profile, runtime)
         self.tmp = profile.scratch_root / "tmp"
         self.home.mkdir(parents=True, exist_ok=True)
         self.tmp.mkdir(parents=True, exist_ok=True)
@@ -778,12 +776,12 @@ class LinuxBwrapSeccompRunner:
             "seccomp_policy_digest": "sha256:" + hashlib.sha256(_seccomp_filter_bytes()).hexdigest()
             if sys.platform == "linux"
             else "unsupported",
-            "mount_policy": "minimal-system-roots-v2",
+            "mount_policy": "filesystem-mode-aware-roots-v3",
             "namespace_policy": "user-pid-ipc-uts-cgroup-net-v2",
         }
-        return "sha256:" + hashlib.sha256(
-            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
-        ).hexdigest()
+        return (
+            "sha256:" + hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        )
 
     @classmethod
     def probe(cls) -> tuple[bool, str]:
@@ -868,15 +866,21 @@ class LinuxBwrapSeccompRunner:
     def _mount_args(self) -> list[str]:
         argv: list[str] = []
         known_mountpoints: set[Path] = set()
-        for raw_root in self._SYSTEM_ROOTS:
-            root = Path(raw_root)
-            if not root.exists():
-                continue
-            self._ensure_mountpoint(argv, root, known=known_mountpoints)
-            argv.extend(("--ro-bind", str(root), str(root)))
-        for root in self._HIDDEN_ROOTS:
-            self._ensure_mountpoint(argv, Path(root), known=known_mountpoints)
-            argv.extend(("--tmpfs", root))
+        unrestricted = self.profile.filesystem == "unrestricted"
+        if unrestricted:
+            # The bind is intentional: smart/trusted-local semantics must not
+            # silently become workspace-only merely because Kernel is enabled.
+            argv.extend(("--bind", "/", "/"))
+        else:
+            for raw_root in self._SYSTEM_ROOTS:
+                root = Path(raw_root)
+                if not root.exists():
+                    continue
+                self._ensure_mountpoint(argv, root, known=known_mountpoints)
+                argv.extend(("--ro-bind", str(root), str(root)))
+            for root in self._HIDDEN_ROOTS:
+                self._ensure_mountpoint(argv, Path(root), known=known_mountpoints)
+                argv.extend(("--tmpfs", root))
         self._ensure_mountpoint(argv, Path("/proc"), known=known_mountpoints)
         self._ensure_mountpoint(argv, Path("/dev"), known=known_mountpoints)
         argv.extend(("--proc", "/proc", "--dev", "/dev"))
@@ -884,12 +888,15 @@ class LinuxBwrapSeccompRunner:
         self._ensure_mountpoint(argv, Path("/sys"), known=known_mountpoints)
         argv.extend(("--tmpfs", "/sys"))
 
+        if unrestricted:
+            # `/` already carries the complete host filesystem authority for
+            # trusted-local mode. Any later workspace/scratch/root projection
+            # would narrow that authority again (notably, an empty
+            # `write_roots` profile used to remount workspace read-only).
+            return argv
+
         roots = set(self.profile.read_roots) | set(self.profile.write_roots)
-        roots = {
-            root
-            for root in roots
-            if root not in {self.profile.workspace_root, self.profile.scratch_root}
-        }
+        roots = {root for root in roots if root not in {self.profile.workspace_root, self.profile.scratch_root}}
         ordered = [self.profile.workspace_root, self.profile.scratch_root]
         ordered.extend(sorted(roots, key=lambda path: (len(path.parts), str(path))))
         for root in ordered:
@@ -975,8 +982,7 @@ class LinuxBwrapSeccompRunner:
             try:
                 python_home_path = Path(python_home).expanduser().resolve(strict=True)
                 if not any(
-                    python_home_path == root or root in python_home_path.parents
-                    for root in self.profile.read_roots
+                    python_home_path == root or root in python_home_path.parents for root in self.profile.read_roots
                 ):
                     raise ValueError("PYTHONHOME must stay inside an authorized read root")
             except OSError as exc:

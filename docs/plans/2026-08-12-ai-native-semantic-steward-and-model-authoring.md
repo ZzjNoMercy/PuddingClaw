@@ -832,12 +832,14 @@ P0 的主体就是 **Semantic Steward Skill + Toolset**。Backend 只补 Toolset
 - Agent 使用现有只读能力读取 Markdown/Profile；写出完整候选，不要求用户填写 YAML。
 - `prepare_semantic_markdown` 校验并冻结候选，返回正文预览、机器效果、技术 Diff 与 digest-bound plan，不触碰 active definition。
 - `publish_semantic_markdown` 执行 plan/session/TTL/candidate/baseline 校验、单文件 atomic replace、Registry refresh 和失败恢复。
-- Harness 对每次 publish 发起单次用户审批，批准指纹包含准确的 `plan_id + plan_digest`；Skill 文本不是唯一审批防线。
+- Agent 展示 prepare 结果后在同一轮发起 publish；Harness 立即弹出唯一一次用户审批，批准指纹包含准确的 `plan_id + plan_digest`。不再先要求用户用聊天消息回复“批准”；Skill 文本不是唯一审批防线。
 - 主 `/api/agent` 保持 managed read-only；遗留写工具移除定义目录白名单并增加回归测试。
 
-验收：创建与修改 Measure 都必须经过“prepare → 用户审核准确 plan digest → publish”；人工并发编辑返回 `baseline_changed`；发布后 Registry 能读取该 Measure；失败不留下半发布文件。
+验收：创建与修改 Measure 都必须经过“prepare → 展示审核内容并同轮请求 publish → Harness HITL 单次批准”；人工并发编辑返回 `baseline_changed`；发布后 Registry 能读取该 Measure；失败不留下半发布文件。
 
 当前验证记录（2026-08-13）：首个 Measure 纵切的审批、Brief、legacy chat 和路径泄漏阻断已关闭；横向扩展与 Discovery 门禁加入后，39 个 Semantic Authoring 定向测试及 563 个 Steward、Tool Execution、Registry、Analytics Model、Dimension Builder、Runtime、Project Export、Toolset、DeepAgents 组合回归通过，Ruff、compileall 与 diff check 通过。Luna 对抗复核提出的正文嵌套值审计、Relation key mapping 一致性、缺失 `table_asset:`、语义空查询和 receipt 篡改阻断均已关闭。
+
+交互修正（2026-08-14）：删除“prepare 后等待用户在聊天中回复批准”的重复确认。Agent 展示冻结候选后必须在同一轮请求 publish，由 Harness 的 digest-bound HITL 卡片完成唯一审批；批准后恢复原调用，拒绝则不写入。Semantic Authoring 与 Toolset 定向回归 98 项通过。
 
 ### P0-2：在同一协议上扩展五类对象（已实现）
 
@@ -923,7 +925,7 @@ frontend/src/components/analytics/
 
 - 用户一句话创建任一普通语义对象，Agent 先搜索并比较已有定义，再读取证据并只追问业务歧义。
 - 用户全程不接触 Schema/frontmatter，Agent 生成完整正文和提案字段。
-- Agent 在 prepare 后停止；只有用户批准准确的 plan digest 后才 publish。
+- Agent 在 prepare 后先展示正文和机器效果，再在同一轮请求 publish；Harness HITL 卡片是唯一批准动作，用户无需再发送“批准”消息。
 - 并发修改导致 baseline digest 变化，发布返回 `baseline_changed` 而不是覆盖。
 - 人工通过 Monaco 修改同一 Markdown 后，Agent 重新读取并生成新 Diff。
 - Agent 修改存量定义时保留无关正文，只对本次已确认口径做可见 Patch。
@@ -948,7 +950,7 @@ frontend/src/components/analytics/
 4. publish 只应用用户审核过的冻结候选，具备 session/TTL/digest CAS、atomic replace、Registry refresh 和失败恢复。
 5. 通用 Agent 写工具不能绕过 Steward，人工 Monaco/REST/Import 仍可维护同一 Markdown，并会使旧 plan stale。
 6. Effect Registry 与测试覆盖 Measure 已使用字段；Backend 不从正文/Brief 猜业务行为。
-7. Skill 黑盒演练能保持“prepare 后停止、明确批准后 publish”的边界，不暴露宿主路径。
+7. Skill 黑盒演练能保持“prepare 后展示结果、同轮触发 digest-bound HITL、批准后恢复 publish”的单次审批边界，不暴露宿主路径。
 
 ### 五类对象 P0 完成
 

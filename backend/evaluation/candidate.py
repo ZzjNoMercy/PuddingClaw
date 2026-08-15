@@ -30,7 +30,6 @@ HARNESS_WORKSPACE_CORE_TOOLS = (
     "update_todos",
     "patch_file",
     "materialize_source_ref",
-    "delete_file",
     "validate_artifact_contract",
 )
 HARNESS_CAPABILITY_PROFILE = "puddingclaw_workspace_harness@1"

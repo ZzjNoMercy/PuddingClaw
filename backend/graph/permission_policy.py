@@ -225,6 +225,7 @@ class PermissionBindingPolicy:
     _COMMON_KEYS = (
         "approval_mode",
         "backend_mode",
+        "filesystem_mode",
         "policy_epoch",
         "policy_version",
         "permission_rules_revision",
@@ -322,6 +323,7 @@ class PermissionBindingPolicy:
             "policy_version",
             "permission_rules_revision",
             "workspace_id",
+            "filesystem_mode",
             "isolation_policy_id",
             "profile_schema",
         )
@@ -420,6 +422,7 @@ class RunPermissionContext:
     backend_mode: str
     backend_id: str
     workspace_id: str
+    filesystem_mode: str = "restricted"
     rules: tuple[PermissionRule, ...] = ()
     permission_rules_revision: int = 0
 
@@ -434,6 +437,16 @@ class RunPermissionContext:
         current_permissions = permission_policy_snapshot(frozen_permissions)
         execution = payload.get("execution")
         execution = execution if isinstance(execution, Mapping) else {}
+        configured_filesystem = str(execution.get("filesystem_mode") or "").strip().lower()
+        if configured_filesystem not in {"restricted", "unrestricted"}:
+            # Backward-compatible snapshots from the pre-alignment schema
+            # derive the interactive smart-local contract once, at restore.
+            configured_filesystem = (
+                "unrestricted"
+                if normalize_approval_mode(current_permissions["approval_mode"]) is ApprovalMode.SMART
+                and str(execution.get("backend_mode") or "spawn") in {"spawn", "kernel"}
+                else "restricted"
+            )
         return cls(
             approval_mode=normalize_approval_mode(current_permissions["approval_mode"]),
             policy_epoch=int(current_permissions["policy_epoch"]),
@@ -443,6 +456,7 @@ class RunPermissionContext:
             backend_mode=str(execution.get("backend_mode") or "spawn"),
             backend_id=str(execution.get("backend_id") or ""),
             workspace_id=str(execution.get("workspace_id") or ""),
+            filesystem_mode=configured_filesystem,
             rules=compile_permission_rules(frozen_permissions.get("rules")),
             permission_rules_revision=int(current_permissions.get("permission_rules_revision") or 0),
         )
@@ -459,6 +473,7 @@ class RunPermissionContext:
             "backend_mode": self.backend_mode,
             "backend_id": self.backend_id,
             "workspace_id": self.workspace_id,
+            "filesystem_mode": self.filesystem_mode,
             "permission_rules_revision": self.permission_rules_revision,
         }
 
@@ -471,6 +486,7 @@ class RunPermissionContext:
             "policy_version": self.policy_version,
             "permission_rules_revision": self.permission_rules_revision,
             "workspace_id": self.workspace_id,
+            "filesystem_mode": self.filesystem_mode,
             "isolation_policy_id": SHELL_ISOLATION_POLICY_ID,
             "profile_schema": SHELL_PROFILE_SCHEMA,
         }

@@ -13,6 +13,7 @@ def _bindings(*, backend_mode: str = "docker", workspace_id: str = "workspace:on
         "approval_mode": "strict",
         "backend_mode": backend_mode,
         "backend_id": "runtime:ignored-for-session-directory",
+        "filesystem_mode": "restricted",
         "policy_epoch": 1,
         "policy_version": "tool-execution-v4",
         "workspace_id": workspace_id,
@@ -26,6 +27,7 @@ def _shell_bindings(*, workspace_id: str = "workspace:one"):
         "policy_version": "tool-execution-v4",
         "permission_rules_revision": 0,
         "workspace_id": workspace_id,
+        "filesystem_mode": "restricted",
         "isolation_policy_id": "spawn-kernel-shared-v1",
         "profile_schema": "sandbox-grant-profile-v1",
     }

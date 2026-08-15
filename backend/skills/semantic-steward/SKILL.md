@@ -33,13 +33,13 @@ Treat the rendered Markdown body as the user's review surface and the published 
 7. Propose business frontmatter explicitly. Never infer or silently change name, description, aliases, tags, type, calculation behavior, grain, relation, model dependencies, filters, or guardrails.
 8. Call `prepare_semantic_markdown` with the targeted discovery receipt. Address every error. If discovery is stale, discover and compare again.
 9. Show the rendered body and natural-language machine-effect summary. Offer the technical diff only as an expandable detail.
-10. Stop and wait for explicit approval of that exact `plan_digest`.
-11. Only after approval, call `publish_semantic_markdown` with the exact plan id and digest. If it reports stale discovery or baseline, repeat discovery/read/compare and prepare a new plan.
+10. In that same assistant turn, call `publish_semantic_markdown` with the exact plan id and digest. This intentionally opens the Harness HITL card; the card is the one and only approval boundary. Do not stop and ask the user to type “approve” first.
+11. If the user approves the HITL card, let the interrupted call resume and report the result. If the user rejects it, do not publish. If publication reports stale discovery or baseline, repeat discovery/read/compare and prepare a new plan.
 
 ## Hard boundaries
 
 - Do not use `write_file`, `edit_file`, shell commands, or generic patch tools to change active semantic definitions.
-- Do not call prepare and publish back-to-back before the user has reviewed the prepared result.
+- Surface the prepared result before issuing the publish call in the same turn. Never replace the digest-bound Harness HITL card with an unbound chat confirmation.
 - Do not publish with unresolved business decisions.
 - Do not prepare from an inventory-only or another Session's discovery receipt.
 - Do not claim the Backend proved free-form prose semantically equivalent to frontmatter. Deterministic checks catch structural conflicts; the Agent must review meaning.

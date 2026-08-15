@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import re
 import shlex
 import shutil
 from html.parser import HTMLParser
@@ -62,10 +63,7 @@ class _CandidateHTMLValidator(HTMLParser):
         tag: str,
         attrs: list[tuple[str, str | None]],
     ) -> None:
-        normalized_attrs = {
-            str(key).lower(): str(value or "")
-            for key, value in attrs
-        }
+        normalized_attrs = {str(key).lower(): str(value or "") for key, value in attrs}
         element_id = normalized_attrs.get("id", "").strip()
         if element_id:
             if element_id in self.ids:
@@ -167,6 +165,9 @@ class PermissionedCompositeBackend(CompositeBackend):
                     workspace_prefixes.append(f"/workspace/{relative}/")
         self._readonly_workspace_prefixes = tuple(workspace_prefixes)
         self.external_directory_writable_enabled = False
+        # Set by the Run builder after the persisted approval mode is known.
+        # The backend remains restricted by default for isolated callers.
+        self.filesystem_mode = "restricted"
 
     def _classify_path(self, file_path: str) -> ClassifiedPath:
         return classify_path_authority(
@@ -181,18 +182,12 @@ class PermissionedCompositeBackend(CompositeBackend):
             return False
         expected_prefix = f"/{classified.authority.value}"
         expected_backend = next(
-            (
-                backend
-                for prefix, backend in self.routes.items()
-                if prefix.rstrip("/") == expected_prefix
-            ),
+            (backend for prefix, backend in self.routes.items() if prefix.rstrip("/") == expected_prefix),
             None,
         )
         if expected_backend is None:
             return False
-        routed_backend, _routed_path = self._get_backend_and_key(
-            classified.virtual_path
-        )
+        routed_backend, _routed_path = self._get_backend_and_key(classified.virtual_path)
         return routed_backend is expected_backend
 
     @staticmethod
@@ -230,34 +225,22 @@ class PermissionedCompositeBackend(CompositeBackend):
         authority_root: Path | None = None
         if classified.authority is PathAuthority.WORKSPACE:
             workspace_route = next(
-                (
-                    backend
-                    for prefix, backend in self.routes.items()
-                    if prefix.rstrip("/") == "/workspace"
-                ),
+                (backend for prefix, backend in self.routes.items() if prefix.rstrip("/") == "/workspace"),
                 None,
             )
             if workspace_route is None:
                 return None
-            routed_backend, routed_path = self._get_backend_and_key(
-                classified.virtual_path
-            )
+            routed_backend, routed_path = self._get_backend_and_key(classified.virtual_path)
             backend_root = getattr(routed_backend, "cwd", None)
             if routed_backend is not workspace_route or backend_root is None:
                 return None
             authority_root = Path(backend_root).resolve()
-            canonical = (authority_root / routed_path.lstrip("/")).resolve(
-                strict=False
-            )
+            canonical = (authority_root / routed_path.lstrip("/")).resolve(strict=False)
             if self.workspace_root is not None and authority_root != self.workspace_root:
                 return None
         elif classified.authority is PathAuthority.SCRATCH:
             scratch_route = next(
-                (
-                    backend
-                    for prefix, backend in self.routes.items()
-                    if prefix.rstrip("/") == "/scratch"
-                ),
+                (backend for prefix, backend in self.routes.items() if prefix.rstrip("/") == "/scratch"),
                 None,
             )
             if scratch_route is None:
@@ -359,10 +342,7 @@ class PermissionedCompositeBackend(CompositeBackend):
             return {
                 "status": "conflict",
                 "error_code": "source_version_changed",
-                "error": (
-                    "conflict: target changed; "
-                    f"expected {expected_sha256}, current {current_sha256}"
-                ),
+                "error": (f"conflict: target changed; expected {expected_sha256}, current {current_sha256}"),
                 "current_sha256": current_sha256,
                 "expected_sha256": expected_sha256,
                 "next_action": "reinspect_and_rebase",
@@ -417,11 +397,7 @@ class PermissionedCompositeBackend(CompositeBackend):
                 exists = "already exists" in written.error.lower()
                 return {
                     "status": "conflict" if exists else "io_error",
-                    "error_code": (
-                        "target_already_exists"
-                        if exists
-                        else "internal_backend_create_failed"
-                    ),
+                    "error_code": ("target_already_exists" if exists else "internal_backend_create_failed"),
                     "error": written.error,
                 }
             return {
@@ -484,11 +460,10 @@ class PermissionedCompositeBackend(CompositeBackend):
 
         content_sha256 = f"sha256:{hashlib.sha256(content).hexdigest()}"
         digest = content_sha256.removeprefix("sha256:")
-        safe_name = "".join(
-            character
-            for character in target.canonical_path.name
-            if character.isalnum() or character in "._-"
-        ) or f"candidate{suffix}"
+        safe_name = (
+            "".join(character for character in target.canonical_path.name if character.isalnum() or character in "._-")
+            or f"candidate{suffix}"
+        )
         validator_kind, validator_version, command_prefix = validator
         if command_prefix == "__internal_html__":
             virtual_path = "internal://html-candidate"
@@ -498,28 +473,18 @@ class PermissionedCompositeBackend(CompositeBackend):
                 parser.feed(text)
                 parser.close()
                 if parser.stack:
-                    parser.errors.append(
-                        "unclosed tags: " + ", ".join(parser.stack[-10:])
-                    )
-                output = (
-                    "; ".join(parser.errors)
-                    if parser.errors
-                    else "html structure ok"
-                )
+                    parser.errors.append("unclosed tags: " + ", ".join(parser.stack[-10:]))
+                output = "; ".join(parser.errors) if parser.errors else "html structure ok"
                 exit_code = 1 if parser.errors else 0
             except (UnicodeDecodeError, ValueError) as exc:
                 output = f"invalid HTML candidate: {exc}"
                 exit_code = 1
         else:
             execution_backend = getattr(self, "execution_backend", None)
-            scratch_root = str(
-                getattr(self, "execution_scratch_host_path", "") or ""
-            )
+            scratch_root = str(getattr(self, "execution_scratch_host_path", "") or "")
             execution_error: Exception | None = None
             if execution_backend is None or not scratch_root:
-                execution_error = RuntimeError(
-                    "registered validation infrastructure is unavailable"
-                )
+                execution_error = RuntimeError("registered validation infrastructure is unavailable")
                 virtual_path = "unavailable://validation-candidate"
                 output = str(execution_error)
                 exit_code = 1
@@ -548,9 +513,7 @@ class PermissionedCompositeBackend(CompositeBackend):
                 )
                 raw_exit_code = getattr(result, "exit_code", None)
                 if not isinstance(raw_exit_code, int):
-                    execution_error = RuntimeError(
-                        "validation backend returned no exit code"
-                    )
+                    execution_error = RuntimeError("validation backend returned no exit code")
                     exit_code = 1
                 else:
                     exit_code = raw_exit_code
@@ -558,17 +521,14 @@ class PermissionedCompositeBackend(CompositeBackend):
         content_observed = True
         if exit_code != 0:
             lowered_output = output.lower()
-            if (
-                command_prefix != "__internal_html__"
-                and (
-                    execution_error is not None
-                    or exit_code in {124, 126, 127, 137}
-                    or "timed out" in lowered_output
-                    or "infrastructure error" in lowered_output
-                    or "command not found" in lowered_output
-                    or "out of memory" in lowered_output
-                    or "killed" in lowered_output
-                )
+            if command_prefix != "__internal_html__" and (
+                execution_error is not None
+                or exit_code in {124, 126, 127, 137}
+                or "timed out" in lowered_output
+                or "infrastructure error" in lowered_output
+                or "command not found" in lowered_output
+                or "out of memory" in lowered_output
+                or "killed" in lowered_output
             ):
                 failure_class = "infrastructure_failure"
                 content_observed = False
@@ -591,12 +551,8 @@ class PermissionedCompositeBackend(CompositeBackend):
             },
             sort_keys=True,
         )
-        receipt_id = "validation-" + hashlib.sha256(
-            receipt_seed.encode("utf-8")
-        ).hexdigest()[:20]
-        artifact_id = "artifact-" + hashlib.sha256(
-            f"external\0{target.canonical_path}".encode()
-        ).hexdigest()[:20]
+        receipt_id = "validation-" + hashlib.sha256(receipt_seed.encode("utf-8")).hexdigest()[:20]
+        artifact_id = "artifact-" + hashlib.sha256(f"external\0{target.canonical_path}".encode()).hexdigest()[:20]
         return {
             "kind": "validation_receipt",
             "validation_receipt_id": receipt_id,
@@ -610,8 +566,7 @@ class PermissionedCompositeBackend(CompositeBackend):
                     "content_sha256": content_sha256,
                 }
             ],
-            "command_evidence_ref": "sha256:"
-            + hashlib.sha256(output.encode("utf-8")).hexdigest(),
+            "command_evidence_ref": "sha256:" + hashlib.sha256(output.encode("utf-8")).hexdigest(),
             "exit_code": exit_code,
             "checks_passed": 1 if exit_code == 0 else 0,
             "checks_failed": 0 if exit_code == 0 else 1,
@@ -639,43 +594,25 @@ class PermissionedCompositeBackend(CompositeBackend):
         self,
         changes: list[dict[str, Any]],
     ) -> dict[str, Any]:
-        authorities = [
-            self._classify_path(str(change.get("file_path") or ""))
-            for change in changes
-        ]
+        authorities = [self._classify_path(str(change.get("file_path") or "")) for change in changes]
         if any(item.authority is PathAuthority.ESCAPE for item in authorities):
-            escaped = next(
-                item for item in authorities if item.authority is PathAuthority.ESCAPE
-            )
+            escaped = next(item for item in authorities if item.authority is PathAuthority.ESCAPE)
             return self._escape_result(escaped.original_path)
         if any(item.authority is PathAuthority.MANAGED for item in authorities):
-            managed = next(
-                item for item in authorities if item.authority is PathAuthority.MANAGED
-            )
+            managed = next(item for item in authorities if item.authority is PathAuthority.MANAGED)
             return self._managed_write_result(managed.original_path)
         readonly_change = next(
-            (
-                change
-                for change in changes
-                if self._managed_readonly(str(change.get("file_path") or ""))
-            ),
+            (change for change in changes if self._managed_readonly(str(change.get("file_path") or ""))),
             None,
         )
         if readonly_change is not None:
-            return self._managed_write_result(
-                str(readonly_change.get("file_path") or "")
-            )
-        internal_authorities = {
-            item.authority for item in authorities if item.internally_writable
-        }
+            return self._managed_write_result(str(readonly_change.get("file_path") or ""))
+        internal_authorities = {item.authority for item in authorities if item.internally_writable}
         if len(internal_authorities) > 1:
             return {
                 "status": "io_error",
                 "error_code": "mixed_authority_transaction_unsupported",
-                "error": (
-                    "io_error: one transaction cannot mix workspace and scratch "
-                    "authority roots"
-                ),
+                "error": ("io_error: one transaction cannot mix workspace and scratch authority roots"),
                 "next_action": "split_transaction_by_authority",
             }
         if authorities and all(item.internally_writable for item in authorities):
@@ -704,10 +641,7 @@ class PermissionedCompositeBackend(CompositeBackend):
                     return {
                         "status": "conflict",
                         "error_code": "source_version_changed",
-                        "error": (
-                            f"conflict: {classified.original_path} expected "
-                            f"{expected}, current {current}"
-                        ),
+                        "error": (f"conflict: {classified.original_path} expected {expected}, current {current}"),
                     }
                 prepared.append(
                     (
@@ -747,10 +681,7 @@ class PermissionedCompositeBackend(CompositeBackend):
                     classified.virtual_path or classified.original_path
                     for classified, _before, _after, _current in prepared
                 ],
-                "target_sha256": [
-                    self._content_sha256(after)
-                    for _classified, _before, after, _current in prepared
-                ],
+                "target_sha256": [self._content_sha256(after) for _classified, _before, after, _current in prepared],
                 "authority_kind": "internal",
             }
         if any(item.internally_writable for item in authorities):
@@ -758,8 +689,7 @@ class PermissionedCompositeBackend(CompositeBackend):
                 "status": "io_error",
                 "error_code": "mixed_authority_transaction_unsupported",
                 "error": (
-                    "io_error: one transaction cannot mix internal workspace/scratch "
-                    "files with external host files"
+                    "io_error: one transaction cannot mix internal workspace/scratch files with external host files"
                 ),
                 "next_action": "split_transaction_by_authority",
             }
@@ -789,7 +719,43 @@ class PermissionedCompositeBackend(CompositeBackend):
                 content,
                 expected_sha256=expected_sha256,
             )
-        if classified.authority is PathAuthority.MANAGED:
+        if self.filesystem_mode == "unrestricted" and classified.authority in {
+            PathAuthority.EXTERNAL,
+            PathAuthority.MANAGED,
+        }:
+            target = self._unrestricted_host_path(classified)
+            if target is None:
+                return self._escape_result(file_path)
+            if self.host_file_broker is not None:
+                result = self.host_file_broker.replace_unrestricted(
+                    str(target),
+                    content,
+                    expected_sha256=expected_sha256,
+                    operation=operation,
+                )
+                result.setdefault("authority_kind", "external")
+                return result
+            try:
+                before = target.read_bytes()
+                current = self._content_sha256(before)
+                if current != expected_sha256:
+                    return {
+                        "status": "conflict",
+                        "error_code": "source_version_changed",
+                        "error": f"conflict: target expected {expected_sha256}, current {current}",
+                    }
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(content)
+            except OSError as exc:
+                return {"status": "io_error", "error_code": "host_replace_failed", "error": f"io_error: {exc}"}
+            return {
+                "status": "completed",
+                "target_path": str(target),
+                "previous_sha256": current,
+                "target_sha256": self._content_sha256(content),
+                "authority_kind": "external",
+            }
+        if classified.authority is PathAuthority.MANAGED and self.filesystem_mode != "unrestricted":
             return self._managed_write_result(file_path)
         if self.host_file_broker is None:
             return {
@@ -826,7 +792,28 @@ class PermissionedCompositeBackend(CompositeBackend):
                     "error": "io_error: internal virtual files must be UTF-8 text",
                 }
             return self._create_internal_file(classified, content)
-        if classified.authority is PathAuthority.MANAGED:
+        if self.filesystem_mode == "unrestricted" and classified.authority in {
+            PathAuthority.EXTERNAL,
+            PathAuthority.MANAGED,
+        }:
+            target = self._unrestricted_host_path(classified)
+            if target is None:
+                return self._escape_result(file_path)
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with target.open("xb") as handle:
+                    handle.write(content)
+            except FileExistsError as exc:
+                return {"status": "conflict", "error_code": "target_already_exists", "error": str(exc)}
+            except OSError as exc:
+                return {"status": "io_error", "error_code": "host_create_failed", "error": f"io_error: {exc}"}
+            return {
+                "status": "completed",
+                "target_path": str(target),
+                "target_sha256": self._content_sha256(content),
+                "authority_kind": "external",
+            }
+        if classified.authority is PathAuthority.MANAGED and self.filesystem_mode != "unrestricted":
             return self._managed_write_result(file_path)
         if self.host_file_broker is None:
             return {
@@ -853,7 +840,7 @@ class PermissionedCompositeBackend(CompositeBackend):
             return self._escape_result(source_path)
         if target_authority.authority is PathAuthority.ESCAPE:
             return self._escape_result(target_path)
-        if target_authority.authority is PathAuthority.MANAGED:
+        if target_authority.authority is PathAuthority.MANAGED and self.filesystem_mode != "unrestricted":
             return self._managed_write_result(target_path)
         if self._managed_readonly(target_path):
             return {
@@ -890,10 +877,7 @@ class PermissionedCompositeBackend(CompositeBackend):
                 return {
                     "status": "conflict",
                     "error_code": "source_version_changed",
-                    "error": (
-                        f"conflict: source expected {expected_source_sha256}, "
-                        f"current {source_sha256}"
-                    ),
+                    "error": (f"conflict: source expected {expected_source_sha256}, current {source_sha256}"),
                     "source_sha256": source_sha256,
                 }
             source_result = {
@@ -901,17 +885,35 @@ class PermissionedCompositeBackend(CompositeBackend):
                 "source_sha256": source_sha256,
             }
         else:
-            if self.host_file_broker is None:
+            if self.filesystem_mode == "unrestricted" and source_authority.authority is PathAuthority.EXTERNAL:
+                source = source_authority.canonical_host_path
+                if source is None:
+                    return self._escape_result(source_path)
+                try:
+                    content = source.read_bytes()
+                except OSError as exc:
+                    return {"status": "io_error", "error_code": "host_read_failed", "error": f"io_error: {exc}"}
+                source_sha256 = self._content_sha256(content)
+                if expected_source_sha256 and expected_source_sha256 != source_sha256:
+                    return {
+                        "status": "conflict",
+                        "error_code": "source_version_changed",
+                        "error": f"conflict: source expected {expected_source_sha256}, current {source_sha256}",
+                        "source_sha256": source_sha256,
+                    }
+                source_result = {"source_path": str(source), "source_sha256": source_sha256}
+            elif self.host_file_broker is None:
                 return {
                     "status": "permission_required",
                     "error_code": "host_file_broker_unavailable",
                     "error": "permission_required: no active HostFileBroker Run",
                 }
-            content, source_result = self.host_file_broker.load_authorized_file(
-                source_path, expected_sha256=expected_source_sha256
-            )
-            if content is None:
-                return source_result
+            else:
+                content, source_result = self.host_file_broker.load_authorized_file(
+                    source_path, expected_sha256=expected_source_sha256
+                )
+                if content is None:
+                    return source_result
 
         if target_authority.internally_writable:
             try:
@@ -934,18 +936,28 @@ class PermissionedCompositeBackend(CompositeBackend):
                     else created.get("authority_kind")
                 ),
             }
+        if self.filesystem_mode == "unrestricted" and target_authority.authority is PathAuthority.MANAGED:
+            return self.create_external_file(target_path, content, operation="copy")
+        if source_authority.authority is PathAuthority.EXTERNAL:
+            if self.filesystem_mode == "unrestricted":
+                return self.create_external_file(target_path, content, operation="copy")
+            if self.host_file_broker is None:
+                return {
+                    "status": "permission_required",
+                    "error_code": "host_file_broker_unavailable",
+                    "error": "permission_required: no active HostFileBroker Run",
+                }
+            return self.host_file_broker.copy(
+                source_path,
+                target_path,
+                expected_source_sha256=expected_source_sha256,
+            )
         if self.host_file_broker is None:
             return {
                 "status": "permission_required",
                 "error_code": "host_file_broker_unavailable",
                 "error": "permission_required: no active HostFileBroker Run",
             }
-        if source_authority.authority is PathAuthority.EXTERNAL:
-            return self.host_file_broker.copy(
-                source_path,
-                target_path,
-                expected_source_sha256=expected_source_sha256,
-            )
         return self.host_file_broker.create(
             target_path,
             content,
@@ -986,10 +998,7 @@ class PermissionedCompositeBackend(CompositeBackend):
                 return {
                     "status": "conflict",
                     "error_code": "source_version_changed",
-                    "error": (
-                        f"conflict: target expected {expected_sha256}, "
-                        f"current {current_sha256}"
-                    ),
+                    "error": (f"conflict: target expected {expected_sha256}, current {current_sha256}"),
                 }
             try:
                 HostFileBroker._unlink_bound(target, expected_before=before)
@@ -1006,7 +1015,27 @@ class PermissionedCompositeBackend(CompositeBackend):
                 "deleted_path": classified.virtual_path or file_path,
                 "authority_kind": classified.authority.value,
             }
-        if classified.authority is PathAuthority.MANAGED:
+        if self.filesystem_mode == "unrestricted" and classified.authority in {
+            PathAuthority.EXTERNAL,
+            PathAuthority.MANAGED,
+        }:
+            target = self._unrestricted_host_path(classified)
+            if target is None:
+                return self._escape_result(file_path)
+            try:
+                before = target.read_bytes()
+                current = self._content_sha256(before)
+                if current != expected_sha256:
+                    return {
+                        "status": "conflict",
+                        "error_code": "source_version_changed",
+                        "error": f"conflict: target expected {expected_sha256}, current {current}",
+                    }
+                target.unlink()
+            except OSError as exc:
+                return {"status": "io_error", "error_code": "host_delete_failed", "error": f"io_error: {exc}"}
+            return {"status": "completed", "deleted_path": str(target), "authority_kind": "external"}
+        if classified.authority is PathAuthority.MANAGED and self.filesystem_mode != "unrestricted":
             return self._managed_write_result(file_path)
         if self.host_file_broker is None:
             return {
@@ -1049,10 +1078,7 @@ class PermissionedCompositeBackend(CompositeBackend):
                 "error": f"io_error: unsupported mode {mode}",
                 "next_action": "choose_read_only_or_writable_draft",
             }
-        if (
-            mode == "writable_draft"
-            and not self.external_directory_writable_enabled
-        ):
+        if mode == "writable_draft" and not self.external_directory_writable_enabled:
             return {
                 "status": "permission_required",
                 "error_code": "external_directory_writable_disabled",
@@ -1064,10 +1090,7 @@ class PermissionedCompositeBackend(CompositeBackend):
             }
         if not directory.is_dir() or (
             not spawn_read_only
-            and (
-                self.host_file_broker is None
-                or not self.host_file_broker.authorize(directory, access=access)
-            )
+            and (self.host_file_broker is None or not self.host_file_broker.authorize(directory, access=access))
         ):
             return {
                 "status": "permission_required",
@@ -1113,10 +1136,7 @@ class PermissionedCompositeBackend(CompositeBackend):
                         or ""
                     )
                 )
-                or (
-                    not str(lease.get("goal_id") or "")
-                    and str(lease.get("run_id") or "") != self.run_id
-                )
+                or (not str(lease.get("goal_id") or "") and str(lease.get("run_id") or "") != self.run_id)
             ):
                 return {
                     "status": "conflict",
@@ -1124,14 +1144,9 @@ class PermissionedCompositeBackend(CompositeBackend):
                     "error": "conflict: directory lease is not bound to this Run/Goal/path",
                     "next_action": "stage_external_directory",
                 }
-            scratch_root_raw = str(
-                getattr(self, "execution_scratch_host_path", "") or ""
-            )
+            scratch_root_raw = str(getattr(self, "execution_scratch_host_path", "") or "")
             staged_virtual = str(lease.get("staged_dir") or "")
-            if (
-                not scratch_root_raw
-                or not staged_virtual.startswith("/scratch/")
-            ):
+            if not scratch_root_raw or not staged_virtual.startswith("/scratch/"):
                 return {
                     "status": "io_error",
                     "error_code": "directory_draft_unavailable",
@@ -1139,9 +1154,7 @@ class PermissionedCompositeBackend(CompositeBackend):
                     "next_action": "stage_external_directory",
                 }
             scratch_root = Path(scratch_root_raw).resolve(strict=True)
-            execution_directory = (
-                scratch_root / staged_virtual.removeprefix("/scratch/")
-            ).resolve(strict=True)
+            execution_directory = (scratch_root / staged_virtual.removeprefix("/scratch/")).resolve(strict=True)
             try:
                 execution_directory.relative_to(scratch_root)
             except ValueError:
@@ -1173,11 +1186,9 @@ class PermissionedCompositeBackend(CompositeBackend):
                 _scan_source_directory,
             )
 
-            staged_manifest, _contents, _skipped, scan_error = (
-                _scan_source_directory(
-                    execution_directory,
-                    include_content=False,
-                )
+            staged_manifest, _contents, _skipped, scan_error = _scan_source_directory(
+                execution_directory,
+                include_content=False,
             )
             if scan_error is not None:
                 return {
@@ -1194,8 +1205,7 @@ class PermissionedCompositeBackend(CompositeBackend):
                 "modified": sorted(
                     path
                     for path in source_paths & staged_paths
-                    if str(source_manifest[path].get("sha256") or "")
-                    != str(staged_manifest[path].get("sha256") or "")
+                    if str(source_manifest[path].get("sha256") or "") != str(staged_manifest[path].get("sha256") or "")
                 ),
                 "deleted": sorted(source_paths - staged_paths),
             }
@@ -1227,9 +1237,7 @@ class PermissionedCompositeBackend(CompositeBackend):
                     "lease_id": str(lease_id or ""),
                     "draft_plan_preview": draft_plan,
                     "next_action": (
-                        "prepare_external_directory_commit"
-                        if exit_code == 0
-                        else "discard_and_restage_directory"
+                        "prepare_external_directory_commit" if exit_code == 0 else "discard_and_restage_directory"
                     ),
                 }
             )
@@ -1255,10 +1263,7 @@ class PermissionedCompositeBackend(CompositeBackend):
                     "status": "invocation_error",
                     "error_code": "html_report_not_found",
                     "failure_class": "invocation_failure",
-                    "error": (
-                        f"收到虚拟路径 {original_path}，但当前 Run 未绑定 workspace；"
-                        "请改用宿主机绝对路径。"
-                    ),
+                    "error": (f"收到虚拟路径 {original_path}，但当前 Run 未绑定 workspace；请改用宿主机绝对路径。"),
                 }
             relative = original_path.removeprefix("/workspace/").strip("/")
             resolved_input = str(self.workspace_root / relative) if relative else str(self.workspace_root)
@@ -1284,8 +1289,7 @@ class PermissionedCompositeBackend(CompositeBackend):
                 "error_code": "html_report_not_found",
                 "failure_class": "invocation_failure",
                 "error": (
-                    f"文件不存在：{original_path}（已解析为 {requested}）。"
-                    "请先确认产物已写入该路径，再发起验证。"
+                    f"文件不存在：{original_path}（已解析为 {requested}）。请先确认产物已写入该路径，再发起验证。"
                 ),
             }
         if original_path.startswith("/workspace") and self.workspace_root is not None:
@@ -1296,9 +1300,7 @@ class PermissionedCompositeBackend(CompositeBackend):
                     "status": "invocation_error",
                     "error_code": "html_report_not_found",
                     "failure_class": "invocation_failure",
-                    "error": (
-                        f"虚拟路径越出 workspace：{original_path}（解析为 {canonical}）。"
-                    ),
+                    "error": (f"虚拟路径越出 workspace：{original_path}（解析为 {canonical}）。"),
                 }
         if not canonical.is_file():
             return {
@@ -1309,32 +1311,22 @@ class PermissionedCompositeBackend(CompositeBackend):
             }
 
         run_payload = (
-            session_manager.get_run_state(self.session_id, self.run_id)
-            if self.session_id and self.run_id
-            else None
+            session_manager.get_run_state(self.session_id, self.run_id) if self.session_id and self.run_id else None
         )
         verification_contract = (
             run_payload.get("verification_contract")
-            if isinstance(run_payload, dict)
-            and isinstance(run_payload.get("verification_contract"), dict)
+            if isinstance(run_payload, dict) and isinstance(run_payload.get("verification_contract"), dict)
             else {}
         )
-        contracted_browser_e2e = bool(
-            verification_contract.get("browser_e2e_required")
-        )
-        requested_browser_e2e = (
-            contracted_browser_e2e
-            if browser_e2e is None
-            else bool(browser_e2e)
-        )
+        contracted_browser_e2e = bool(verification_contract.get("browser_e2e_required"))
+        requested_browser_e2e = contracted_browser_e2e if browser_e2e is None else bool(browser_e2e)
         if requested_browser_e2e != contracted_browser_e2e:
             return {
                 "status": "invocation_error",
                 "error_code": "html_validation_mode_contract_mismatch",
                 "failure_class": "invocation_failure",
                 "error": (
-                    "browser_e2e must match the server-authored "
-                    f"verification contract ({contracted_browser_e2e})"
+                    f"browser_e2e must match the server-authored verification contract ({contracted_browser_e2e})"
                 ),
                 "html_file_path": str(canonical),
                 "browser_e2e_required": contracted_browser_e2e,
@@ -1349,34 +1341,24 @@ class PermissionedCompositeBackend(CompositeBackend):
                 parser.close()
                 failures.extend(parser.errors)
                 if parser.stack:
-                    failures.append(
-                        "unclosed tags: " + ", ".join(parser.stack[-10:])
-                    )
+                    failures.append("unclosed tags: " + ", ".join(parser.stack[-10:]))
                 if "html" not in parser.tags or "body" not in parser.tags:
-                    failures.append(
-                        "full HTML report must contain <html> and <body>"
-                    )
+                    failures.append("full HTML report must contain <html> and <body>")
                 if parser.duplicate_ids:
-                    failures.append(
-                        "duplicate element ids: "
-                        + ", ".join(sorted(parser.duplicate_ids)[:20])
-                    )
+                    failures.append("duplicate element ids: " + ", ".join(sorted(parser.duplicate_ids)[:20]))
                 missing_resources: list[str] = []
                 for raw_ref in parser.local_resource_refs:
                     relative_ref = raw_ref.split("#", 1)[0].split("?", 1)[0]
                     if not relative_ref:
                         continue
                     referenced = (
-                        Path(relative_ref)
-                        if Path(relative_ref).is_absolute()
-                        else canonical.parent / relative_ref
+                        Path(relative_ref) if Path(relative_ref).is_absolute() else canonical.parent / relative_ref
                     )
                     if not referenced.is_file():
                         missing_resources.append(raw_ref)
                 if missing_resources:
                     failures.append(
-                        "missing local resources: "
-                        + ", ".join(sorted(dict.fromkeys(missing_resources))[:20])
+                        "missing local resources: " + ", ".join(sorted(dict.fromkeys(missing_resources))[:20])
                     )
             except (OSError, UnicodeDecodeError, ValueError) as exc:
                 failures.append(f"invalid HTML report: {exc}")
@@ -1387,11 +1369,7 @@ class PermissionedCompositeBackend(CompositeBackend):
                 "html_file_path": str(canonical),
                 "failures": failures,
                 "element_id_count": len(parser.ids) if parser is not None else 0,
-                "local_resource_count": (
-                    len(parser.local_resource_refs)
-                    if parser is not None
-                    else 0
-                ),
+                "local_resource_count": (len(parser.local_resource_refs) if parser is not None else 0),
             }
             return {
                 "status": "completed" if not failures else "io_error",
@@ -1405,16 +1383,10 @@ class PermissionedCompositeBackend(CompositeBackend):
                     ensure_ascii=False,
                     sort_keys=True,
                 ),
-                **(
-                    {}
-                    if not failures
-                    else {"failure_class": "artifact_failure"}
-                ),
+                **({} if not failures else {"failure_class": "artifact_failure"}),
             }
 
-        command_prefix = (
-            "node /opt/puddingclaw/bin/validate-html-report-e2e.mjs "
-        )
+        command_prefix = "node /opt/puddingclaw/bin/validate-html-report-e2e.mjs "
         response_payload: dict[str, Any]
         workspace = self.workspace_root
         in_workspace = False
@@ -1451,8 +1423,7 @@ class PermissionedCompositeBackend(CompositeBackend):
                 }
             else:
                 response = execute(
-                    command_prefix
-                    + shlex.quote(f"/workspace/{relative.as_posix()}"),
+                    command_prefix + shlex.quote(f"/workspace/{relative.as_posix()}"),
                     timeout=timeout,
                 )
                 exit_code = getattr(response, "exit_code", None)
@@ -1481,8 +1452,7 @@ class PermissionedCompositeBackend(CompositeBackend):
             output = str(response_payload.get("output") or "")
             lowered = output.lower()
             if (
-                str(response_payload.get("status") or "")
-                == "permission_required"
+                str(response_payload.get("status") or "") == "permission_required"
                 or "err_file_not_found" in lowered
                 or "no such file" in lowered
             ):
@@ -1522,6 +1492,8 @@ class PermissionedCompositeBackend(CompositeBackend):
         return False
 
     def _managed_readonly(self, file_path: str) -> bool:
+        if self.filesystem_mode == "unrestricted":
+            return False
         if self._readonly_virtual_path(file_path) or self._readonly_host_path(file_path):
             return True
         classified = self._classify_path(file_path)
@@ -1535,6 +1507,51 @@ class PermissionedCompositeBackend(CompositeBackend):
             except ValueError:
                 continue
         return False
+
+    def _unrestricted_host_target(
+        self,
+        file_path: str | None,
+        *,
+        require_existing: bool = False,
+    ) -> tuple[FilesystemBackend, str, Path] | None:
+        """Project an ordinary absolute host path without a directory Grant."""
+
+        if self.filesystem_mode != "unrestricted" or not file_path:
+            return None
+        classified = self._classify_path(file_path)
+        if classified.authority is not PathAuthority.EXTERNAL:
+            return None
+        requested = Path(file_path).expanduser()
+        if not requested.is_absolute():
+            return None
+        try:
+            # Missing unrestricted host paths are still ordinary host paths.
+            # Route them through the filesystem backend so callers receive the
+            # native ENOENT instead of a synthetic permission_required error.
+            resolved = requested.resolve(strict=False)
+        except (OSError, ValueError):
+            return None
+        if resolved.is_dir():
+            return FilesystemBackend(root_dir=resolved, virtual_mode=True), "/", resolved
+        return FilesystemBackend(root_dir=resolved.parent, virtual_mode=True), f"/{resolved.name}", resolved
+
+    def _unrestricted_host_path(self, classified: ClassifiedPath) -> Path | None:
+        """Resolve a managed alias to its host location for trusted-local edits."""
+
+        if self.filesystem_mode != "unrestricted":
+            return None
+        if classified.canonical_host_path is not None:
+            return classified.canonical_host_path
+        if not classified.virtual_path:
+            return None
+        try:
+            routed_backend, routed_path = self._get_backend_and_key(classified.virtual_path)
+            backend_root = getattr(routed_backend, "cwd", None)
+            if backend_root is None:
+                return None
+            return (Path(backend_root).resolve() / routed_path.lstrip("/")).resolve(strict=False)
+        except (OSError, ValueError):
+            return None
 
     def _unrouted_external_path(self, file_path: str | None) -> bool:
         """Identify a host absolute path that no normal Backend may touch.
@@ -1560,10 +1577,7 @@ class PermissionedCompositeBackend(CompositeBackend):
 
     @staticmethod
     def _permission_error(file_path: str) -> str:
-        return (
-            "permission_required: external host path is not covered by an "
-            f"effective file Grant: {file_path}"
-        )
+        return f"permission_required: external host path is not covered by an effective file Grant: {file_path}"
 
     def _routed_virtual_path(self, file_path: str) -> bool:
         """Return whether CompositeBackend, not host grants, owns this path."""
@@ -1587,10 +1601,7 @@ class PermissionedCompositeBackend(CompositeBackend):
         normalized = str(file_path or "").strip().replace("\\", "/")
         if not normalized:
             return False
-        return any(
-            normalized == prefix.rstrip("/") or normalized.startswith(prefix)
-            for prefix in self.routes
-        )
+        return any(normalized == prefix.rstrip("/") or normalized.startswith(prefix) for prefix in self.routes)
 
     def _approved_external_target(self, file_path: str) -> tuple[FilesystemBackend, str, str] | None:
         if not self.session_id:
@@ -1607,11 +1618,7 @@ class PermissionedCompositeBackend(CompositeBackend):
         return backend, f"/{resolved.name}", str(resolved)
 
     def _approved_external_read_target(self, file_path: str) -> tuple[FilesystemBackend, str] | None:
-        if (
-            not self.session_id
-            or self._routed_virtual_path(file_path)
-            or self._managed_readonly(file_path)
-        ):
+        if not self.session_id or self._routed_virtual_path(file_path) or self._managed_readonly(file_path):
             return None
         requested = Path(file_path).expanduser()
         if not requested.is_absolute():
@@ -1665,8 +1672,29 @@ class PermissionedCompositeBackend(CompositeBackend):
 
     @staticmethod
     def _restore_external_path(result: Any, resolved: str):
-        if result.path is not None:
+        if getattr(result, "path", None) is not None:
             result.path = resolved
+        file_data = getattr(result, "file_data", None)
+        if isinstance(file_data, dict) and file_data.get("path"):
+            file_data["path"] = resolved
+        if getattr(result, "error", None):
+            backend_path = f"/{Path(resolved).name}"
+            error = str(result.error)
+            # FilesystemBackend may mention both its projected basename and an
+            # already-resolved OS path in the same exception. Replace only the
+            # standalone projection token; a global substring replacement
+            # would append ``resolved`` to the parent of the real OS path.
+            for quote in ("'", '"'):
+                error = error.replace(
+                    f"{quote}{backend_path}{quote}",
+                    f"{quote}{resolved}{quote}",
+                )
+            error = re.sub(
+                rf"(?<!\S){re.escape(backend_path)}(?=$|[\s.,;:)\]])",
+                lambda _match: resolved,
+                error,
+            )
+            result.error = error
         return result
 
     def write(self, file_path: str, content: str):
@@ -1674,6 +1702,10 @@ class PermissionedCompositeBackend(CompositeBackend):
             return WriteResult(error=f"Managed resource is read-only: {file_path}")
         if self._mounted_backend_path(file_path):
             return super().write(file_path, content)
+        unrestricted = self._unrestricted_host_target(file_path)
+        if unrestricted is not None:
+            backend, backend_path, resolved = unrestricted
+            return self._restore_external_path(backend.write(backend_path, content), str(resolved))
         if self.host_file_broker is not None:
             broker_result = self.host_file_broker.write(file_path, content)
             if broker_result is not None:
@@ -1692,6 +1724,13 @@ class PermissionedCompositeBackend(CompositeBackend):
     def read(self, file_path: str, offset: int = 0, limit: int = 2000):
         if self._mounted_backend_path(file_path):
             return super().read(file_path, offset=offset, limit=limit)
+        unrestricted = self._unrestricted_host_target(file_path, require_existing=True)
+        if unrestricted is not None:
+            backend, backend_path, resolved = unrestricted
+            return self._restore_external_path(
+                backend.read(backend_path, offset=offset, limit=limit),
+                str(resolved),
+            )
         spawn_target = self._spawn_external_read_target(file_path)
         if spawn_target is not None:
             backend, backend_path, _root = spawn_target
@@ -1717,6 +1756,13 @@ class PermissionedCompositeBackend(CompositeBackend):
     async def aread(self, file_path: str, offset: int = 0, limit: int = 2000):
         if self._mounted_backend_path(file_path):
             return await super().aread(file_path, offset=offset, limit=limit)
+        unrestricted = self._unrestricted_host_target(file_path, require_existing=True)
+        if unrestricted is not None:
+            backend, backend_path, resolved = unrestricted
+            return self._restore_external_path(
+                await backend.aread(backend_path, offset=offset, limit=limit),
+                str(resolved),
+            )
         spawn_target = self._spawn_external_read_target(file_path)
         if spawn_target is not None:
             backend, backend_path, _root = spawn_target
@@ -1745,6 +1791,10 @@ class PermissionedCompositeBackend(CompositeBackend):
             return WriteResult(error=f"Managed resource is read-only: {file_path}")
         if self._mounted_backend_path(file_path):
             return await super().awrite(file_path, content)
+        unrestricted = self._unrestricted_host_target(file_path)
+        if unrestricted is not None:
+            backend, backend_path, resolved = unrestricted
+            return self._restore_external_path(await backend.awrite(backend_path, content), str(resolved))
         if self.host_file_broker is not None:
             broker_result = await asyncio.to_thread(
                 self.host_file_broker.write,
@@ -1775,6 +1825,13 @@ class PermissionedCompositeBackend(CompositeBackend):
             return EditResult(error=f"Managed resource is read-only: {file_path}")
         if self._mounted_backend_path(file_path):
             return super().edit(file_path, old_string, new_string, replace_all=replace_all)
+        unrestricted = self._unrestricted_host_target(file_path, require_existing=True)
+        if unrestricted is not None:
+            backend, backend_path, resolved = unrestricted
+            return self._restore_external_path(
+                backend.edit(backend_path, old_string, new_string, replace_all=replace_all),
+                str(resolved),
+            )
         if self.host_file_broker is not None:
             broker_result = self.host_file_broker.edit(
                 file_path,
@@ -1806,6 +1863,13 @@ class PermissionedCompositeBackend(CompositeBackend):
             return EditResult(error=f"Managed resource is read-only: {file_path}")
         if self._mounted_backend_path(file_path):
             return await super().aedit(file_path, old_string, new_string, replace_all=replace_all)
+        unrestricted = self._unrestricted_host_target(file_path, require_existing=True)
+        if unrestricted is not None:
+            backend, backend_path, resolved = unrestricted
+            return self._restore_external_path(
+                await backend.aedit(backend_path, old_string, new_string, replace_all=replace_all),
+                str(resolved),
+            )
         if self.host_file_broker is not None:
             broker_result = await asyncio.to_thread(
                 self.host_file_broker.edit,
@@ -1830,6 +1894,10 @@ class PermissionedCompositeBackend(CompositeBackend):
     def ls(self, path: str):
         if self._mounted_backend_path(path):
             return super().ls(path)
+        unrestricted = self._unrestricted_host_target(path, require_existing=True)
+        if unrestricted is not None:
+            backend, backend_path, root = unrestricted
+            return self._restore_spawn_host_paths(backend.ls(backend_path), root)
         spawn_target = self._spawn_external_read_target(path)
         if spawn_target is not None:
             backend, backend_path, root = spawn_target
@@ -1845,6 +1913,10 @@ class PermissionedCompositeBackend(CompositeBackend):
     async def als(self, path: str):
         if self._mounted_backend_path(path):
             return await super().als(path)
+        unrestricted = self._unrestricted_host_target(path, require_existing=True)
+        if unrestricted is not None:
+            backend, backend_path, root = unrestricted
+            return self._restore_spawn_host_paths(await backend.als(backend_path), root)
         spawn_target = self._spawn_external_read_target(path)
         if spawn_target is not None:
             backend, backend_path, root = spawn_target
@@ -1861,6 +1933,10 @@ class PermissionedCompositeBackend(CompositeBackend):
     def glob(self, pattern: str, path: str | None = None):
         if self._mounted_backend_path(path):
             return super().glob(pattern, path=path)
+        unrestricted = self._unrestricted_host_target(path, require_existing=True)
+        if unrestricted is not None:
+            backend, backend_path, root = unrestricted
+            return self._restore_spawn_host_paths(backend.glob(pattern, path=backend_path), root)
         spawn_target = self._spawn_external_read_target(path)
         if spawn_target is not None:
             backend, backend_path, root = spawn_target
@@ -1877,6 +1953,10 @@ class PermissionedCompositeBackend(CompositeBackend):
     async def aglob(self, pattern: str, path: str | None = None):
         if self._mounted_backend_path(path):
             return await super().aglob(pattern, path=path)
+        unrestricted = self._unrestricted_host_target(path, require_existing=True)
+        if unrestricted is not None:
+            backend, backend_path, root = unrestricted
+            return self._restore_spawn_host_paths(await backend.aglob(pattern, path=backend_path), root)
         spawn_target = self._spawn_external_read_target(path)
         if spawn_target is not None:
             backend, backend_path, root = spawn_target
@@ -1897,6 +1977,10 @@ class PermissionedCompositeBackend(CompositeBackend):
     def grep(self, pattern: str, path: str | None = None, glob: str | None = None):
         if self._mounted_backend_path(path):
             return super().grep(pattern, path=path, glob=glob)
+        unrestricted = self._unrestricted_host_target(path, require_existing=True)
+        if unrestricted is not None:
+            backend, backend_path, root = unrestricted
+            return self._restore_spawn_host_paths(backend.grep(pattern, path=backend_path, glob=glob), root)
         spawn_target = self._spawn_external_read_target(path)
         if spawn_target is not None:
             backend, backend_path, root = spawn_target
@@ -1913,6 +1997,13 @@ class PermissionedCompositeBackend(CompositeBackend):
     async def agrep(self, pattern: str, path: str | None = None, glob: str | None = None):
         if self._mounted_backend_path(path):
             return await super().agrep(pattern, path=path, glob=glob)
+        unrestricted = self._unrestricted_host_target(path, require_existing=True)
+        if unrestricted is not None:
+            backend, backend_path, root = unrestricted
+            return self._restore_spawn_host_paths(
+                await backend.agrep(pattern, path=backend_path, glob=glob),
+                root,
+            )
         spawn_target = self._spawn_external_read_target(path)
         if spawn_target is not None:
             backend, backend_path, root = spawn_target

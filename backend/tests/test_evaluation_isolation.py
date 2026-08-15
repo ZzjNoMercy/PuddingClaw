@@ -66,6 +66,7 @@ def test_candidate_fingerprint_captures_effective_model_binding(tmp_path: Path, 
     assert first.config["capability_profile"] == "puddingclaw_workspace_harness@1"
     assert "patch_file" in first.config["offered_tools"]
     assert "edit_file" not in first.config["offered_tools"]
+    assert "delete_file" not in first.config["offered_tools"]
 
     harness = tmp_path / "harness"
     harness.mkdir()

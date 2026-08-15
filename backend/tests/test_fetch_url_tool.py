@@ -10,6 +10,7 @@ from tools.fetch_url_tool import (
     FetchURLTool,
     UnsafePublicURL,
     _FetchedResponse,
+    _parse_macos_https_proxy,
     _resolve_public_addresses,
     _validated_url,
 )
@@ -105,6 +106,76 @@ def test_https_hostname_accepts_standard_fake_ip_but_http_does_not(monkeypatch) 
     assert _resolve_public_addresses("public.example", 443, scheme="https") == ["198.18.0.118"]
     with pytest.raises(UnsafePublicURL, match="non-public"):
         _resolve_public_addresses("public.example", 80, scheme="http")
+
+
+def test_macos_https_proxy_parser_requires_enabled_valid_proxy() -> None:
+    output = """
+    <dictionary> {
+      HTTPEnable : 1
+      HTTPSEnable : 1
+      HTTPSPort : 27890
+      HTTPSProxy : 127.0.0.1
+    }
+    """
+
+    assert _parse_macos_https_proxy(output) == "http://127.0.0.1:27890"
+    assert _parse_macos_https_proxy(output.replace("HTTPSEnable : 1", "HTTPSEnable : 0")) == ""
+    assert _parse_macos_https_proxy(output.replace("HTTPSPort : 27890", "HTTPSPort : invalid")) == ""
+
+
+def test_fake_ip_https_request_uses_configured_proxy(monkeypatch) -> None:
+    class FakeResponse:
+        status = 200
+        headers = {"content-type": "image/jpeg", "content-length": "300"}
+
+        @staticmethod
+        def stream(_chunk_size, *, decode_content):
+            assert decode_content is True
+            return iter([b"x" * 300])
+
+        @staticmethod
+        def release_conn():
+            return None
+
+    class FakeProxyManager:
+        def __init__(self, proxy_url, **kwargs):
+            assert proxy_url == "http://127.0.0.1:27890"
+            assert kwargs["retries"] is False
+
+        def urlopen(self, method, url, **kwargs):
+            assert method == "GET"
+            assert url == "https://cdn.example/image.jpg"
+            assert kwargs["headers"]["Host"] == "cdn.example"
+            assert kwargs["redirect"] is False
+            return FakeResponse()
+
+        @staticmethod
+        def clear():
+            return None
+
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda *_args, **_kwargs: [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("198.18.1.63", 443)),
+        ],
+    )
+    monkeypatch.setattr(
+        "tools.fetch_url_tool._configured_https_proxy_url",
+        lambda: "http://127.0.0.1:27890",
+    )
+    monkeypatch.setattr("tools.fetch_url_tool.ProxyManager", FakeProxyManager)
+    monkeypatch.setattr(
+        FetchURLTool,
+        "_pool",
+        staticmethod(lambda **_kwargs: pytest.fail("Fake-IP request must not use direct IP pool")),
+    )
+
+    response = FetchURLTool._request_once("https://cdn.example/image.jpg")
+
+    assert response.status == 200
+    assert response.headers["content-type"] == "image/jpeg"
+    assert response.body == b"x" * 300
 
 
 def test_redirect_is_revalidated_before_following(monkeypatch) -> None:

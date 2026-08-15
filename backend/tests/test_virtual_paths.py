@@ -40,8 +40,8 @@ def test_path_authority_separates_internal_managed_and_external(tmp_path):
         is PathAuthority.SCRATCH
     )
     temporary = classify_path_authority("/tmp/report.txt", workspace_root=workspace)
-    assert temporary.authority is PathAuthority.SCRATCH
-    assert temporary.virtual_path == "/scratch/tmp/report.txt"
+    assert temporary.authority is PathAuthority.EXTERNAL
+    assert temporary.virtual_path is None
     assert (
         classify_path_authority("/knowledge/report.md", workspace_root=workspace).authority
         is PathAuthority.MANAGED

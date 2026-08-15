@@ -15,7 +15,6 @@ from observability import emit_harness_metric
 from tools.filesystem.inspect import digest, read_all
 from tools.filesystem.schemas import (
     CommitExternalArtifactInput,
-    DeleteFileInput,
     ExecuteExternalDirectoryInput,
     RewindExternalFileChangesInput,
     StageExternalArtifactInput,
@@ -66,28 +65,6 @@ def build_lease_tools(backend: Any) -> list[StructuredTool]:
             name="rewind_external_file_changes",
             tool_call_id=runtime.tool_call_id,
             status=("success" if status in {"completed", "noop"} else "error"),
-        )
-
-    def delete_file(
-        file_path: str,
-        expected_sha256: str,
-        runtime: ToolRuntime[Any, Any],
-    ) -> ToolMessage:
-        delete = getattr(backend, "delete_external_file", None)
-        if not callable(delete):
-            return ToolMessage(
-                content="io_error: this Backend does not support versioned file deletion",
-                name="delete_file",
-                tool_call_id=runtime.tool_call_id,
-                status="error",
-            )
-        result = delete(file_path, expected_sha256=expected_sha256)
-        status = str(result.get("status") or "io_error")
-        return ToolMessage(
-            content=json.dumps(result, ensure_ascii=False, sort_keys=True),
-            name="delete_file",
-            tool_call_id=runtime.tool_call_id,
-            status="success" if status == "completed" else "error",
         )
 
     def execute_external_directory(
@@ -687,18 +664,6 @@ def build_lease_tools(backend: Any) -> list[StructuredTool]:
             ),
             func=rewind_external_file_changes,
             args_schema=RewindExternalFileChangesInput,
-            infer_schema=False,
-        ),
-        StructuredTool.from_function(
-            name="delete_file",
-            description=(
-                "Delete one exact file after verifying the version from inspect_file_version. "
-                "Workspace and scratch files use their existing internal authority; external "
-                "Host files require exact delete authority. This never deletes directories and "
-                "never performs bulk or recursive deletion."
-            ),
-            func=delete_file,
-            args_schema=DeleteFileInput,
             infer_schema=False,
         ),
         StructuredTool.from_function(

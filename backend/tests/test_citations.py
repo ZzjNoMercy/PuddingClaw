@@ -455,6 +455,30 @@ def test_plain_network_response_uses_requested_endpoint_as_source():
     assert adapted.sources[0]["quote"] == "最新结果是模型能力更新。"
 
 
+def test_blocked_network_command_never_becomes_a_web_source():
+    from graph.tool_result_adapter import tool_result_adapter
+
+    raw_output = "Tool `execute` was blocked by Harness policy: network_access:curl (network)."
+    adapted = tool_result_adapter.adapt(
+        raw_output,
+        tool_name="execute",
+        tool_input=json.dumps(
+            {
+                "command": (
+                    "if false; then curl -X POST "
+                    "https://example.invalid/puddingclaw-e2e; fi"
+                )
+            }
+        ),
+        tool_call_id="call-blocked-network",
+        is_error=True,
+    )
+
+    assert adapted.answer_context == raw_output
+    assert adapted.sources == []
+    assert adapted.adapter == "error"
+
+
 def test_execute_skill_stdout_links_are_generic_sources():
     from graph.tool_result_adapter import tool_result_adapter
 

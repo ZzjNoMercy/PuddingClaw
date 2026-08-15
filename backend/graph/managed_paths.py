@@ -22,7 +22,12 @@ def is_relative_to(path: Path, parent: Path) -> bool:
 
 
 def is_managed_resource_path(path: Path, base_dir: Path) -> bool:
-    resolved = path.expanduser().resolve()
+    try:
+        resolved = path.expanduser().resolve()
+    except (OSError, RuntimeError, ValueError):
+        # Paths originate in user/model text. Malformed or overlong tokens are
+        # ordinary non-managed inputs, never a reason to abort the Agent turn.
+        return False
     roots: list[Path] = []
 
     try:

@@ -13,6 +13,33 @@ from deepagents.middleware.memory import MemoryMiddleware
 from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, ToolMessage, message_to_dict
 
 
+@pytest.mark.parametrize(
+    "control_type",
+    ["skill_cache_loaded", "skill_context_loaded_on_demand"],
+)
+def test_skill_context_load_is_not_projected_as_tool_error(control_type):
+    from graph.deepagents_manager import DeepAgentsAgentManager
+
+    message = ToolMessage(
+        content="Skill 上下文已加载",
+        tool_call_id="load-skill-1",
+        name="load_skill_context",
+        status="error",
+        additional_kwargs={
+            "puddingclaw_control_plane": {"type": control_type},
+        },
+    )
+
+    assert DeepAgentsAgentManager._is_tool_error(message, str(message.content)) is False
+    actual_error = ToolMessage(
+        content="执行失败",
+        tool_call_id="failed-tool-1",
+        name="database_evidence_search",
+        status="error",
+    )
+    assert DeepAgentsAgentManager._is_tool_error(actual_error, str(actual_error.content)) is True
+
+
 def _rubric_runtime(tmp_path: Path, *, objective: str = "完成任务"):
     """Create the persisted Rubric Goal/request required by the middleware."""
 
@@ -4269,6 +4296,26 @@ def test_build_backend_resolves_workspace_and_skills(tmp_path):
     assert backend.read(str(workspace / "dashboard.html")).file_data["content"] == "dashboard"
     assert backend.read("/skills/design-html/SKILL.md").file_data["content"] == "skill doc"
     assert backend.read("/knowledge/test.md").file_data["content"] == "kb doc"
+    assert set(backend.execution_backend.managed_readonly_path_aliases) == {
+        ("/skills", Path(backend.managed_host_path_aliases["/skills"])),
+        ("/knowledge", Path(backend.managed_host_path_aliases["/knowledge"])),
+        (
+            "/semantic-assets",
+            Path(backend.managed_host_path_aliases["/semantic-assets"]),
+        ),
+        (
+            "/sql-guardrails",
+            Path(backend.managed_host_path_aliases["/sql-guardrails"]),
+        ),
+        (
+            "/analytics-models",
+            Path(backend.managed_host_path_aliases["/analytics-models"]),
+        ),
+        (
+            "/large_tool_results",
+            Path(backend.managed_host_path_aliases["/large_tool_results"]),
+        ),
+    }
     # Bare POSIX roots are external host paths; project files use /workspace.
     assert backend.read("/dashboard.html").error is not None
 
@@ -5689,7 +5736,23 @@ def test_deepagents_manager_emits_graph_structure(tmp_path, monkeypatch):
         async def astream(self, *_args, **_kwargs):
             yield (
                 "messages",
-                (AIMessageChunk(content="hello"), {"langgraph_node": "model"}),
+                (AIMessageChunk(content="hello", id="provider-call-1"), {"langgraph_node": "model"}),
+            )
+            yield (
+                "messages",
+                (
+                    AIMessageChunk(
+                        content="",
+                        id="provider-call-1",
+                        usage_metadata={
+                            "input_tokens": 1_000,
+                            "output_tokens": 200,
+                            "total_tokens": 1_200,
+                            "input_token_details": {"cache_read": 800},
+                        },
+                    ),
+                    {"langgraph_node": "model"},
+                ),
             )
             yield ("values", {"messages": [AIMessage(content="hello")]})
 
@@ -5716,7 +5779,16 @@ def test_deepagents_manager_emits_graph_structure(tmp_path, monkeypatch):
 
     events = asyncio.run(collect())
     graph_event = next((e for e in events if e["event"] == "graph_structure"), None)
+    usage_event = next((e for e in events if e["event"] == "usage_summary"), None)
     assert graph_event is not None
+    assert usage_event is not None
+    usage_summary = json.loads(usage_event["data"])
+    assert usage_summary["input_tokens"] == 1_000
+    assert usage_summary["output_tokens"] == 200
+    assert usage_summary["cache_hit_rate"] == 80.0
+    persisted = session_manager.load_session("agent-graph-session")[-1]["usage_summary"]
+    assert persisted["input_tokens"] == 1_000
+    assert persisted["output_tokens"] == 200
     structure = json.loads(graph_event["data"])
     assert {n["id"] for n in structure["nodes"]} == {"__start__", "model", "tools"}
     assert any(e["source"] == "__start__" and e["target"] == "model" for e in structure["edges"])

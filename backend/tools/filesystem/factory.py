@@ -32,7 +32,6 @@ class VersionedPatchMiddleware(AgentMiddleware[Any, Any, Any]):
             "materialize_source_ref",
             "patch_files",
             "rewind_external_file_changes",
-            "delete_file",
             "execute_external_directory",
             "validate_html_report",
             "stage_external_artifact",
@@ -40,14 +39,13 @@ class VersionedPatchMiddleware(AgentMiddleware[Any, Any, Any]):
             "upsert_scratch_file",
             "validate_artifact_contract",
         )
-        # Product Agents use native write_file plus standard shell cp/mv/mkdir.
+        # Product Agents use native write_file plus standard shell cp/mv/mkdir/rm.
         # Keep the broader HostFileBroker adapters callable internally and in
         # focused tests, but do not make the model choose among overlapping
         # copy/replace/stage/transaction orchestration surfaces.
         model_order = (
             "patch_file",
             "materialize_source_ref",
-            "delete_file",
             "validate_html_report",
             "validate_artifact_contract",
         )

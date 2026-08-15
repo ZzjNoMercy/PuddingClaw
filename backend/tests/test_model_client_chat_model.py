@@ -283,7 +283,12 @@ def test_model_client_chat_model_marks_context_summary_as_internal():
             result = model.invoke(summary_prompt)
 
     assert result.additional_kwargs[INTERNAL_CALL_MARKER] == "context_summary"
-    assert writer.call_args_list == [
+    context_events = [
+        call
+        for call in writer.call_args_list
+        if call.args[0].get("type") == "context_maintenance"
+    ]
+    assert context_events == [
         mock.call(
             {
                 "type": "context_maintenance",
@@ -300,6 +305,13 @@ def test_model_client_chat_model_marks_context_summary_as_internal():
             }
         ),
     ]
+    usage_events = [
+        call.args[0]
+        for call in writer.call_args_list
+        if call.args[0].get("type") == "model_usage"
+    ]
+    assert len(usage_events) == 1
+    assert usage_events[0]["measured"] is False
 
 
 def test_model_client_chat_model_does_not_mark_regular_answer_as_internal():

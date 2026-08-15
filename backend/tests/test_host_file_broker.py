@@ -207,6 +207,32 @@ def test_copy_and_hash_guarded_replace_are_atomic(tmp_path: Path) -> None:
     ] == ["copy", "replace"]
 
 
+def test_unrestricted_replace_still_uses_atomic_mutation_receipt(tmp_path: Path) -> None:
+    backend, _external, outside, run = _setup(tmp_path)
+    backend.filesystem_mode = "unrestricted"
+    target = outside / "smart.txt"
+    target.write_text("before\n", encoding="utf-8")
+
+    replaced = backend.replace_external_file(
+        str(target),
+        b"after\n",
+        expected_sha256=_digest("before\n"),
+        operation="patch",
+    )
+
+    assert replaced["status"] == "completed"
+    assert replaced["authority_kind"] == "external"
+    assert replaced["mutation_receipt_id"].startswith("external-mutation-")
+    assert target.read_text(encoding="utf-8") == "after\n"
+    receipts = session_manager.list_external_mutation_receipts(
+        "broker-session",
+        run_id=run.run_id,
+    )
+    assert [item["operation"] for item in receipts] == ["patch"]
+    assert receipts[0]["atomic"] is True
+    assert receipts[0]["permission_grant_id"] == "smart-unrestricted"
+
+
 def test_workspace_replace_is_internal_and_never_requires_a_grant(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()

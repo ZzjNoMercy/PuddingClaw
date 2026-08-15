@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+import uuid
 from typing import Any
 
 from langchain_core.language_models.chat_models import BaseChatModel
@@ -18,7 +19,6 @@ from langchain_core.runnables.config import var_child_runnable_config
 from langgraph.config import get_stream_writer
 
 from config import get_fallback_llm_config
-from graph.token_usage_store import record_token_usage
 from llm.thinking_mapping import normalize_model_temperature
 
 logger = logging.getLogger(__name__)
@@ -82,6 +82,39 @@ def _emit_model_stream_event(payload: dict[str, Any]) -> None:
         get_stream_writer()(payload)
     except (KeyError, RuntimeError):
         return
+
+
+def _usage_value(usage: dict[str, Any], *path: str) -> int:
+    value: Any = usage
+    for key in path:
+        if not isinstance(value, dict):
+            return 0
+        value = value.get(key)
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _merge_usage(total: dict[str, Any], usage: dict[str, Any]) -> None:
+    """Merge LangChain usage chunks without discarding provider details."""
+
+    for key in ("input_tokens", "output_tokens", "total_tokens"):
+        value = _usage_value(usage, key)
+        if value:
+            total[key] = _usage_value(total, key) + value
+    for detail_key, target_key in (
+        ("cache_read", "cache_read"),
+        ("cache_creation", "cache_creation"),
+    ):
+        value = _usage_value(usage, "input_token_details", detail_key)
+        if value:
+            details = total.setdefault("input_token_details", {})
+            details[target_key] = _usage_value(details, target_key) + value
+    reasoning = _usage_value(usage, "output_token_details", "reasoning")
+    if reasoning:
+        details = total.setdefault("output_token_details", {})
+        details["reasoning"] = _usage_value(details, "reasoning") + reasoning
 
 
 def _message_text(message: BaseMessage) -> str:
@@ -231,7 +264,7 @@ class ModelClient:
     """统一 LLM 调用入口。
 
     Args:
-        role: 调用角色，用于 token 用量分类，如 "agent" / "title" / "summary" / "compensation"
+        role: 调用角色，用于区分 Agent、标题、摘要等模型工作负载
         temperature: 采样温度；None 时使用 config.json 中的默认值
         streaming: 是否启用流式输出
         force_direct: 为 True 时跳过 Higress，直接走直连 provider（用于测试或兜底）
@@ -246,7 +279,6 @@ class ModelClient:
         force_direct: bool = False,
         tools: list[Any] | None = None,
         bind_tools_kwargs: dict[str, Any] | None = None,
-        record_usage: bool = True,
         thinking_enabled: bool | None = None,
         model_override: str | None = None,
         model_id_override: str | None = None,
@@ -296,7 +328,7 @@ class ModelClient:
         self.force_direct = force_direct
         self.tools = tools or []
         self.bind_tools_kwargs = bind_tools_kwargs or {}
-        self.record_usage = record_usage
+
     def get_chat_model(self) -> BaseChatModel:
         """获取已绑定的直连 Provider 模型。"""
         return self._apply_tools(self._direct_model())
@@ -377,34 +409,61 @@ class ModelClient:
             base_url=self.cfg.get("base_url", "https://api.openai.com/v1"),
             temperature=self.temperature,
             streaming=self.streaming,
+            stream_usage=True,
             **thinking_kwargs,
         )
 
-    def _record_usage(
+    def _emit_usage(
         self,
         usage: dict[str, Any],
-        start_time: float,
         *,
-        user_id: str,
-        session_id: str,
-        round_num: int,
+        call_id: str,
+        started_at: float,
+        generation_started_at: float | None = None,
     ) -> None:
-        """从 usage_metadata 提取并记录 token 用量。"""
-        if not self.record_usage:
-            return
-        try:
-            record_token_usage(
-                user_id=user_id,
-                session_id=session_id,
-                round_num=round_num,
-                input_tokens=usage.get("input_tokens", 0),
-                output_tokens=usage.get("output_tokens", 0),
-                total_tokens=usage.get("total_tokens", 0),
-                start_time=start_time,
-                role=self.role,
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("[ModelClient] record token usage failed: %s", exc)
+        """Publish one provider call's facts to the enclosing Agent stream."""
+
+        completed_at = time.perf_counter()
+        input_tokens = _usage_value(usage, "input_tokens")
+        output_tokens = _usage_value(usage, "output_tokens")
+        total_tokens = _usage_value(usage, "total_tokens") or input_tokens + output_tokens
+        duration_seconds = max(0.0, completed_at - started_at)
+        generation_seconds = max(
+            0.0,
+            completed_at - (generation_started_at if generation_started_at is not None else started_at),
+        )
+        measured = bool(usage) and any(
+            (input_tokens, output_tokens, total_tokens)
+        )
+        _emit_model_stream_event(
+            {
+                "type": "model_usage",
+                "call_id": call_id,
+                "provider": str(self.cfg.get("provider") or ""),
+                "model": str(self.cfg.get("model") or ""),
+                "role": self.role,
+                "binding": self.binding,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "total_tokens": total_tokens,
+                "cache_read_tokens": _usage_value(
+                    usage, "input_token_details", "cache_read"
+                ),
+                "cache_creation_tokens": _usage_value(
+                    usage, "input_token_details", "cache_creation"
+                ),
+                "reasoning_tokens": _usage_value(
+                    usage, "output_token_details", "reasoning"
+                ),
+                "duration_ms": round(duration_seconds * 1000),
+                "tokens_per_second": (
+                    round(output_tokens / generation_seconds, 1)
+                    if output_tokens > 0 and generation_seconds > 0
+                    else None
+                ),
+                "measured": measured,
+            }
+        )
 
     async def ainvoke(
         self,
@@ -417,17 +476,16 @@ class ModelClient:
         stop: list[str] | None = None,
         **kwargs: Any,
     ) -> BaseMessage:
-        """异步调用 LLM 并记录 token 用量。"""
+        """异步调用 LLM，并向当前 Agent Run 发布 provider 用量。"""
         llm = self.get_chat_model()
-        start = time.time()
+        call_id = uuid.uuid4().hex
+        start = time.perf_counter()
         response = await llm.ainvoke(messages, config=config, stop=stop, **kwargs)
         usage = getattr(response, "usage_metadata", {}) or {}
-        self._record_usage(
+        self._emit_usage(
             usage,
-            start,
-            user_id=user_id,
-            session_id=session_id,
-            round_num=round_num,
+            call_id=call_id,
+            started_at=start,
         )
         return response
 
@@ -442,18 +500,20 @@ class ModelClient:
         stop: list[str] | None = None,
         **kwargs: Any,
     ) -> Any:
-        """异步流式调用 LLM 并记录 token 用量。
+        """异步流式调用 LLM 并发布 provider 用量。
 
         注意：流式用量的聚合依赖底层模型在最后一个 chunk 返回 usage_metadata，
         不同 provider 行为不一致，这里做 best-effort 记录。
         """
         llm = self.get_chat_model()
-        start = time.time()
+        call_id = uuid.uuid4().hex
+        start = time.perf_counter()
+        generation_started_at: float | None = None
         route = "direct"
         max_attempts = 2
         for attempt in range(1, max_attempts + 1):
             emitted_chunks = 0
-            attempt_usage: dict[str, int] = {}
+            attempt_usage: dict[str, Any] = {}
             _emit_model_stream_event(
                 {
                     "type": "model_stream_attempt",
@@ -467,6 +527,8 @@ class ModelClient:
             try:
                 async for chunk in llm.astream(messages, config=config, stop=stop, **kwargs):
                     emitted_chunks += 1
+                    if generation_started_at is None:
+                        generation_started_at = time.perf_counter()
                     preview = _message_text(chunk)
                     if preview:
                         _emit_model_stream_event(
@@ -478,9 +540,7 @@ class ModelClient:
                             }
                         )
                     chunk_usage = getattr(chunk, "usage_metadata", None) or {}
-                    for key in ("input_tokens", "output_tokens", "total_tokens"):
-                        if chunk_usage.get(key):
-                            attempt_usage[key] = attempt_usage.get(key, 0) + chunk_usage[key]
+                    _merge_usage(attempt_usage, chunk_usage)
                     # Preserve genuine provider streaming. Once a chunk has
                     # crossed this boundary the model node must never retry,
                     # because a second attempt would replay or contradict
@@ -543,12 +603,11 @@ class ModelClient:
                     "chunks_received": emitted_chunks,
                 }
             )
-            self._record_usage(
+            self._emit_usage(
                 attempt_usage,
-                start,
-                user_id=user_id,
-                session_id=session_id,
-                round_num=round_num,
+                call_id=call_id,
+                started_at=start,
+                generation_started_at=generation_started_at,
             )
             return
 
@@ -563,17 +622,16 @@ class ModelClient:
         stop: list[str] | None = None,
         **kwargs: Any,
     ) -> BaseMessage:
-        """同步调用 LLM 并记录 token 用量。"""
+        """同步调用 LLM，并向当前 Agent Run 发布 provider 用量。"""
         llm = self.get_chat_model()
-        start = time.time()
+        call_id = uuid.uuid4().hex
+        start = time.perf_counter()
         response = llm.invoke(messages, config=config, stop=stop, **kwargs)
         usage = getattr(response, "usage_metadata", {}) or {}
-        self._record_usage(
+        self._emit_usage(
             usage,
-            start,
-            user_id=user_id,
-            session_id=session_id,
-            round_num=round_num,
+            call_id=call_id,
+            started_at=start,
         )
         return response
 
@@ -588,14 +646,16 @@ class ModelClient:
         stop: list[str] | None = None,
         **kwargs: Any,
     ) -> Any:
-        """同步流式调用 LLM 并记录 token 用量。"""
+        """同步流式调用 LLM 并发布 provider 用量。"""
         llm = self.get_chat_model()
-        start = time.time()
+        call_id = uuid.uuid4().hex
+        start = time.perf_counter()
+        generation_started_at: float | None = None
         route = "direct"
         max_attempts = 2
         for attempt in range(1, max_attempts + 1):
             emitted_chunks = 0
-            attempt_usage: dict[str, int] = {}
+            attempt_usage: dict[str, Any] = {}
             _emit_model_stream_event(
                 {
                     "type": "model_stream_attempt",
@@ -609,6 +669,8 @@ class ModelClient:
             try:
                 for chunk in llm.stream(messages, config=config, stop=stop, **kwargs):
                     emitted_chunks += 1
+                    if generation_started_at is None:
+                        generation_started_at = time.perf_counter()
                     preview = _message_text(chunk)
                     if preview:
                         _emit_model_stream_event(
@@ -620,9 +682,7 @@ class ModelClient:
                             }
                         )
                     chunk_usage = getattr(chunk, "usage_metadata", None) or {}
-                    for key in ("input_tokens", "output_tokens", "total_tokens"):
-                        if chunk_usage.get(key):
-                            attempt_usage[key] = attempt_usage.get(key, 0) + chunk_usage[key]
+                    _merge_usage(attempt_usage, chunk_usage)
                     yield chunk
             except Exception as exc:
                 retryable = _retryable_stream_error(exc)
@@ -681,12 +741,11 @@ class ModelClient:
                     "chunks_received": emitted_chunks,
                 }
             )
-            self._record_usage(
+            self._emit_usage(
                 attempt_usage,
-                start,
-                user_id=user_id,
-                session_id=session_id,
-                round_num=round_num,
+                call_id=call_id,
+                started_at=start,
+                generation_started_at=generation_started_at,
             )
             return
 
@@ -727,7 +786,6 @@ class ModelClientChatModel(BaseChatModel):
             force_direct=force_direct,
             tools=tools,
             bind_tools_kwargs=bind_tools_kwargs,
-            record_usage=False,
             thinking_enabled=thinking_enabled,
             model_override=model_override,
             model_id_override=model_id_override,

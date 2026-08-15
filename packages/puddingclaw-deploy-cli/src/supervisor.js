@@ -24,6 +24,54 @@ function controlPath(home, instanceId, role) {
   return path.join(home, "control", key);
 }
 
+function matchesIdentity(identity, item, nonce) {
+  return identity?.ok === true
+    && identity.nonce === nonce
+    && identity.pid === item.pid
+    && identity.instance_id === item.instance_id
+    && identity.role === item.role;
+}
+
+async function runIdentityHandshake(item, root, { legacy = false, timeoutMs = 2000 } = {}) {
+  const nonce = randomUUID();
+  const requestPath = path.join(root, legacy ? "request.json" : `request-${nonce}.json`);
+  const responsePath = path.join(root, legacy ? "response.json" : `response-${nonce}.json`);
+  try {
+    await fs.rm(responsePath, { force: true });
+    await writeJsonAtomic(requestPath, { action: "identify", token: item.control_token, nonce });
+    const started = Date.now();
+    while (Date.now() - started < timeoutMs) {
+      const identity = await readJson(responsePath, null).catch(() => null);
+      if (matchesIdentity(identity, item, nonce)) return true;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    return false;
+  } finally {
+    await fs.rm(requestPath, { force: true }).catch(() => {});
+    await fs.rm(responsePath, { force: true }).catch(() => {});
+  }
+}
+
+async function acquireLegacyHandshakeLock(root, timeoutMs = 2500) {
+  const lock = path.join(root, ".legacy-handshake.lock");
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    try {
+      await fs.mkdir(lock, { mode: 0o700 });
+      return lock;
+    } catch (error) {
+      if (error?.code !== "EEXIST") return null;
+      const stat = await fs.stat(lock).catch(() => null);
+      if (stat && Date.now() - stat.mtimeMs > 5000) {
+        await fs.rm(lock, { recursive: true, force: true }).catch(() => {});
+      } else {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+    }
+  }
+  return null;
+}
+
 async function verifyOwnedProcess(item, home) {
   if (!item || !Number.isInteger(item.pid) || !item.launcher || !item.instance_id) return false;
   if (!isAlive(item.pid)) return false;
@@ -31,33 +79,14 @@ async function verifyOwnedProcess(item, home) {
   const expectedRoot = path.resolve(item.control_path);
   const controlRoot = path.resolve(home, "control");
   if (!expectedRoot.startsWith(`${controlRoot}${path.sep}`)) return false;
-  const nonce = randomUUID();
-  const requestPath = path.join(expectedRoot, `request-${nonce}.json`);
-  const responsePath = path.join(expectedRoot, `response-${nonce}.json`);
+  if (await runIdentityHandshake(item, expectedRoot)) return true;
+  if (!isAlive(item.pid)) return false;
+  const legacyLock = await acquireLegacyHandshakeLock(expectedRoot);
+  if (!legacyLock) return false;
   try {
-    await fs.rm(responsePath, { force: true });
-    await writeJsonAtomic(requestPath, { action: "identify", token: item.control_token, nonce });
-    const started = Date.now();
-    while (Date.now() - started < 2000) {
-      try {
-        const identity = await readJson(responsePath, null);
-        if (identity?.nonce !== nonce) {
-          await new Promise((resolve) => setTimeout(resolve, 50));
-          continue;
-        }
-        return identity.ok === true
-          && identity.pid === item.pid
-          && identity.instance_id === item.instance_id
-          && identity.role === item.role;
-      } catch (error) {
-        if (error?.code !== "ENOENT") return false;
-      }
-      await new Promise((resolve) => setTimeout(resolve, 50));
-    }
-    return false;
+    return await runIdentityHandshake(item, expectedRoot, { legacy: true });
   } finally {
-    await fs.rm(requestPath, { force: true }).catch(() => {});
-    await fs.rm(responsePath, { force: true }).catch(() => {});
+    await fs.rm(legacyLock, { recursive: true, force: true }).catch(() => {});
   }
 }
 

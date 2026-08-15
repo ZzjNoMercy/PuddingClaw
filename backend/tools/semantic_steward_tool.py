@@ -167,10 +167,11 @@ class PrepareSemanticMarkdownTool(BaseTool):
 class PublishSemanticMarkdownTool(BaseTool):
     name: str = "publish_semantic_markdown"
     description: str = (
-        "Publish exactly one frozen semantic Markdown plan after the user explicitly approves its rendered body, "
-        "machine-effect summary, risk, and plan digest. Performs baseline digest CAS, atomic file replacement, "
-        "Registry refresh, and rollback on failure. Never call in the same turn that prepared the plan unless "
-        "the user had already approved that exact digest."
+        "Request publication of exactly one frozen semantic Markdown plan. After surfacing its rendered body, "
+        "machine-effect summary, risk, and plan digest, call this immediately in the same assistant turn; the "
+        "Harness will pause the call and display the single digest-bound HITL approval card. Do not ask the user "
+        "for a separate chat approval. On approval it performs baseline digest CAS, atomic file replacement, "
+        "Registry refresh, and rollback on failure."
     )
     args_schema: type[BaseModel] = PublishSemanticMarkdownInput
     risk_level: str = "moderate"

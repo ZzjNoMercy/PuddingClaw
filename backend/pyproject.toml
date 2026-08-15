@@ -1,6 +1,6 @@
 [project]
 name = "puddingclaw-backend"
-version = "0.1.16"
+version = "0.1.17"
 description = "PuddingClaw backend API, agent, and knowledge base services"
 requires-python = ">=3.11,<3.13"
 license = { text = "MIT" }

@@ -297,6 +297,7 @@ class EvaluationWorkerManager:
                 "DOCKER_CERT_PATH",
                 "UV_CACHE_DIR",
                 "PUDDINGCLAW_SWEBENCH_NAMESPACE",
+                "PUDDINGCLAW_SWEBENCH_ARCH",
                 "PUDDINGCLAW_SWEBENCH_TEST_TIMEOUT_SECONDS",
                 "PUDDINGCLAW_SWEBENCH_JOB_TIMEOUT_SECONDS",
                 "PUDDINGCLAW_SWEBENCH_MAX_WORKERS",
@@ -506,29 +507,89 @@ class EvaluationWorkerManager:
             await self._terminate_official_harness(experiment_id)
             await self._terminate_swebench_image_preparation(experiment_id)
             await self._terminate_worker_group(process)
-            from .contracts import ExperimentStatus
+            from .contracts import ExperimentStatus, utc_now
             from .repository import get_evaluation_repository
 
             repository = get_evaluation_repository()
             try:
                 experiment = repository.get_experiment(experiment_id)
                 if experiment.status in {ExperimentStatus.QUEUED, ExperimentStatus.RUNNING}:
-                    restart = experiment.model_copy(
-                        update={
-                            "status": ExperimentStatus.QUEUED,
-                            "verdict": "pending",
-                            "error": None,
-                            "started_at": None,
-                            "finished_at": None,
-                            "remote_experiment_id": None,
-                            "remote_url": None,
-                            "summary": self._restart_summary(experiment),
-                        }
-                    )
-                    repository.reset_experiment_execution(
-                        restart,
-                        expected_status=experiment.status,
-                    )
+                    execution_mode = experiment.summary.get("execution_mode")
+                    incremental_recovery = execution_mode in {
+                        "official_verifier_replay",
+                        "swebench_missing_case_resume",
+                    }
+                    if incremental_recovery:
+                        if execution_mode == "swebench_missing_case_resume":
+                            repository.cancel_running_attempts(
+                                experiment.experiment_id,
+                                "Application reloaded during missing-Case resume",
+                            )
+                        replay = dict(
+                            experiment.summary.get("swebench_verifier_replay") or {}
+                        )
+                        case_resume = dict(
+                            experiment.summary.get("swebench_case_resume") or {}
+                        )
+                        is_case_resume = execution_mode == "swebench_missing_case_resume"
+                        incremental_summary = dict(experiment.summary)
+                        if is_case_resume:
+                            incremental_summary["swebench_case_resume"] = {
+                                **case_resume,
+                                "status": "queued",
+                                "restart_pending": True,
+                            }
+                        else:
+                            incremental_summary["swebench_verifier_replay"] = {
+                                **replay,
+                                "status": "queued",
+                                "restart_pending": True,
+                            }
+                        restart = experiment.model_copy(
+                            update={
+                                "status": ExperimentStatus.QUEUED,
+                                "verdict": "pending",
+                                "error": None,
+                                "started_at": None,
+                                "finished_at": None,
+                                "summary": {
+                                    **incremental_summary,
+                                    "progress": {
+                                        **dict(experiment.summary.get("progress") or {}),
+                                        "stage": "queued",
+                                        "message": (
+                                            "开发服务已热重载，将继续补跑缺失 Case"
+                                            if is_case_resume
+                                            else "开发服务已热重载，将继续复用 patch 重新判卷"
+                                        ),
+                                        "completed": 0,
+                                        "failed": 0,
+                                        "updated_at": utc_now().isoformat(),
+                                    },
+                                },
+                            }
+                        )
+                        repository.update_experiment(
+                            restart,
+                            expected_status=experiment.status,
+                        )
+                    else:
+                        restart = experiment.model_copy(
+                            update={
+                                "status": ExperimentStatus.QUEUED,
+                                "verdict": "pending",
+                                "error": None,
+                                "started_at": None,
+                                "finished_at": None,
+                                "remote_experiment_id": None,
+                                "remote_url": None,
+                                "summary": self._restart_summary(experiment),
+                            }
+                        )
+                        repository.reset_experiment_execution(
+                            restart,
+                            expected_status=experiment.status,
+                        )
             except Exception:
                 # Shutdown must continue even if the durable recovery marker
                 # cannot be written; startup orphan handling remains fail-closed.

@@ -98,6 +98,27 @@ def test_seatbelt_runs_standard_host_toolchains_without_docker(tmp_path: Path) -
     assert "git version" in result.output
 
 
+def test_seatbelt_unrestricted_uses_real_home_and_arbitrary_host_path(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    scratch = tmp_path / "scratch"
+    external = tmp_path / "ordinary-host-directory"
+    for path in (workspace, scratch, external):
+        path.mkdir()
+    profile = SandboxGrantProfile.build(
+        workspace_root=workspace,
+        scratch_root=scratch,
+        filesystem="unrestricted",
+    )
+    runner = MacOSSeatbeltRunner(profile)
+    target = external / "kernel-unrestricted.txt"
+
+    result = runner.execute(f"printf '%s\\n' \"$HOME\" && printf ok > {target}")
+
+    assert result.exit_code == 0, result.output
+    assert result.output.splitlines()[0] == str(Path.home().resolve())
+    assert target.read_text(encoding="utf-8") == "ok"
+
+
 def test_seatbelt_executes_authorized_external_python_script_read_only(
     tmp_path: Path,
 ) -> None:
@@ -146,6 +167,10 @@ def test_kernel_execute_runs_platform_skill_from_virtual_namespace(
         path.mkdir()
     script_dir = skills / "get-date" / "scripts"
     script_dir.mkdir(parents=True)
+    (script_dir.parent / "SKILL.md").write_text(
+        "---\nname: get-date\ndescription: Kernel E2E fixture\n---\n",
+        encoding="utf-8",
+    )
     (script_dir / "get_datetime.py").write_text(
         "print('managed-skill-ok')\n",
         encoding="utf-8",
@@ -225,9 +250,7 @@ async def test_tool_gate_permit_executes_canonical_compound_external_command_end
     )
     coordinator.transition(run, RunStatus.RUNNING)
     run_state = session_manager.get_run_state("kernel-e2e-session", run.run_id)
-    permission_context = RunPermissionContext.from_config_snapshot(
-        run_state["config_snapshot"]
-    )
+    permission_context = RunPermissionContext.from_config_snapshot(run_state["config_snapshot"])
     session_manager.add_shell_directory_grants_atomic(
         "kernel-e2e-session",
         grant_specs=[
@@ -246,8 +269,7 @@ async def test_tool_gate_permit_executes_canonical_compound_external_command_end
         workspace_backend=backend,
     )
     command = (
-        f"cp {external_alias / 'source.txt'} {external_alias / 'copy.txt'}"
-        f" && mkdir -p {external_alias / 'nested'}"
+        f"cp {external_alias / 'source.txt'} {external_alias / 'copy.txt'} && mkdir -p {external_alias / 'nested'}"
     )
     request = ToolCallRequest(
         tool_call={

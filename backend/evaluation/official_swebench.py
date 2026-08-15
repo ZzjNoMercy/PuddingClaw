@@ -27,6 +27,8 @@ from .swebench_adapter import (
 )
 
 SWEBENCH_PACKAGE = "swebench==4.1.0"
+SWEBENCH_ARCHITECTURE_ENV = "PUDDINGCLAW_SWEBENCH_ARCH"
+SUPPORTED_SWEBENCH_ARCHITECTURES = frozenset({"arm64", "x86_64"})
 MAX_PROCESS_LOG_BYTES = 20 * 1024 * 1024
 MAX_PROCESS_TAIL_BYTES = 200_000
 MAX_REPORT_BYTES = 20 * 1024 * 1024
@@ -56,12 +58,30 @@ _puddingclaw_guarded_create.__puddingclaw_guarded__ = True
 ContainerCollection.create = _puddingclaw_guarded_create
 """
 HARNESS_ENTRY_MODULE = """\
+import os
 import runpy
 
 from docker.models.containers import ContainerCollection
+from swebench.harness.test_spec import test_spec as test_spec_module
 
 if not getattr(ContainerCollection.create, "__puddingclaw_guarded__", False):
     raise RuntimeError("PuddingClaw Docker safety guard was not installed")
+
+architecture = os.environ.get("PUDDINGCLAW_SWEBENCH_ARCH", "")
+if architecture not in {"arm64", "x86_64"}:
+    raise RuntimeError("PuddingClaw SWE-bench architecture is missing or unsupported")
+
+# SWE-bench 4.1.0's CLI does not expose an architecture option and its
+# make_test_spec() default is x86_64.  Bind the platform-selected architecture
+# before run_evaluation imports the function, so image keys, Docker platforms,
+# and cache lookup remain identical to the Agent environment.
+_original_make_test_spec = test_spec_module.make_test_spec
+
+def _architecture_bound_make_test_spec(instance, *args, **kwargs):
+    kwargs["arch"] = architecture
+    return _original_make_test_spec(instance, *args, **kwargs)
+
+test_spec_module.make_test_spec = _architecture_bound_make_test_spec
 
 runpy.run_module("swebench.harness.run_evaluation", run_name="__main__")
 """
@@ -90,11 +110,41 @@ def _bounded_memory() -> str:
     return f"{min(64, max(2, int(match.group(1))))}g"
 
 
-def _namespace() -> str:
+def normalize_swebench_architecture(value: str) -> str:
+    normalized = str(value or "").strip().lower()
+    aliases = {
+        "aarch64": "arm64",
+        "arm64": "arm64",
+        "amd64": "x86_64",
+        "x64": "x86_64",
+        "x86-64": "x86_64",
+        "x86_64": "x86_64",
+    }
+    architecture = aliases.get(normalized)
+    if architecture not in SUPPORTED_SWEBENCH_ARCHITECTURES:
+        raise ValueError(f"Unsupported SWE-bench Docker architecture: {value!r}")
+    return architecture
+
+
+def _configured_architecture() -> str | None:
+    configured = os.getenv(SWEBENCH_ARCHITECTURE_ENV)
+    return normalize_swebench_architecture(configured) if configured is not None else None
+
+
+def _host_architecture() -> str:
+    return normalize_swebench_architecture(platform.machine())
+
+
+def _namespace(architecture: str | None = None) -> str:
     configured = os.getenv("PUDDINGCLAW_SWEBENCH_NAMESPACE")
     if configured is not None:
         return configured or "none"
-    return "none" if platform.machine().lower() in {"arm64", "aarch64"} else "swebench"
+    selected = normalize_swebench_architecture(
+        architecture or _configured_architecture() or _host_architecture()
+    )
+    # Official prebuilt namespace images are x86_64. ARM64 builds are local
+    # and share the same un-namespaced image keys across Agent + Verifier.
+    return "none" if selected == "arm64" else "swebench"
 
 
 async def _terminate_process_tree(
@@ -244,6 +294,37 @@ async def _docker_probe(environment: dict[str, str], root: Path) -> tuple[bool, 
     return True, version
 
 
+async def _docker_architecture_probe(
+    environment: dict[str, str],
+    root: Path,
+) -> tuple[bool, str]:
+    """Resolve the architecture of the Docker daemon that will run images."""
+
+    try:
+        configured = _configured_architecture()
+    except ValueError as exc:
+        return False, str(exc)
+    if configured is not None:
+        return True, configured
+    docker = shutil.which("docker")
+    if docker is None:
+        return False, "Docker CLI is not installed"
+    result = await _run_process(
+        [docker, "info", "--format", "{{.Architecture}}"],
+        cwd=root,
+        environment=environment,
+        timeout_seconds=20,
+        log_path=root / "docker-architecture-probe.log",
+    )
+    raw_architecture = result.output_tail.strip().splitlines()[-1] if result.output_tail.strip() else ""
+    if result.exit_code != 0 or not raw_architecture:
+        return False, f"Could not determine Docker daemon architecture: {result.output_tail[-500:].strip()}"
+    try:
+        return True, normalize_swebench_architecture(raw_architecture)
+    except ValueError as exc:
+        return False, str(exc)
+
+
 def _docker_backend_is_approved() -> bool:
     if platform.system() == "Darwin":
         # Docker Desktop executes Linux containers inside its managed VM. Linux
@@ -328,12 +409,21 @@ async def probe_official_swebench_runtime() -> dict[str, Any]:
             "reason": "Official verifier is not installed; run `uv sync --extra evaluation` in backend",
         }
     with tempfile.TemporaryDirectory(prefix="puddingclaw-swebench-probe-") as temporary:
-        available, detail = await _docker_probe(_official_environment(), Path(temporary))
+        root = Path(temporary)
+        environment = _official_environment()
+        available, detail = await _docker_probe(environment, root)
+        architecture_available, architecture = (
+            await _docker_architecture_probe(environment, root)
+            if available
+            else (False, "")
+        )
+        available = available and architecture_available
     return {
         "available": available,
         "package": SWEBENCH_PACKAGE,
         "docker_server_version": detail if available else None,
-        "reason": None if available else detail,
+        "docker_architecture": architecture if available else None,
+        "reason": None if available else architecture or detail,
     }
 
 
@@ -368,6 +458,8 @@ async def run_official_swebench_harness(
     dataset: EvalDataset,
     run_envelopes: dict[str, list[dict[str, Any]]],
     runtime_root: Path,
+    *,
+    allow_partial_predictions: bool = False,
 ) -> dict[str, Any]:
     """Run the official verifier and return platform-originated per-instance results."""
 
@@ -380,7 +472,12 @@ async def run_official_swebench_harness(
     started_at = datetime.now(UTC)
     model_name = f"puddingclaw-{experiment.candidate.candidate_id}"
     fixture_content = frozen_swebench_dataset_json(dataset)
-    prediction_content = prediction_jsonl(dataset, run_envelopes, model_name_or_path=model_name)
+    prediction_content = prediction_jsonl(
+        dataset,
+        run_envelopes,
+        model_name_or_path=model_name,
+        allow_partial=allow_partial_predictions,
+    )
     manifest = swebench_run_manifest(
         dataset,
         run_envelopes,
@@ -388,6 +485,7 @@ async def run_official_swebench_harness(
         experiment_id=experiment.experiment_id,
         dataset_version_id=experiment.dataset_version_id,
         dataset_content_hash=experiment.dataset_content_hash,
+        allow_partial=allow_partial_predictions,
     )
     fixture_path = harness_root / "dataset.json"
     predictions_path = harness_root / "predictions.jsonl"
@@ -396,6 +494,11 @@ async def run_official_swebench_harness(
 
     environment = _official_environment()
     docker_available, docker_detail = await _docker_probe(environment, harness_root)
+    architecture_available, architecture_detail = (
+        await _docker_architecture_probe(environment, harness_root)
+        if docker_available
+        else (False, "")
+    )
     expected_ids = set(manifest["patch_sha256"])
     base_receipt: dict[str, Any] = {
         "schema_version": "1",
@@ -406,6 +509,7 @@ async def run_official_swebench_harness(
         "source_snapshot_sha256": manifest.get("source_snapshot_sha256"),
         "predictions_sha256": manifest["predictions_sha256"],
         "patch_sha256": manifest["patch_sha256"],
+        "missing_instance_ids": manifest["missing_instance_ids"],
         "fixture_sha256": hashlib.sha256(fixture_content.encode("utf-8")).hexdigest(),
         "started_at": started_at.isoformat(),
     }
@@ -417,6 +521,17 @@ async def run_official_swebench_harness(
             "results": {instance_id: {"status": "error", "reason": reason} for instance_id in expected_ids},
             "receipt": {**base_receipt, "status": "error", "reason": reason},
         }
+
+    if not architecture_available:
+        reason = architecture_detail or "Docker daemon architecture is unavailable"
+        return {
+            "status": "error",
+            "reason": reason,
+            "results": {instance_id: {"status": "error", "reason": reason} for instance_id in expected_ids},
+            "receipt": {**base_receipt, "status": "error", "reason": reason},
+        }
+    architecture = normalize_swebench_architecture(architecture_detail)
+    namespace = _namespace(architecture)
 
     if not _docker_backend_is_approved():
         reason = "Docker endpoint is not approved for untrusted SWE-bench candidate execution"
@@ -441,6 +556,7 @@ async def run_official_swebench_harness(
         {
             "PYTHONPATH": str(harness_root),
             "PUDDINGCLAW_SWEBENCH_RUN_ID": run_id,
+            SWEBENCH_ARCHITECTURE_ENV: architecture,
             "PUDDINGCLAW_SWEBENCH_CONTAINER_MEMORY": _bounded_memory(),
             "PUDDINGCLAW_SWEBENCH_CONTAINER_NANO_CPUS": str(
                 _bounded_int("PUDDINGCLAW_SWEBENCH_CONTAINER_CPUS", 4, 1, 16) * 1_000_000_000
@@ -470,7 +586,7 @@ async def run_official_swebench_harness(
         "--run_id",
         run_id,
         "--namespace",
-        _namespace(),
+        namespace,
         "--cache_level",
         "env",
         "--clean",
@@ -539,7 +655,8 @@ async def run_official_swebench_harness(
         **base_receipt,
         "status": overall_status,
         "docker_server_version": docker_detail,
-        "namespace": _namespace(),
+        "docker_architecture": architecture,
+        "namespace": namespace,
         "test_timeout_seconds": test_timeout,
         "job_timeout_seconds": job_timeout,
         "max_workers": max_workers,

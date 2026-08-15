@@ -82,11 +82,28 @@ _POSIX_ROOT_PREFIXES = (
     "/mnt/",
     "/opt/",
 )
-_VIRTUAL_RESOURCE_PREFIXES = ("/workspace", "/scratch", "/tmp", "/skills", "/memories")
+_VIRTUAL_RESOURCE_PREFIXES = ("/workspace", "/scratch", "/skills", "/memories")
 _SCRIPT_SRC_RE = re.compile(
     r"<script\b[^>]*\bsrc\s*=\s*[\"'](?P<src>[^\"']+\.js(?:\?[^\"']*)?)[\"']",
     re.IGNORECASE,
 )
+
+
+def _lexical_path_end(message: str, start: int) -> int:
+    """Return the first hard token boundary after a possible path start.
+
+    Spaces may legitimately occur inside a local path, so they are not hard
+    boundaries. Markdown/code quotes are: a path that starts inside one inline
+    code span must never consume prose from later spans while searching for a
+    familiar file suffix.
+    """
+
+    boundaries = [
+        position
+        for marker in ("\r", "\n", "\0", "\t", "`", "'", '"')
+        if (position := message.find(marker, start)) >= 0
+    ]
+    return min(boundaries) if boundaries else len(message)
 
 
 def extract_local_resource_paths(message: str) -> list[str]:
@@ -114,15 +131,19 @@ def extract_local_directory_paths(message: str) -> list[str]:
             continue
         if any(existing_start <= start < existing_end for existing_start, existing_end in occupied):
             continue
-        line_breaks = [
-            position
-            for marker in ("\r", "\n", "\0")
-            if (position := message.find(marker, start)) >= 0
-        ]
-        lexical_end = min(line_breaks) if line_breaks else len(message)
+        lexical_end = _lexical_path_end(message, start)
         if lexical_end - start > MAX_LOCAL_RESOURCE_PATH_CHARS:
             continue
         for end in range(lexical_end, start, -1):
+            # Never degrade a nonexistent `/tmp/example/...` token into an
+            # implicit grant for its existing `/tmp` ancestor.
+            next_char = message[end : end + 1]
+            if end != lexical_end and not (
+                next_char.isspace()
+                or next_char in "`'\"()（）[]【】{},，。；;:："
+                or "\u4e00" <= next_char <= "\u9fff"
+            ):
+                continue
             raw = message[start:end].replace("\\ ", " ").strip().strip("`'\"()（）[]【】{},，。；;:：")
             if not raw:
                 continue
@@ -149,7 +170,7 @@ def extract_declared_artifact_targets(message: str) -> list[str]:
 
     targets: list[str] = []
     for path, start, end in _path_spans(message):
-        if path == "/tmp" or path.startswith("/tmp/") or path == "/scratch" or path.startswith("/scratch/"):
+        if path == "/scratch" or path.startswith("/scratch/"):
             # Ephemeral Run storage is never a formal delivery target.
             continue
         before = message[max(0, start - 20) : start].strip(" `\t\r\n，,：:")
@@ -336,12 +357,7 @@ def _path_spans(message: str) -> list[tuple[str, int, int]]:
         # a later ``.html`` URL.  Besides being a false attachment detection,
         # passing that multi-kilobyte value to pathlib can raise ENAMETOOLONG
         # before the Agent gets its first model turn.
-        line_breaks = [
-            position
-            for marker in ("\r", "\n", "\0")
-            if (position := message.find(marker, start)) >= 0
-        ]
-        lexical_end = min(line_breaks) if line_breaks else len(message)
+        lexical_end = _lexical_path_end(message, start)
         for suffix in LOCAL_RESOURCE_SUFFIXES:
             search_from = start
             while True:

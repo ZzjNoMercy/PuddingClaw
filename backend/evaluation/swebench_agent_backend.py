@@ -16,6 +16,7 @@ import os
 import platform
 import posixpath
 import queue
+import re
 import shlex
 import shutil
 import subprocess
@@ -39,12 +40,15 @@ from .code_eval import (
 )
 from .contracts import EvalCase
 from .official_swebench import (
+    SWEBENCH_ARCHITECTURE_ENV,
     _bounded_int,
     _bounded_memory,
+    _docker_architecture_probe,
     _docker_backend_is_approved,
     _namespace,
     _official_environment,
     _run_process,
+    normalize_swebench_architecture,
 )
 
 MAX_AGENT_EXECUTE_OUTPUT = 200_000
@@ -52,7 +56,9 @@ AGENT_UID_GID = "65532:65532"
 
 
 def _architecture() -> str:
-    return "arm64" if platform.machine().lower() in {"arm64", "aarch64"} else "x86_64"
+    return normalize_swebench_architecture(
+        os.getenv(SWEBENCH_ARCHITECTURE_ENV) or platform.machine()
+    )
 
 
 def _instance_payload(case: EvalCase) -> dict[str, Any]:
@@ -72,15 +78,20 @@ def _instance_payload(case: EvalCase) -> dict[str, Any]:
     }
 
 
-def _make_test_spec(payload: dict[str, Any]):
+def _make_test_spec(payload: dict[str, Any], *, architecture: str | None = None):
     from swebench.harness.test_spec.test_spec import make_test_spec
 
-    namespace_value = _namespace()
+    selected_architecture = normalize_swebench_architecture(architecture or _architecture())
+    namespace_value = _namespace(selected_architecture)
     namespace = None if namespace_value == "none" else namespace_value
-    return make_test_spec(payload, namespace=namespace, arch=_architecture())
+    return make_test_spec(payload, namespace=namespace, arch=selected_architecture)
 
 
-def ensure_swebench_instance_image_payload(payload: dict[str, Any]) -> None:
+def ensure_swebench_instance_image_payload(
+    payload: dict[str, Any],
+    *,
+    architecture: str | None = None,
+) -> None:
     """Ensure one image in an isolated provisioning process."""
 
     if not _docker_backend_is_approved():
@@ -92,9 +103,10 @@ def ensure_swebench_instance_image_payload(payload: dict[str, Any]) -> None:
     except ImportError as exc:
         raise RuntimeError("Official SWE-bench runtime is not installed") from exc
 
-    namespace_value = _namespace()
+    selected_architecture = normalize_swebench_architecture(architecture or _architecture())
+    namespace_value = _namespace(selected_architecture)
     namespace = None if namespace_value == "none" else namespace_value
-    spec = _make_test_spec(payload)
+    spec = _make_test_spec(payload, architecture=selected_architecture)
     client = docker.from_env(timeout=60)
     try:
         client.images.get(spec.instance_image_key)
@@ -144,10 +156,19 @@ async def ensure_swebench_instance_image(
     )
     os.chmod(payload_path, 0o600)
     run_id = f"puddingclaw-{experiment_id}"
+    environment = _official_environment()
+    architecture_available, architecture_detail = await _docker_architecture_probe(
+        environment,
+        runtime_path,
+    )
+    if not architecture_available:
+        raise RuntimeError(architecture_detail or "Could not determine SWE-bench Docker architecture")
+    architecture = normalize_swebench_architecture(architecture_detail)
     environment = {
-        **_official_environment(),
+        **environment,
         "PYTHONPATH": str(Path(__file__).resolve().parents[1]),
         "PUDDINGCLAW_SWEBENCH_RUN_ID": run_id,
+        SWEBENCH_ARCHITECTURE_ENV: architecture,
     }
     for name in (
         "PUDDINGCLAW_SWEBENCH_ISOLATED_DOCKER",
@@ -179,7 +200,7 @@ async def ensure_swebench_instance_image(
             raise RuntimeError(
                 f"Official SWE-bench Agent image preparation {reason}: {result.output_tail[-1000:]}"
             )
-        return _make_test_spec(_instance_payload(case))
+        return _make_test_spec(_instance_payload(case), architecture=architecture)
     finally:
         payload_path.unlink(missing_ok=True)
 
@@ -226,6 +247,22 @@ class SWEbenchAgentWorkspaceBackend(FilesystemBackend, SandboxBackendProtocol):
     @property
     def kernel_runner_mode(self) -> str:
         return "kernel_swebench_docker"
+
+    def normalize_execution_command(self, command: str) -> str:
+        """Canonicalize the official image's source alias to the public workspace.
+
+        SWE-bench images keep the checkout at ``/testbed`` and expose it to
+        the Agent through ``/workspace``.  Test output and Python metadata can
+        still reveal the internal spelling.  Treat only that exact path root
+        as an alias of the candidate workspace; every other absolute container
+        path remains subject to the normal external-path policy.
+        """
+
+        return re.sub(
+            r"(?<![A-Za-z0-9_./-])/testbed(?=$|[/\s'\"`;,:)}\]])",
+            "/workspace",
+            str(command or ""),
+        )
 
     @property
     def kernel_runner_binding_digest(self) -> str:

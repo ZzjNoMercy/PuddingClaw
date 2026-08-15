@@ -785,6 +785,7 @@ class SessionManager:
         run_boundary_notice: dict[str, Any] | None = None,  # 跨 Run 续跑/停止说明
         attachments: list[dict[str, Any]] | None = None,  # Session-scoped stable attachment refs
         output_attachments: list[dict[str, Any]] | None = None,  # Assistant-published derived attachments
+        usage_summary: dict[str, Any] | None = None,  # Per-Run provider usage; no separate DB
         created_at: float | None = None,  # Query/message input time as Unix seconds
     ) -> None:
         """追加一条消息到会话历史"""
@@ -815,6 +816,7 @@ class SessionManager:
             run_boundary_notice=run_boundary_notice,
             attachments=attachments,
             output_attachments=output_attachments,
+            usage_summary=usage_summary,
             created_at=created_at,
         )
         data["messages"].append(msg)  # 追加到消息列表末尾
@@ -840,6 +842,7 @@ class SessionManager:
         run_boundary_notice: dict[str, Any] | None = None,
         attachments: list[dict[str, Any]] | None = None,
         output_attachments: list[dict[str, Any]] | None = None,
+        usage_summary: dict[str, Any] | None = None,
         query_id: str | None = None,
         status: str | None = None,
         created_at: float | None = None,
@@ -918,6 +921,8 @@ class SessionManager:
                 for item in output_attachments
                 if isinstance(item, dict) and item.get("id")
             ]
+        if usage_summary is not None:
+            msg["usage_summary"] = dict(usage_summary)
         if query_id:
             msg["query_id"] = query_id
         if status:
@@ -943,6 +948,7 @@ class SessionManager:
         verification_summary: str | None = None,
         run_boundary_notice: dict[str, Any] | None = None,
         output_attachments: list[dict[str, Any]] | None = None,
+        usage_summary: dict[str, Any] | None = None,
         status: str = "running",
     ) -> None:
         """Create or replace the assistant draft for a query.
@@ -971,6 +977,7 @@ class SessionManager:
             verification_summary=verification_summary,
             run_boundary_notice=run_boundary_notice,
             output_attachments=output_attachments,
+            usage_summary=usage_summary,
             query_id=query_id,
             status=status,
         )
@@ -1050,6 +1057,7 @@ class SessionManager:
         segments: list[dict[str, Any]] | None = None,
         output_attachments: list[dict[str, Any]] | None = None,
         verification_summary: str | None = None,
+        usage_summary: dict[str, Any] | None = None,
     ) -> None:
         """Atomically publish an accepted answer with its Run/Goal authority.
 
@@ -1177,6 +1185,7 @@ class SessionManager:
             timeline=timeline,
             segments=segments,
             output_attachments=output_attachments,
+            usage_summary=usage_summary,
             query_id=query_id,
             status="completed",
         )
@@ -8092,6 +8101,64 @@ class SessionManager:
             reverse=True,
         )
         return inactive[: max(0, int(limit))]
+
+    @_session_write_locked
+    def append_permission_decision(
+        self,
+        session_id: str,
+        decision: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Persist one immutable HITL outcome for model-visible Run audit."""
+
+        data = self._read_file(session_id)
+        if not data:
+            raise FileNotFoundError(f"Session {session_id} not found")
+        request_id = str(decision.get("request_id") or "")
+        if not request_id:
+            raise ValueError("permission decision requires request_id")
+        permissions = data.setdefault("permissions", {})
+        decisions = permissions.setdefault("decisions", [])
+        if not isinstance(decisions, list):
+            decisions = []
+            permissions["decisions"] = decisions
+        for existing in decisions:
+            if isinstance(existing, dict) and str(existing.get("request_id") or "") == request_id:
+                return deepcopy(existing)
+        persisted = deepcopy(decision)
+        decisions.append(persisted)
+        # The complete recent audit belongs in the Session, not in transient
+        # in-process registry state. Bound growth while retaining ample trace.
+        if len(decisions) > 200:
+            del decisions[:-200]
+        # Resolving a control-plane prompt is not user/session activity. Keep
+        # the existing inactivity timestamp so headless TTL cleanup can still
+        # collect an expired Session immediately after its pending prompt is
+        # cancelled.
+        self._atomic_write_json(self._session_path(session_id), data, indent=2)
+        return deepcopy(persisted)
+
+    def list_permission_decisions(
+        self,
+        session_id: str,
+        *,
+        run_id: str | None = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        """Return durable approval and rejection outcomes in chronological order."""
+
+        data = self._read_file(session_id)
+        permissions = data.get("permissions") if data else None
+        decisions = permissions.get("decisions") if isinstance(permissions, dict) else None
+        if not isinstance(decisions, list):
+            return []
+        selected = [
+            deepcopy(item)
+            for item in decisions
+            if isinstance(item, dict)
+            and (run_id is None or str(item.get("run_id") or "") == run_id)
+        ]
+        selected.sort(key=lambda item: float(item.get("resolved_at") or 0))
+        return selected[-max(0, int(limit)) :]
 
     @_session_write_locked
     def migrate_permission_grants(self, session_id: str) -> int:

@@ -232,6 +232,10 @@ _DESTRUCTIVE_OR_WRITE_COMMANDS = frozenset(
         "tee",
         "dd",
         "install",
+        "ln",
+        "patch",
+        "rsync",
+        "unlink",
     }
 )
 _SAFE_READ_COMMANDS = frozenset(
@@ -251,23 +255,34 @@ _SAFE_READ_COMMANDS = frozenset(
         "df",
         "which",
         "whereis",
+        "id",
+        "whoami",
+        "uname",
+        "date",
         "printf",
         "echo",
         "sort",
         "uniq",
         "cut",
         "tr",
+        "awk",
         "jq",
     }
 )
-_WRAPPERS = frozenset({"command", "env", "timeout", "gtimeout", "nice", "nohup"})
+_WRAPPERS = frozenset({"command", "env", "timeout", "gtimeout", "nice", "nohup", "time", "builtin"})
 _SHELLS = frozenset({"sh", "bash", "zsh"})
-_SHELL_META_PATTERN = re.compile(r"(`|\$\(|\$\{|\n|<<)")
+_SHELL_META_PATTERN = re.compile(r"(`|\$\(|\$\{|[<>]\(|\n|<<)")
 _ENV_ASSIGNMENT_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=.*$", re.DOTALL)
 _CRITICAL_EXECUTION_ENV_OVERRIDE_PATTERN = re.compile(
     r"(?:^|[;&|()\s])(?:env\s+)?(?:PATH|LD_PRELOAD|DYLD_INSERT_LIBRARIES|"
     r"PYTHONPATH|PYTHONSTARTUP|NODE_OPTIONS|RUBYOPT|PERL5OPT|BASH_ENV|ENV)\s*=",
     re.IGNORECASE,
+)
+_PERSISTENCE_TARGET_PATTERN = re.compile(
+    r"(?i)(?:^|[/\\s'\"])(?:\.zshrc|\.bashrc|\.bash_profile|\.profile|"
+    r"\.config/autostart/|library/launchagents/|library/launchdaemons/|"
+    r"\.ssh/|\.aws/(?:credentials|config)|\.config/gcloud/|\.kube/config|"
+    r"authorized_keys|crontab)(?:[/\\s'\";&|()<>]|$)"
 )
 _NETWORK_URL_PATTERN = re.compile(r"\b(?:https?|wss?)://", re.IGNORECASE)
 _NON_MATERIAL_REDIRECT_SINKS = frozenset(
@@ -289,7 +304,7 @@ _EMBEDDED_WRITE_API_PATTERN = re.compile(
     r"(?:open\s*\([^)]*(?:,\s*|mode\s*=\s*)['\"][wax+]|"
     r"urlretrieve\s*\(|\.write_(?:text|bytes)\s*\(|"
     r"(?:os|shutil)\.(?:remove|unlink|rename|replace|mkdir|makedirs|rmtree|copy|move)\s*\(|"
-    r"(?:fs\.)?(?:writeFile|appendFile|unlink|rename|mkdir)\s*\()",
+    r"(?:fs(?:\.promises)?\.)?(?:writeFile|appendFile|copyFile|unlink|rename|mkdir)(?:Sync)?\s*\()",
     re.IGNORECASE,
 )
 _KNOWN_NETWORK_SKILL_ENTRYPOINT_PATTERN = re.compile(
@@ -337,15 +352,17 @@ class ShellPolicyAnalyzer:
         *,
         workspace_path: str,
         backend_mode: str,
+        filesystem_mode: str = "restricted",
         allowed_external_paths: tuple[str | Path, ...] = (),
+        path_resolver: Callable[[str], str | Path] | None = None,
     ) -> None:
         self.workspace_path = Path(workspace_path).expanduser().resolve()
         self.backend_mode = backend_mode
+        self.filesystem_mode = filesystem_mode
         self.allowed_external_paths = tuple(
-            Path(path).expanduser().resolve(strict=False)
-            for path in allowed_external_paths
-            if str(path)
+            Path(path).expanduser().resolve(strict=False) for path in allowed_external_paths if str(path)
         )
+        self.path_resolver = path_resolver
 
     def analyze(self, command: str) -> ToolPolicyResult:
         if not isinstance(command, str) or not command.strip():
@@ -424,6 +441,7 @@ class ShellPolicyAnalyzer:
         command: str,
         *,
         workspace_path: str | Path,
+        path_resolver: Callable[[str], str | Path] | None = None,
     ) -> ExecutionRequirements:
         """Return a fail-closed, runner-neutral execution description.
 
@@ -445,6 +463,7 @@ class ShellPolicyAnalyzer:
         external_candidates = cls._external_path_candidates(
             segments,
             workspace_path=workspace_path,
+            path_resolver=path_resolver,
         )
         if has_redirect:
             return ExecutionRequirements(
@@ -501,8 +520,9 @@ class ShellPolicyAnalyzer:
                 operand_indexes,
                 strict=True,
             ):
+                resolved_path = str(path_resolver(raw_path)) if path_resolver is not None else raw_path
                 classified = classify_path_authority(
-                    raw_path,
+                    resolved_path,
                     workspace_root=workspace_path,
                 )
                 if classified.authority is PathAuthority.ESCAPE:
@@ -523,7 +543,8 @@ class ShellPolicyAnalyzer:
                         external_path_candidates=external_candidates,
                     )
                 canonical_text = str(canonical)
-                normalized_tokens[operand_index] = canonical_text
+                if resolved_path == raw_path:
+                    normalized_tokens[operand_index] = canonical_text
                 external.append(FilesystemIntent(path=canonical_text, access=access))
             normalized_segments.append(shlex.join(normalized_tokens))
         return ExecutionRequirements(
@@ -539,6 +560,7 @@ class ShellPolicyAnalyzer:
         segments: list[list[str]],
         *,
         workspace_path: str | Path,
+        path_resolver: Callable[[str], str | Path] | None = None,
     ) -> tuple[str, ...]:
         candidates: list[str] = []
         for segment in segments:
@@ -551,8 +573,9 @@ class ShellPolicyAnalyzer:
                     # before SMART-mode execution policy can approve it.
                     if raw_path in _NON_MATERIAL_REDIRECT_SINKS:
                         continue
+                    resolved_path = str(path_resolver(raw_path)) if path_resolver is not None else raw_path
                     classified = classify_path_authority(
-                        raw_path,
+                        resolved_path,
                         workspace_root=workspace_path,
                     )
                     if classified.authority is PathAuthority.EXTERNAL and classified.canonical_host_path is not None:
@@ -886,6 +909,19 @@ class ShellPolicyAnalyzer:
             executable = Path(tokens[0]).name.lower()
             args = [item.lower() for item in tokens[1:]]
             joined_args = " ".join(tokens[1:])
+            if executable == "xargs":
+                nested_tokens = cls._xargs_command(tokens[1:])
+                if nested_tokens:
+                    nested = cls.capabilities(
+                        shlex.join(nested_tokens),
+                        workspace_path=workspace_path,
+                        _seen_scripts=_seen_scripts,
+                    )
+                    network = network or nested.network
+                    workspace_write = workspace_write or nested.workspace_write
+                    package_install = package_install or nested.package_install
+                    destructive = destructive or nested.destructive
+                continue
             if executable in _SHELLS and len(tokens) >= 3 and args[0] in {"-c", "-lc"}:
                 nested = cls.capabilities(
                     tokens[2],
@@ -919,6 +955,15 @@ class ShellPolicyAnalyzer:
                 network = True
                 if executable == "wget" or (executable == "curl" and cls._curl_writes_material_output(tokens)):
                     workspace_write = True
+            if executable == "rsync":
+                remote_operands = [item for item in tokens[1:] if not item.startswith("-")]
+                if any(
+                    item.lower().startswith("rsync://") or re.match(r"^(?:[^/@\s]+@)?[^/:\s]+:.+", item)
+                    for item in remote_operands
+                ):
+                    network = True
+                if any(item == "--delete" or item.startswith("--delete-") for item in args):
+                    destructive = True
             managed_match = cls._managed_cli_match(tokens)
             if managed_match is not None:
                 network = network or managed_match.requires_network
@@ -963,6 +1008,14 @@ class ShellPolicyAnalyzer:
                         workspace_write = workspace_write or nested.workspace_write
                         package_install = package_install or nested.package_install
                         destructive = destructive or nested.destructive
+            if executable == "tar" and any(
+                item in {"-x", "--extract", "--get", "-c", "--create", "-r", "--append", "-u", "--update"}
+                or (item.startswith("-") and not item.startswith("--") and any(flag in item[1:] for flag in "xcru"))
+                for item in args
+            ):
+                workspace_write = True
+            if executable == "unzip" and not any(item in {"-l", "-t", "-p", "-c", "-z", "-v"} for item in args):
+                workspace_write = True
             package_subcommands = {
                 "install",
                 "uninstall",
@@ -1138,13 +1191,14 @@ class ShellPolicyAnalyzer:
                             "scratch_path_traversal",
                             "critical",
                         )
-                    if self.backend_mode != "spawn":
+                    if self.backend_mode != "spawn" or self.filesystem_mode == "unrestricted":
                         continue
                     if raw == "/workspace" or raw.startswith("/workspace/"):
                         continue
                     if raw == "/scratch" or raw.startswith("/scratch/"):
                         continue
-                    resolved = Path(raw).expanduser()
+                    resolved_raw = str(self.path_resolver(raw)) if self.path_resolver is not None else raw
+                    resolved = Path(resolved_raw).expanduser()
                     try:
                         resolved = resolved.resolve()
                         resolved.relative_to(self.workspace_path)
@@ -1256,7 +1310,7 @@ class ShellPolicyAnalyzer:
                         "container_workspace_escape",
                         "critical",
                     )
-                if self.backend_mode != "spawn":
+                if self.backend_mode != "spawn" or self.filesystem_mode == "unrestricted":
                     continue
                 if raw == "/workspace":
                     candidate = self.workspace_path
@@ -1265,9 +1319,11 @@ class ShellPolicyAnalyzer:
                 elif raw == "/scratch" or raw.startswith("/scratch/"):
                     continue
                 elif raw.startswith("~/"):
-                    candidate = Path(raw).expanduser()
+                    resolved_raw = str(self.path_resolver(raw)) if self.path_resolver is not None else raw
+                    candidate = Path(resolved_raw).expanduser()
                 elif Path(raw).is_absolute():
-                    candidate = Path(raw)
+                    resolved_raw = str(self.path_resolver(raw)) if self.path_resolver is not None else raw
+                    candidate = Path(resolved_raw)
                 else:
                     candidate = self.workspace_path / raw
                 resolved_candidate = candidate
@@ -1351,8 +1407,11 @@ class ShellPolicyAnalyzer:
         return segments, has_write_redirect
 
     def _analyze_segment(self, tokens: list[str]) -> ToolPolicyResult:
+        raw_tokens = list(tokens)
         tokens = self._unwrap(tokens)
         if not tokens:
+            if raw_tokens:
+                return ToolPolicyResult(PolicyDecision.ALLOW, "shell_control", "low")
             return ToolPolicyResult(PolicyDecision.ASK, "wrapper_without_command", "high")
         command = Path(tokens[0]).name.lower()
         args = tokens[1:]
@@ -1363,6 +1422,17 @@ class ShellPolicyAnalyzer:
                 f"hard_denied_command:{command}",
                 "critical",
             )
+        if command in {"eval", "source", "."}:
+            return ToolPolicyResult(
+                PolicyDecision.ASK,
+                f"dynamic_shell_execution:{command}",
+                "high",
+            )
+        if command == "xargs":
+            nested = self._xargs_command(args)
+            if nested:
+                return self._analyze_segment(nested)
+            return ToolPolicyResult(PolicyDecision.ALLOW, "safe_read", "low")
         if command in _SHELLS and len(args) >= 2 and args[0] in {"-c", "-lc"}:
             return self.analyze(args[1])
         if command in _SHELLS:
@@ -1478,6 +1548,14 @@ class ShellPolicyAnalyzer:
                     f"managed_workspace_write:find:{matched_flag}",
                     "managed_write",
                 )
+        if command == "tar" and any(
+            arg in {"-x", "--extract", "--get", "-c", "--create", "-r", "--append", "-u", "--update"}
+            or (arg.startswith("-") and not arg.startswith("--") and any(flag in arg[1:] for flag in "xcru"))
+            for arg in args
+        ):
+            return ToolPolicyResult(PolicyDecision.ASK, "managed_workspace_write:tar", "managed_write")
+        if command == "unzip" and not any(arg.lower() in {"-l", "-t", "-p", "-c", "-z", "-v"} for arg in args):
+            return ToolPolicyResult(PolicyDecision.ASK, "managed_workspace_write:unzip", "managed_write")
         if command == "rg" and any(arg == "--pre" or arg.startswith("--pre=") for arg in args):
             return ToolPolicyResult(
                 PolicyDecision.ASK,
@@ -1574,6 +1652,35 @@ class ShellPolicyAnalyzer:
     @staticmethod
     def _unwrap(tokens: list[str]) -> list[str]:
         remaining = list(tokens)
+        # shlex does not classify grouping punctuation unless it is included
+        # in ``punctuation_chars``.  Without normalizing it here, commands such
+        # as ``( rm -rf path )`` and ``{ chmod -R ...; }`` look like unknown
+        # executables and can lose their real effect classification.
+        while remaining and remaining[0] in {"(", "{"}:
+            remaining.pop(0)
+        while remaining and remaining[-1] in {
+            ")",
+            "}",
+        }:
+            remaining.pop()
+        control_prefixes = {"!", "if", "then", "elif", "else", "while", "until", "do"}
+        while remaining and remaining[0].lower() in control_prefixes:
+            remaining.pop(0)
+        if remaining and remaining[0].lower() in {"fi", "done", "esac"}:
+            return []
+        if remaining and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*\(\)\{?", remaining[0]):
+            remaining.pop(0)
+        if remaining and remaining[0].lower() == "case":
+            pattern_index = next(
+                (index for index, item in enumerate(remaining[1:], start=1) if item.endswith(")")),
+                None,
+            )
+            if pattern_index is None:
+                return []
+            remaining = remaining[pattern_index + 1 :]
+        elif len(remaining) > 1 and remaining[0].endswith(")"):
+            # A subsequent case arm begins with its ``pattern)`` token.
+            remaining.pop(0)
         while remaining:
             while remaining and _ENV_ASSIGNMENT_PATTERN.match(remaining[0]):
                 remaining.pop(0)
@@ -1590,6 +1697,43 @@ class ShellPolicyAnalyzer:
             elif wrapper in {"timeout", "gtimeout"} and remaining:
                 remaining.pop(0)
         return remaining
+
+    @staticmethod
+    def _xargs_command(args: list[str]) -> list[str]:
+        """Return the explicit command invoked by xargs, if one is present."""
+
+        value_options = {
+            "-a",
+            "--arg-file",
+            "-E",
+            "--eof",
+            "-I",
+            "--replace",
+            "-L",
+            "--max-lines",
+            "-n",
+            "--max-args",
+            "-P",
+            "--max-procs",
+            "-s",
+            "--max-chars",
+        }
+        index = 0
+        while index < len(args):
+            item = args[index]
+            if item == "--":
+                return args[index + 1 :]
+            if item in value_options:
+                index += 2
+                continue
+            if any(item.startswith(f"{option}=") for option in value_options if option.startswith("--")):
+                index += 1
+                continue
+            if item.startswith("-"):
+                index += 1
+                continue
+            return args[index:]
+        return []
 
     @staticmethod
     def _strictest(results: list[ToolPolicyResult]) -> ToolPolicyResult:
@@ -1635,7 +1779,6 @@ class ToolExecutionPipeline(AgentMiddleware):
             "replace_file",
             "patch_file",
             "patch_files",
-            "delete_file",
             "execute_external_directory",
             "validate_html_report",
             "rewind_external_file_changes",
@@ -1668,7 +1811,6 @@ class ToolExecutionPipeline(AgentMiddleware):
             "replace_file",
             "patch_file",
             "patch_files",
-            "delete_file",
             "validate_html_report",
             "rewind_external_file_changes",
             "upsert_scratch_file",
@@ -1759,6 +1901,128 @@ class ToolExecutionPipeline(AgentMiddleware):
             return effective
         return self.backend_mode
 
+    @property
+    def _smart_local_filesystem_unrestricted(self) -> bool:
+        """Whether ordinary host paths are intentionally outside Harness roots."""
+
+        return bool(
+            self.permission_context.smart
+            and self.permission_context.filesystem_mode == "unrestricted"
+            and self._effective_backend_mode() in {"spawn", "kernel"}
+        )
+
+    @property
+    def _filesystem_mode(self) -> str:
+        return "unrestricted" if self._smart_local_filesystem_unrestricted else "restricted"
+
+    def _policy_command(self, command: str) -> str:
+        """Return the backend-canonical command used for policy and execution.
+
+        A backend may expose a private in-sandbox alias for the same public
+        workspace (for example SWE-bench ``/testbed`` → ``/workspace``).  The
+        canonicalizer is backend-owned and runs before path classification, so
+        aliases cannot manufacture host authority or bypass the permit bound
+        to the original tool call.
+        """
+
+        normalize = getattr(self.workspace_backend, "normalize_execution_command", None)
+        if not callable(normalize):
+            return command
+        normalized = normalize(command)
+        if not isinstance(normalized, str) or (command.strip() and not normalized.strip()):
+            raise ValueError("Workspace backend returned an invalid canonical execution command")
+        return normalized
+
+    def _execution_path_resolver(self) -> Callable[[str], str | Path] | None:
+        resolver = getattr(self.workspace_backend, "resolve_execution_path", None)
+        return resolver if callable(resolver) else None
+
+    def _filesystem_roots(self, access: str) -> tuple[Path, ...]:
+        attribute = {
+            "read": "filesystem_read_roots",
+            "write": "filesystem_write_roots",
+            "delete": "filesystem_delete_roots",
+        }.get(access)
+        if attribute is None or self.workspace_backend is None:
+            return ()
+        return tuple(
+            Path(root).expanduser().resolve(strict=False)
+            for root in (getattr(self.workspace_backend, attribute, ()) or ())
+        )
+
+    @staticmethod
+    def _covered_by_roots(path: Path, roots: tuple[Path, ...]) -> bool:
+        for root in roots:
+            try:
+                path.relative_to(root)
+                return True
+            except ValueError:
+                continue
+        return False
+
+    def _baseline_filesystem_access(self, intent: FilesystemIntent) -> bool | None:
+        """Return allow/deny only for paths owned by the runner grant profile."""
+
+        if self._smart_local_filesystem_unrestricted:
+            return True
+
+        candidate = Path(intent.path).expanduser().resolve(strict=False)
+        required_roots = self._filesystem_roots(intent.access)
+        if self._covered_by_roots(candidate, required_roots):
+            return True
+        all_roots = tuple(
+            dict.fromkeys(
+                (
+                    *self._filesystem_roots("read"),
+                    *self._filesystem_roots("write"),
+                    *self._filesystem_roots("delete"),
+                )
+            )
+        )
+        return False if self._covered_by_roots(candidate, all_roots) else None
+
+    def _baseline_filesystem_violation(
+        self,
+        requirements: ExecutionRequirements,
+    ) -> FilesystemIntent | None:
+        intents = requirements.filesystem_intents
+        if requirements.opaque:
+            access = (
+                "delete"
+                if requirements.capabilities.destructive
+                else "write"
+                if requirements.capabilities.workspace_write
+                else "read"
+            )
+            intents = tuple(
+                FilesystemIntent(path=path, access=access) for path in requirements.external_path_candidates
+            )
+        return next(
+            (intent for intent in intents if self._baseline_filesystem_access(intent) is False),
+            None,
+        )
+
+    def _execution_requirements(
+        self,
+        command: str,
+        *,
+        workspace_path: str | Path,
+    ) -> ExecutionRequirements:
+        policy_command = self._policy_command(command)
+        requirements = ShellPolicyAnalyzer.requirements(
+            policy_command,
+            workspace_path=workspace_path,
+            path_resolver=self._execution_path_resolver(),
+        )
+        # Opaque shell grammar intentionally has no analyzer-produced command,
+        # but a backend workspace alias must still be canonical at the actual
+        # spawn boundary.  Preserve any stronger operand canonicalization the
+        # analyzer already produced; otherwise bind the backend-normalized
+        # command into the immutable requirements digest.
+        if policy_command != command and not requirements.execution_command:
+            requirements = replace(requirements, execution_command=policy_command)
+        return requirements
+
     @staticmethod
     def _kernel_fallback_error(request: ToolCallRequest, *, reason: str) -> ToolMessage:
         return ToolMessage(
@@ -1794,16 +2058,19 @@ class ToolExecutionPipeline(AgentMiddleware):
         run_id = str(context.get("run_id") or "")
         if not session_id or not run_id:
             return self._kernel_fallback_error(request, reason=self._kernel_fallback_reason())
-        probe_fingerprint = "sha256:" + hashlib.sha256(
-            json.dumps(
-                {
-                    "backend": str(getattr(self.workspace_backend, "id", "")),
-                    "reason": self._kernel_fallback_reason(),
-                    "runner": str(getattr(self.workspace_backend, "kernel_runner_mode", "")),
-                },
-                sort_keys=True,
-            ).encode("utf-8")
-        ).hexdigest()
+        probe_fingerprint = (
+            "sha256:"
+            + hashlib.sha256(
+                json.dumps(
+                    {
+                        "backend": str(getattr(self.workspace_backend, "id", "")),
+                        "reason": self._kernel_fallback_reason(),
+                        "runner": str(getattr(self.workspace_backend, "kernel_runner_mode", "")),
+                    },
+                    sort_keys=True,
+                ).encode("utf-8")
+            ).hexdigest()
+        )
         request_payload = kernel_fallback_resume_registry.create(
             session_id=session_id,
             run_id=run_id,
@@ -1812,9 +2079,8 @@ class ToolExecutionPipeline(AgentMiddleware):
             goal_revision=context.get("goal_revision"),
             project_id=(str(context.get("project_id")) if context.get("project_id") else None),
             tool_call_id=str(request.tool_call.get("id") or ""),
-            workspace_identity="sha256:" + hashlib.sha256(
-                str(context.get("workspace_path") or "").encode("utf-8")
-            ).hexdigest(),
+            workspace_identity="sha256:"
+            + hashlib.sha256(str(context.get("workspace_path") or "").encode("utf-8")).hexdigest(),
             configured_mode="kernel",
             availability_class="stable" if "unsupported" in self._kernel_fallback_reason().lower() else "transient",
             reason_code="probe_failed",
@@ -1869,8 +2135,8 @@ class ToolExecutionPipeline(AgentMiddleware):
             return value
         return decisions[0]
 
-    @staticmethod
     def _external_authority_requirements(
+        self,
         requirements: ExecutionRequirements,
     ) -> ExecutionRequirements:
         """Turn opaque path candidates into a conservative permission request.
@@ -1881,20 +2147,23 @@ class ToolExecutionPipeline(AgentMiddleware):
         enforces the Grant Profile for commands the parser does not understand.
         """
 
-        if not requirements.opaque:
-            return requirements
-        if requirements.capabilities.destructive:
-            access = "delete"
-        elif requirements.capabilities.workspace_write:
-            access = "write"
+        if requirements.opaque:
+            if requirements.capabilities.destructive:
+                access = "delete"
+            elif requirements.capabilities.workspace_write:
+                access = "write"
+            else:
+                access = "read"
+            intents = tuple(
+                FilesystemIntent(path=path, access=access) for path in requirements.external_path_candidates
+            )
         else:
-            access = "read"
+            intents = requirements.filesystem_intents
+        external = tuple(intent for intent in intents if self._baseline_filesystem_access(intent) is None)
         return ExecutionRequirements(
             capabilities=requirements.capabilities,
-            filesystem_intents=tuple(
-                FilesystemIntent(path=path, access=access) for path in requirements.external_path_candidates
-            ),
-            shell_access_required=bool(requirements.external_path_candidates),
+            filesystem_intents=external,
+            shell_access_required=bool(external),
             external_path_candidates=requirements.external_path_candidates,
         )
 
@@ -1914,7 +2183,7 @@ class ToolExecutionPipeline(AgentMiddleware):
 
         if self._effective_backend_mode() != "spawn":
             return ()
-        requirements = ShellPolicyAnalyzer.requirements(
+        requirements = self._execution_requirements(
             command,
             workspace_path=workspace_path,
         )
@@ -2065,9 +2334,7 @@ class ToolExecutionPipeline(AgentMiddleware):
                 return False
             executable = Path(tokens[0]).name.lower()
             args = tokens[1:]
-            if executable == "rg" and any(
-                item == "--pre" or item.startswith("--pre=") for item in args
-            ):
+            if executable == "rg" and any(item == "--pre" or item.startswith("--pre=") for item in args):
                 return False
             if executable in _SAFE_READ_COMMANDS or executable in {"pdfinfo", "strings"}:
                 continue
@@ -2177,12 +2444,27 @@ class ToolExecutionPipeline(AgentMiddleware):
         command = self._command(request)
         if not workspace_path or not command:
             return None
-        requirements = ShellPolicyAnalyzer.requirements(
+        requirements = self._execution_requirements(
             command,
             workspace_path=workspace_path,
         )
+        violation = self._baseline_filesystem_violation(requirements)
+        if violation is not None:
+            return ToolMessage(
+                content=(
+                    "Shell filesystem access was denied by the execution grant profile: "
+                    f"{violation.access} {violation.path}"
+                ),
+                name="execute",
+                tool_call_id=str(request.tool_call.get("id") or ""),
+                status="error",
+            )
         authority_requirements = self._external_authority_requirements(requirements)
         if not authority_requirements.filesystem_intents:
+            return None
+        if self._smart_local_filesystem_unrestricted:
+            # Trusted-local smart mode does not turn an ordinary host path
+            # into a directory Grant. Effect policy is evaluated separately.
             return None
         if self._spawn_read_only_external_paths(
             command=command,
@@ -2307,7 +2589,7 @@ class ToolExecutionPipeline(AgentMiddleware):
         command = self._command(request)
         if not session_id or not run_id or not workspace_path or not command:
             return ()
-        requirements = ShellPolicyAnalyzer.requirements(
+        requirements = self._execution_requirements(
             command,
             workspace_path=workspace_path,
         )
@@ -2346,7 +2628,12 @@ class ToolExecutionPipeline(AgentMiddleware):
             raise RuntimeError("Sandbox execution roots are unavailable")
         scratch = Path(scratch_value).expanduser().resolve()
         command = self._command(request)
-        requirements = ShellPolicyAnalyzer.requirements(command, workspace_path=workspace)
+        requirements = self._execution_requirements(command, workspace_path=workspace)
+        violation = self._baseline_filesystem_violation(requirements)
+        if violation is not None:
+            raise PermissionError(
+                f"Execution requirements exceed the runner filesystem grant: {violation.access} {violation.path}"
+            )
         session_id = str(context.get("session_id") or "")
         run_id = str(context.get("run_id") or "")
         active_skill_ids = tuple(
@@ -2380,19 +2667,11 @@ class ToolExecutionPipeline(AgentMiddleware):
             SelectedGrantSet.select(effective, authority_requirements)
         selected = SelectedGrantSet.all_shell_authority(effective)
         runtime_for_command = getattr(self.workspace_backend, "skill_runtime_for_command", None)
-        explicit_docker_skill = bool(
-            callable(runtime_for_command) and runtime_for_command(command) == "docker"
-        )
-        kernel_runner_mode = str(
-            getattr(self.workspace_backend, "kernel_runner_mode", "kernel_macos_seatbelt")
-        )
+        explicit_docker_skill = bool(callable(runtime_for_command) and runtime_for_command(command) == "docker")
+        kernel_runner_mode = str(getattr(self.workspace_backend, "kernel_runner_mode", "kernel_macos_seatbelt"))
         selected_runner = (
             "docker"
-            if backend_mode == "docker"
-            or backend_mode == "adaptive"
-            and (
-                explicit_docker_skill
-            )
+            if backend_mode == "docker" or backend_mode == "adaptive" and (explicit_docker_skill)
             else kernel_runner_mode
         )
         runtime_read_roots: tuple[Path, ...] = ()
@@ -2401,6 +2680,7 @@ class ToolExecutionPipeline(AgentMiddleware):
 
         def runtime_environment_current() -> bool:
             return True
+
         if selected_runner.startswith("kernel_"):
             prepare_host = getattr(self.workspace_backend, "prepare_host_execution", None)
             if callable(prepare_host):
@@ -2431,9 +2711,7 @@ class ToolExecutionPipeline(AgentMiddleware):
                 requirements = replace(
                     requirements,
                     execution_command=execution_command,
-                    environment_binding_digest=str(
-                        getattr(projection, "environment_binding_digest", "") or ""
-                    ),
+                    environment_binding_digest=str(getattr(projection, "environment_binding_digest", "") or ""),
                 )
         managed_readonly_roots = (
             tuple(getattr(self.workspace_backend, "managed_readonly_host_roots", ()) or ())
@@ -2453,6 +2731,7 @@ class ToolExecutionPipeline(AgentMiddleware):
             external_write_roots=selected.write_roots,
             external_delete_roots=selected.delete_roots,
             network_allowed=requirements.capabilities.network,
+            filesystem=self._filesystem_mode,
         )
         runner_binding_digest = ""
         if selected_runner.startswith("kernel_"):
@@ -2507,7 +2786,7 @@ class ToolExecutionPipeline(AgentMiddleware):
         if not session_id or not run_id or not workspace_path:
             return None
         command = self._command(request)
-        requirements = ShellPolicyAnalyzer.requirements(
+        requirements = self._execution_requirements(
             command,
             workspace_path=workspace_path,
         )
@@ -3836,9 +4115,7 @@ class ToolExecutionPipeline(AgentMiddleware):
                 PolicyDecision.ASK,
                 "digest_bound_semantic_definition_publish",
                 "managed_definition_write",
-                explanation=(
-                    "发布会替换用户语义定义；批准只绑定本次调用中的 plan_id 和 plan_digest。"
-                ),
+                explanation=("发布会替换用户语义定义；批准只绑定本次调用中的 plan_id 和 plan_digest。"),
             )
         if tool_name == "install_packages":
             if self.permission_context.backend_mode not in {"spawn", "kernel", "adaptive", "docker"}:
@@ -3865,7 +4142,12 @@ class ToolExecutionPipeline(AgentMiddleware):
                 "high",
             )
         if tool_name == "execute_external_directory":
-            if self.permission_context.backend_mode not in {"spawn", "kernel", "docker", "adaptive"} or self._effective_backend_mode() not in {
+            if self.permission_context.backend_mode not in {
+                "spawn",
+                "kernel",
+                "docker",
+                "adaptive",
+            } or self._effective_backend_mode() not in {
                 "kernel",
                 "spawn",
                 "docker",
@@ -3951,10 +4233,52 @@ class ToolExecutionPipeline(AgentMiddleware):
         context = self._context(request)
         workspace_path = str(context.get("workspace_path") or ".")
         command = self._command(request)
-        raw_requirements = ShellPolicyAnalyzer.requirements(
+        policy_command = self._policy_command(command)
+        raw_requirements = self._execution_requirements(
             command,
             workspace_path=workspace_path,
         )
+        if self._smart_local_filesystem_unrestricted and self._persistence_write(
+            command,
+            raw_requirements,
+        ):
+            return ToolPolicyResult(
+                PolicyDecision.ASK,
+                "persistence_write",
+                "high",
+                explanation="写入 Shell 启动、LaunchAgents、crontab 或 authorized_keys 仍属于持久化副作用。",
+            )
+        if self._smart_local_filesystem_unrestricted and self._sensitive_host_read(
+            command,
+            raw_requirements,
+        ):
+            return ToolPolicyResult(
+                PolicyDecision.ASK,
+                "sensitive_host_read",
+                "high",
+            )
+        if self._smart_local_filesystem_unrestricted and (
+            _EMBEDDED_DESTRUCTIVE_API_PATTERN.search(command)
+            or _OPAQUE_DYNAMIC_CODE_PATTERN.search(command)
+            or _CRITICAL_EXECUTION_ENV_OVERRIDE_PATTERN.search(command)
+        ):
+            # Full filesystem authority must not erase independent effect
+            # policy.  Dynamic imports and executable-resolution overrides can
+            # hide deletion, network, installation, or arbitrary native code
+            # behind an otherwise ordinary local path.
+            return ToolPolicyResult(
+                PolicyDecision.ASK,
+                "local_dynamic_effect_unprovable",
+                "high",
+            )
+        violation = self._baseline_filesystem_violation(raw_requirements)
+        if violation is not None:
+            return ToolPolicyResult(
+                PolicyDecision.DENY,
+                "filesystem_grant_access_denied",
+                "critical",
+                explanation=(f"Runner grant permits no {violation.access} access to {violation.path}."),
+            )
         raw_authority = self._external_authority_requirements(raw_requirements)
         if (
             self._effective_backend_mode() in {"spawn", "kernel"}
@@ -4006,13 +4330,18 @@ class ToolExecutionPipeline(AgentMiddleware):
                 command=command,
                 workspace_path=workspace_path,
             ),
+            *self._filesystem_roots("read"),
+            *self._filesystem_roots("write"),
+            *self._filesystem_roots("delete"),
         )
         analyzer = ShellPolicyAnalyzer(
             workspace_path=workspace_path,
             backend_mode=self.backend_mode,
+            filesystem_mode=self._filesystem_mode,
             allowed_external_paths=allowed_external_paths,
+            path_resolver=self._execution_path_resolver(),
         )
-        result = analyzer.analyze(command)
+        result = analyzer.analyze(policy_command)
         external_shell_result = self._granted_external_shell_fast_path(
             request,
             result,
@@ -4020,7 +4349,7 @@ class ToolExecutionPipeline(AgentMiddleware):
         if external_shell_result is not None:
             return external_shell_result
         effects = analyzer.capabilities(
-            command,
+            policy_command,
             workspace_path=workspace_path,
         )
         credential_network_result = self._credential_network_result(
@@ -4038,7 +4367,34 @@ class ToolExecutionPipeline(AgentMiddleware):
         )
         if rule_result is not None:
             return rule_result
-        if effects.network and result.decision == PolicyDecision.ALLOW:
+        if (
+            effects.destructive
+            and result.decision is not PolicyDecision.DENY
+            and not (
+                result.reason.startswith("destructive_")
+                or result.reason in _SMART_DOCKER_DESTRUCTIVE_REASONS
+                or result.reason.startswith("managed_workspace_write:find:")
+                or result.reason.startswith("managed_git_write:")
+            )
+        ):
+            return ToolPolicyResult(
+                PolicyDecision.ASK,
+                "destructive_shell_effect",
+                "high",
+                explanation="Shell 控制流中包含递归删除或其他破坏性文件效果。",
+            )
+        if (
+            effects.network
+            and result.decision is not PolicyDecision.DENY
+            and not result.reason.startswith(
+                (
+                    "network_access:",
+                    "git_network",
+                    "package_management",
+                    "credential_network_coupling:",
+                )
+            )
+        ):
             return ToolPolicyResult(
                 PolicyDecision.ASK,
                 "network_access:embedded_command",
@@ -4145,6 +4501,13 @@ class ToolExecutionPipeline(AgentMiddleware):
             )
         )
 
+    @staticmethod
+    def _persistence_write(command: str, requirements: ExecutionRequirements) -> bool:
+        has_write_intent = any(intent.access in {"write", "delete"} for intent in requirements.filesystem_intents)
+        if not has_write_intent and (not requirements.opaque or not requirements.capabilities.workspace_write):
+            return False
+        return bool(_PERSISTENCE_TARGET_PATTERN.search(str(command or "")))
+
     def _permission_rule_result(
         self,
         *,
@@ -4162,6 +4525,29 @@ class ToolExecutionPipeline(AgentMiddleware):
         pattern = self._command_pattern(command)
         if pattern is None:
             return None
+        workspace_path = str(self._context(request).get("workspace_path") or ".")
+        scope = "none"
+        try:
+            requirements = self._execution_requirements(command, workspace_path=workspace_path)
+            scopes: set[str] = set()
+            workspace = Path(workspace_path).expanduser().resolve()
+            scratch = (
+                Path(str(getattr(self.workspace_backend, "scratch_path", ""))).expanduser().resolve()
+                if getattr(self.workspace_backend, "scratch_path", None)
+                else None
+            )
+            for intent in requirements.filesystem_intents:
+                candidate = Path(intent.path).expanduser().resolve(strict=False)
+                if candidate == workspace or workspace in candidate.parents:
+                    scopes.add("workspace")
+                elif scratch is not None and (candidate == scratch or scratch in candidate.parents):
+                    scopes.add("scratch")
+                else:
+                    scopes.add("external")
+            if scopes:
+                scope = next(iter(scopes)) if len(scopes) == 1 else "mixed"
+        except (OSError, ValueError):
+            scope = "mixed"
         rule_decision = evaluate_permission_rules(
             rules,
             tool=tool_name,
@@ -4171,7 +4557,7 @@ class ToolExecutionPipeline(AgentMiddleware):
                 "credentials": self._contains_credential_literal(command),
                 "destructive": effects.destructive,
                 "package_install": effects.package_install,
-                "write_scope": "workspace" if effects.workspace_write else "none",
+                "write_scope": scope if effects.workspace_write else "none",
             },
         )
         if rule_decision is None:
@@ -4375,9 +4761,13 @@ class ToolExecutionPipeline(AgentMiddleware):
             return None
         if effects.network or effects.package_install or effects.destructive:
             return None
-        if result.reason in _SMART_DOCKER_DESTRUCTIVE_REASONS or result.reason.startswith(
-            "managed_workspace_write:find:"
+        if result.reason in _SMART_DOCKER_DESTRUCTIVE_REASONS and not (
+            self._smart_local_filesystem_unrestricted
+            and result.reason == "managed_workspace_write:chmod"
+            and self._smart_chmod_allowed(command)
         ):
+            return None
+        if result.reason.startswith("managed_workspace_write:find:"):
             return None
         script_entrypoint = self._script_entrypoint(command)
         # Unknown native programs remain a reviewer gray zone. Script entry
@@ -4395,20 +4785,37 @@ class ToolExecutionPipeline(AgentMiddleware):
                 )
             )
             and script_entrypoint is None
+            and not self._smart_local_filesystem_unrestricted
         ):
+            return None
+        if self._smart_local_filesystem_unrestricted and result.reason.startswith(
+            ("arbitrary_shell:", "unreadable_shell_script:", "dynamic_shell_execution:")
+        ):
+            # A shell reading commands from stdin, eval/source, or an
+            # unreadable script has no statically reviewable effect surface.
+            # Full filesystem authority is not permission to erase the
+            # independent destructive/network/persistence effect boundary.
             return None
         if result.reason.startswith("managed_git_write:"):
             if not self._smart_git_write_allowed(command, result.reason):
                 return None
-        if result.reason == "managed_workspace_write:mv" and not self._smart_move_allowed(command):
+        if (
+            result.reason == "managed_workspace_write:mv"
+            and not self._smart_local_filesystem_unrestricted
+            and not self._smart_move_allowed(command)
+        ):
             return None
         if result.reason.startswith(("external_command_hook:", "git_network")):
             return None
 
-        # Command substitution remains an opaque execution boundary.  A
-        # multiline Python/Node program, on the other hand, is common in Agent
-        # workflows and is contained by the Docker workspace policy.
-        if re.search(r"`|\$\(|\$\{", command):
+        if result.reason == "complex_shell_expansion" and self._smart_local_filesystem_unrestricted:
+            expansion_result = self._smart_shell_expansion_policy(command)
+            if expansion_result is not None:
+                return expansion_result
+        # Restricted profiles retain the conservative syntax boundary. Smart
+        # trusted-local mode evaluates simple substitutions above and treats
+        # newlines/heredocs as shell syntax, not as filesystem authority.
+        if re.search(r"`|\$\(|\$\{", command) and not self._smart_local_filesystem_unrestricted:
             return None
         if _EMBEDDED_DESTRUCTIVE_API_PATTERN.search(command):
             return None
@@ -4418,6 +4825,132 @@ class ToolExecutionPipeline(AgentMiddleware):
             "smart_sandbox_workspace_write" if effects.workspace_write else "smart_sandbox_execute",
             "managed_write" if effects.workspace_write else "low",
         )
+
+    def _smart_shell_expansion_policy(self, command: str) -> ToolPolicyResult | None:
+        """Return an effect prompt only when a shell expansion is not safe local work."""
+
+        arithmetic_expansions = re.findall(r"\$\(\(([^()]*)\)\)", command, re.DOTALL)
+        if command.count("$((") != len(arithmetic_expansions) or any(
+            not re.fullmatch(r"[A-Za-z0-9_+\-*/%<>=!&|^~?: \t.]*", expression) for expression in arithmetic_expansions
+        ):
+            return ToolPolicyResult(
+                PolicyDecision.ASK,
+                "shell_effect_unprovable",
+                "high",
+                explanation="Shell 算术展开包含嵌套命令或无法确定的语法。",
+            )
+        command_without_arithmetic = re.sub(r"\$\(\([^()]*\)\)", "", command)
+        dollar_substitutions = re.findall(r"\$\(([^()]*)\)", command_without_arithmetic, re.DOTALL)
+        backtick_substitutions = re.findall(r"`([^`\n]*)`", command_without_arithmetic)
+        process_substitutions = re.findall(r"[<>]\(([^()]*)\)", command_without_arithmetic, re.DOTALL)
+        if (
+            command_without_arithmetic.count("$(") != len(dollar_substitutions)
+            or command_without_arithmetic.count("`") != 2 * len(backtick_substitutions)
+            or len(re.findall(r"[<>]\(", command_without_arithmetic)) != len(process_substitutions)
+        ):
+            return ToolPolicyResult(
+                PolicyDecision.ASK,
+                "shell_effect_unprovable",
+                "high",
+                explanation="命令包含嵌套或无法完整解析的 Shell/进程替换，无法确定其真实副作用。",
+            )
+        parameter_expansions = re.findall(r"\$\{([^{}\n]+)\}", command)
+        if command.count("${") != len(parameter_expansions):
+            return ToolPolicyResult(
+                PolicyDecision.ASK,
+                "shell_effect_unprovable",
+                "high",
+                explanation="命令包含无法完整解析的 Shell 参数展开。",
+            )
+        if any(
+            not re.fullmatch(
+                r"[A-Za-z_][A-Za-z0-9_]*(?:(?::?[-+?=])[^{}]*)?",
+                expression,
+            )
+            for expression in parameter_expansions
+        ):
+            return ToolPolicyResult(
+                PolicyDecision.ASK,
+                "shell_effect_unprovable",
+                "high",
+                explanation="Shell 参数展开超出确定性支持范围。",
+            )
+        heredoc_matches = list(
+            re.finditer(
+                r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1[^\n]*\n(.*?)\n\2(?:\n|$)",
+                command,
+                re.DOTALL,
+            )
+        )
+        heredoc_operator_count = len(re.findall(r"<<-?(?!<)", command))
+        if heredoc_operator_count != len(heredoc_matches):
+            return ToolPolicyResult(
+                PolicyDecision.ASK,
+                "shell_effect_unprovable",
+                "high",
+                explanation="命令包含无法完整解析的 heredoc。",
+            )
+        shell_heredoc_bodies: list[str] = []
+        for match in heredoc_matches:
+            prefix = command[: match.start()]
+            try:
+                prefix_segments = ShellPolicyAnalyzer.parse_segments(prefix)
+            except ValueError:
+                prefix_segments = []
+            if prefix_segments:
+                prefix_tokens = ShellPolicyAnalyzer.unwrap_command(prefix_segments[-1])
+                if prefix_tokens and Path(prefix_tokens[0]).name.lower() in _SHELLS:
+                    shell_heredoc_bodies.append(match.group(3))
+
+        for nested_command in (
+            *dollar_substitutions,
+            *backtick_substitutions,
+            *process_substitutions,
+            *shell_heredoc_bodies,
+        ):
+            nested_effects = ShellPolicyAnalyzer.capabilities(nested_command)
+            if nested_effects.network:
+                return ToolPolicyResult(
+                    PolicyDecision.ASK,
+                    "network_access:shell_expansion",
+                    "network",
+                    explanation="Shell 命令替换内部需要联网。",
+                )
+            if nested_effects.package_install:
+                return ToolPolicyResult(
+                    PolicyDecision.ASK,
+                    "package_management:shell_expansion",
+                    "package_install",
+                    explanation="Shell 命令替换内部会安装或更新依赖。",
+                )
+            if nested_effects.destructive or _OPAQUE_CRITICAL_ACTION_PATTERN.search(nested_command):
+                return ToolPolicyResult(
+                    PolicyDecision.ASK,
+                    "destructive_shell_expansion",
+                    "high",
+                    explanation="Shell 命令替换内部包含删除或高风险系统修改。",
+                )
+            nested_result = ShellPolicyAnalyzer(
+                workspace_path="/__puddingclaw_shell_expansion__",
+                backend_mode=self._effective_backend_mode(),
+                filesystem_mode="unrestricted",
+            ).analyze(nested_command)
+            ordinary_nested_write = (
+                nested_result.decision is PolicyDecision.ASK
+                and (
+                    nested_result.reason == "shell_redirection"
+                    or nested_result.reason.startswith("managed_workspace_write:")
+                )
+                and nested_result.reason not in _SMART_DOCKER_DESTRUCTIVE_REASONS
+            )
+            if nested_result.decision is not PolicyDecision.ALLOW and not ordinary_nested_write:
+                return ToolPolicyResult(
+                    PolicyDecision.ASK,
+                    "shell_effect_unprovable",
+                    "high",
+                    explanation="Shell 命令替换内部效果无法被确定性分析。",
+                )
+        return None
 
     def _smart_network_result(
         self,
@@ -4625,6 +5158,50 @@ class ToolExecutionPipeline(AgentMiddleware):
             return True
         return False
 
+    @staticmethod
+    def _smart_chmod_allowed(command: str) -> bool:
+        """Allow one reversible, non-recursive chmod on an ordinary target."""
+
+        try:
+            segments = ShellPolicyAnalyzer.parse_segments(command)
+        except ValueError:
+            return False
+        found = False
+        protected_roots = {
+            "/",
+            "/Users",
+            "/home",
+            str(Path.home().expanduser().resolve()),
+        }
+        for segment in segments:
+            tokens = ShellPolicyAnalyzer.unwrap_command(segment)
+            if not tokens or Path(tokens[0]).name.lower() != "chmod":
+                continue
+            found = True
+            args = tokens[1:]
+            if any(item in {"-R", "--recursive"} or (item.startswith("-") and "R" in item[1:]) for item in args):
+                return False
+            positional = [item for item in args if not item.startswith("-")]
+            if len(positional) != 2:
+                return False
+            mode, target = positional
+            if not (
+                re.fullmatch(r"[0-7]{3,4}", mode)
+                or re.fullmatch(r"[ugoa]*[+=-][rwxXstugo]+(?:,[ugoa]*[+=-][rwxXstugo]+)*", mode)
+            ):
+                return False
+            if len(mode) == 4 and mode.isdigit() and mode[0] != "0":
+                # setuid/setgid/sticky changes stay an explicit effect.
+                return False
+            normalized_target = target.replace("\\", "/").rstrip("/") or "/"
+            if (
+                normalized_target in protected_roots
+                or any(char in normalized_target for char in "*?[")
+                or ".." in Path(normalized_target).parts
+            ):
+                return False
+        return found
+
     @classmethod
     def _browser_e2e_required(cls, request: ToolCallRequest) -> bool:
         context = cls._context(request)
@@ -4782,20 +5359,54 @@ class ToolExecutionPipeline(AgentMiddleware):
             if decoded == candidate.lower():
                 break
             candidate = decoded
-        lowered = candidate.lower()
-        if not re.search(r"\b(curl|wget|httpie|python|python3|node|deno)\b", lowered):
-            return False
-        # These options move the destination out of the command text or make
-        # redirects/proxies authoritative, so lexical inspection cannot prove
-        # that the process will not reach loopback:10086.
-        return bool(
-            re.search(
+        try:
+            parsed_segments = ShellPolicyAnalyzer.parse_segments(candidate)
+        except ValueError:
+            # Unparseable shell stays fail-closed at this daemon-bypass
+            # boundary.  Parsed compound commands are assessed per segment so
+            # an unrelated later ``echo "$(cat file)"`` cannot make an
+            # ordinary Python/Node file operation look like hidden network
+            # access.
+            parsed_segments = []
+        if not parsed_segments:
+            # Preserve fail-closed handling for malformed commands that name
+            # a network-capable executable anywhere in the opaque surface.
+            lowered = candidate.lower()
+            return bool(
+                re.search(r"\b(curl|wget|httpie|python|python3|node|deno)\b", lowered)
+                and re.search(
+                    r"(?:--config(?:=|\s)|\s-k(?:\s|$)|\s-k\S|--input-file(?:=|\s)|"
+                    r"--proxy(?:=|\s)|--resolve(?:=|\s)|--connect-to(?:=|\s)|"
+                    r"(?:^|\s)-l(?:\s|$)|--location(?:\s|$)|\$\(|`|\$\{)",
+                    lowered,
+                )
+            )
+        for raw_segment in parsed_segments:
+            raw_lowered = shlex.join(raw_segment).lower()
+            if re.search(
+                r"(?:\$\(|`)\s*(?:(?:env|command|sudo)\s+)*(?:curl|wget|httpie|python|python3|node|deno)\b",
+                raw_lowered,
+            ):
+                return True
+            segment_tokens = ShellPolicyAnalyzer.unwrap_command(raw_segment)
+            if not segment_tokens:
+                continue
+            executable = Path(segment_tokens[0]).name.lower()
+            if executable not in {"curl", "wget", "httpie", "python", "python3", "node", "deno"}:
+                continue
+            lowered = shlex.join(segment_tokens).lower()
+            # These options move the destination out of the command text or
+            # make redirects/proxies authoritative, so lexical inspection
+            # cannot prove that this specific network-capable segment will
+            # not reach loopback:10086.
+            if re.search(
                 r"(?:--config(?:=|\s)|\s-k(?:\s|$)|\s-k\S|--input-file(?:=|\s)|"
                 r"--proxy(?:=|\s)|--resolve(?:=|\s)|--connect-to(?:=|\s)|"
                 r"(?:^|\s)-l(?:\s|$)|--location(?:\s|$)|\$\(|`|\$\{)",
                 lowered,
-            )
-        )
+            ):
+                return True
+        return False
 
     def _action_preview(self, request: ToolCallRequest) -> str:
         tool_name = str(request.tool_call.get("name") or "")
@@ -4954,8 +5565,7 @@ class ToolExecutionPipeline(AgentMiddleware):
                 "managed_cli_credential_network_authorization",
                 "high",
                 explanation=(
-                    "本次 Managed CLI 同时使用用户凭证和网络；必须由用户批准这对绑定，"
-                    "网络授权或凭证授权不能单独复用。"
+                    "本次 Managed CLI 同时使用用户凭证和网络；必须由用户批准这对绑定，网络授权或凭证授权不能单独复用。"
                 ),
             )
         if route == "installer":
@@ -5212,11 +5822,7 @@ class ToolExecutionPipeline(AgentMiddleware):
         # local and non-destructive. Network, credentials, package mutation,
         # and destructive shell actions remain exact-once even when the
         # command text looks stable.
-        if (
-            capabilities.network
-            or capabilities.destructive
-            or capabilities.package_install
-        ):
+        if capabilities.network or capabilities.destructive or capabilities.package_install:
             return None
         # A stable-looking interpreter prefix is not a stable effect
         # identity.  `python/node -c`, a script path, or a shell wrapper can

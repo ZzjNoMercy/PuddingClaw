@@ -396,14 +396,20 @@ def test_configured_knowledge_exception_is_read_only_and_symlink_safe(
         )
         is None
     )
-    assert ExternalFilePermissionMiddleware._external_write_path(
-        str(knowledge_file),
-        str(workspace),
-    ) == knowledge_file.resolve()
-    assert ExternalFilePermissionMiddleware._external_read_path(
-        str(link),
-        str(workspace),
-    ) == outside_file.resolve()
+    assert (
+        ExternalFilePermissionMiddleware._external_write_path(
+            str(knowledge_file),
+            str(workspace),
+        )
+        == knowledge_file.resolve()
+    )
+    assert (
+        ExternalFilePermissionMiddleware._external_read_path(
+            str(link),
+            str(workspace),
+        )
+        == outside_file.resolve()
+    )
 
 
 def test_external_delete_request_is_a_separate_capability(tmp_path):
@@ -416,7 +422,7 @@ def test_external_delete_request_is_a_separate_capability(tmp_path):
             tool_call_id="call-delete",
             path=tmp_path / "obsolete.txt",
             access="delete",
-            operation="delete_file",
+            operation="delete_external_file",
             change_preview={"expected_sha256": "sha256:current"},
         )
 
@@ -589,6 +595,83 @@ def test_permission_middleware_accepts_virtual_namespace_roots(
     assert ExternalFilePermissionMiddleware().after_model(state, runtime) is None
 
 
+@pytest.mark.parametrize("backend_mode", ["spawn", "kernel"])
+@pytest.mark.parametrize(
+    ("tool_name", "args"),
+    [
+        ("ls", {"path": "{workspace}"}),
+        ("glob", {"path": "{workspace}/reports", "pattern": "**/*"}),
+        ("grep", {"path": "{workspace}/reports", "pattern": "needle"}),
+        ("read_file", {"file_path": "{workspace}/reports/note.md"}),
+        ("write_file", {"file_path": "{workspace}/reports/new.md", "content": "new"}),
+        (
+            "patch_file",
+            {
+                "file_path": "{workspace}/reports/note.md",
+                "expected_sha256": "sha256:current",
+                "replacements": [],
+            },
+        ),
+    ],
+)
+def test_permission_middleware_treats_absolute_active_project_paths_as_workspace(
+    tmp_path,
+    monkeypatch,
+    backend_mode,
+    tool_name,
+    args,
+):
+    from langchain_core.messages import AIMessage
+
+    import graph.permission_middleware as permission_middleware_module
+    from graph.permission_middleware import ExternalFilePermissionMiddleware
+
+    workspace = tmp_path / "workspace"
+    reports = workspace / "reports"
+    reports.mkdir(parents=True)
+    (reports / "note.md").write_text("needle", encoding="utf-8")
+    resolved_args = {
+        key: value.format(workspace=str(workspace.resolve())) if isinstance(value, str) else value
+        for key, value in args.items()
+    }
+
+    def fail_interrupt(_payload):
+        raise AssertionError(f"{backend_mode} must not request external-path HITL for the active project")
+
+    monkeypatch.setattr(permission_middleware_module, "interrupt", fail_interrupt)
+    state = {
+        "messages": [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": tool_name,
+                        "args": resolved_args,
+                        "id": f"call-{backend_mode}-{tool_name}",
+                        "type": "tool_call",
+                    }
+                ],
+            )
+        ]
+    }
+    runtime = SimpleNamespace(
+        context={
+            "session_id": f"absolute-workspace-{backend_mode}-{tool_name}",
+            "query_id": "query-absolute-workspace",
+            "run_id": "run-absolute-workspace",
+            "workspace_path": str(workspace),
+        }
+    )
+
+    assert (
+        ExternalFilePermissionMiddleware(
+            backend_mode=backend_mode,
+            approval_mode="smart",
+        ).after_model(state, runtime)
+        is None
+    )
+
+
 def test_permission_middleware_accepts_versioned_patch_inside_virtual_scratch(
     tmp_path,
     monkeypatch,
@@ -679,7 +762,7 @@ def test_permission_middleware_never_requests_host_grant_for_scratch_copy(
     assert ExternalFilePermissionMiddleware().after_model(state, runtime) is None
 
 
-def test_read_resource_maps_virtual_workspace_path(tmp_path):
+def test_read_resource_rejects_virtual_workspace_text_path(tmp_path):
     from tools.read_resource_tool import ReadResourceTool
 
     report = tmp_path / "report.md"
@@ -691,8 +774,9 @@ def test_read_resource_maps_virtual_workspace_path(tmp_path):
 
     result = tool.invoke({"resource": "/workspace/report.md"})
 
-    assert "E2E_GOAL_OK" in result
-    assert "Permission required" not in result
+    assert "E2E_GOAL_OK" not in result
+    assert "only accepts attachment refs" in result
+    assert "Use read_file" in result
 
 
 def test_permission_middleware_interrupts_misrouted_external_read_file(tmp_path, monkeypatch):
@@ -749,6 +833,89 @@ def test_permission_middleware_interrupts_misrouted_external_read_file(tmp_path,
     assert request["type"] == "external_file_read"
     assert request["path"] == str(external.resolve())
     assert request["operation"] == "read_file"
+
+
+def test_permission_middleware_does_not_gate_unsupported_external_text_read_resource(
+    tmp_path,
+    monkeypatch,
+):
+    from types import SimpleNamespace
+
+    from langchain_core.messages import AIMessage
+
+    import graph.permission_middleware as permission_middleware_module
+    from graph.permission_middleware import ExternalFilePermissionMiddleware
+
+    external = tmp_path / "outside" / "notes.txt"
+    external.parent.mkdir()
+    external.write_text("ordinary text", encoding="utf-8")
+
+    def fail_interrupt(_payload):
+        raise AssertionError("unsupported read_resource text input must not manufacture a permission request")
+
+    monkeypatch.setattr(permission_middleware_module, "interrupt", fail_interrupt)
+    state = {
+        "messages": [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "read_resource",
+                        "args": {"resource": str(external)},
+                        "id": "call-read-resource-text",
+                        "type": "tool_call",
+                    }
+                ],
+            )
+        ]
+    }
+    runtime = SimpleNamespace(
+        context={
+            "session_id": "resource-text-contract-session",
+            "query_id": "query-resource-text-contract",
+            "workspace_path": str(tmp_path / "workspace"),
+        }
+    )
+
+    assert ExternalFilePermissionMiddleware().after_model(state, runtime) is None
+
+
+def test_permission_middleware_does_not_gate_web_image_read_resource(monkeypatch):
+    from types import SimpleNamespace
+
+    from langchain_core.messages import AIMessage
+
+    import graph.permission_middleware as permission_middleware_module
+    from graph.permission_middleware import ExternalFilePermissionMiddleware
+
+    def fail_interrupt(_payload):
+        raise AssertionError("web resources belong to fetch_url, not filesystem permission")
+
+    monkeypatch.setattr(permission_middleware_module, "interrupt", fail_interrupt)
+    state = {
+        "messages": [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "read_resource",
+                        "args": {"resource": "https://example.test/chart.png"},
+                        "id": "call-read-resource-url",
+                        "type": "tool_call",
+                    }
+                ],
+            )
+        ]
+    }
+    runtime = SimpleNamespace(
+        context={
+            "session_id": "resource-url-contract-session",
+            "query_id": "query-resource-url-contract",
+            "workspace_path": "/workspace",
+        }
+    )
+
+    assert ExternalFilePermissionMiddleware().after_model(state, runtime) is None
 
 
 def test_spawn_permission_middleware_does_not_interrupt_external_read_file(
@@ -820,9 +987,7 @@ def test_kernel_smart_permission_middleware_allows_ordinary_external_read_file(
     monkeypatch.setattr(
         permission_middleware_module,
         "interrupt",
-        lambda _payload: (_ for _ in ()).throw(
-            AssertionError("Kernel Smart ordinary reads must not create HITL")
-        ),
+        lambda _payload: (_ for _ in ()).throw(AssertionError("Kernel Smart ordinary reads must not create HITL")),
     )
     state = {
         "messages": [
@@ -843,6 +1008,73 @@ def test_kernel_smart_permission_middleware_allows_ordinary_external_read_file(
         context={
             "session_id": "kernel-smart-external-read-session",
             "query_id": "query-kernel-smart-read",
+            "workspace_path": str(workspace),
+        }
+    )
+
+    async def invoke():
+        return ExternalFilePermissionMiddleware(
+            backend_mode="kernel",
+            approval_mode="smart",
+        ).after_model(state, runtime)
+
+    assert asyncio.run(invoke()) is None
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "extra_args"),
+    [
+        ("ls", {}),
+        ("glob", {"pattern": "*.txt"}),
+        ("grep", {"pattern": "ordinary"}),
+    ],
+)
+def test_kernel_smart_permission_middleware_allows_ordinary_external_searches(
+    tmp_path,
+    monkeypatch,
+    tool_name,
+    extra_args,
+):
+    from langchain_core.messages import AIMessage
+
+    import graph.permission_middleware as permission_middleware_module
+    from graph.permission_middleware import ExternalFilePermissionMiddleware
+    from graph.session_manager import session_manager
+
+    session_manager.initialize(tmp_path)
+    session_manager.create_session("kernel-smart-external-search-session")
+    workspace = tmp_path / "workspace"
+    external = tmp_path / "Downloads"
+    workspace.mkdir()
+    external.mkdir()
+    (external / "document.txt").write_text("ordinary", encoding="utf-8")
+
+    monkeypatch.setattr(
+        permission_middleware_module,
+        "interrupt",
+        lambda _payload: (_ for _ in ()).throw(
+            AssertionError("Kernel Smart ordinary searches must not create HITL")
+        ),
+    )
+    state = {
+        "messages": [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": tool_name,
+                        "args": {"path": str(external), **extra_args},
+                        "id": f"call-kernel-smart-{tool_name}",
+                        "type": "tool_call",
+                    }
+                ],
+            )
+        ]
+    }
+    runtime = SimpleNamespace(
+        context={
+            "session_id": "kernel-smart-external-search-session",
+            "query_id": "query-kernel-smart-search",
             "workspace_path": str(workspace),
         }
     )
@@ -913,35 +1145,30 @@ def test_kernel_smart_permission_middleware_still_interrupts_sensitive_host_read
     assert captured["request"]["type"] == "external_file_read"
 
 
-def test_read_resource_supports_line_pagination(tmp_path):
-    from graph.session_manager import session_manager
+def test_read_resource_supports_attachment_line_pagination(tmp_path):
+    from io import BytesIO
+
+    from graph.attachment_store import attachment_store
     from tools.read_resource_tool import ReadResourceTool
 
-    session_manager.initialize(tmp_path)
-    session_manager.create_session("resource-pagination-session")
-    workspace = tmp_path / "workspace"
-    workspace.mkdir()
-    external = tmp_path / "external" / "large.html"
-    external.parent.mkdir()
-    external.write_text("\n".join(f"line-{index}" for index in range(20)), encoding="utf-8")
-    session_manager.add_permission_grant(
-        "resource-pagination-session",
-        grant_type="external_file_read",
-        target_kind="exact_file",
-        target=str(external.resolve()),
-        capabilities=["read", "external_path"],
+    attachment_store.initialize(tmp_path)
+    attachment = attachment_store.save(
+        session_id="resource-pagination-session",
+        filename="large.txt",
+        mime_type="text/plain",
+        source="paste",
+        stream=BytesIO("\n".join(f"line-{index}" for index in range(20)).encode()),
     )
 
     content = ReadResourceTool(
         session_id="resource-pagination-session",
-        workspace_path=str(workspace),
-    ).invoke({"resource": str(external), "offset": 5, "limit": 3})
+    ).invoke({"resource": attachment["id"], "offset": 5, "limit": 3})
 
-    assert content.startswith("line-5\nline-6\nline-7")
+    assert "line-5\nline-6\nline-7" in content
     assert "Continue with offset=8" in content
 
 
-def test_kernel_read_resource_consumes_parent_directory_grant(tmp_path):
+def test_kernel_read_resource_opens_external_image_with_parent_directory_grant(tmp_path):
     from graph.session_manager import session_manager
     from harness.models import RunRecord
     from tools.read_resource_tool import ReadResourceTool
@@ -952,8 +1179,8 @@ def test_kernel_read_resource_consumes_parent_directory_grant(tmp_path):
     external = tmp_path / "external"
     workspace.mkdir()
     external.mkdir()
-    document = external / "report.txt"
-    document.write_text("directory-authorized", encoding="utf-8")
+    document = external / "report.png"
+    document.write_bytes(b"not-decoded-by-resource-marker")
     run = RunRecord(
         run_id="run-directory-read",
         query_id="query-directory-read",
@@ -985,7 +1212,7 @@ def test_kernel_read_resource_consumes_parent_directory_grant(tmp_path):
         backend_mode="kernel",
     ).invoke({"resource": str(document)})
 
-    assert content == "directory-authorized"
+    assert f"PuddingClaw-Resource-Image-Path: {document.resolve()}" in content
 
 
 def test_read_resource_rejects_http_url_as_a_local_path(tmp_path):
@@ -1082,7 +1309,7 @@ def test_read_external_file_tool_kernel_smart_allows_ordinary_but_not_sensitive(
     assert "Permission required" in spawn_tool.invoke({"path": str(sensitive)})
 
 
-def test_read_resource_tool_reads_attachment_and_keeps_external_permission(tmp_path):
+def test_read_resource_tool_reads_attachment_and_rejects_ordinary_text_path(tmp_path):
     from io import BytesIO
 
     from graph.attachment_store import attachment_store
@@ -1111,8 +1338,9 @@ def test_read_resource_tool_reads_attachment_and_keeps_external_permission(tmp_p
     attachment_content = tool.invoke({"resource": attachment["id"]})
     assert "hello attachment" in attachment_content
 
-    denied = tool.invoke({"resource": str(external_file)})
-    assert "Permission required" in denied
+    rejected = tool.invoke({"resource": str(external_file)})
+    assert "only accepts attachment refs" in rejected
+    assert "Use read_file" in rejected
 
 
 def test_deny_permission_request_resumes_pending_run():
@@ -1142,7 +1370,7 @@ def test_deny_permission_request_resumes_pending_run():
     assert response.status_code == 200
     assert response.json()["resumed"] is True
     assert future.done()
-    assert future.result() == {"type": "reject", "message": "No thanks."}
+    assert future.result() == {"type": "reject", "scope": "none", "message": "No thanks."}
     assert permission_resume_registry.get("perm-req-deny-test")["decision"]["type"] == "reject"
     loop.close()
 
@@ -1217,6 +1445,7 @@ def test_tool_action_grant_cannot_be_replayed(tmp_path):
     grants = session_manager.list_permission_grants("tool-action-session")
     assert len(grants) == 1
     assert grants[0]["metadata"] == {
+        "permission_request_id": request_id,
         "tool_name": "execute",
         "command": "python3 --version",
         "reason": "arbitrary_interpreter:python3",
@@ -1433,6 +1662,49 @@ def test_fetch_url_once_grant_stays_exact_fingerprint(tmp_path):
     assert grant["target"] == "sha256:exact-url"
     assert grant["scope"] == "once"
     assert "session_target" not in grant["metadata"]
+    loop.close()
+
+
+def test_tool_action_api_rejects_scope_not_offered_by_pending_request(tmp_path):
+    from fastapi.testclient import TestClient
+
+    from app import app
+    from graph.permission_resume import permission_resume_registry
+    from graph.session_manager import session_manager
+
+    session_manager.initialize(tmp_path)
+    session_manager.create_session("one-time-effect-session")
+    loop = asyncio.new_event_loop()
+    request_id = "perm-req-one-time-persistence"
+    permission_resume_registry._pending[request_id] = loop.create_future()
+    permission_resume_registry._requests[request_id] = {
+        "id": request_id,
+        "type": "tool_action",
+        "session_id": "one-time-effect-session",
+        "status": "pending",
+        "fingerprint": "sha256:one-time-persistence",
+        "tool_name": "execute",
+        "command": "printf x >> ~/.zshrc",
+        "reason": "persistence_write",
+        "risk": "high",
+        "capabilities": ["execute", "managed_write"],
+        "options": ["once"],
+        "session_target_kind": "command_pattern",
+        "session_target": "printf x *",
+    }
+
+    response = TestClient(app).post(
+        "/api/sessions/one-time-effect-session/permissions/tool-actions",
+        json={"permission_request_id": request_id, "scope": "session"},
+    )
+
+    assert response.status_code == 400
+    assert "only supports one-time approval" in response.json()["detail"]
+    assert permission_resume_registry.get(request_id)["status"] == "pending"
+    permission_resume_registry.resolve(
+        request_id,
+        {"type": "reject", "scope": "none", "message": "test cleanup"},
+    )
     loop.close()
 
 

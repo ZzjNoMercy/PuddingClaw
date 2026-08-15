@@ -73,6 +73,11 @@ import {
   releaseOrphanedPlaceholderLock,
   rebindSessionScopedLock,
 } from "./sessionConcurrency";
+import {
+  mergeUsageSummaries,
+  normalizeUsageSummary,
+  type UsageSummary,
+} from "./usageSummary";
 
 // ── Types ──────────────────────────────────────────────────
 
@@ -285,6 +290,7 @@ export interface ChatMessage {
   errorNotice?: string;
   runBoundaryNotice?: RunBoundaryNotice;
   verificationSummary?: string;
+  usageSummary?: UsageSummary;
   timestamp: number;
 }
 
@@ -580,6 +586,7 @@ function parseHistoryMessages(
     interruption_notice?: string;
     error_notice?: string;
     verification_summary?: string;
+    usage_summary?: Record<string, unknown>;
     run_boundary_notice?: {
       reason?: string;
       message?: string;
@@ -662,6 +669,7 @@ function parseHistoryMessages(
         interruptionNotice: msg.interruption_notice,
         errorNotice: msg.error_notice,
         verificationSummary: msg.verification_summary,
+        usageSummary: normalizeUsageSummary(msg.usage_summary),
         // Run boundaries are Harness control-plane state. They remain in the
         // persisted audit record, but are intentionally not rendered as chat
         // messages; the Goal drawer owns the cross-Run timeline.
@@ -681,6 +689,10 @@ function parseHistoryMessages(
         previous.toolCalls = [...(previous.toolCalls || []), ...(restored.toolCalls || [])];
         previous.timeline = [...(previous.timeline || []), ...(restored.timeline || [])];
         previous.verificationSummary = restored.verificationSummary || previous.verificationSummary;
+        previous.usageSummary = mergeUsageSummaries(
+          previous.usageSummary,
+          restored.usageSummary,
+        );
         previous.sources = [...(previous.sources || []), ...(restored.sources || [])];
         previous.citations = [...(previous.citations || []), ...(restored.citations || [])];
         previous.outputAttachments = [
@@ -2781,6 +2793,17 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             continue;
           }
 
+          if (event.event === "usage_summary") {
+            const usageSummary = normalizeUsageSummary(event.data);
+            if (usageSummary) {
+              const targetId = getAssistantId();
+              updateMsgs((previous) => previous.map((message) =>
+                message.id === targetId ? { ...message, usageSummary } : message
+              ));
+            }
+            continue;
+          }
+
           if (event.event === "token") {
             setMaintenanceStatus((current) =>
               current?.phase === "reasoning" ? null : current
@@ -2818,6 +2841,8 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
                 content: currentContent ? message.content : finalContent || message.content,
                 segments,
                 verificationSummary: verificationSummary || message.verificationSummary,
+                usageSummary:
+                  normalizeUsageSummary(event.data.usage_summary) || message.usageSummary,
               };
             }));
             updateSessionRunActivity(sendSessionId, {
@@ -4380,6 +4405,8 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
                   if (verificationSummary) {
                     msg.verificationSummary = verificationSummary;
                   }
+                  msg.usageSummary =
+                    normalizeUsageSummary(event.data.usage_summary) || msg.usageSummary;
                 }
                 break;
 

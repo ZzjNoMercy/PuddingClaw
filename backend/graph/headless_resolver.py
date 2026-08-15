@@ -193,8 +193,15 @@ def headless_authority_from_environment() -> dict[str, Any]:
 
     raw_dirs = os.getenv("PUDDINGCLAW_HEADLESS_ALLOWED_DIRECTORIES", "")
     raw_origins = os.getenv("PUDDINGCLAW_HEADLESS_ALLOWED_NETWORK_ORIGINS", "")
+    configured_profile = os.getenv("PUDDINGCLAW_HEADLESS_AUTHORITY_PROFILE", "").strip().lower()
+    configured_filesystem = os.getenv("PUDDINGCLAW_HEADLESS_FILESYSTEM_MODE", "").strip().lower()
     return {
-        "profile": os.getenv("PUDDINGCLAW_HEADLESS_AUTHORITY_PROFILE", "smart").strip().lower(),
+        # Missing deployment configuration is deliberately not equivalent to
+        # trusted-local.  The headless path has no interactive risk card.
+        "profile": configured_profile,
+        "filesystem_mode": configured_filesystem
+        if configured_filesystem in {"restricted", "unrestricted"}
+        else "restricted",
         "directories": [item.strip() for item in raw_dirs.split(",") if item.strip()],
         "network_origins": [item.strip() for item in raw_origins.split(",") if item.strip()],
     }

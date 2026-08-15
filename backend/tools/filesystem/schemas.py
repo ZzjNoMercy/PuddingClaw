@@ -183,13 +183,6 @@ class RewindExternalFileChangesInput(BaseModel):
     """The active Run scope is supplied by the Backend, not the model."""
 
 
-class DeleteFileInput(BaseModel):
-    file_path: str = Field(description="Exact external file to delete; directories are rejected")
-    expected_sha256: str = Field(
-        description="sha256:<hex> returned by inspect_file_version for the exact file version"
-    )
-
-
 class ExecuteExternalDirectoryInput(BaseModel):
     directory_path: str = Field(
         description="Exact authorized external directory bound to this command"

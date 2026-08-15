@@ -134,6 +134,15 @@ async def grant_external_file_permission(
     expected_target_kind = "exact_directory" if is_directory else "exact_file"
     if pending is None and req.target_kind == "exact_directory":
         raise HTTPException(status_code=400, detail="external directory permission requires a pending request")
+    if (
+        pending is not None
+        and str(pending.get("reason") or "") in {"sensitive_host_read", "persistence_write"}
+        and req.target_kind != "exact_file"
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="sensitive file effects require the exact pending file",
+        )
     effective_target_kind = "exact_directory" if is_directory else req.target_kind
     if access in {"write", "delete"} and effective_target_kind != expected_target_kind:
         raise HTTPException(
@@ -221,7 +230,11 @@ async def grant_external_file_permission(
     if req.permission_request_id:
         resumed = permission_resume_registry.resolve(
             req.permission_request_id,
-            {"type": "approve", "grant_id": grant["id"]},
+            {
+                "type": "approve",
+                "grant_id": grant["id"],
+                "scope": effective_scope if is_directory else "session",
+            },
         )
         if not resumed:
             session_manager.revoke_permission_grant(session_id, grant["id"])
@@ -248,7 +261,11 @@ async def grant_external_file_permission(
                 path=target,
                 access=access,
                 capabilities=list(grant.get("capabilities") or []),
-                decision={"type": "approve", "grant_id": grant["id"]},
+                decision={
+                    "type": "approve",
+                    "grant_id": grant["id"],
+                    "scope": "session",
+                },
                 grant_bindings=grant_bindings,
                 exclude_request_id=req.permission_request_id,
                 binding_resolver=resolve_pending_bindings,
@@ -285,6 +302,7 @@ async def deny_permission_request(
         req.permission_request_id,
         {
             "type": "reject",
+            "scope": "none",
             "message": req.message or "User denied permission.",
         },
     )
@@ -360,7 +378,11 @@ async def grant_shell_directory_permission(
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     resumed = permission_resume_registry.resolve(
         req.permission_request_id,
-        {"type": "approve", "grant_ids": [grant["id"] for grant in grants]},
+        {
+            "type": "approve",
+            "grant_ids": [grant["id"] for grant in grants],
+            "scope": req.scope,
+        },
     )
     if not resumed:
         for grant in grants:
@@ -420,6 +442,16 @@ async def grant_tool_action_permission(
             status_code=409,
             detail="permission request is no longer pending",
         )
+    offered_scopes = {
+        str(item)
+        for item in pending.get("options") or []
+        if str(item)
+    }
+    if offered_scopes and req.scope not in offered_scopes:
+        raise HTTPException(
+            status_code=400,
+            detail="This action only supports one-time approval",
+        )
     capabilities = [str(item) for item in (pending.get("capabilities") or ["execute"])]
     is_skill_management = str(pending.get("tool_name") or "") in {
         "prepare_skill_install",
@@ -445,6 +477,10 @@ async def grant_tool_action_permission(
     if req.scope == "project" and (
         str(pending.get("tool_name") or "") != "execute"
         or session_target_kind != "command_pattern"
+        or bool(
+            {"network_access", "package_install", "destructive_write"}
+            .intersection(capabilities)
+        )
     ):
         raise HTTPException(
             status_code=400,
@@ -454,6 +490,7 @@ async def grant_tool_action_permission(
     target_kind = session_target_kind if use_reusable_scope else "fingerprint"
     target = session_target if use_reusable_scope else fingerprint
     metadata = {key: value for key, value in {
+        "permission_request_id": req.permission_request_id,
         "tool_name": pending.get("tool_name"),
         "command": pending.get("command"),
         "reason": pending.get("reason"),
@@ -511,6 +548,7 @@ async def grant_tool_action_permission(
                 {
                     "type": "approve",
                     "grant_id": grant["id"],
+                    "scope": "project",
                     "project_id": project_id,
                     "project_rule_revision": project.permission_rules_revision,
                 },
@@ -548,7 +586,7 @@ async def grant_tool_action_permission(
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     resumed = permission_resume_registry.resolve(
         req.permission_request_id,
-        {"type": "approve", "grant_id": grant["id"]},
+        {"type": "approve", "grant_id": grant["id"], "scope": req.scope},
     )
     if not resumed:
         session_manager.revoke_permission_grant(session_id, grant["id"])
@@ -563,7 +601,11 @@ async def grant_tool_action_permission(
             target_kind=target_kind,
             target=target,
             capabilities=capabilities,
-            decision={"type": "approve", "grant_id": grant["id"]},
+            decision={
+                "type": "approve",
+                "grant_id": grant["id"],
+                "scope": req.scope,
+            },
             grant_bindings=(
                 dict(pending["grant_bindings"])
                 if isinstance(pending.get("grant_bindings"), dict)

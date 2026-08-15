@@ -62,10 +62,13 @@ def test_headless_request_rejects_caller_selected_model():
         HeadlessRunRequest(message="分析销售", analytics_model_id="sales")
 
 
-def test_headless_authority_defaults_to_smart(monkeypatch):
+def test_headless_authority_defaults_to_restricted_without_explicit_opt_in(monkeypatch):
     monkeypatch.delenv("PUDDINGCLAW_HEADLESS_AUTHORITY_PROFILE", raising=False)
+    monkeypatch.delenv("PUDDINGCLAW_HEADLESS_FILESYSTEM_MODE", raising=False)
 
-    assert headless_authority_from_environment()["profile"] == "smart"
+    authority = headless_authority_from_environment()
+    assert authority["profile"] == ""
+    assert authority["filesystem_mode"] == "restricted"
 
 
 def test_model_routing_candidates_are_limited_by_worker_key(monkeypatch):

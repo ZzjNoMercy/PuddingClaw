@@ -92,7 +92,6 @@ _WRITE_TOOLS = frozenset(
 _PROPORTIONAL_MUTATION_TOOLS = frozenset(
     {
         *_WRITE_TOOLS,
-        "delete_file",
         "install_skill",
         "update_skill",
         "apply_logical_dataset_rule",

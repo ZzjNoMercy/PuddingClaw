@@ -813,6 +813,7 @@ async def _consume_run(
     analytics_model_id: str,
     analytics_model_match: dict[str, Any],
     worker_key_id: str = "",
+    filesystem_mode: str = "restricted",
 ) -> dict[str, Any]:
     stream = deepagents_agent_manager.astream(
         message=request.message,
@@ -826,9 +827,10 @@ async def _consume_run(
         # consumer keeps the original graph invocation alive while the HTTP
         # caller is released with a structured ``needs_input`` response.
         interaction_mode="external",
-        authority_profile=str(authority.get("profile") or "smart"),
+        authority_profile=str(authority.get("profile") or "restricted"),
         authority_directories=list(authority.get("directories") or []),
         authority_network_origins=list(authority.get("network_origins") or []),
+        filesystem_mode=filesystem_mode,
         query_created_at=request_received_at,
     )
     execution = _HeadlessExecution(
@@ -962,12 +964,12 @@ async def worker_health(authorization: str | None = Header(default=None)):
     return {
         "schema_version": "1",
         "agent_id": "puddingclaw",
-        "cli_version": "0.1.16",
+        "cli_version": "0.1.17",
         "protocol_version": "1",
         "configured": True,
         "authenticated": True,
         "reachable": True,
-        "server_version": "0.1.16",
+        "server_version": "0.1.17",
         "project_id": project_id,
         "workspace_ready": path.is_dir(),
         "capabilities": ["data.query", "data.analysis", "data.nl2sql", "knowledge.query"],
@@ -1031,7 +1033,11 @@ async def create_headless_run(
     configured_mode = os.getenv("PUDDINGCLAW_HEADLESS_APPROVAL_MODE", "smart").strip().lower()
     if configured_mode not in {"strict", "smart"}:
         configured_mode = "smart"
-    authority_profile = str(principal.get("authority_profile") or "smart").strip().lower()
+    authority_profile = str(
+        authority.get("profile")
+        or principal.get("authority_profile")
+        or "restricted"
+    ).strip().lower()
     approval_mode = configured_mode
     if not _claim_headless_session(session_id):
         _abandon_idempotency(key, request_hash)
@@ -1162,6 +1168,7 @@ async def create_headless_run(
                 analytics_model_id=selected,
                 analytics_model_match=model_route.to_dict(),
                 worker_key_id=str(principal.get("key_id") or ""),
+                filesystem_mode=str(authority.get("filesystem_mode") or "restricted"),
             )
         except asyncio.TimeoutError:
             response = {

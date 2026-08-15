@@ -290,6 +290,55 @@ def test_swebench_import_omits_gold_patch_and_exports_official_prediction():
     assert '"model_name_or_path": "test-model"' in output
 
 
+def test_partial_swebench_prediction_export_is_explicit_opt_in():
+    dataset = swebench_dataset_from_rows(
+        [
+            {
+                "instance_id": instance_id,
+                "repo": "django/django",
+                "base_commit": commit * 40,
+                "problem_statement": "Fix the regression",
+                "test_patch": "diff --git a/test.py b/test.py",
+                "FAIL_TO_PASS": "[]",
+                "PASS_TO_PASS": "[]",
+                "version": "4.2",
+            }
+            for instance_id, commit in (
+                ("django__django-12345", "a"),
+                ("django__django-12346", "b"),
+            )
+        ],
+        name="Partial sample",
+    )
+    first = dataset.cases[0]
+    envelopes = {
+        first.case_id: [
+            {
+                "outcome": "completed",
+                "metadata": {
+                    "code_verification": {
+                        "mode": "swebench",
+                        "status": "not_evaluated",
+                        "patch": "diff --git a/a.py b/a.py",
+                    }
+                },
+            }
+        ]
+    }
+
+    with pytest.raises(ValueError, match="predictions are incomplete"):
+        prediction_jsonl(dataset, envelopes, model_name_or_path="test-model")
+
+    output = prediction_jsonl(
+        dataset,
+        envelopes,
+        model_name_or_path="test-model",
+        allow_partial=True,
+    )
+    assert "django__django-12345" in output
+    assert "django__django-12346" not in output
+
+
 @pytest.mark.asyncio
 async def test_coding_runner_exposes_execute_and_forces_kernel(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     repository = EvaluationRepository(tmp_path / "evaluation.sqlite3")

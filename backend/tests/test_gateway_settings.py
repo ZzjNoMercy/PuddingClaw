@@ -1218,7 +1218,8 @@ def test_agent_user_content_routes_pasted_absolute_file_path_to_host_file_broker
     assert "[本地文件路径]" in content
     assert "非 workspace 本地路径" in content
     assert "直接对原始绝对路径使用 read_file" in content
-    assert "精确写入由 HostFileBroker 原子落到正式路径" in content
+    assert "普通读写不需要 project、目录或 exact-file HITL" in content
+    assert "HostFileBroker 仅可作为原子落盘与回执实现" in content
     assert "只提交一次原始操作" in content
     assert "模型无需编排 Grant" in content
     assert str(external_file) in content
@@ -1267,7 +1268,8 @@ def test_agent_user_content_preserves_spaced_external_html_target(tmp_path):
         "直接对原始绝对路径使用 "
         "read_file/write_file/materialize_source_ref/patch_file"
     ) in content
-    assert "精确写入由 HostFileBroker 原子落到正式路径" in content
+    assert "普通读写不需要 project、目录或 exact-file HITL" in content
+    assert "HostFileBroker 仅可作为原子落盘与回执实现" in content
     assert "不要创建 /workspace 或 /scratch 影子副本" in content
     assert extract_declared_artifact_targets(f"{external_file} 刷新这个报告到 2026 年") == [str(external_file)]
     source_file = tmp_path / "input data.csv"
@@ -1287,7 +1289,9 @@ def test_artifact_target_parser_handles_compact_chinese_and_negation():
     ):
         assert extract_declared_artifact_targets(f"请修改{target}并交付") == [target]
         assert extract_declared_artifact_targets(f"请勿修改 {target}，只做审查") == []
-    assert extract_declared_artifact_targets("请修改/tmp/export.zip并交付") == []
+    assert extract_declared_artifact_targets("请修改/tmp/export.zip并交付") == [
+        "/tmp/export.zip"
+    ]
     assert extract_declared_artifact_targets("请分析 https://example.com/reports/latest.html，不要写入本地") == []
 
 
@@ -1414,5 +1418,23 @@ def test_overlong_local_path_candidate_does_not_abort_user_content(tmp_path):
     assert DeepAgentsAgentManager._build_user_content(
         message,
         session_id="session-overlong-path",
+        workspace_path=tmp_path,
+    ) == message
+
+
+def test_single_line_markdown_path_example_does_not_consume_later_prompt_text(tmp_path):
+    from harness.artifact_paths import extract_local_directory_paths, extract_local_resource_paths
+
+    message = (
+        "所有测试数据只能写入本轮新建的 `/tmp/puddingclaw-fs-e2e.XXXXXX` 目录。"
+        "先单独运行 `mktemp -d /tmp/puddingclaw-fs-e2e.XXXXXX`，记录返回路径为 ROOT；"
+        "后续不使用未展开变量。测试 1：用 write_file 写入 `ROOT/project-a/file-tool.txt`。"
+    )
+
+    assert extract_local_resource_paths(message) == []
+    assert extract_local_directory_paths(message) == []
+    assert DeepAgentsAgentManager._build_user_content(
+        message,
+        session_id="session-single-line-path-prompt",
         workspace_path=tmp_path,
     ) == message

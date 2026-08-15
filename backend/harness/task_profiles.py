@@ -494,7 +494,15 @@ class TaskProfileClassifier:
             names.extend(
                 match.group(1).strip()
                 for match in re.finditer(pattern, message, flags=re.IGNORECASE)
-                if match.group(1).strip() and not _keyword_is_negated(message.lower(), match.start())
+                if match.group(1).strip()
+                # Shell environment variables such as $HOME and $PATH are
+                # not explicit Skill invocations. Skill ids remain available
+                # via lowercase/mixed-case $skill-id syntax.
+                and not (
+                    pattern.startswith(r"[$]")
+                    and match.group(1).strip().upper() == match.group(1).strip()
+                )
+                and not _keyword_is_negated(message.lower(), match.start())
             )
         return list(dict.fromkeys(names))
 

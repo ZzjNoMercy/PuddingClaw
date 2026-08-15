@@ -69,6 +69,9 @@ _ARTICLE_NOISE_SELECTORS = (
 )
 _LAZY_IMAGE_ATTRIBUTES = ("data-src", "data-original", "data-lazy-src", "data-actualsrc")
 _WECHAT_HEADING_PATTERN = re.compile(r"^(?:\d+[.、．]|[一二三四五六七八九十]+[、.．])\s*\S+")
+_X_ARTICLE_IMAGE_PATTERN = re.compile(
+    r'original_img_url\s*:\s*"(?P<url>https:(?:\\/|/){2}pbs\.twimg\.com(?:\\/|/)media(?:\\/|/)[^"?]+(?:\?[^" ]*)?)"'
+)
 _TRACKING_PARAMS = {
     "fbclid", "gclid", "dclid", "msclkid", "mc_cid", "mc_eid", "igshid", "spm", "from",
 }
@@ -234,6 +237,39 @@ def _prepare_wechat_article(root: BeautifulSoup | Tag) -> None:
         block.name = "h2" if styled_heading else "div"
 
 
+def _append_x_article_images(markdown: str, *, source_html: str, page_url: str) -> str:
+    """Recover X Article images stored in its server-rendered data stream.
+
+    X renders the article body as HTML but keeps non-cover media in Relay data
+    as ``original_img_url`` fields. Those images are not represented by ``img``
+    elements until client-side hydration, so a deterministic HTTP capture must
+    promote them into Markdown before the normal local image cache runs.
+    """
+
+    host = (urlsplit(page_url).hostname or "").lower()
+    if host not in {"x.com", "www.x.com", "twitter.com", "www.twitter.com"}:
+        return markdown
+
+    existing_urls = {
+        urljoin(page_url, match.group("url").strip("<>"))
+        for match in _MARKDOWN_IMAGE_PATTERN.finditer(markdown)
+    }
+    supplemental_urls: list[str] = []
+    for match in _X_ARTICLE_IMAGE_PATTERN.finditer(source_html):
+        image_url = match.group("url").replace("\\/", "/")
+        if image_url in existing_urls or image_url in supplemental_urls:
+            continue
+        supplemental_urls.append(image_url)
+    if not supplemental_urls:
+        return markdown
+
+    images = "\n\n".join(
+        f"![原文图片 {index}]({image_url})"
+        for index, image_url in enumerate(supplemental_urls, start=1)
+    )
+    return f"{markdown.rstrip()}\n\n## 原文图片\n\n{images}"
+
+
 def _extract_markdown(html: str, url: str) -> tuple[dict[str, str], str]:
     soup = BeautifulSoup(html, "lxml")
     title = _meta(soup, ("property", "og:title"), ("name", "twitter:title"))
@@ -285,6 +321,7 @@ def _extract_markdown(html: str, url: str) -> tuple[dict[str, str], str]:
     markdown = re.sub(r"^(#{1,6}\s+)(\d+)\\\.", r"\1\2.", markdown, flags=re.MULTILINE)
     markdown = re.sub(r"[ \t]+\n", "\n", markdown)
     markdown = re.sub(r"\n{3,}", "\n\n", markdown)
+    markdown = _append_x_article_images(markdown, source_html=html, page_url=url)
     return metadata, markdown
 
 

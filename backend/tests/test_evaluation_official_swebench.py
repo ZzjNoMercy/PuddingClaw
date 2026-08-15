@@ -105,6 +105,61 @@ def test_swebench_agent_environment_uses_frozen_reference_without_gold_patch():
     assert "patch" not in payload
 
 
+@pytest.mark.parametrize(
+    ("reported", "expected"),
+    [
+        ("aarch64", "arm64"),
+        ("arm64", "arm64"),
+        ("amd64", "x86_64"),
+        ("x86_64", "x86_64"),
+    ],
+)
+def test_swebench_architecture_aliases_are_canonical(reported: str, expected: str):
+    assert official_module.normalize_swebench_architecture(reported) == expected
+
+
+def test_swebench_agent_testspec_uses_selected_architecture_and_matching_namespace(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    payload = _instance_payload(_dataset().cases[0])
+    monkeypatch.delenv("PUDDINGCLAW_SWEBENCH_NAMESPACE", raising=False)
+
+    arm_spec = agent_backend_module._make_test_spec(payload, architecture="arm64")
+    x86_spec = agent_backend_module._make_test_spec(payload, architecture="x86_64")
+
+    assert arm_spec.arch == "arm64"
+    assert arm_spec.platform == "linux/arm64/v8"
+    assert arm_spec.namespace is None
+    assert ".arm64." in arm_spec.instance_image_key
+    assert x86_spec.arch == "x86_64"
+    assert x86_spec.platform == "linux/x86_64"
+    assert x86_spec.namespace == "swebench"
+    assert ".x86_64." in x86_spec.instance_image_key
+
+
+@pytest.mark.asyncio
+async def test_docker_architecture_probe_uses_daemon_architecture(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    observed: dict[str, object] = {}
+
+    async def fake_process(argv, **kwargs):
+        observed["argv"] = argv
+        observed["kwargs"] = kwargs
+        return ProcessResult(exit_code=0, output_tail="aarch64\n")
+
+    monkeypatch.delenv("PUDDINGCLAW_SWEBENCH_ARCH", raising=False)
+    monkeypatch.setattr(official_module.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(official_module, "_run_process", fake_process)
+
+    available, architecture = await official_module._docker_architecture_probe({}, tmp_path)
+
+    assert available is True
+    assert architecture == "arm64"
+    assert observed["argv"] == ["/usr/bin/docker", "info", "--format", "{{.Architecture}}"]
+
+
 @pytest.mark.asyncio
 async def test_run_process_accepts_localized_process_identity(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -226,7 +281,7 @@ def test_instance_image_preparation_accepts_official_threadpool_payloads(
 
     monkeypatch.setattr(docker_build, "build_instance_images", fake_build)
     monkeypatch.setattr(agent_backend_module, "_docker_backend_is_approved", lambda: True)
-    monkeypatch.setattr(agent_backend_module, "_namespace", lambda: "none")
+    monkeypatch.setattr(agent_backend_module, "_namespace", lambda _architecture=None: "none")
 
     agent_backend_module.ensure_swebench_instance_image_payload(payload)
 
@@ -285,6 +340,73 @@ def test_swebench_execute_consumes_real_tool_gate_permit_once(
     with bind_authorized_execution(authorized):
         assert backend.execute(command).exit_code == 0
         assert backend.execute(command).exit_code == 126
+
+
+def test_swebench_tool_gate_canonicalizes_testbed_workspace_alias(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    workspace = tmp_path / "workspace"
+    scratch = tmp_path / "scratch"
+    workspace.mkdir()
+    scratch.mkdir()
+    backend = agent_backend_module.SWEbenchAgentWorkspaceBackend.__new__(
+        agent_backend_module.SWEbenchAgentWorkspaceBackend
+    )
+    backend.workspace_path = workspace.resolve()
+    backend.scratch_path = scratch.resolve()
+    backend.test_spec = SimpleNamespace(instance_id="astropy__astropy-13453")
+    backend._base_commit = "b" * 40
+    backend.experiment_id = "exp_test"
+    backend._container = None
+    backend._container_id = "container-test"
+    backend._image_id = "sha256:image-test"
+    pipeline = ToolExecutionPipeline(
+        known_tools={"execute"},
+        backend_mode="kernel",
+        permission_context=RunPermissionContext.from_config_snapshot(
+            {
+                "permissions": {"approval_mode": "smart", "policy_epoch": 1},
+                "execution": {"backend_mode": "kernel", "backend_id": backend.id},
+            }
+        ),
+        workspace_backend=backend,
+    )
+    command = "sed -n '1,80p' /testbed/astropy/io/ascii/html.py"
+    request = ToolCallRequest(
+        tool_call={"id": "call-testbed-alias", "name": "execute", "args": {"command": command}},
+        tool=None,
+        state={},
+        runtime=SimpleNamespace(context={"workspace_path": str(workspace)}),
+    )
+
+    authorized = pipeline._compile_kernel_execution(request)
+
+    assert authorized is not None
+    assert authorized.requirements.filesystem_intents == ()
+    assert authorized.execution_command == "sed -n '1,80p' /workspace/astropy/io/ascii/html.py"
+    executed: list[str] = []
+
+    def fake_execute_raw(actual, *, timeout=None, spawn_guard=None):
+        del timeout
+        assert bool(spawn_guard and spawn_guard())
+        executed.append(actual)
+        return ExecuteResponse(output="ok", exit_code=0)
+
+    monkeypatch.setattr(backend, "_sync_host_to_container", lambda: None)
+    monkeypatch.setattr(backend, "_execute_raw", fake_execute_raw)
+    with bind_authorized_execution(authorized):
+        response = backend.execute(command)
+
+    assert response.exit_code == 0
+    assert executed == ["sed -n '1,80p' /workspace/astropy/io/ascii/html.py"]
+    assert backend.normalize_execution_command("cat /testbed-other/file") == "cat /testbed-other/file"
+    assert (
+        backend.normalize_execution_command(
+            "python -c \"from pathlib import Path; print(Path('/testbed/a.py').read_text())\""
+        )
+        == "python -c \"from pathlib import Path; print(Path('/workspace/a.py').read_text())\""
+    )
 
 
 def test_swebench_agent_shell_workspace_has_hard_layer_quota_not_host_rw_bind(
@@ -525,7 +647,7 @@ def test_real_astropy_candidate_container_full_start_execute_sync_cleanup(tmp_pa
         (workspace / "SMOKE_FILE_TOOL.txt").write_text("file-tool-ok", encoding="utf-8")
         command = (
             'python -c "import astropy; from pathlib import Path; '
-            "Path('/workspace/SMOKE_SHELL.txt').write_text('shell-ok'); "
+            "Path('/testbed/SMOKE_SHELL.txt').write_text('shell-ok'); "
             "print('probe-ok', astropy.__version__)\""
         )
         pipeline = ToolExecutionPipeline(
@@ -819,6 +941,9 @@ async def test_managed_official_harness_runs_pinned_package_and_parses_report(
     async def docker_probe(environment, root):
         return True, "29.6.2"
 
+    async def architecture_probe(environment, root):
+        return True, "arm64"
+
     async def fake_process(
         argv, *, cwd, environment, timeout_seconds, log_path, isolate_process_group=False, pid_path=None
     ):
@@ -828,11 +953,15 @@ async def test_managed_official_harness_runs_pinned_package_and_parses_report(
         assert "LANGSMITH_API_KEY" not in environment
         assert argv[1:3] == ["-m", "puddingclaw_swebench_entry"]
         assert environment["PYTHONPATH"] == str(cwd)
+        assert environment["PUDDINGCLAW_SWEBENCH_ARCH"] == "arm64"
+        assert argv[argv.index("--namespace") + 1] == "none"
         guard = (cwd / "sitecustomize.py").read_text(encoding="utf-8")
         assert 'kwargs["network_disabled"] = True' in guard
         assert 'kwargs["cap_drop"] = ["ALL"]' in guard
         assert 'kwargs["pids_limit"]' in guard
         assert 'kwargs["storage_opt"]' in guard
+        entry = (cwd / "puddingclaw_swebench_entry.py").read_text(encoding="utf-8")
+        assert 'kwargs["arch"] = architecture' in entry
         run_id = argv[argv.index("--run_id") + 1]
         report = {
             "completed_ids": ["pytest-dev__pytest-1234"],
@@ -845,6 +974,7 @@ async def test_managed_official_harness_runs_pinned_package_and_parses_report(
         return ProcessResult(exit_code=0, output_tail="official harness complete")
 
     monkeypatch.setattr(official_module, "_docker_probe", docker_probe)
+    monkeypatch.setattr(official_module, "_docker_architecture_probe", architecture_probe)
     monkeypatch.setattr(official_module, "_run_process", fake_process)
     monkeypatch.setattr(official_module.shutil, "which", lambda name: f"/usr/bin/{name}")
     monkeypatch.setenv("LANGSMITH_API_KEY", "must-not-enter-official-harness")
@@ -854,6 +984,7 @@ async def test_managed_official_harness_runs_pinned_package_and_parses_report(
     assert result["status"] == "completed"
     assert result["results"]["pytest-dev__pytest-1234"]["status"] == "passed"
     assert result["receipt"]["provenance"] == "platform_managed_official_harness"
+    assert result["receipt"]["docker_architecture"] == "arm64"
     assert result["receipt"]["report_sha256"]
     assert "diff --git" not in json.dumps(result["receipt"])
 
@@ -900,6 +1031,9 @@ async def test_managed_official_harness_rejects_inconsistent_aggregate_report(
     async def docker_probe(environment, root):
         return True, "29.6.2"
 
+    async def architecture_probe(environment, root):
+        return True, "x86_64"
+
     async def fake_process(
         argv, *, cwd, environment, timeout_seconds, log_path, isolate_process_group=False, pid_path=None
     ):
@@ -916,6 +1050,7 @@ async def test_managed_official_harness_rejects_inconsistent_aggregate_report(
         return ProcessResult(exit_code=0, output_tail="inconsistent report")
 
     monkeypatch.setattr(official_module, "_docker_probe", docker_probe)
+    monkeypatch.setattr(official_module, "_docker_architecture_probe", architecture_probe)
     monkeypatch.setattr(official_module, "_run_process", fake_process)
 
     result = await run_official_swebench_harness(
@@ -965,8 +1100,24 @@ async def test_runner_applies_platform_managed_official_result_to_attempt(
         }
     ]
 
-    async def fake_official(experiment, dataset, run_envelopes, runtime_root):
+    async def fake_official(
+        experiment,
+        dataset,
+        run_envelopes,
+        runtime_root,
+        *,
+        allow_partial_predictions=False,
+    ):
         del experiment, dataset, run_envelopes, runtime_root
+        assert allow_partial_predictions is False
+        running = repository.get_experiment(_experiment_id)
+        progress = running.summary["progress"]
+        assert progress["stage"] == "official_verifier"
+        assert progress["completed"] == 0
+        assert progress["current_index"] == 0
+        assert progress["total"] == 1
+        assert progress["current_case_id"] is None
+        assert progress["current_case_name"] is None
         return {
             "status": "completed",
             "reason": "Official SWE-bench Harness completed",
@@ -985,10 +1136,12 @@ async def test_runner_applies_platform_managed_official_result_to_attempt(
                 "predictions_sha256": "predictions",
                 "patch_sha256": {"pytest-dev__pytest-1234": "patch"},
                 "source_snapshot_sha256": "snapshot",
+                "docker_architecture": "x86_64",
                 "aggregate": {"resolved_ids": ["pytest-dev__pytest-1234"]},
             },
         }
 
+    _experiment_id = experiment.experiment_id
     monkeypatch.setattr(runner_module, "run_official_swebench_harness", fake_official)
     runner = EvaluationRunner(repository, LangSmithSettings(enabled=False), tmp_path)
     summary = await runner._run_and_apply_official_swebench(
@@ -1000,6 +1153,7 @@ async def test_runner_applies_platform_managed_official_result_to_attempt(
 
     assert summary["status"] == "completed"
     assert summary["resolved"] == 1
+    assert summary["docker_architecture"] == "x86_64"
     saved_run = repository.load_run_envelopes(experiment.experiment_id)[case.case_id][0]
     assert saved_run["metadata"]["code_verification"]["status"] == "passed"
     saved_code_result = next(
@@ -1009,3 +1163,302 @@ async def test_runner_applies_platform_managed_official_result_to_attempt(
     )
     assert saved_code_result["outcome"] == "pass"
     assert all_attempts[0]["summary"]["verdict"] == "pass"
+
+
+@pytest.mark.asyncio
+async def test_verifier_replay_reuses_attempt_patch_without_running_agent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    repository = EvaluationRepository(tmp_path / "evaluation.db")
+    draft = repository.create_dataset(_dataset())
+    bundle = repository.publish_dataset(draft.dataset_id, draft.revision)
+    base = _experiment(bundle.dataset, status=ExperimentStatus.QUEUED)
+    experiment = repository.create_experiment(
+        base.model_copy(
+            update={
+                "dataset_id": draft.dataset_id,
+                "dataset_version_id": bundle.version_id,
+                "dataset_content_hash": bundle.checksum,
+                "summary": {
+                    "execution_mode": "official_verifier_replay",
+                    "case_attempts": 1,
+                    "failed_attempts": 0,
+                    "swebench_predictions_available": True,
+                    "swebench_verifier_replay": {
+                        "generation": 1,
+                        "status": "queued",
+                        "total": 1,
+                        "langsmith_projection_was_published": False,
+                    },
+                    "progress": {
+                        "stage": "queued",
+                        "total": 1,
+                        "completed": 0,
+                        "failed": 0,
+                    },
+                },
+            }
+        )
+    )
+    case = bundle.dataset.cases[0]
+    attempt_id = repository.create_attempt(experiment.experiment_id, case.case_id, 0)
+    envelope = _envelopes(experiment, bundle.dataset, attempt_id)[case.case_id][0]
+    run = AgentRunEnvelope.model_validate(
+        {key: value for key, value in envelope.items() if not key.startswith("_")}
+    )
+    repository.finish_attempt(attempt_id, status="completed", run=run)
+    code_evaluator = evaluator_registry.get_registered("code_verification.v1")
+    assert code_evaluator is not None
+    initial = code_evaluator[1](
+        case,
+        run,
+        TraceEvidence(available_kinds={"code_patch", "code_verification"}),
+    )
+    repository.save_result(experiment.experiment_id, attempt_id, initial)
+
+    async def fake_official(
+        _experiment,
+        _dataset,
+        _run_envelopes,
+        _runtime_root,
+        *,
+        allow_partial_predictions=False,
+    ):
+        assert allow_partial_predictions is True
+        return {
+            "status": "completed",
+            "reason": "Official SWE-bench Harness completed",
+            "results": {
+                "pytest-dev__pytest-1234": {
+                    "status": "passed",
+                    "resolved": True,
+                    "reason": "Official SWE-bench Harness resolved the instance",
+                }
+            },
+            "receipt": {
+                "provenance": "platform_managed_official_harness",
+                "package": "swebench==4.1.0",
+                "run_id": "run-replay",
+                "report_sha256": "report-replay",
+                "predictions_sha256": "predictions-replay",
+                "patch_sha256": {"pytest-dev__pytest-1234": "patch"},
+                "source_snapshot_sha256": "snapshot",
+                "docker_architecture": "arm64",
+                "aggregate": {"resolved_ids": ["pytest-dev__pytest-1234"]},
+            },
+        }
+
+    monkeypatch.setattr(runner_module, "run_official_swebench_harness", fake_official)
+    runner = EvaluationRunner(repository, LangSmithSettings(enabled=False), tmp_path)
+    monkeypatch.setattr(runner, "_initialize_isolated_runtime", lambda _root: None)
+    monkeypatch.setattr(runner, "_runtime_root", lambda _experiment_id: tmp_path / "runtime")
+    monkeypatch.setattr(
+        repository,
+        "create_attempt",
+        lambda *_args, **_kwargs: pytest.fail("verifier replay must not create an Attempt"),
+    )
+
+    completed = await runner.run(experiment.experiment_id)
+
+    assert completed.status == ExperimentStatus.COMPLETED
+    assert completed.verdict == "pass"
+    assert completed.summary["swebench_official_harness"]["docker_architecture"] == "arm64"
+    assert completed.summary["swebench_verifier_replay"]["status"] == "completed"
+    assert completed.summary["swebench_verifier_replay"]["instance_results"] == {
+        "pytest-dev__pytest-1234": {"status": "passed", "resolved": True}
+    }
+    assert len(completed.summary["swebench_verifier_replay_history"]) == 1
+    assert repository.load_run_envelopes(experiment.experiment_id)[case.case_id][0][
+        "metadata"
+    ]["code_verification"]["patch"] == "diff --git a/a.py b/a.py"
+    rows = repository.list_results(experiment.experiment_id)
+    assert {row["attempt_id"] for row in rows} == {attempt_id}
+    saved_code = next(
+        row["result"]
+        for row in rows
+        if row["result"] and row["result"]["evaluator_id"] == "code_verification.v1"
+    )
+    assert saved_code["outcome"] == "pass"
+
+
+@pytest.mark.asyncio
+async def test_missing_case_resume_runs_only_missing_case_and_reuses_existing_patch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    repository = EvaluationRepository(tmp_path / "evaluation.db")
+    dataset = swebench_dataset_from_rows(
+        [
+            {
+                "instance_id": "pytest-dev__pytest-1234",
+                "repo": "pytest-dev/pytest",
+                "base_commit": "b" * 40,
+                "problem_statement": "Fix collection",
+                "version": "8.0",
+                "test_patch": "diff --git a/testing/test_x.py b/testing/test_x.py",
+                "FAIL_TO_PASS": "[]",
+                "PASS_TO_PASS": "[]",
+            },
+            {
+                "instance_id": "pytest-dev__pytest-5678",
+                "repo": "pytest-dev/pytest",
+                "base_commit": "c" * 40,
+                "problem_statement": "Fix another collection issue",
+                "version": "8.0",
+                "test_patch": "diff --git a/testing/test_y.py b/testing/test_y.py",
+                "FAIL_TO_PASS": "[]",
+                "PASS_TO_PASS": "[]",
+            },
+        ],
+        name="Resume managed verifier",
+    )
+    draft = repository.create_dataset(dataset)
+    bundle = repository.publish_dataset(draft.dataset_id, draft.revision)
+    experiment = repository.create_experiment(
+        EvalExperiment(
+            name="Resume SWE experiment",
+            dataset_id=draft.dataset_id,
+            dataset_version=1,
+            dataset_version_id=bundle.version_id,
+            dataset_content_hash=bundle.checksum,
+            candidate=ExperimentCandidate(name="model"),
+            profile_id="coding_agent@1",
+            status=ExperimentStatus.QUEUED,
+            summary={
+                "execution_mode": "swebench_missing_case_resume",
+                "case_attempts": 2,
+                "failed_attempts": 1,
+                "swebench_case_resume": {
+                    "generation": 1,
+                    "status": "queued",
+                    "missing_instance_ids": ["pytest-dev__pytest-5678"],
+                    "persisted_patch_count": 1,
+                    "dataset_total": 2,
+                    "langsmith_projection_was_published": False,
+                },
+                "progress": {
+                    "stage": "queued",
+                    "total": 1,
+                    "completed": 0,
+                    "failed": 0,
+                },
+            },
+        )
+    )
+    completed_case, failed_case = bundle.dataset.cases
+    old_completed_id = repository.create_attempt(
+        experiment.experiment_id, completed_case.case_id, 0
+    )
+    old_run = AgentRunEnvelope(
+        case_id=completed_case.case_id,
+        experiment_id=experiment.experiment_id,
+        candidate_id=experiment.candidate.candidate_id,
+        session_id="old-session",
+        response="patched",
+        metadata={
+            "code_verification": {
+                "mode": "swebench",
+                "status": "not_evaluated",
+                "patch": "diff --git a/a.py b/a.py\n+old = True\n",
+                "patch_sha256": "old-patch",
+                "changed_paths": ["a.py"],
+            }
+        },
+    )
+    repository.finish_attempt(old_completed_id, status="completed", run=old_run)
+    code_evaluator = evaluator_registry.get_registered("code_verification.v1")
+    assert code_evaluator is not None
+    old_result = code_evaluator[1](
+        completed_case,
+        old_run,
+        TraceEvidence(available_kinds={"code_patch", "code_verification"}),
+    )
+    repository.save_result(experiment.experiment_id, old_completed_id, old_result)
+    old_failed_id = repository.create_attempt(
+        experiment.experiment_id, failed_case.case_id, 0
+    )
+    repository.finish_attempt(
+        old_failed_id,
+        status="failed",
+        error={"code": "case_execution_failed", "message": "no patch"},
+    )
+
+    runner = EvaluationRunner(repository, LangSmithSettings(), tmp_path)
+    monkeypatch.setattr(runner_module, "verify_candidate_snapshot", lambda *_args: [])
+    monkeypatch.setattr(runner, "_initialize_isolated_runtime", lambda _root: None)
+    monkeypatch.setattr(runner, "_runtime_root", lambda _experiment_id: tmp_path / "runtime")
+    executed: list[tuple[str, int]] = []
+    verifier_calls: list[list[str]] = []
+
+    async def fake_run_case(
+        current_experiment,
+        case,
+        repetition,
+        _runtime_root,
+        _classification,
+    ):
+        executed.append((case.case_id, repetition))
+        attempt_id = repository.create_attempt(
+            current_experiment.experiment_id, case.case_id, repetition
+        )
+        run = AgentRunEnvelope(
+            case_id=case.case_id,
+            experiment_id=current_experiment.experiment_id,
+            candidate_id=current_experiment.candidate.candidate_id,
+            session_id="resume-session",
+            response="patched missing Case",
+            metadata={
+                "code_verification": {
+                    "mode": "swebench",
+                    "status": "not_evaluated",
+                    "patch": "diff --git a/b.py b/b.py\n+new = True\n",
+                    "patch_sha256": "new-patch",
+                    "changed_paths": ["b.py"],
+                }
+            },
+        )
+        repository.finish_attempt(attempt_id, status="completed", run=run)
+        result = code_evaluator[1](
+            case,
+            run,
+            TraceEvidence(available_kinds={"code_patch", "code_verification"}),
+        )
+        repository.save_result(current_experiment.experiment_id, attempt_id, result)
+        return {
+            "case_id": case.case_id,
+            "attempt_id": attempt_id,
+            "response": run.response,
+            "results": [result.model_dump(mode="json")],
+            "summary": evaluator_registry.summarize(case, [result]),
+            "attempt_status": "completed",
+            "agent_trace_export": "disabled",
+        }
+
+    async def fake_verifier(
+        _experiment,
+        _dataset,
+        _runtime_root,
+        all_attempts,
+        *,
+        allow_partial_predictions=False,
+    ):
+        assert allow_partial_predictions is True
+        verifier_calls.append([str(item["case_id"]) for item in all_attempts])
+        return {"status": "completed", "resolved": 0, "total": 2, "results": {}}
+
+    monkeypatch.setattr(runner, "_run_case", fake_run_case)
+    monkeypatch.setattr(runner, "_run_and_apply_official_swebench", fake_verifier)
+
+    completed = await runner.run(experiment.experiment_id)
+
+    assert completed.status == ExperimentStatus.COMPLETED
+    assert executed == [(failed_case.case_id, 1)]
+    assert verifier_calls == [[completed_case.case_id, failed_case.case_id]]
+    assert completed.summary["swebench_predictions_available"] is True
+    assert completed.summary["swebench_missing_predictions"] == 0
+    assert completed.summary["case_attempts"] == 2
+    assert completed.summary["attempt_history_count"] == 3
+    assert completed.summary["superseded_attempt_count"] == 1
+    assert completed.summary["swebench_case_resume"]["new_attempt_count"] == 1
+    assert len(repository.list_results(experiment.experiment_id)) == 3

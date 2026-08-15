@@ -3,6 +3,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useApp, type SourceRecord } from "@/lib/store";
 import { shouldShowInlineBudgetRequest } from "@/lib/goalControls";
+import { formatUsageSummary } from "@/lib/usageSummary";
 import ChatMessage from "./ChatMessage";
 import ChatInput from "./ChatInput";
 import GoalBudgetRequestCard from "./GoalBudgetRequestCard";
@@ -74,7 +75,9 @@ export default function ChatPanel() {
     previousHistoryLoadingRef.current = sessionHistoryLoading;
   }, [sessionId, sessionHistoryLoading, messages, maintenanceStatus, activeGoal?.status]);
 
-  const lastAssistantId = [...messages].reverse().find((m) => m.role === "assistant")?.id;
+  const lastAssistantMessage = [...messages].reverse().find((m) => m.role === "assistant");
+  const lastAssistantId = lastAssistantMessage?.id;
+  const latestUsageSummary = lastAssistantMessage?.usageSummary;
   const lastMessageId = messages[messages.length - 1]?.id;
   const sessionSources = useMemo(() => {
     const catalog = new Map<string, SourceRecord>();
@@ -169,6 +172,19 @@ export default function ChatPanel() {
                 </span>
               ) : null}
             </div>
+          </div>
+        </div>
+      ) : null}
+      {(isStreaming || latestUsageSummary) ? (
+        <div
+          className="h-7 shrink-0 px-7"
+          aria-label="最近一次运行用量"
+          data-testid="composer-usage-summary"
+        >
+          <div className="mx-auto flex h-full w-full max-w-[900px] items-center justify-center overflow-hidden px-1 text-center text-[11px] leading-5 text-slate-400 tabular-nums">
+            <span className="max-w-full truncate whitespace-nowrap">
+              {latestUsageSummary ? formatUsageSummary(latestUsageSummary) : "\u00a0"}
+            </span>
           </div>
         </div>
       ) : null}

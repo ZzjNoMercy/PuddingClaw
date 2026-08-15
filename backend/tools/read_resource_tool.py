@@ -1,4 +1,4 @@
-"""ReadResourceTool — unified PuddingClaw resource reader."""
+"""ReadResourceTool — attachment and visual-resource bridge."""
 
 from __future__ import annotations
 
@@ -13,7 +13,6 @@ from graph.host_read_policy import is_sensitive_host_read_path
 from graph.managed_paths import is_managed_resource_path
 from graph.session_manager import session_manager
 from knowledge.paths import get_knowledge_root
-from tools.read_external_file_tool import ReadExternalFileTool
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff"}
 
@@ -21,26 +20,23 @@ IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".
 class ReadResourceInput(BaseModel):
     resource: str = Field(
         description=(
-            "Resource to read. Pass either an attachment id like att_11d3cfb4dc67 for uploaded/pasted "
-            "attachments or the exact non-workspace host path the user provided. "
-            "This includes POSIX absolute paths, Windows absolute paths, and home-relative paths. "
-            "HTTP(S) URLs are web resources and must be passed to fetch_url, not read_resource. "
-            "Do not pass managed virtual paths such as /workspace, /scratch, /tmp, /knowledge, /skills, "
-            "/semantic-assets, /analytics-models, or /sql-guardrails here; use read_file for them."
+            "Attachment or visual resource to open. Pass an attachment id like att_11d3cfb4dc67 for an "
+            "uploaded/pasted attachment, or an absolute/home-relative/virtual local image path that must be "
+            "injected into visual analysis. Ordinary text paths must use read_file. HTTP(S) URLs must use "
+            "fetch_url."
         )
     )
-    offset: int = Field(default=0, ge=0, description="Zero-based line offset for text files")
-    limit: int = Field(default=2000, ge=1, le=2000, description="Maximum text lines to return")
+    offset: int = Field(default=0, ge=0, description="Zero-based line offset for text attachments")
+    limit: int = Field(default=2000, ge=1, le=2000, description="Maximum attachment text lines to return")
 
 
 class ReadResourceTool(BaseTool):
     name: str = "read_resource"
     description: str = (
-        "Read a PuddingClaw resource from a single entry point. Use this for uploaded/pasted attachment refs "
-        "(`att_xxx`) and user-provided host paths outside the managed virtual namespaces. "
-        "This tool does not extract PDF text; activate the PDF Skill and use its extraction flow. "
-        "Use read_file for `/workspace`, `/scratch`, `/tmp`, `/knowledge`, `/skills`, `/semantic-assets`, "
-        "`/analytics-models`, `/sql-guardrails`, and `/large_tool_results`."
+        "Open an uploaded/pasted attachment ref (`att_xxx`) or a local image path that must be injected into "
+        "visual analysis. This is not a general filesystem reader: use read_file for every ordinary text "
+        "path, whether real or virtual. This tool does not extract PDF text; activate the PDF Skill and use "
+        "its extraction flow."
     )
     args_schema: type[BaseModel] = ReadResourceInput
     risk_level: str = "moderate"
@@ -52,7 +48,7 @@ class ReadResourceTool(BaseTool):
     allowed_attachment_ids: list[str] = Field(default_factory=list, exclude=True)
     enforce_attachment_allowlist: bool = Field(default=False, exclude=True)
 
-    def _read_attachment(self, attachment_id: str) -> str:
+    def _read_attachment(self, attachment_id: str, *, offset: int = 0, limit: int = 2000) -> str:
         item = attachment_store.get(self.session_id, attachment_id)
         if not item:
             return f"❌ Attachment not found: {attachment_id}"
@@ -83,16 +79,22 @@ class ReadResourceTool(BaseTool):
         if not path.is_file():
             return f"❌ Attachment file missing: {attachment_id}"
         try:
-            content = path.read_text(encoding="utf-8", errors="replace")
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
         except Exception as exc:
             return f"❌ Error reading attachment: {exc}"
-        if len(content) > 40000:
-            content = content[:40000] + "\n...[truncated]"
+        selected = lines[offset : offset + limit]
+        content = "\n".join(selected)
+        suffix = (
+            f"\n\n[Showing lines {offset + 1}-{offset + len(selected)} of {len(lines)}. "
+            f"Continue with offset={offset + limit}.]"
+            if offset + limit < len(lines)
+            else ""
+        )
         return (
             f"Attachment: {item.get('name')}\n"
             f"Type: {attachment_type}\n"
             f"Size: {item.get('size')} bytes\n\n"
-            f"{content}"
+            f"{content}{suffix}"
         )
 
     @staticmethod
@@ -129,7 +131,11 @@ class ReadResourceTool(BaseTool):
                 not unrestricted_spawn_read
                 and not smart_ordinary_read
                 and not is_managed_resource_path(path, base_dir)
-                and not session_manager.has_external_file_read_permission(self.session_id, path)
+                and not session_manager.has_external_path_read_permission(
+                    self.session_id,
+                    path,
+                    run_id=self.run_id,
+                )
             ):
                 return (
                     "🔒 Permission required: this file is outside the current workspace.\n"
@@ -169,32 +175,6 @@ class ReadResourceTool(BaseTool):
             return None
         return path
 
-    def _read_workspace_path(
-        self,
-        path: Path,
-        *,
-        offset: int,
-        limit: int,
-    ) -> str:
-        if not path.exists():
-            return f"❌ File not found: {path}"
-        if not path.is_file():
-            return f"❌ Not a file: {path}"
-        image_marker = self._read_image_path_marker(str(path))
-        if image_marker is not None:
-            return image_marker
-        try:
-            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-        except Exception as exc:
-            return f"❌ Error reading workspace resource: {exc}"
-        selected = lines[offset : offset + limit]
-        suffix = (
-            f"\n...[{len(lines) - offset - len(selected)} more lines]"
-            if offset + len(selected) < len(lines)
-            else ""
-        )
-        return "\n".join(selected) + suffix
-
     def _run(self, resource: str, offset: int = 0, limit: int = 2000) -> str:
         value = resource.strip()
         if not value:
@@ -206,27 +186,22 @@ class ReadResourceTool(BaseTool):
         if parsed is not None and parsed.scheme.lower() in {"http", "https"} and parsed.netloc:
             return "❌ Web URL supplied to read_resource; use fetch_url for HTTP(S) resources."
         if value.startswith("att_"):
-            return self._read_attachment(value)
+            return self._read_attachment(value, offset=offset, limit=limit)
+        if Path(value).suffix.lower() not in IMAGE_EXTENSIONS:
+            return (
+                "❌ read_resource only accepts attachment refs (`att_xxx`) and local image paths. "
+                "Use read_file for ordinary text paths."
+            )
         workspace_path = self._resolve_workspace_virtual_path(value)
         if workspace_path is not None:
-            return self._read_workspace_path(
-                workspace_path,
-                offset=offset,
-                limit=limit,
-            )
+            value = str(workspace_path)
         knowledge_path = self._resolve_knowledge_virtual_path(value)
         if knowledge_path is not None:
             value = str(knowledge_path)
         image_marker = self._read_image_path_marker(value)
         if image_marker is not None:
             return image_marker
-        return ReadExternalFileTool(
-            session_id=self.session_id,
-            run_id=self.run_id,
-            workspace_path=self.workspace_path,
-            backend_mode=self.backend_mode,
-            approval_mode=self.approval_mode,
-        ).invoke({"path": value, "offset": offset, "limit": limit})
+        return "❌ read_resource could not resolve the local image path."
 
 
 def create_read_resource_tool(base_dir: Path) -> ReadResourceTool:

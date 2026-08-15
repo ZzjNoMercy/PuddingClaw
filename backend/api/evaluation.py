@@ -982,3 +982,265 @@ async def retry_experiment(experiment_id: str) -> dict[str, Any]:
         _raise_repository_error(exc)
     await evaluation_worker_manager.start(retried.experiment_id)
     return retried.model_dump(mode="json")
+
+
+@router.post("/experiments/{experiment_id}/verify/swebench", status_code=202)
+async def rerun_swebench_verifier(experiment_id: str) -> dict[str, Any]:
+    """Re-run only the official verifier against persisted Agent patches."""
+
+    repository = get_evaluation_repository()
+    try:
+        experiment = await run_in_threadpool(repository.get_experiment, experiment_id)
+        if experiment.status not in {"completed", "failed", "cancelled"}:
+            raise ConflictError("Only terminal Experiments can be re-verified")
+        dataset = await run_in_threadpool(
+            repository.get_dataset,
+            experiment.dataset_id,
+            experiment.dataset_version,
+        )
+        if dataset.current_version_id != experiment.dataset_version_id:
+            raise ConflictError("Pinned Dataset version identity mismatch")
+        swebench_cases = [
+            case
+            for case in dataset.cases
+            if case.enabled
+            and case.code is not None
+            and case.code.repository.swebench is not None
+        ]
+        if not swebench_cases:
+            raise ConflictError("Experiment has no enabled SWE-bench Cases")
+        envelopes = await run_in_threadpool(repository.load_run_envelopes, experiment_id)
+        manifest = swebench_prediction_manifest(
+            dataset,
+            envelopes,
+            model_name_or_path=(experiment.candidate.llm_model_id or experiment.candidate.name),
+        )
+        if not manifest["predictions"]:
+            raise ConflictError("Experiment has no persisted SWE-bench patch to verify")
+        result_rows = await run_in_threadpool(repository.list_results, experiment_id)
+        completed_attempt_ids = {
+            str(row["attempt_id"])
+            for row in result_rows
+            if row.get("attempt_status") == "completed"
+        }
+        selected_attempt_ids = {
+            str(item["attempt_id"]) for item in manifest["predictions"]
+        }
+        if not selected_attempt_ids or not selected_attempt_ids <= completed_attempt_ids:
+            raise ConflictError("Persisted patches must belong to completed Attempts")
+        verifier_status = await probe_official_swebench_runtime()
+        if not verifier_status["available"]:
+            raise ConflictError(
+                "SWE-bench Docker Verifier is unavailable: "
+                + str(verifier_status.get("reason") or "unknown")
+            )
+        patch_sha256 = {
+            str(item["instance_id"]): hashlib.sha256(
+                str(item["model_patch"]).encode("utf-8")
+            ).hexdigest()
+            for item in manifest["predictions"]
+        }
+        envelope_by_attempt_id = {
+            str(envelope.get("_attempt_id") or ""): envelope
+            for case_envelopes in envelopes.values()
+            for envelope in case_envelopes
+        }
+        previous_instance_results: dict[str, dict[str, Any]] = {}
+        for prediction in manifest["predictions"]:
+            envelope = envelope_by_attempt_id.get(str(prediction["attempt_id"])) or {}
+            verification = (envelope.get("metadata") or {}).get("code_verification") or {}
+            previous_instance_results[str(prediction["instance_id"])] = {
+                "status": verification.get("status"),
+                "passed": verification.get("passed"),
+                "reason": str(verification.get("reason") or "")[:500],
+                "patch_sha256": patch_sha256[str(prediction["instance_id"])],
+            }
+        previous_replay = dict(experiment.summary.get("swebench_verifier_replay") or {})
+        generation = int(previous_replay.get("generation") or 0) + 1
+        requested_at = utc_now()
+        projection_was_published = bool(
+            experiment.remote_experiment_id
+            or experiment.summary.get("experiment_projection") == "synced"
+        )
+        replay = {
+            "generation": generation,
+            "status": "queued",
+            "requested_at": requested_at.isoformat(),
+            "total": len(manifest["predictions"]),
+            "dataset_total": len(swebench_cases),
+            "missing_instance_ids": list(manifest["missing_instance_ids"]),
+            "source_attempt_ids": sorted(selected_attempt_ids),
+            "patch_sha256": patch_sha256,
+            "previous_status": str(experiment.status),
+            "previous_verdict": experiment.verdict,
+            "previous_started_at": (
+                experiment.started_at.isoformat() if experiment.started_at else None
+            ),
+            "previous_finished_at": (
+                experiment.finished_at.isoformat() if experiment.finished_at else None
+            ),
+            "previous_report_sha256": (
+                (experiment.summary.get("swebench_official_harness") or {}).get(
+                    "report_sha256"
+                )
+            ),
+            "previous_instance_results": previous_instance_results,
+            "langsmith_projection_was_published": projection_was_published,
+        }
+        summary = {
+            **experiment.summary,
+            "execution_mode": "official_verifier_replay",
+            "swebench_verifier_replay": replay,
+            "swebench_official_harness": {
+                "status": "queued",
+                "total": len(manifest["predictions"]),
+                "resolved": 0,
+            },
+            "progress": {
+                "stage": "queued",
+                "message": "已保存的 Agent patch 正在等待 Docker 重新判卷",
+                "total": len(manifest["predictions"]),
+                "completed": 0,
+                "failed": 0,
+                "updated_at": requested_at.isoformat(),
+            },
+        }
+        if projection_was_published:
+            summary["experiment_projection"] = "stale_after_verifier_replay"
+            summary["langsmith_projection"] = "stale_after_verifier_replay"
+        queued = experiment.model_copy(
+            update={
+                "status": "queued",
+                "verdict": "pending",
+                "error": None,
+                "started_at": None,
+                "finished_at": None,
+                "summary": summary,
+            }
+        )
+        queued = await run_in_threadpool(
+            repository.update_experiment,
+            queued,
+            expected_status=experiment.status,
+        )
+    except EvaluationRepositoryError as exc:
+        _raise_repository_error(exc)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    await evaluation_worker_manager.start(experiment_id)
+    return queued.model_dump(mode="json")
+
+
+@router.post("/experiments/{experiment_id}/resume/swebench", status_code=202)
+async def resume_missing_swebench_cases(experiment_id: str) -> dict[str, Any]:
+    """Run only SWE-bench Cases that do not yet have a persisted valid patch."""
+
+    repository = get_evaluation_repository()
+    try:
+        experiment = await run_in_threadpool(repository.get_experiment, experiment_id)
+        if experiment.status not in {"completed", "failed", "cancelled"}:
+            raise ConflictError("Only terminal Experiments can resume missing SWE-bench Cases")
+        dataset = await run_in_threadpool(
+            repository.get_dataset,
+            experiment.dataset_id,
+            experiment.dataset_version,
+        )
+        if dataset.current_version_id != experiment.dataset_version_id:
+            raise ConflictError("Pinned Dataset version identity mismatch")
+        swebench_cases = [
+            case
+            for case in dataset.cases
+            if case.enabled
+            and case.code is not None
+            and case.code.repository.swebench is not None
+        ]
+        if not swebench_cases:
+            raise ConflictError("Experiment has no enabled SWE-bench Cases")
+        envelopes = await run_in_threadpool(repository.load_run_envelopes, experiment_id)
+        manifest = swebench_prediction_manifest(
+            dataset,
+            envelopes,
+            model_name_or_path=(experiment.candidate.llm_model_id or experiment.candidate.name),
+        )
+        missing_instance_ids = list(manifest["missing_instance_ids"])
+        if not missing_instance_ids:
+            raise ConflictError("Every enabled SWE-bench Case already has a persisted patch")
+
+        # A resumed Case executes the Agent code that is deployed now. Freeze
+        # that Candidate explicitly while retaining per-Attempt candidate IDs
+        # and resume lineage for the already persisted patches.
+        candidate_request = CandidateRequest(
+            name=experiment.candidate.name,
+            llm_model_id=experiment.candidate.llm_model_id,
+            thinking_level=experiment.candidate.thinking_level,
+            credential_name=experiment.candidate.credential_name,
+            analytics_model_id=experiment.candidate.analytics_model_id,
+        )
+        candidate = await run_in_threadpool(resolve_candidate, BASE_DIR, candidate_request)
+        candidate = bind_candidate_capability(candidate, experiment.profile_id)
+        previous_resume = dict(experiment.summary.get("swebench_case_resume") or {})
+        generation = int(previous_resume.get("generation") or 0) + 1
+        requested_at = utc_now()
+        projection_was_published = bool(
+            experiment.remote_experiment_id
+            or experiment.summary.get("experiment_projection") == "synced"
+        )
+        source_attempt_ids = sorted(
+            str(item["attempt_id"]) for item in manifest["predictions"]
+        )
+        resume = {
+            "generation": generation,
+            "status": "queued",
+            "requested_at": requested_at.isoformat(),
+            "missing_instance_ids": missing_instance_ids,
+            "source_attempt_ids": source_attempt_ids,
+            "persisted_patch_count": len(manifest["predictions"]),
+            "dataset_total": len(swebench_cases),
+            "previous_candidate_id": experiment.candidate.candidate_id,
+            "previous_candidate_fingerprint": experiment.candidate.fingerprint,
+            "resume_candidate_id": candidate.candidate_id,
+            "resume_candidate_fingerprint": candidate.fingerprint,
+            "mixed_candidate_attempts": bool(source_attempt_ids),
+            "previous_status": str(experiment.status),
+            "previous_verdict": experiment.verdict,
+            "langsmith_projection_was_published": projection_was_published,
+        }
+        summary = {
+            **experiment.summary,
+            "execution_mode": "swebench_missing_case_resume",
+            "swebench_case_resume": resume,
+            "swebench_missing_predictions": len(missing_instance_ids),
+            "progress": {
+                "stage": "queued",
+                "message": f"正在等待补跑 {len(missing_instance_ids)} 个缺失 Patch 的 Case",
+                "total": len(missing_instance_ids),
+                "completed": 0,
+                "failed": 0,
+                "updated_at": requested_at.isoformat(),
+            },
+        }
+        if projection_was_published:
+            summary["experiment_projection"] = "stale_after_case_resume"
+            summary["langsmith_projection"] = "stale_after_case_resume"
+        queued = experiment.model_copy(
+            update={
+                "candidate": candidate,
+                "status": "queued",
+                "verdict": "pending",
+                "error": None,
+                "started_at": None,
+                "finished_at": None,
+                "summary": summary,
+            }
+        )
+        queued = await run_in_threadpool(
+            repository.update_experiment,
+            queued,
+            expected_status=experiment.status,
+        )
+    except EvaluationRepositoryError as exc:
+        _raise_repository_error(exc)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    await evaluation_worker_manager.start(experiment_id)
+    return queued.model_dump(mode="json")

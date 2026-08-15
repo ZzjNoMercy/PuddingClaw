@@ -37,7 +37,6 @@ UNCONDITIONAL_EXTENSION_TOOLSETS: dict[str, frozenset[str]] = {
         "replace_file",
         "patch_file",
         "patch_files",
-        "delete_file",
         "execute_external_directory",
         "validate_html_report",
         "rewind_external_file_changes",
@@ -143,7 +142,7 @@ TOOLSETS: dict[str, frozenset[str]] = {
 DEFAULT_TOOLSETS = frozenset({*NATIVE_TOOLSETS, *UNCONDITIONAL_EXTENSION_TOOLSETS})
 # Explicit PuddingClaw extensions that remain available without loading a
 # business Skill. They are not DeepAgents-native and keep their own permission
-# policies (for example, read_resource's external-file HITL gate).
+# policies (for example, read_resource's attachment scope and visual-image gate).
 DEFAULT_CUSTOM_TOOL_NAMES = frozenset({"read_resource"}).union(
     *UNCONDITIONAL_EXTENSION_TOOLSETS.values()
 )
@@ -262,12 +261,6 @@ TOOL_CONTROL_DESCRIPTORS: dict[str, ToolControlDescriptor] = {
     "replace_file": _WORKSPACE_WRITE,
     "patch_file": _WORKSPACE_WRITE,
     "patch_files": _WORKSPACE_WRITE,
-    "delete_file": ToolControlDescriptor(
-        side_effect="external_delete",
-        idempotency="required",
-        approval_scope="call_or_session_root",
-        policy="boundary",
-    ),
     "execute_external_directory": ToolControlDescriptor(
         side_effect="ephemeral_external_directory_execution",
         idempotency="not_applicable",

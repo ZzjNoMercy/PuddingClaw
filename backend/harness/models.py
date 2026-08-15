@@ -343,10 +343,13 @@ class PermissionManifest(BaseModel):
     manifest_id: str
     run_id: str
     approval_mode: Literal["strict", "smart"]
+    backend_mode: str = ""
+    filesystem_mode: Literal["restricted", "unrestricted"] = "restricted"
     allowed: list[dict[str, Any]] = Field(default_factory=list)
     runtime_evaluated: list[dict[str, Any]] = Field(default_factory=list)
     hitl_required: list[dict[str, Any]] = Field(default_factory=list)
     blocked: list[dict[str, Any]] = Field(default_factory=list)
+    recent_decisions: list[dict[str, Any]] = Field(default_factory=list)
     policy_epoch: int = 1
     policy_version: str = ""
     created_at: float = Field(default_factory=time.time)

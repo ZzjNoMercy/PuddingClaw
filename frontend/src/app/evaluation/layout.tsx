@@ -45,9 +45,9 @@ export default function EvaluationLayout({ children }: { children: React.ReactNo
             <header className="shrink-0 border-b border-black/[0.06] bg-white/60">
               <div className="workspace-page-width px-5 pb-4 pt-6">
                 <WorkspacePageHeader
-                  eyebrow="EVALUATION WORKSPACE"
+                  eyebrow="评估工作台"
                   title="评估"
-                  description="用版本化评测集和可追踪实验，持续验证 Agent 的质量、稳定性与回归表现。"
+                  description="用版本化评测集和可追踪实验，持续验证智能体的质量、稳定性与回归表现。"
                   actions={
                     <button onClick={() => setDialog(true)} className="flex items-center gap-2 rounded-lg border border-gray-200 bg-white px-3 py-1.5 text-xs text-gray-600">
                       <span className={`h-2 w-2 rounded-full ${settings?.enabled && settings.api_key_configured ? "bg-emerald-500" : "bg-gray-300"}`} />LangSmith<Settings2 className="h-3.5 w-3.5" />
@@ -55,10 +55,10 @@ export default function EvaluationLayout({ children }: { children: React.ReactNo
                   }
                 />
                 <div className="mt-5 flex items-center gap-5">
-                  <div className="flex items-center gap-2 text-sm font-semibold text-gray-900"><FlaskConical className="h-4 w-4 text-[#002fa7]" />Agent 评估</div>
+                  <div className="flex items-center gap-2 whitespace-nowrap text-sm font-semibold text-gray-900"><FlaskConical className="h-4 w-4 text-[#002fa7]" />智能体评估</div>
                   <nav className="flex gap-1 text-sm">
-                  <Link href="/evaluation/datasets" className={`rounded-lg px-3 py-1.5 ${pathname.startsWith("/evaluation/datasets") ? "bg-[#002fa7] text-white" : "text-gray-500 hover:bg-gray-100"}`}>Dataset</Link>
-                  <Link href="/evaluation/experiments" className={`rounded-lg px-3 py-1.5 ${pathname.startsWith("/evaluation/experiments") ? "bg-[#002fa7] text-white" : "text-gray-500 hover:bg-gray-100"}`}>Experiments</Link>
+                  <Link href="/evaluation/datasets" className={`whitespace-nowrap rounded-lg px-3 py-1.5 ${pathname.startsWith("/evaluation/datasets") ? "bg-[#002fa7] text-white" : "text-gray-500 hover:bg-gray-100"}`}>评测集</Link>
+                  <Link href="/evaluation/experiments" className={`whitespace-nowrap rounded-lg px-3 py-1.5 ${pathname.startsWith("/evaluation/experiments") ? "bg-[#002fa7] text-white" : "text-gray-500 hover:bg-gray-100"}`}>评测实验</Link>
                   </nav>
                 </div>
               </div>
@@ -71,8 +71,8 @@ export default function EvaluationLayout({ children }: { children: React.ReactNo
           <div className="mb-4 flex items-center justify-between"><h2 className="font-semibold">LangSmith 评估后端</h2><button onClick={() => setDialog(false)}><X className="h-4 w-4" /></button></div>
           <label className="mb-1 flex items-center gap-2 text-sm"><input type="checkbox" checked={settings.enabled} onChange={(event) => setSettings({ ...settings, enabled: event.target.checked })} />评测完成后自动投影到 LangSmith</label>
           <p className="mb-3 text-xs text-gray-400">关闭自动投影时仍然可以保存 API Key 和测试连接。</p>
-          <label className="mb-3 block text-xs text-gray-500">Endpoint<input value={settings.endpoint} onChange={(event) => setSettings({ ...settings, endpoint: event.target.value })} className="mt-1 w-full rounded-lg border px-3 py-2 text-sm text-gray-800" /></label>
-          <label className="mb-3 block text-xs text-gray-500">Project<input value={settings.project} onChange={(event) => setSettings({ ...settings, project: event.target.value })} className="mt-1 w-full rounded-lg border px-3 py-2 text-sm text-gray-800" /></label>
+          <label className="mb-3 block text-xs text-gray-500">服务地址<input value={settings.endpoint} onChange={(event) => setSettings({ ...settings, endpoint: event.target.value })} className="mt-1 w-full rounded-lg border px-3 py-2 text-sm text-gray-800" /></label>
+          <label className="mb-3 block text-xs text-gray-500">项目名称<input value={settings.project} onChange={(event) => setSettings({ ...settings, project: event.target.value })} className="mt-1 w-full rounded-lg border px-3 py-2 text-sm text-gray-800" /></label>
           <div className="mb-3 grid grid-cols-2 gap-3">
             <label className="block text-xs text-gray-500">单次请求超时（秒）<input type="number" min={1} max={120} value={settings.request_timeout_seconds} onChange={(event) => setSettings({ ...settings, request_timeout_seconds: Number(event.target.value) })} className="mt-1 w-full rounded-lg border px-3 py-2 text-sm text-gray-800" /></label>
             <label className="block text-xs text-gray-500">最大重试次数<input type="number" min={0} max={5} value={settings.max_retries} onChange={(event) => setSettings({ ...settings, max_retries: Number(event.target.value) })} className="mt-1 w-full rounded-lg border px-3 py-2 text-sm text-gray-800" /></label>

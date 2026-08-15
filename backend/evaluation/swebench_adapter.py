@@ -228,12 +228,13 @@ def prediction_jsonl(
     run_envelopes: dict[str, list[dict[str, Any]]],
     *,
     model_name_or_path: str,
+    allow_partial: bool = False,
 ) -> str:
     manifest = swebench_prediction_manifest(dataset, run_envelopes, model_name_or_path=model_name_or_path)
     predictions = manifest["predictions"]
     if not predictions:
         raise ValueError("Experiment has no SWE-bench code patches to export")
-    if manifest["missing_instance_ids"]:
+    if manifest["missing_instance_ids"] and not allow_partial:
         raise ValueError(
             "SWE-bench predictions are incomplete; missing: " + ", ".join(manifest["missing_instance_ids"][:20])
         )
@@ -257,8 +258,14 @@ def swebench_run_manifest(
     experiment_id: str,
     dataset_version_id: str,
     dataset_content_hash: str,
+    allow_partial: bool = False,
 ) -> dict[str, Any]:
-    content = prediction_jsonl(dataset, run_envelopes, model_name_or_path=model_name_or_path)
+    content = prediction_jsonl(
+        dataset,
+        run_envelopes,
+        model_name_or_path=model_name_or_path,
+        allow_partial=allow_partial,
+    )
     prediction_manifest = swebench_prediction_manifest(
         dataset,
         run_envelopes,
@@ -276,6 +283,7 @@ def swebench_run_manifest(
         "source_snapshot_sha256": dataset.metadata.get("source_snapshot_sha256"),
         "predictions_sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
         "patch_sha256": patch_hashes,
+        "missing_instance_ids": prediction_manifest["missing_instance_ids"],
     }
 
 

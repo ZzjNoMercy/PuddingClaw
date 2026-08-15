@@ -899,6 +899,7 @@ def test_session_directory_grant_survives_container_rebuild_but_stays_workspace_
     assert grant["stable_bindings"] == {
         "approval_mode": "smart",
         "backend_mode": "docker",
+        "filesystem_mode": "restricted",
         "policy_epoch": 1,
         "permission_rules_revision": 0,
         "policy_version": "tool-execution-v4",
@@ -1164,7 +1165,8 @@ def test_user_supplied_external_directory_gets_host_file_broker_instructions(
     assert isinstance(content, str)
     assert "复制、移动、建目录直接使用 execute 中的标准 cp/mv/mkdir" in content
     assert "ls/glob/grep/read_file" in content
-    assert "Kernel 仅是底层隔离实现" in content
+    assert "Kernel 仅增加底层隔离" in content
+    assert "不以项目或目录归属触发 HITL" in content
     assert "内部 HostFileBroker 原子提交" in content
     assert "模型无需处理 Grant、lease、staged path 或 hash 编排" in content
 
@@ -1192,7 +1194,8 @@ def test_precise_external_file_does_not_infer_parent_directory(tmp_path: Path) -
     ) in content
     assert "若确认必须发现同目录依赖" in content
     assert "对直接父目录调用 ls/glob/grep" in content
-    assert "精确写入由 HostFileBroker 原子落到正式路径" in content
+    assert "普通读写不需要 project、目录或 exact-file HITL" in content
+    assert "HostFileBroker 仅可作为原子落盘与回执实现" in content
     assert "不得猜测兄弟路径或提升到更高祖先目录" in content
 
 
