@@ -48,7 +48,7 @@ PuddingClaw 目前主打两条产品主线：
 - 导入、解析、向量发布采用任务队列，支持查看进度、失败原因、重试和索引重建。
 - 检索结果携带来源信息，可进入对话右侧的来源与证据面板。
 
-知识库目录是用户资产目录，不是缓存目录。PostgreSQL 保存 Catalog、任务和引用元数据；Milvus 保存可重建的检索索引，两者都不替代本地原始资产。
+知识库目录是用户资产目录，不是缓存目录。Catalog 数据库（桌面/本地默认 SQLite，无需 PostgreSQL/Docker；服务端可显式选择 PostgreSQL）保存 Catalog、任务和引用元数据；Milvus 保存可重建的检索索引，两者都不替代本地原始资产。
 
 #### P0 开发中：LLM Wiki + gbrain 稳定知识补充层
 
@@ -189,7 +189,7 @@ analysis-project/
 ## 典型使用流程
 
 1. 在“设置 → 模型服务”登记 Provider、接口和凭证，并为对话、视觉、文本 Embedding、多模态 Embedding、Rerank 绑定默认模型。
-2. 在“设置 → 知识库”选择长期知识目录，配置 PostgreSQL、MinerU 和可选 Milvus。
+2. 在“设置 → 知识库”选择长期知识目录；Catalog 默认使用内置 SQLite，按需配置 PostgreSQL、MinerU 和可选 Milvus。
 3. 在“知识库”上传文档或表格，或登记数据库源；查看导入、解析与索引任务。
 4. 在“智能问数”生成 Profile，维护语义资产、逻辑数据集、SQL 守卫和分析模型。
 5. 回到 Agent 对话，选择分析模型后用自然语言提问；在右侧面板核对来源、SQL、任务进度、权限与验收证据。
@@ -205,11 +205,11 @@ analysis-project/
 | 项目上下文 | 当前项目的业务背景、架构约束、目录约定与稳定决策 |
 | 智能问数设置 | 上下文 Token 预算、明细行列保护、SQL 超时、结果持久化、分页、Profile 与导出 |
 | RAG 设置 | Top-K、相似度阈值、文本 / 图片 / BM25 权重、候选池与 Rerank |
-| 知识库 | Catalog PostgreSQL、用户知识目录、多模态 Embedding 并发、Milvus / 本地索引与索引重建 |
+| 知识库 | Catalog 数据库（默认 SQLite，可选 PostgreSQL）、用户知识目录、多模态 Embedding 并发、Milvus / 本地索引与索引重建 |
 | 记忆管理 | Markdown / mem0 长期记忆及相关后端配置 |
 | Harness 配置 | SubAgent、上下文压缩、Goal 与验收、终端 / Docker 沙箱、模型调用保护 |
 | 高级设置 | 兼容性压缩参数等低频运行选项 |
-| 系统状态 | PostgreSQL、Milvus、MinerU、模型接入等能力探测与降级状态 |
+| 系统状态 | Catalog 数据库（默认 SQLite，可选 PostgreSQL）、pgvector、Milvus、MinerU、模型接入等能力探测与降级状态 |
 
 正常桌面使用以代码 defaults 与 `~/.puddingclaw/config.json` 的稀疏用户覆盖合并结果为事实源；环境变量仅用于部署覆盖。Provider 凭据和数据库密码进入 Credential Vault，不写入配置文件。
 
@@ -221,11 +221,11 @@ analysis-project/
 
 | 方式 | 适用场景 | 包含内容 |
 | --- | --- | --- |
-| **本机应用 + Docker 基础设施（推荐）** | macOS / Linux / WSL2 单机使用和开发 | 前后端在宿主机运行；Docker 运行 PostgreSQL 和 Milvus；MinerU 按需启动 |
-| **Docker Core** | 服务器、演示环境或希望统一容器管理 | Compose 运行 PostgreSQL、backend 和 frontend；不自动包含 Milvus / MinerU |
+| **本机应用 + Docker 基础设施（推荐）** | macOS / Linux / WSL2 单机使用和开发 | 前后端在宿主机运行；Docker 运行 Milvus，PostgreSQL 可选（仅显式选择 PostgreSQL Core 或 gbrain 时需要）；MinerU 按需启动 |
+| **Docker Core** | 服务器、演示环境或希望统一容器管理 | Compose 运行 backend 和 frontend（Core 默认 SQLite）；postgres 服务保留为可选；不自动包含 Milvus / MinerU |
 | **手动开发** | 需要单独调试前端或后端 | 手动安装 Python / Node 依赖并分别启动 |
 
-Milvus、MinerU、gbrain 和 Docker Agent Sandbox 都是按能力启用的增强组件。知识库 Catalog 和任务管理依赖 PostgreSQL；不使用图文向量检索时，可以不启动 Milvus，本地文件和精确检索仍可使用。
+Milvus、MinerU、gbrain、PostgreSQL Core 和 Docker Agent Sandbox 都是按能力启用的增强组件。知识库 Catalog 和任务管理默认使用内置 SQLite（无需 PostgreSQL/Docker），可显式切换 PostgreSQL；不使用图文向量检索时，可以不启动 Milvus，本地文件和精确检索仍可使用。
 
 ### 方式 A：本机应用 + Docker 基础设施（推荐）
 
@@ -242,7 +242,9 @@ cd PuddingClaw
 chmod +x scripts/start-local-infra.sh scripts/start-macos-linux.sh
 ```
 
-#### 2. 启动 PostgreSQL 和 Milvus
+#### 2. 启动基础设施（Milvus；PostgreSQL 可选）
+
+Core 默认使用 SQLite，不需要 PostgreSQL；只有显式选择 PostgreSQL Core 或启用 gbrain(pgvector) 时才需要以下 PostgreSQL 部分。
 
 ```bash
 ./scripts/start-local-infra.sh
@@ -292,14 +294,14 @@ curl http://127.0.0.1:8888/api/capabilities
 - 前端：<http://127.0.0.1:3000>
 - 后端 API：<http://127.0.0.1:8888>
 - OpenAPI：<http://127.0.0.1:8888/docs>
-- PostgreSQL：`127.0.0.1:5432`
+- PostgreSQL：`127.0.0.1:5432`（可选；仅显式选择 PostgreSQL Core / gbrain 时）
 - Milvus：`127.0.0.1:19530`
 
 #### 5. 完成首次配置
 
 1. 在“设置 → 模型服务”登记 Provider，为对话、视觉、Embedding 和 Rerank 绑定模型。
 2. 在“设置 → 知识库”确认 Catalog Database 连接，并选择长期知识目录。
-3. 在“系统状态”确认 PostgreSQL / Milvus 健康；未启用的可选能力应显示为降级，而不是伪装成可用。
+3. 在“系统状态”确认 Catalog Database（默认 SQLite）/ Milvus 健康；未启用的可选能力应显示为降级，而不是伪装成可用。
 
 Provider 密钥推荐在设置页管理，并只保存到 Credential Vault。数据库账号和知识库路径等机器配置由设置页或后续 `puddingclaw init` 写入 Home 覆盖。
 
@@ -315,7 +317,7 @@ python scripts/setup-mineru.py --foreground
 
 ### 方式 B：Docker Core
 
-Docker Core 适合将 Web 前端、API 和 PostgreSQL 统一交给 Compose 管理。它不包含 Milvus 和 MinerU；需要图文向量检索时，应另行部署并在设置页绑定。
+Docker Core 适合将 Web 前端、API 统一交给 Compose 管理；Core 默认使用容器卷上的 SQLite，postgres 服务保留给显式选择 PostgreSQL Core 或 gbrain 的场景。它不包含 Milvus 和 MinerU；需要图文向量检索时，应另行部署并在设置页绑定。
 
 #### 1. 创建本地配置
 
@@ -323,7 +325,7 @@ Docker Core 适合将 Web 前端、API 和 PostgreSQL 统一交给 Compose 管�
 cp backend/.env.example backend/.env
 ```
 
-修改 `backend/.env` 里的 `POSTGRES_PASSWORD`，生产或可被其他设备访问的环境不得使用默认密码。默认连接串直接使用该密码，因此建议使用字母、数字、`_` / `-` / `.` 组成的强密码；如果包含 URL 保留字符，请额外设置经百分号编码的 `PUDDINGCLAW_DATABASE_URL`。
+Core 默认 SQLite，无需数据库密码。仅在显式选择 PostgreSQL Core / gbrain 时：修改 `backend/.env` 里的 `POSTGRES_PASSWORD`，生产或可被其他设备访问的环境不得使用默认密码；并显式设置 `PUDDINGCLAW_DATABASE_URL` 指向 compose 的 postgres 服务（见 `docker-compose.yml` 注释）。密码建议使用字母、数字、`_` / `-` / `.` 组成的强密码；如果包含 URL 保留字符，请在连接串中使用百分号编码。
 
 #### 2. 构建并启动
 
@@ -335,7 +337,7 @@ docker compose --env-file backend/.env ps
 
 容器内固定使用 `/app/.puddingclaw`；宿主 Home 通过 bind mount 映射，`db/` 再由独立 named volume 覆盖，避免 SQLite 位于 Docker Desktop 共享文件系统。
 
-Compose 会把 backend 数据库连接强制指向容器内的 `postgres:5432`，避免误用 `config.json` 中的宿主机地址。首次启动可通过以下命令观察健康检查：
+Compose 默认不再为 backend 注入数据库连接（`PUDDINGCLAW_DATABASE_URL` 默认可空，Core 使用 named volume 上的 SQLite）；显式设置 `PUDDINGCLAW_DATABASE_URL=postgresql+asyncpg://...@postgres:5432/...` 即可继续使用 bundled PostgreSQL，避免误用 `config.json` 中的宿主机地址。首次启动可通过以下命令观察健康检查：
 
 ```bash
 docker compose --env-file backend/.env logs -f backend frontend
@@ -359,7 +361,7 @@ docker compose --env-file backend/.env down
 
 ### 方式 C：手动开发
 
-先确保 PostgreSQL 已配置；需要向量检索时再启动 Milvus。
+Core 默认 SQLite，无需预先配置 PostgreSQL；仅在显式选择 PostgreSQL Core / gbrain 时才需要准备 PostgreSQL（并安装 `postgres` extra），需要图文向量检索时再启动 Milvus。
 
 ```bash
 # 后端
@@ -434,7 +436,7 @@ PuddingClaw/
 | Next.js / Electron | 对话、知识库、智能问数、设置、Trace 与桌面集成 |
 | FastAPI | API、SSE、配置、任务、Catalog 和运行时编排 |
 | DeepAgents / LangGraph | 模型—工具循环、Middleware、状态与 Checkpoint |
-| PostgreSQL | 知识文档、导入任务、数据源与 Catalog 等业务事实 |
+| Catalog 数据库（默认 SQLite，可选 PostgreSQL） | 知识文档、导入任务、数据源与 Catalog 等业务事实 |
 | 本地文件系统 | 原始知识、解析 Artifact、语义资产、模型、模板、会话与导出项目 |
 | Milvus | 知识库文本 / 图片向量与 Vanna 训练索引；均应可重建 |
 | MinerU | 可选的高质量 PDF 解析服务，不拥有最终知识资产 |

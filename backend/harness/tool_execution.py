@@ -4998,15 +4998,42 @@ class ToolExecutionPipeline(AgentMiddleware):
 
     @classmethod
     def _smart_public_curl_read(cls, command: str) -> bool:
-        if any(marker in command for marker in ("$", "`", "\n", "\r", ">", "<", "|", ";", "&")):
+        """Recognize a public curl download plus inert local verification.
+
+        ``curl -L`` is the normal spelling for downloads from arXiv, GitHub,
+        and object stores.  Redirect syntax alone is not a WebBridge bypass:
+        a GET/HEAD request cannot invoke the daemon's POST-only command API.
+        Keep credentials, request bodies, proxy/target overrides, and trusted
+        redirect forwarding outside this fast path, while allowing a download
+        to be followed by deterministic ``file``/``ls``/hash checks.
+        """
+
+        if any(marker in command for marker in ("$", "`", "\n", "\r")):
             return False
         try:
-            segments = ShellPolicyAnalyzer.parse_segments(command)
+            segments, operators, has_redirect = ShellPolicyAnalyzer._requirements_structure(command)
         except ValueError:
             return False
-        if len(segments) != 1:
+        if not segments or has_redirect or any(operator != "&&" for operator in operators):
             return False
         tokens = ShellPolicyAnalyzer.unwrap_command(segments[0])
+        if not cls._smart_public_curl_tokens_read(tokens):
+            return False
+        verification_commands = {"file", "ls", "stat", "wc", "shasum", "sha256sum", "md5"}
+        for raw_segment in segments[1:]:
+            verification_tokens = ShellPolicyAnalyzer.unwrap_command(raw_segment)
+            if (
+                not verification_tokens
+                or Path(verification_tokens[0]).name.lower() not in verification_commands
+            ):
+                return False
+            effects = ShellPolicyAnalyzer.capabilities(shlex.join(verification_tokens))
+            if effects.network or effects.workspace_write or effects.package_install or effects.destructive:
+                return False
+        return True
+
+    @classmethod
+    def _smart_public_curl_tokens_read(cls, tokens: list[str]) -> bool:
         if not tokens or Path(tokens[0]).name.lower() != "curl":
             return False
         lowered = [item.lower() for item in tokens[1:]]
@@ -5037,19 +5064,34 @@ class ToolExecutionPipeline(AgentMiddleware):
             "--netrc-file",
             "--cert",
             "--key",
-            "-l",
-            "--location",
+            "--oauth2-bearer",
+            "--aws-sigv4",
             "--location-trusted",
             "--proxy",
+            "--proxy-user",
+            "--preproxy",
+            "--socks4",
+            "--socks4a",
+            "--socks5",
+            "--socks5-hostname",
             "-x",
             "--resolve",
             "--connect-to",
+            "--url",
+            "--request-target",
+            "--unix-socket",
+            "--abstract-unix-socket",
         }
+        unsafe_attached_short_flags = ("-d", "-F", "-T", "-u", "-H", "-b", "-c", "-K", "-k", "-x", "-X", "-E", "-U")
         if any(
             item in forbidden_flags
             or any(item.startswith(f"{flag}=") for flag in forbidden_flags if flag.startswith("--"))
             or item.startswith("@")
-            for item in lowered
+            or any(
+                original.startswith(flag)
+                for flag in unsafe_attached_short_flags
+            )
+            for item, original in zip(lowered, tokens[1:], strict=True)
         ):
             return False
         for index, item in enumerate(lowered):
@@ -5061,10 +5103,21 @@ class ToolExecutionPipeline(AgentMiddleware):
         urls = [item for item in tokens[1:] if item.lower().startswith(("http://", "https://"))]
         if not urls:
             return False
-        intent = ShellPolicyAnalyzer.network_intent(command)
+        intent = ShellPolicyAnalyzer.network_intent(shlex.join(tokens))
         if not intent.target_known or intent.remote_effect != "read" or len(intent.origins) != len(urls):
             return False
         return all(cls._public_https_url(url) for url in urls)
+
+    @staticmethod
+    def _curl_follows_redirects(tokens: list[str]) -> bool:
+        for token in tokens[1:]:
+            if token in {"-L", "--location", "--location-trusted"}:
+                return True
+            if token.startswith("--location=") or token.startswith("--location-trusted="):
+                return True
+            if token.startswith("-") and not token.startswith("--") and "L" in token[1:]:
+                return True
+        return False
 
     @staticmethod
     def _public_https_url(raw_url: str) -> bool:
@@ -5349,14 +5402,14 @@ class ToolExecutionPipeline(AgentMiddleware):
             candidate = decoded
         return False
 
-    @staticmethod
-    def _contains_webbridge_indirect_access(command: str) -> bool:
+    @classmethod
+    def _contains_webbridge_indirect_access(cls, command: str) -> bool:
         """Reject shell network indirection that can hide the daemon target."""
 
         candidate = str(command or "")
         for _ in range(3):
-            decoded = unquote(candidate).lower()
-            if decoded == candidate.lower():
+            decoded = unquote(candidate)
+            if decoded == candidate:
                 break
             candidate = decoded
         try:
@@ -5377,7 +5430,7 @@ class ToolExecutionPipeline(AgentMiddleware):
                 and re.search(
                     r"(?:--config(?:=|\s)|\s-k(?:\s|$)|\s-k\S|--input-file(?:=|\s)|"
                     r"--proxy(?:=|\s)|--resolve(?:=|\s)|--connect-to(?:=|\s)|"
-                    r"(?:^|\s)-l(?:\s|$)|--location(?:\s|$)|\$\(|`|\$\{)",
+                    r"--location-trusted(?:=|\s|$)|\$\(|`|\$\{)",
                     lowered,
                 )
             )
@@ -5394,6 +5447,15 @@ class ToolExecutionPipeline(AgentMiddleware):
             executable = Path(segment_tokens[0]).name.lower()
             if executable not in {"curl", "wget", "httpie", "python", "python3", "node", "deno"}:
                 continue
+            if (
+                executable == "curl"
+                and cls._curl_follows_redirects(segment_tokens)
+                and not cls._smart_public_curl_tokens_read(segment_tokens)
+            ):
+                # Redirects are safe on the no-credential GET/HEAD fast path.
+                # Any request body, auth material, target override, or private
+                # destination keeps the original fail-closed behavior.
+                return True
             lowered = shlex.join(segment_tokens).lower()
             # These options move the destination out of the command text or
             # make redirects/proxies authoritative, so lexical inspection
@@ -5402,7 +5464,7 @@ class ToolExecutionPipeline(AgentMiddleware):
             if re.search(
                 r"(?:--config(?:=|\s)|\s-k(?:\s|$)|\s-k\S|--input-file(?:=|\s)|"
                 r"--proxy(?:=|\s)|--resolve(?:=|\s)|--connect-to(?:=|\s)|"
-                r"(?:^|\s)-l(?:\s|$)|--location(?:\s|$)|\$\(|`|\$\{)",
+                r"--location-trusted(?:=|\s|$)|\$\(|`|\$\{)",
                 lowered,
             ):
                 return True

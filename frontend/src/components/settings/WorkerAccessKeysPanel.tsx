@@ -13,8 +13,12 @@ import {
   RotateCcw,
   Search,
   Shield,
+  Terminal,
   Trash2,
 } from "lucide-react";
+import CapabilitiesStatus from "@/components/settings/CapabilitiesStatus";
+import SettingsAnchorLayout, { type SettingsAnchorSection } from "@/components/settings/SettingsAnchorLayout";
+import type { RuntimeExtensions } from "@/lib/useRuntimeProfile";
 import {
   createWorkerAccessKey,
   listWorkerAccessKeys,
@@ -37,6 +41,12 @@ const EMPTY_LOG_PAGE: WorkerAccessLogPage = {
   timezone: "Asia/Shanghai",
 };
 
+const WORKER_SECTIONS: SettingsAnchorSection[] = [
+  { id: "keys", label: "Access Key", description: "创建、轮换与吊销", icon: KeyRound },
+  { id: "cli", label: "CLI 探测", description: "本地命令行客户端状态", icon: Terminal },
+  { id: "logs", label: "调用日志", description: "Headless API 请求记录", icon: History },
+];
+
 function beijingDateBoundary(date: string, endOfDay = false): number | undefined {
   if (!date) return undefined;
   const suffix = endOfDay ? "23:59:59.999" : "00:00:00.000";
@@ -44,7 +54,7 @@ function beijingDateBoundary(date: string, endOfDay = false): number | undefined
   return Number.isFinite(timestamp) ? timestamp / 1000 : undefined;
 }
 
-export default function WorkerAccessKeysPanel() {
+export default function WorkerAccessKeysPanel({ extensions }: { extensions: RuntimeExtensions | null }) {
   const [keys, setKeys] = useState<WorkerAccessKey[]>([]);
   const [name, setName] = useState("");
   const [profile, setProfile] = useState("smart");
@@ -189,9 +199,10 @@ export default function WorkerAccessKeysPanel() {
   );
 
   return (
-    <SettingsCard title="Worker 接入" icon={KeyRound} color="#002fa7">
-      <div className="space-y-6">
-        <div className="space-y-5">
+    <SettingsAnchorLayout prefix="worker" sections={WORKER_SECTIONS}>
+      <section id="worker-section-keys" className="scroll-mt-6">
+        <SettingsCard title="Worker Access Key" icon={KeyRound} color="#002fa7">
+          <div className="space-y-5">
           <p className="text-xs leading-5 text-gray-500">
             本机通过回环地址管理 Worker Access Key，无需额外管理员 Token。Worker Key 供 PuddingTeams CLI 调用 Headless API；后端只保存哈希，明文只在创建或轮换成功后显示一次。远程部署可通过 PUDDINGCLAW_ADMIN_TOKEN 保护管理接口。
           </p>
@@ -244,13 +255,29 @@ export default function WorkerAccessKeysPanel() {
               </div>
             ))}
           </div>
-        </div>
+          </div>
+        </SettingsCard>
+      </section>
 
-        <section className="border-t border-gray-200 pt-6" aria-labelledby="worker-access-log-title">
+      <section id="worker-section-cli" className="scroll-mt-6">
+        <SettingsCard title="CLI 探测" icon={Terminal} color="#002fa7">
+          <p className="mb-4 text-xs leading-5 text-gray-500">
+            检查本机 PuddingClaw CLI 的安装与可用状态。该状态只影响本地终端接入，不影响 Worker Access Key 管理。
+          </p>
+          <CapabilitiesStatus
+            refreshIntervalMs={30000}
+            extensions={extensions}
+            includeKeys={["cli"]}
+            showSummary={false}
+          />
+        </SettingsCard>
+      </section>
+
+      <section id="worker-section-logs" className="scroll-mt-6" aria-labelledby="worker-access-log-title">
+        <SettingsCard title="调用日志" icon={History} color="#002fa7">
           <div className="mb-4 flex flex-wrap items-end justify-between gap-3">
             <div>
-              <div className="flex items-center gap-2 text-sm font-semibold text-gray-800" id="worker-access-log-title"><History className="h-4 w-4 text-[#002fa7]" />调用日志</div>
-              <p className="mt-1 text-xs text-gray-500">记录通过 Worker Key 发起的 Headless Run，请求时间统一按北京时间展示。</p>
+              <p className="text-xs text-gray-500" id="worker-access-log-title">记录通过 Worker Key 发起的 Headless Run，请求时间统一按北京时间展示。</p>
             </div>
             <p className="text-[11px] text-gray-400">共 {logs.total} 条 · 每页 10 条</p>
           </div>
@@ -319,9 +346,9 @@ export default function WorkerAccessKeysPanel() {
               </div>
             </div>
           </div>
-        </section>
-      </div>
-    </SettingsCard>
+        </SettingsCard>
+      </section>
+    </SettingsAnchorLayout>
   );
 }
 

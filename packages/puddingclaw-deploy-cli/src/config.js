@@ -54,9 +54,8 @@ export function defaultConfig({
     infrastructure: {
       catalog: {
         mode: "sqlite",
-        preferred_mode: "postgresql",
-        fallback_mode: "sqlite",
-        source: "fallback",
+        provider: "sqlite",
+        source: "local_file",
         host: "",
         port: 0,
         database: "",
@@ -178,6 +177,20 @@ export function validateConfig(config) {
     throw new CliError("infrastructure.catalog.mode must be sqlite or postgresql", {
       code: "configuration_error",
     });
+  }
+  const catalogProvider = config.infrastructure.catalog?.provider;
+  if (catalogProvider !== undefined && !["sqlite", "postgresql"].includes(catalogProvider)) {
+    throw new CliError("infrastructure.catalog.provider must be sqlite or postgresql", {
+      code: "configuration_error",
+    });
+  }
+  const catalogSource = config.infrastructure.catalog?.source;
+  if (catalogSource !== undefined
+      && !["local_file", "local", "native_apt", "docker", "external", "fallback"].includes(catalogSource)) {
+    throw new CliError(
+      "infrastructure.catalog.source must be local_file, local, native_apt, docker, external, or fallback",
+      { code: "configuration_error" },
+    );
   }
   if (typeof config.infrastructure.milvus?.enabled !== "boolean") {
     throw new CliError("infrastructure.milvus.enabled must be boolean", { code: "configuration_error" });

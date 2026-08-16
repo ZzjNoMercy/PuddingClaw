@@ -11,6 +11,6 @@ router = APIRouter()
 
 @router.get("/capabilities")
 async def get_capabilities() -> dict:
-    """返回 PostgreSQL / pgvector / Docker / Milvus / MinerU 的可用性状态。"""
+    """返回 core_database / pgvector(gbrain) / external_datasources / Docker / Milvus / MinerU 的可用性状态。"""
     caps = await capabilities.detect_capabilities(force=True)
     return caps.to_dict()

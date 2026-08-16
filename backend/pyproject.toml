@@ -20,12 +20,10 @@ dependencies = [
     "pydantic>=2.12.0",
     "pydantic-settings>=2.13.0",
     "python-dotenv>=1.0.0",
-    # Database
+    # Database (Core defaults to SQLite; PostgreSQL drivers live in the
+    # optional `postgres` extra below).
     "sqlalchemy[asyncio]>=2.0.48",
     "aiosqlite>=0.22.0",
-    # PostgreSQL is a core catalog option in every init profile, including
-    # Harness-only. Keep its runtime driver out of extension-only extras.
-    "asyncpg>=0.29.0",
     # LangChain / LangGraph
     "deepagents>=0.6.12",
     "langchain>=1.3.11",
@@ -62,6 +60,13 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# PostgreSQL 驱动：PostgreSQL Core Catalog、Analytics PostgreSQL 数据源、
+# gbrain/pgvector 共用此 extra。Core 默认 SQLite（aiosqlite 已在基础依赖），
+# 不安装本 extra 也可正常运行；选择 PostgreSQL 时才需要 `pip install .[postgres]`。
+postgres = [
+    "asyncpg>=0.29.0",
+]
+
 evaluation = [
     # Official SWE-bench Docker verifier. Keep this exact and resolved through
     # uv.lock; evaluation workers never download Python code at run time.
@@ -133,16 +138,22 @@ build-backend = "hatchling.build"
 # 后端是扁平多包应用，显式声明需要打进 editable wheel 的模块/包。
 only-include = [
     "app.py",
+    "backend_lease.py",
     "capabilities.py",
+    "catalog_backup.py",
+    "catalog_migration.py",
     "cli_runtime.py",
     "config.py",
     "db.py",
+    "db_maintenance.py",
     "gbrain_runtime.py",
     "headless_session_lifecycle.py",
     "observability.py",
     "postgres_dependencies.py",
     "provider_registry.py",
     "higress_config_reader.py",
+    "runtime_control.py",
+    "schema_migrations.py",
     "worker_access.py",
     "extensions.py",
     "api",

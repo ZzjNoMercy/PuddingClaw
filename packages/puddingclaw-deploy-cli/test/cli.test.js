@@ -11,6 +11,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { selectPorts } from "../src/init.js";
 import {
+  discoverExtensionInfrastructure,
   discoverInitialMultimodalProvider,
   multimodalProviderPreset,
   providerPreset,
@@ -226,7 +227,7 @@ test("init plan covers core settings and excludes disabled extension probes", as
   assert.equal(harness.steps.find((step) => step.id === "headless.worker").status, "selected");
   assert.equal(harness.steps.find((step) => step.id === "database.shared").status, "selected");
   assert.deepEqual(harness.branches.database, [
-    "postgresql_detect", "existing_or_native_or_docker", "sqlite_fallback",
+    "sqlite_local_default", "postgresql_if_explicit", "sqlite_fallback_on_unreachable",
   ]);
 
   const full = buildInitPlan("full");
@@ -280,8 +281,9 @@ test("non-interactive Harness init enables its Worker and disables business exte
     assert.equal(config.provider.status, "unconfigured");
     assert.equal(config.multimodal_provider.status, "unconfigured");
     assert.equal(config.infrastructure.catalog.mode, "sqlite");
-    assert.equal(config.infrastructure.catalog.preferred_mode, "postgresql");
-    assert.equal(config.infrastructure.catalog.fallback_mode, "sqlite");
+    assert.equal(config.infrastructure.catalog.provider, "sqlite");
+    assert.equal(config.infrastructure.catalog.source, "local_file");
+    assert.equal(config.infrastructure.catalog.probe_status, "skipped");
     assert.equal(config.infrastructure.milvus.enabled, false);
     const tokenFile = path.join(home, "secrets", "headless-token");
     assert.match(await readFile(tokenFile, "utf8"), /^pck_[A-Za-z0-9_-]{32,}\n$/);
@@ -290,6 +292,53 @@ test("non-interactive Harness init enables its Worker and disables business exte
   } finally {
     await rm(home, { recursive: true, force: true });
   }
+});
+
+test("init infrastructure defaults directly to SQLite without database discovery", async () => {
+  const discovered = await discoverExtensionInfrastructure({
+    profile: "harness",
+    flags: {},
+    nonInteractive: false,
+    home: "/unused",
+  });
+
+  assert.deepEqual(discovered.catalog, {
+    mode: "sqlite",
+    provider: "sqlite",
+    source: "local_file",
+    host: "",
+    port: 0,
+    database: "",
+    probe_status: "skipped",
+  });
+  assert.equal(discovered.databaseUrl, "");
+  assert.deepEqual(discovered.probes, []);
+});
+
+test("forced init preserves an existing PostgreSQL catalog without rediscovery", async () => {
+  const existingCatalog = {
+    mode: "postgresql",
+    provider: "postgresql",
+    source: "external",
+    host: "db.example.com",
+    port: 5432,
+    database: "puddingclaw",
+    username: "puddingclaw",
+    probe_status: "available",
+  };
+  const databaseUrl = "postgresql+asyncpg://puddingclaw:secret@db.example.com/puddingclaw";
+  const discovered = await discoverExtensionInfrastructure({
+    profile: "harness",
+    flags: {},
+    nonInteractive: false,
+    home: "/unused",
+    existingCatalog,
+    existingDatabaseUrl: databaseUrl,
+  });
+
+  assert.deepEqual(discovered.catalog, existingCatalog);
+  assert.equal(discovered.databaseUrl, databaseUrl);
+  assert.deepEqual(discovered.probes, []);
 });
 
 test("database configure updates only the database after init", async () => {
@@ -320,6 +369,49 @@ test("database configure updates only the database after init", async () => {
     assert.equal(shown.code, 0, shown.stderr);
     assert.equal(JSON.parse(shown.stdout).database.mode, "sqlite");
   } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("database configure blocks a silent provider switch when the source catalog has data", async () => {
+  const home = await tempHome();
+  const listener = net.createServer();
+  await new Promise((resolve) => listener.listen(0, "127.0.0.1", resolve));
+  const pgPort = listener.address().port;
+  try {
+    const env = await fakePython(home);
+    const initialized = await runCli([
+      "init", "--profile", "harness", "--non-interactive", "--port", "auto", "--json",
+    ], { home, env });
+    assert.equal(initialized.code, 0, `${initialized.stderr}\n${initialized.stdout}`);
+
+    // Simulate an existing non-empty SQLite catalog at the real runtime path
+    // ($PUDDINGCLAW_HOME/db/catalog.sqlite3, see backend/runtime_identity/paths.py).
+    await mkdir(path.join(home, "db"), { recursive: true });
+    await writeFile(path.join(home, "db", "catalog.sqlite3"), "not-empty");
+
+    const databaseUrl = `postgresql+asyncpg://u:p@127.0.0.1:${pgPort}/puddingclaw`;
+    const blocked = await runCli([
+      "database", "configure", "--database-mode", "postgresql",
+      "--database-url", databaseUrl, "--non-interactive", "--json",
+    ], { home, env });
+    assert.equal(blocked.code, 1, blocked.stderr);
+    assert.equal(JSON.parse(blocked.stdout).error_code, "database_switch_requires_confirmation");
+
+    const confirmed = await runCli([
+      "database", "configure", "--database-mode", "postgresql",
+      "--database-url", databaseUrl, "--non-interactive", "--confirm-empty-switch", "--json",
+    ], { home, env });
+    // The guard passes; the run then fails later because no runtime Python is prepared.
+    assert.equal(confirmed.code, 1);
+    assert.equal(JSON.parse(confirmed.stdout).error_code, "runtime_python_not_prepared");
+
+    // Neither attempt modified the stored catalog.
+    const config = JSON.parse(await readFile(path.join(home, "deploy.json"), "utf8"));
+    assert.equal(config.infrastructure.catalog.provider, "sqlite");
+    assert.equal(config.infrastructure.catalog.mode, "sqlite");
+  } finally {
+    listener.close();
     await rm(home, { recursive: true, force: true });
   }
 });
@@ -855,6 +947,83 @@ test("stop refuses an unverified PID and leaves the unknown process alive", asyn
     assert.doesNotThrow(() => process.kill(unknown.pid, 0));
   } finally {
     unknown.kill("SIGKILL");
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("database migrate runs catalog_migration through the runtime Python", {
+  skip: process.platform === "win32",
+}, async () => {
+  const home = await tempHome();
+  try {
+    const env = await fakePython(home);
+    const initialized = await runCli([
+      "init", "--profile", "harness", "--non-interactive", "--port", "auto", "--json",
+    ], { home, env });
+    assert.equal(initialized.code, 0, `${initialized.stderr}\n${initialized.stdout}`);
+    const bundle = await runtimeBundle(home);
+    await mkdir(path.join(bundle, "backend"), { recursive: true });
+    const installed = await runCli(["runtime", "install", bundle, "--json"], { home });
+    assert.equal(installed.code, 0, installed.stderr);
+
+    // Recording fake Python replaces the init-selected interpreter.
+    const recorder = path.join(home, "python-args.txt");
+    const python = path.join(home, "recording-python");
+    await writeFile(python, `#!/bin/sh\nprintf '%s\\n' "$@" > "${recorder}"\n`, { mode: 0o700 });
+    await chmod(python, 0o700);
+    const configPath = path.join(home, "deploy.json");
+    const config = JSON.parse(await readFile(configPath, "utf8"));
+    config.runtime.python.command = python;
+    await writeFile(configPath, `${JSON.stringify(config)}\n`);
+
+    const migrated = await runCli([
+      "database", "migrate", "sqlite-to-postgres",
+      "--url", "postgresql://u:p@db.internal:5432/puddingclaw", "--json",
+    ], { home });
+    assert.equal(migrated.code, 0, `${migrated.stderr}\n${migrated.stdout}`);
+    assert.deepEqual(JSON.parse(migrated.stdout), {
+      status: "migrated",
+      direction: "sqlite-to-postgres",
+      next_command: "puddingclaw start",
+    });
+    const args = (await readFile(recorder, "utf8")).trim().split("\n");
+    assert.deepEqual(args, [
+      "-m", "catalog_migration", "sqlite-to-pg",
+      "--target-url", "postgresql://u:p@db.internal:5432/puddingclaw",
+    ]);
+
+    const down = await runCli(["database", "migrate", "postgres-to-sqlite", "--json"], { home });
+    assert.equal(down.code, 0, `${down.stderr}\n${down.stdout}`);
+    const downArgs = (await readFile(recorder, "utf8")).trim().split("\n");
+    assert.deepEqual(downArgs, ["-m", "catalog_migration", "pg-to-sqlite"]);
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("database migrate validates direction and the required --url", async () => {
+  const home = await tempHome();
+  try {
+    const env = await fakePython(home);
+    const initialized = await runCli([
+      "init", "--profile", "harness", "--non-interactive", "--port", "auto", "--json",
+    ], { home, env });
+    assert.equal(initialized.code, 0, `${initialized.stderr}\n${initialized.stdout}`);
+
+    const badDirection = await runCli(["database", "migrate", "sideways", "--json"], { home });
+    assert.equal(badDirection.code, 2);
+    assert.equal(JSON.parse(badDirection.stdout).error_code, "argument_error");
+
+    const missingUrl = await runCli(["database", "migrate", "sqlite-to-postgres", "--json"], { home });
+    assert.equal(missingUrl.code, 2);
+    assert.equal(JSON.parse(missingUrl.stdout).error_code, "argument_error");
+
+    const unknownFlag = await runCli([
+      "database", "migrate", "postgres-to-sqlite", "--typo", "value", "--json",
+    ], { home });
+    assert.equal(unknownFlag.code, 2);
+    assert.equal(JSON.parse(unknownFlag.stdout).error_code, "argument_error");
+  } finally {
     await rm(home, { recursive: true, force: true });
   }
 });

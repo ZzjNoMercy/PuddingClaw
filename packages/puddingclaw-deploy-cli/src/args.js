@@ -13,7 +13,7 @@ export function parseArgs(argv) {
     const name = rawName.replaceAll("-", "_");
     if ([
       "json", "jsonl", "help", "non_interactive", "force", "prepare_python", "install_runtime", "yes", "plan",
-      "database_create_if_missing",
+      "database_create_if_missing", "confirm_empty_switch",
     ].includes(name)) {
       flags[name] = inline === undefined ? true : inline !== "false";
       continue;

@@ -225,7 +225,12 @@ export async function startRuntime(paths, { automaticPorts = false, timeoutMs = 
   const embeddingApiKey = config.infrastructure?.embedding?.status === "disabled"
     ? ""
     : await readSecret(paths.embeddingApiKey);
-  const databaseUrl = config.infrastructure?.catalog?.mode === "postgresql"
+  const catalog = config.infrastructure?.catalog || {};
+  // New-schema provider wins; legacy catalogs only carry mode.
+  const databaseProvider = ["sqlite", "postgresql"].includes(catalog.provider)
+    ? catalog.provider
+    : catalog.mode === "postgresql" ? "postgresql" : "sqlite";
+  const databaseUrl = databaseProvider === "postgresql"
     ? await readSecret(paths.databaseUrl)
     : "";
   const ports = await selectPorts({
@@ -290,8 +295,10 @@ export async function startRuntime(paths, { automaticPorts = false, timeoutMs = 
               ? { PUDDINGCLAW_INITIAL_MULTIMODAL_PROVIDER_API_KEY: initialMultimodalProviderApiKey }
               : {}),
             ...(embeddingApiKey ? { DASHSCOPE_API_KEY: embeddingApiKey } : {}),
-            PUDDINGCLAW_DATABASE_MODE: config.infrastructure?.catalog?.mode || "sqlite",
-            PUDDINGCLAW_DATABASE_SOURCE: config.infrastructure?.catalog?.source || "fallback",
+            PUDDINGCLAW_DATABASE_PROVIDER: databaseProvider,
+            PUDDINGCLAW_DATABASE_MODE: catalog.mode || databaseProvider,
+            PUDDINGCLAW_DATABASE_SOURCE: catalog.source
+              || (databaseProvider === "sqlite" ? "local_file" : "fallback"),
             ...(databaseUrl ? { PUDDINGCLAW_DATABASE_URL: databaseUrl } : {}),
             ...(config.infrastructure?.milvus?.enabled
               ? {

@@ -7,7 +7,9 @@
 #
 # 端口保持与现有部署约定一致：
 #   Milvus:          grpc://localhost:19530
-#   PostgreSQL:      postgresql://localhost:5432  # 可选 bundled；已有本机 PostgreSQL 时可外接
+#   PostgreSQL:      postgresql://localhost:5432  # 可选 bundled；仅供显式选择
+#                    PostgreSQL Core 或 gbrain(pgvector) 使用；Core 默认 SQLite，
+#                    不启动本服务也不影响桌面/本地默认体验。已有本机 PostgreSQL 时可外接
 #   MinerU API:      http://localhost:8002  # 本机运行，不在本 compose 内
 #
 # 启动：
@@ -24,13 +26,15 @@
 #   username: puddingclaw
 #   password: puddingclaw
 #
-# 本地 backend 推荐环境变量：
+# 本地 backend 推荐环境变量（仅当显式选择 PostgreSQL Core / gbrain 时；
+# Core 默认 SQLite，无需设置 DATABASE_URL）：
 #   DATABASE_URL=postgresql+asyncpg://puddingclaw:puddingclaw@127.0.0.1:5432/puddingclaw
 #   MINERU_URL=http://localhost:8002
 
 services:
   postgres:
-    # pgvector is a required PostgreSQL server dependency for LLM Wiki/gbrain.
+    # pgvector is required by gbrain (LLM Wiki) and by PostgreSQL Core;
+    # SQLite Core（默认）不需要本服务。
     image: ${POSTGRES_IMAGE:-pgvector/pgvector:pg16}
     container_name: puddingclaw-postgres
     environment:

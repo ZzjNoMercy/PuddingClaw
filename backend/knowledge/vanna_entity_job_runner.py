@@ -10,32 +10,40 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
 from pathlib import Path
 
 from db import get_sessionmaker
 from knowledge.import_jobs import mark_job_failed, process_vanna_entity_import_job
 from knowledge.models import KnowledgeImportJob
+from knowledge.queue_repository import bind_lease_owner, reset_lease_owner
 from runtime_identity.paths import PuddingClawPaths
 
 logger = logging.getLogger(__name__)
 
 
 async def run_job(job_id: str, *, base_dir: Path) -> int:
-    sessionmaker = get_sessionmaker()
-    async with sessionmaker() as session:
-        job = await session.get(KnowledgeImportJob, job_id)
-        if job is None:
-            logger.error("[vanna-entity-runner] job not found: %s", job_id)
-            return 2
+    lease_owner = os.getenv("PUDDINGCLAW_JOB_LEASE_OWNER", "").strip()
+    token = bind_lease_owner(lease_owner) if lease_owner else None
+    try:
+        sessionmaker = get_sessionmaker()
+        async with sessionmaker() as session:
+            job = await session.get(KnowledgeImportJob, job_id)
+            if job is None:
+                logger.error("[vanna-entity-runner] job not found: %s", job_id)
+                return 2
 
-        try:
-            await process_vanna_entity_import_job(session, base_dir=base_dir, job=job)
-        except Exception as exc:  # noqa: BLE001 - persist any runner failure to job state
-            logger.exception("[vanna-entity-runner] failed job_id=%s", job_id)
-            await mark_job_failed(session, job, exc)
-            return 1
+            try:
+                await process_vanna_entity_import_job(session, base_dir=base_dir, job=job)
+            except Exception as exc:  # noqa: BLE001 - persist any runner failure to job state
+                logger.exception("[vanna-entity-runner] failed job_id=%s", job_id)
+                await mark_job_failed(session, job, exc)
+                return 1
 
-    return 0
+        return 0
+    finally:
+        if token is not None:
+            reset_lease_owner(token)
 
 
 def main() -> int:

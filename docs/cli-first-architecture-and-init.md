@@ -11,8 +11,8 @@
 `run/respond/cancel/models/capabilities` 已合并到产品 CLI 开发包，并保持 JSON、JSONL、Session、HITL
 和 artifact export 协议兼容。
 `init --plan --json` 会输出按 Profile 裁剪、含 `depends_on` 和 `execution_order` 的 Settings/Probe 计划。
-0.1.17 已接入首次可用所需的 Agent Provider、图片分析 SubAgent Provider、Catalog、PostgreSQL/pgvector、Milvus、Embedding 与 MinerU
-分支；Harness 高级调优项仍使用产品默认值，后续由共享 Settings Schema 驱动高级向导，避免 Node CLI
+0.1.17 已接入首次可用所需的 Agent Provider、图片分析 SubAgent Provider、SQLite Catalog、Milvus、Embedding 与 MinerU
+分支；PostgreSQL/pgvector 仅在显式数据库配置或 gbrain 路径中探测。Harness 高级调优项仍使用产品默认值，后续由共享 Settings Schema 驱动高级向导，避免 Node CLI
 复制一套会漂移的字段校验。
 
 ### 0.1.17 已落地的初始化顺序
@@ -21,16 +21,12 @@
 Profile
   └─ Initial Agent Provider + API Key 验证
       └─ image_analyzer SubAgent 多模态 Provider + API Key 验证
-          └─ 核心数据库探测
-          ├─ 连接现有 PostgreSQL
-          ├─ 本机安装（Ubuntu/Debian，需 sudo）
-          ├─ Docker 部署（用户显式选择）
-          └─ SQLite 保底
+          └─ Core Catalog：直接使用 SQLite 本地文件（不探测 PostgreSQL）
               └─ Python / uv / Home / Ports
                   ├─ Harness-only
                   │   └─ 安装 requirements-harness.lock
                   └─ Knowledge
-              ├─ PostgreSQL 分支复检认证与 pgvector
+              ├─ 显式 PostgreSQL / gbrain 分支复检认证与 pgvector
               ├─ 本机/远程 Milvus → Collection API
               │   └─ 启用时要求 Embedding Provider
               └─ MinerU /health（可选，不阻断）
@@ -41,14 +37,15 @@ Python requirements。源码开发启动没有 CLI 扩展契约时继续默认�
 CLI 管理的 Runtime 使用显式裁剪状态。
 
 数据库属于 Core 基础设施，在 GUI 设置中使用独立的“数据库”一级入口，不再挂在知识库或智能问数
-下面。该入口始终展示连接模式、主机、端口、数据库名、凭证状态、配置来源和连通性测试；知识库只
-追加 pgvector/Milvus 等扩展依赖，智能问数只管理业务数据源与查询策略。
+下面。SQLite 模式只展示本地 Catalog 文件与健康状态；显式选择 PostgreSQL 后才展示主机、端口、
+数据库名、凭证与连通性测试。知识库只追加 pgvector/Milvus 等扩展依赖，智能问数只管理业务数据源与查询策略。
 
-数据库方案按部署位置分为四类：本机 PostgreSQL、Docker PostgreSQL、SQLite、外部 PostgreSQL，不使用
-“PuddingClaw 管理的 PostgreSQL”作为类型。CLI 只在 `init` 时完成选择、必要的安装或连接探测并写入
-配置；初始化完成后 Backend 只负责连接，数据库服务生命周期仍由操作系统、Docker 或外部服务所有者负责。
+Core 在普通 `init` 中直接使用 SQLite，不出现数据库选择题，也不探测 5432 或 Docker。用户只有通过
+显式 init 数据库参数或 `puddingclaw database configure` 才进入数据库状态机；可选方案按部署位置分为
+本机 PostgreSQL、Docker PostgreSQL、SQLite、外部 PostgreSQL。初始化完成后 Backend 只负责连接，
+数据库服务生命周期仍由操作系统、Docker 或外部服务所有者负责。
 
-数据库初始化必须形成闭环：先选择方案，再采集该方案需要的端口、数据库名、用户名与密码（密码留空
+显式 PostgreSQL 配置必须形成闭环：先选择方案，再采集该方案需要的端口、数据库名、用户名与密码（密码留空
 时安全生成）；只探测 TCP 端口不能算数据库可用。Runtime 准备完成后还要验证认证和目标数据库：CLI
 新安装的本机 PostgreSQL、以及新建的 Docker PostgreSQL，会在用户确认具体参数后创建目标数据库；
 既有本机或外部 PostgreSQL 若缺少目标数据库，必须再次取得“允许创建”的明确授权。未授权不得执行
@@ -72,7 +69,7 @@ Next standalone Web；`init` 再在用户 Home 内用 uv 准备版本隔离的 P
 `verify:publish` 在包名、License、依赖哈希或 Runtime 完整性未满足时阻止发布。
 > 关联文档：[Headless Worker / CLI](./headless-worker-cli.md)、[开源项目结构与可选基础设施方案](./开源项目结构与可选基础设施方案.md)
 
-> 范围说明：本文只描述通过 npm 安装的 PuddingClaw CLI 及其独立管理的 Runtime。当前通过源码脚本、开发服务器或 Electron 运行的 PuddingClaw 不在本次开发范围内；其进程、端口、配置和数据都不应被 CLI 开发版本读取、迁移、停止或改写。
+> 范围说明：本文描述 PuddingClaw CLI 及其独立管理的 Runtime。Electron 首次启动页现已作为 CLI 的展示与授权壳，调用 `profile inspect/apply`；模式计划、探测与配置写入仍只由 CLI 完成。源码脚本和普通开发服务器不应被 CLI 擅自迁移、停止或改写。
 
 ## 1. 决策摘要
 
@@ -124,7 +121,7 @@ npm install -g @puddingai/puddingclaw
 - 本轮不重写 Python Backend 或 Next.js GUI。
 - 本轮不要求 Electron 立即删除。
 - npm 包不内嵌完整 Python 解释器；缺失时由 `init` 一键准备用户级 Python 环境。
-- `init` 不擅自安装任何系统依赖。未发现 PostgreSQL 时，交互模式必须让用户在“本机安装、Docker 部署、SQLite 回退”之间明确选择；本机安装会提前说明需要 `sudo`。CLI 不自动安装 Docker、不安装 MinerU，也不终止未知进程或接管未知容器。
+- `init` 不擅自安装任何系统依赖。默认直接使用 SQLite，不探测 PostgreSQL/Docker；只有用户显式进入 PostgreSQL 配置时才展示本机安装、Docker 或外部连接选项，本机安装会提前说明需要 `sudo`。CLI 不自动安装 Docker、不安装 MinerU，也不终止未知进程或接管未知容器。
 - 不把所有内部兼容参数都暴露成新手问题；`init` 覆盖当前用户可见设置，隐藏的 legacy/internal 参数继续使用默认值。
 
 ### 2.3 产品能力分层
@@ -560,9 +557,10 @@ Agent Worker/Headless API 属于 Agent Harness 核心能力，所有标准 Profi
 
 推荐默认值是 `127.0.0.1`、冲突时询问、非 TTY 时报错。
 
-### 8.4 阶段 3：扩展数据库与 pgvector
+### 8.4 阶段 3：显式 PostgreSQL 与 pgvector
 
-仅在知识库或智能问数扩展需要数据库时进入本阶段。Harness-only 跳过，不探测 PostgreSQL。
+仅在用户显式选择 PostgreSQL Core，或启用需要 PostgreSQL/pgvector 的 gbrain 路径时进入本阶段。
+普通 init 和 SQLite Core 均跳过，不探测 PostgreSQL。
 
 配置：
 
@@ -940,6 +938,8 @@ CLI 先根据扩展状态生成 probe plan。下表中的扩展探测只有在�
 Electron 只做：
 
 - 读取 `runtime.json` 或调用 `puddingclaw status --json`；
+- 首次启动时展示 Harness、Knowledge、Full 三种产品模式，并调用 `puddingclaw profile inspect/apply`；
+- 把 CLI 返回的必需依赖、可选增强和后续配置项原样可视化，不在前端复制探测逻辑；
 - 在窗口内加载 `frontend_url`；
 - 提供系统目录选择器、通知、托盘等可选桌面能力；
 - Backend 未运行时提示用户执行/授权 `puddingclaw start`。
@@ -1048,8 +1048,9 @@ PUDDINGCLAW_HOME="$HOME/.puddingclaw-test" puddingclaw start --port auto
 ### Phase 4：Web-first 与 Electron 薄壳
 
 - 普通浏览器路径补齐目录选择降级；
-- CLI 首期直接打开系统浏览器，不修改当前 Electron 客户端；
-- Electron 连接 CLI Runtime 作为未来可选工作，单独立项；
+- CLI 继续支持直接打开系统浏览器；
+- Electron 首次模式选择和依赖预检已接入 CLI `profile inspect/apply`；
+- Electron 的历史 Backend/Docker Manager 继续收敛到 Runtime Supervisor，避免形成第二套生命周期所有者；
 - 在干净的 macOS/Linux/Windows 机器上验证无 Electron 部署流程。
 
 ## 13. 验收标准
@@ -1084,4 +1085,4 @@ PUDDINGCLAW_HOME="$HOME/.puddingclaw-test" puddingclaw start --port auto
 - capability、设置单项 test、Provider、Docker、gbrain/MCP 共用的 Probe Service Schema；
 - 干净 macOS/Linux/Windows 机器上的安装、升级、回滚和卸载验证。
 
-当前源码/Electron 启动方式保持不变。部署 CLI 通过独立 Home、环境变量和发行产物启动自己的 Runtime，不包裹、不接管当前 Electron Manager，也不操作开发机正在运行的实例。
+当前源码启动方式保持不变。Electron 首次启动模式配置已复用 CLI Home、Profile 和探测协议；生产 Backend 使用 CLI 在用户目录准备的 Runtime。历史 Docker Manager 仍是待收敛边界，不得停止无法证明所有权的实例。

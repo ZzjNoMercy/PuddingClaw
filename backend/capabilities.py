@@ -1,12 +1,18 @@
 """基础设施能力探测。
 
-在 core/full 混合部署下，backend 启动时异步检测 PostgreSQL、pgvector、Docker、Milvus、MinerU 是否可用。
+数据库能力拆分为三个独立状态，避免"一个 postgres 状态代表所有"：
+- ``core_database``（scope=core）：Core Catalog，默认本地 SQLite，PostgreSQL 为服务端可选；
+- ``pgvector``（scope=gbrain）：gbrain / LLM Wiki 向量运行时，独立于 Core 数据库；
+- ``external_datasources``（scope=datasource）：Analytics / 知识数据源连接外部业务数据库的能力。
+
+其余条目（Docker、Milvus、MinerU）为可选基础设施探测。
 模型请求由内部网关统一路由，不属于外部基础设施健康探测。
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import socket
@@ -37,8 +43,22 @@ DEFAULT_MINERU_URL = "http://localhost:8002"
 DEFAULT_POSTGRES_URL = ""
 
 
-def _profile_disabled(name: str) -> CapabilityStatus:
-    return CapabilityStatus(available=False, reason=f"{name} is disabled by the current Runtime Profile")
+def _profile_disabled(name: str, *, scope: str | None = None) -> CapabilityStatus:
+    details = {"scope": scope} if scope else None
+    return CapabilityStatus(
+        available=False,
+        reason=f"{name} is disabled by the current Runtime Profile",
+        details=details,
+    )
+
+
+def _asyncpg_missing_status(*, scope: str, usage: str) -> CapabilityStatus:
+    """asyncpg 是可选依赖；缺失时返回降级状态而不是抛错。"""
+    return CapabilityStatus(
+        available=False,
+        reason="未安装 asyncpg（pip install puddingclaw-backend[postgres]）",
+        details={"scope": scope, "driver": "missing", "用途": usage},
+    )
 
 @dataclass
 class CapabilityStatus:
@@ -55,20 +75,25 @@ class CapabilityStatus:
 
 @dataclass
 class Capabilities:
-    database: CapabilityStatus
+    core_database: CapabilityStatus
     pgvector: CapabilityStatus
     docker: CapabilityStatus
     milvus: CapabilityStatus
     mineru: CapabilityStatus
+    external_datasources: CapabilityStatus
     cli: CapabilityStatus | None = None
 
     def to_dict(self) -> dict[str, Any]:
         result = {
-            "database": self.database.to_dict(),
+            "core_database": self.core_database.to_dict(),
             "pgvector": self.pgvector.to_dict(),
+            "external_datasources": self.external_datasources.to_dict(),
             "docker": self.docker.to_dict(),
             "milvus": self.milvus.to_dict(),
             "mineru": self.mineru.to_dict(),
+            # Deprecated alias of core_database, kept for one version so older
+            # frontends reading "database" do not break.
+            "database": self.core_database.to_dict(),
         }
         if self.cli is not None:
             result["cli"] = self.cli.to_dict()
@@ -180,35 +205,89 @@ def _is_postgres_url(url: str) -> bool:
 
 
 async def _check_postgres(url: str | None) -> CapabilityStatus:
+    """Core Catalog 数据库探测（scope=core）：SQLite 直接可用，PostgreSQL 探测连通性。"""
     target = _resolve_postgres_url(url)
     if not _is_postgres_url(target):
         if get_database_config().get("mode") == "sqlite":
             return CapabilityStatus(
                 available=True,
                 reason="SQLite catalog in PuddingClaw Home",
-                details={"mode": "sqlite"},
+                details={"mode": "sqlite", "scope": "core"},
             )
-        return CapabilityStatus(available=False, reason="PostgreSQL URL not configured")
+        return CapabilityStatus(
+            available=False,
+            reason="PostgreSQL URL not configured",
+            details={"mode": "postgresql", "scope": "core"},
+        )
+
+    try:
+        import asyncpg  # noqa: F401
+    except ImportError:
+        return _asyncpg_missing_status(scope="core", usage="Core Catalog（PostgreSQL 模式）")
 
     engine = None
     try:
         engine = create_async_engine(_normalize_async_postgres_url(target), pool_pre_ping=True)
         async with engine.connect() as conn:
             await conn.execute(text("SELECT 1"))
-        return CapabilityStatus(available=True)
+        return CapabilityStatus(available=True, details={"mode": "postgresql", "scope": "core"})
     except Exception as exc:  # noqa: BLE001
-        return CapabilityStatus(available=False, reason=f"{type(exc).__name__}: {exc}")
+        return CapabilityStatus(
+            available=False,
+            reason=f"{type(exc).__name__}: {exc}",
+            details={"mode": "postgresql", "scope": "core"},
+        )
     finally:
         if engine is not None:
             await engine.dispose()
 
 
-async def _check_pgvector(url: str | None) -> CapabilityStatus:
-    """Check server-side pgvector availability independently of DB health."""
+def _read_gbrain_database_url() -> str:
+    """读取 gbrain 自己的 PostgreSQL DSN（独立于 Core 数据库配置）。
 
-    target = _resolve_postgres_url(url)
+    gbrain 的连接信息位于 ``<gbrain_runtime_home>/.gbrain/config.json``
+    （database_url / url 字段），与 Core Catalog 的 database 配置无关。
+    读不到或格式非法时返回空串。
+    """
+    try:
+        from knowledge.paths import get_gbrain_runtime_home
+
+        config_path = (
+            get_gbrain_runtime_home(Path(__file__).resolve().parent)
+            / ".gbrain"
+            / "config.json"
+        )
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        return str(config.get("database_url") or config.get("url") or "").strip()
+    except Exception:  # noqa: BLE001 - 探测代码不得因配置缺失而抛错
+        return ""
+
+
+async def _check_pgvector(url: str | None = None) -> CapabilityStatus:
+    """Check gbrain/pgvector availability independently of Core DB health (scope=gbrain).
+
+    只探测 gbrain 自己配置的 PostgreSQL（<gbrain_runtime_home>/.gbrain/config.json），
+    不再回退 Core 数据库 URL——两者是独立的部署边界。gbrain 未配置时返回明确的
+    “可选能力未配置”状态。
+    """
+
+    target = (url or "").strip() or _read_gbrain_database_url()
+    if not target:
+        return CapabilityStatus(
+            available=False,
+            reason="gbrain 未配置（可选能力）",
+            details={"scope": "gbrain", "归属": "gbrain / LLM Wiki 向量运行时"},
+        )
     if not _is_postgres_url(target):
-        return CapabilityStatus(available=False, reason="PostgreSQL URL not configured")
+        return CapabilityStatus(
+            available=False,
+            reason="gbrain 配置的数据库 URL 不是 PostgreSQL DSN",
+            details={"scope": "gbrain", "归属": "gbrain / LLM Wiki 向量运行时"},
+        )
+    try:
+        import asyncpg  # noqa: F401
+    except ImportError:
+        return _asyncpg_missing_status(scope="gbrain", usage="gbrain / LLM Wiki 向量运行时")
     engine = None
     try:
         engine = create_async_engine(_normalize_async_postgres_url(target), pool_pre_ping=True)
@@ -217,16 +296,47 @@ async def _check_pgvector(url: str | None) -> CapabilityStatus:
         status = normalize_pgvector_status(row)
         if status["available"]:
             version = status["version"] or "available"
-            return CapabilityStatus(available=True, reason=f"pgvector {version}")
+            return CapabilityStatus(
+                available=True,
+                reason=f"pgvector {version}",
+                details={"scope": "gbrain", "归属": "gbrain / LLM Wiki 向量运行时", "version": version},
+            )
         return CapabilityStatus(
             available=False,
             reason=f"Required PostgreSQL extension is missing. Install: {status['install_command']}",
+            details={"scope": "gbrain", "归属": "gbrain / LLM Wiki 向量运行时"},
         )
     except Exception as exc:  # noqa: BLE001
-        return CapabilityStatus(available=False, reason=f"{type(exc).__name__}: {exc}")
+        return CapabilityStatus(
+            available=False,
+            reason=f"{type(exc).__name__}: {exc}",
+            details={"scope": "gbrain", "归属": "gbrain / LLM Wiki 向量运行时"},
+        )
     finally:
         if engine is not None:
             await engine.dispose()
+
+
+def _check_external_datasources() -> CapabilityStatus:
+    """连接外部业务数据库数据源的能力（scope=datasource）。
+
+    只反映驱动能力（asyncpg 是否可用），供 Analytics / 知识数据库数据源使用；
+    不探测用户已配置数据源的实际连通性。
+    """
+    usage = "Analytics / 知识数据库数据源的外部 PostgreSQL 连接"
+    try:
+        import asyncpg  # noqa: F401
+    except ImportError:
+        return _asyncpg_missing_status(scope="datasource", usage=usage)
+    return CapabilityStatus(
+        available=True,
+        reason="asyncpg 驱动可用",
+        details={
+            "scope": "datasource",
+            "用途": usage,
+            "说明": "仅反映驱动能力，不探测已配置数据源的连通性",
+        },
+    )
 
 
 async def detect_capabilities(
@@ -260,11 +370,11 @@ async def detect_capabilities(
 
     knowledge_enabled = extension_enabled("knowledge")
     knowledge_results = await asyncio.gather(
-        _check_pgvector(postgres_target),
+        _check_pgvector(),
         _check_milvus(milvus_target),
         _check_http_get(mineru_target, "/health"),
     ) if knowledge_enabled else (
-        _profile_disabled("pgvector"),
+        _profile_disabled("pgvector", scope="gbrain"),
         _profile_disabled("Milvus"),
         _profile_disabled("MinerU"),
     )
@@ -274,11 +384,12 @@ async def detect_capabilities(
     )
 
     caps = Capabilities(
-        database=core_results[0],
+        core_database=core_results[0],
         pgvector=knowledge_results[0],
         docker=core_results[1],
         milvus=knowledge_results[1],
         mineru=knowledge_results[2],
+        external_datasources=_check_external_datasources(),
         cli=_check_cli(),
     )
 
@@ -355,14 +466,16 @@ def _detect_capabilities_sync_fallback(
 
     knowledge_enabled = extension_enabled("knowledge")
     caps = Capabilities(
-        database=_check_postgres_sync(postgres_target),
+        core_database=_check_postgres_sync(postgres_target),
         pgvector=CapabilityStatus(
             available=False,
             reason="pgvector status is verified by the asynchronous infrastructure probe",
-        ) if knowledge_enabled else _profile_disabled("pgvector"),
+            details={"scope": "gbrain"},
+        ) if knowledge_enabled else _profile_disabled("pgvector", scope="gbrain"),
         docker=_check_docker_sync(),
         milvus=_check_milvus_sync(milvus_target) if knowledge_enabled else _profile_disabled("Milvus"),
         mineru=_check_http_get_sync(mineru_target, "/health") if knowledge_enabled else _profile_disabled("MinerU"),
+        external_datasources=_check_external_datasources(),
         cli=_check_cli(),
     )
     _CAPABILITIES_CACHE = caps
@@ -414,18 +527,26 @@ def _check_postgres_sync(url: str | None) -> CapabilityStatus:
             return CapabilityStatus(
                 available=True,
                 reason="SQLite catalog in PuddingClaw Home",
-                details={"mode": "sqlite"},
+                details={"mode": "sqlite", "scope": "core"},
             )
-        return CapabilityStatus(available=False, reason="PostgreSQL URL not configured")
+        return CapabilityStatus(
+            available=False,
+            reason="PostgreSQL URL not configured",
+            details={"mode": "postgresql", "scope": "core"},
+        )
 
     parsed = urlparse(target.replace("postgresql+asyncpg://", "postgresql://", 1))
     host = parsed.hostname or "localhost"
     port = parsed.port or 5432
     try:
         with socket.create_connection((host, port), timeout=3.0):
-            return CapabilityStatus(available=True)
+            return CapabilityStatus(available=True, details={"mode": "postgresql", "scope": "core"})
     except Exception as exc:  # noqa: BLE001
-        return CapabilityStatus(available=False, reason=f"{type(exc).__name__}: {exc}")
+        return CapabilityStatus(
+            available=False,
+            reason=f"{type(exc).__name__}: {exc}",
+            details={"mode": "postgresql", "scope": "core"},
+        )
 
 
 def invalidate_capabilities() -> None:

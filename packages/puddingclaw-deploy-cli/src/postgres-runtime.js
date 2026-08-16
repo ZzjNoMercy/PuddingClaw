@@ -263,8 +263,7 @@ export async function installNativePostgres({
     databaseUrl: databaseUrl({ username: selectedUsername, password: selectedPassword, database: selectedDatabase }),
     catalog: {
       mode: "postgresql",
-      preferred_mode: "postgresql",
-      fallback_mode: "sqlite",
+      provider: "postgresql",
       source: "native_apt",
       host: "127.0.0.1",
       port: 5432,
@@ -448,8 +447,7 @@ export async function installDockerPostgres({
     }),
     catalog: {
       mode: "postgresql",
-      preferred_mode: "postgresql",
-      fallback_mode: "sqlite",
+      provider: "postgresql",
       source: "docker",
       host: "127.0.0.1",
       port: selectedPort,

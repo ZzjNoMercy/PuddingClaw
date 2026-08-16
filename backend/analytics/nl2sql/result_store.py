@@ -341,7 +341,19 @@ async def get_query_result_page(
 def _record_to_summary(record: AnalyticsQueryResult, *, include_profile: bool = True) -> dict[str, Any]:
     config = get_database_qa_config()
     artifact = RESULT_DIR / record.artifact_path
+    catalog = _catalog_path(record.id)
     expired = _is_expired(record.expires_at)
+    artifact_exists = artifact.is_file()
+    catalog_exists = catalog.is_file()
+    display_status = (
+        "expired"
+        if expired
+        else "missing_artifact"
+        if not artifact_exists
+        else "missing_catalog"
+        if not catalog_exists
+        else record.status
+    )
     summary = {
         "result_id": record.id,
         "session_id": record.session_id,
@@ -353,9 +365,10 @@ def _record_to_summary(record: AnalyticsQueryResult, *, include_profile: bool = 
         "artifact_path": f"data/query-results/{record.artifact_path}",
         "storage_path": record.artifact_path,
         "artifact_format": record.artifact_format,
-        "status": "expired" if expired else record.status,
+        "status": display_status,
         "expired": expired,
-        "artifact_exists": artifact.exists(),
+        "artifact_exists": artifact_exists,
+        "catalog_exists": catalog_exists,
         "export_enabled": bool(config.get("export_enabled", False)),
         "created_at": record.created_at.isoformat(),
         "expires_at": record.expires_at.isoformat(),

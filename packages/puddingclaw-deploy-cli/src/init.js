@@ -66,6 +66,7 @@ async function confirmSummary(summary) {
         local: "本机 PostgreSQL",
         docker: "Docker PostgreSQL",
         external: "外部 PostgreSQL",
+        local_file: "SQLite 本地文件（默认）",
         fallback: "SQLite",
       };
       const catalogSource = sourceLabels[summary.infrastructure.catalog.source];
@@ -361,8 +362,7 @@ export async function runInit({ flags, paths, interactive = process.stdin.isTTY 
         databaseFallback = { from: "postgresql", to: "sqlite", reason };
         config.infrastructure.catalog = {
           mode: "sqlite",
-          preferred_mode: "postgresql",
-          fallback_mode: "sqlite",
+          provider: "sqlite",
           source: "fallback",
           host: "",
           port: 0,

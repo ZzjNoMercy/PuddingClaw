@@ -7,6 +7,11 @@
 # Core 模式：
 #   docker compose up --build -d
 #
+# 数据库说明：
+#   Core 默认使用 SQLite（backend 内置，无需 PostgreSQL/Docker 数据库）。
+#   本文件中的 postgres 服务仅供显式选择 PostgreSQL Core 或启用 gbrain(pgvector)
+#   时使用；需要时请显式设置 PUDDINGCLAW_DATABASE_URL（见 backend 服务注释）。
+#
 # 访问：
 #   前端：http://localhost:3000
 #   后端 API：http://localhost:8888
@@ -14,7 +19,13 @@
 # Provider 凭证和模型绑定由本地客户端 Provider Registry 管理，模型请求直连 Provider。
 
 services:
+  # Core 默认 SQLite，不依赖本服务。仅供以下场景使用：
+  #   1. 显式选择 PostgreSQL Core（设置 PUDDINGCLAW_DATABASE_URL 指向本服务）；
+  #   2. gbrain(pgvector) 知识图谱运行时。
+  # 本服务挂在 `postgres` profile 下，普通 `docker compose up` 不会启动；
+  # 显式需要时用 `docker compose --profile postgres up -d`。
   postgres:
+    profiles: ["postgres"]
     image: ${POSTGRES_IMAGE:-pgvector/pgvector:pg16}
     container_name: puddingclaw-postgres
     environment:
@@ -54,7 +65,10 @@ services:
       # Deployment override recognized by backend/config.py. Generic DATABASE_URL
       # is intentionally ignored so inherited shell variables cannot silently
       # disagree with Settings.
-      - PUDDINGCLAW_DATABASE_URL=${PUDDINGCLAW_DATABASE_URL:-postgresql+asyncpg://${POSTGRES_USER:-puddingclaw}:${POSTGRES_PASSWORD:-puddingclaw}@postgres:5432/${POSTGRES_DB:-puddingclaw}}
+      # 默认为空：Core 使用 SQLite。显式选择 PostgreSQL Core（或 gbrain 指向本
+      # compose 的 postgres）时再设置，例如：
+      #   PUDDINGCLAW_DATABASE_URL=postgresql+asyncpg://puddingclaw:puddingclaw@postgres:5432/puddingclaw
+      - PUDDINGCLAW_DATABASE_URL=${PUDDINGCLAW_DATABASE_URL:-}
       - PUDDINGCLAW_HOME=/app/.puddingclaw
       # 其他环境变量在 backend/.env 中配置（如 MINERU_URL）
     read_only: true
@@ -74,9 +88,10 @@ services:
         target: /app/logging.yaml
         read_only: true
     restart: unless-stopped
-    depends_on:
-      postgres:
-        condition: service_healthy
+    # Core 默认 SQLite，postgres 服务已挂到 `postgres` profile。depends_on 引用
+    # 带 profile 的服务会要求 backend 也加入该 profile，因此这里不再声明依赖：
+    # 当 PUDDINGCLAW_DATABASE_URL 指向本 compose 的 postgres 时，请用
+    # `docker compose --profile postgres up -d` 一并启动 postgres。
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9100/"]
       interval: 30s

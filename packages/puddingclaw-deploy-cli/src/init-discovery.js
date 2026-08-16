@@ -363,15 +363,29 @@ function sqliteFallback(reason = "", selectionExplicit = false) {
   return {
     catalog: {
       mode: "sqlite",
-      preferred_mode: "postgresql",
-      fallback_mode: "sqlite",
-      source: "fallback",
+      provider: "sqlite",
+      source: selectionExplicit ? "local_file" : "fallback",
       host: "",
       port: 0,
       database: "",
       probe_status: "available",
       selection_explicit: selectionExplicit,
       ...(reason ? { fallback_reason: reason } : {}),
+    },
+    databaseUrl: "",
+  };
+}
+
+function defaultSqliteCatalog() {
+  return {
+    catalog: {
+      mode: "sqlite",
+      provider: "sqlite",
+      source: "local_file",
+      host: "",
+      port: 0,
+      database: "",
+      probe_status: "skipped",
     },
     databaseUrl: "",
   };
@@ -411,8 +425,7 @@ async function externalPostgres({
   return {
     catalog: {
       mode: "postgresql",
-      preferred_mode: "postgresql",
-      fallback_mode: "sqlite",
+      provider: "postgresql",
       source,
       ...metadata,
       create_if_missing: createDatabaseIfMissing,
@@ -446,26 +459,36 @@ export async function discoverCoreDatabase({
   existingDatabaseUrl = "",
   existingCatalog = null,
   reuseExistingDatabaseUrl = true,
+  promptWhenUnspecified = true,
 }) {
   const probes = [];
-  if (!nonInteractive) {
-    output.write("\n核心数据库探索（PostgreSQL 优先，SQLite 保底）：\n");
-    output.write("正在探测本机 PostgreSQL 127.0.0.1:5432…\n");
-  }
-  const localProbe = await probeTcpEndpoint({
-    probe: "database.postgresql.discovery",
-    host: "127.0.0.1",
-    port: 5432,
-    required: false,
-  });
-  probes.push(localProbe);
   const explicitMode = String(flags.database_mode || "").trim().toLowerCase();
+  const explicitlyConfiguredUrl = String(
+    flags.database_url || process.env.PUDDINGCLAW_INIT_DATABASE_URL || "",
+  ).trim();
   const configuredUrl = String(
-    flags.database_url
-      || process.env.PUDDINGCLAW_INIT_DATABASE_URL
+    explicitlyConfiguredUrl
       || (reuseExistingDatabaseUrl ? existingDatabaseUrl : "")
       || "",
   ).trim();
+
+  // `puddingclaw init` has a zero-config SQLite path. It must not prompt for,
+  // probe, install or validate PostgreSQL unless the user explicitly passed a
+  // database option. `puddingclaw database configure` keeps the interactive
+  // selector by leaving promptWhenUnspecified enabled.
+  if (!promptWhenUnspecified && !explicitMode && !explicitlyConfiguredUrl) {
+    if (existingCatalog) {
+      const provider = existingCatalog.provider === "postgresql"
+        || existingCatalog.mode === "postgresql" ? "postgresql" : "sqlite";
+      return {
+        catalog: structuredClone(existingCatalog),
+        databaseUrl: provider === "postgresql" ? existingDatabaseUrl : "",
+        createDatabaseIfMissing: Boolean(existingCatalog.create_if_missing),
+        probes,
+      };
+    }
+    return { ...defaultSqliteCatalog(), probes };
+  }
 
   if (nonInteractive) {
     if (["postgresql", "external"].includes(explicitMode) || (!explicitMode && configuredUrl)) {
@@ -511,89 +534,62 @@ export async function discoverCoreDatabase({
         return { ...sqliteFallback(reason), probes };
       }
     }
+    // SQLite 本地默认：未显式选择 PostgreSQL 时不探测 5432、不安装任何数据库服务。
     return {
       ...sqliteFallback(
-        explicitMode === "sqlite" ? "用户选择 SQLite" : "非交互模式未显式选择 PostgreSQL",
+        explicitMode === "sqlite" ? "用户选择 SQLite" : "非交互模式默认 SQLite（未显式选择 PostgreSQL）",
         explicitMode === "sqlite",
       ),
       probes,
     };
   }
 
-  if (localProbe.status === "available") {
-    output.write("✓ 发现本机 5432 端口；仍需认证并验证目标数据库\n");
-    const docker = await probeDocker();
-    probes.push(docker);
-    output.write("[1] 本机 PostgreSQL（填写连接信息）\n");
-    output.write(`[2] Docker PostgreSQL${docker.status === "available" ? "" : `（不可用：${docker.reason}）`}\n`);
-    output.write("[3] SQLite（Home 内单文件）\n");
-    output.write("[4] 外部 PostgreSQL（提供连接 URL）\n");
-    const selected = explicitMode || await question(
-      "请选择数据库方案",
-      "1",
-    );
-    if (["1", "local", "postgresql"].includes(selected.toLowerCase())) {
-      const discovered = await promptExistingPostgres({
-        configuredUrl: reuseExistingDatabaseUrl && ["local", "native_apt"].includes(existingCatalog?.source)
-          ? configuredUrl
-          : "",
-        nonInteractive,
-        probes,
-        source: "local",
-        label: "本机 PostgreSQL",
-      });
-      if (discovered.catalog.mode === "postgresql") {
-        output.write("✓ PostgreSQL 端口可访问；认证将在 Runtime 准备后复检\n");
-      } else {
-        output.write(`! ${discovered.catalog.fallback_reason}，将回退 SQLite\n`);
-      }
-      return { ...discovered, probes };
-    }
-    if (["2", "docker"].includes(selected.toLowerCase())) {
-      if (docker.status !== "available") {
-        throw new CliError(docker.reason, { code: "docker_required" });
-      }
-      const currentDocker = existingCatalog?.source === "docker" ? existingCatalog : {};
-      const connection = await promptInstalledDatabase({
-        docker: true,
-        defaults: currentDocker,
-        allowedOccupiedPort: Number(currentDocker.port || 0),
-      });
-      if (!(await confirmDatabaseProvisioning("Docker PostgreSQL", connection))) {
-        return { ...sqliteFallback("用户取消 Docker PostgreSQL 配置"), probes };
-      }
-      const installed = await installDockerPostgres({
-        home,
-        requirePgvector: profile === "knowledge" || profile === "full",
-        ...connection,
-      });
-      return { catalog: installed.catalog, databaseUrl: installed.databaseUrl, probes: [...probes, installed.probe] };
-    }
-    if (["4", "external"].includes(selected.toLowerCase())) {
-      const discovered = await promptExistingPostgres({
-        configuredUrl: reuseExistingDatabaseUrl && existingCatalog?.source === "external" ? configuredUrl : "",
-        nonInteractive,
-        probes,
-        source: "external",
-        label: "外部 PostgreSQL",
-      });
-      return { ...discovered, probes };
-    }
-    output.write("- 已选择 SQLite；不会修改或停止占用 5432 的进程\n");
+  // SQLite 本地默认 / PostgreSQL 服务端可选：只有显式选择 PostgreSQL 路径
+  // 时才探测或安装 PostgreSQL。
+  output.write("\n核心数据库（SQLite 本地默认 / PostgreSQL 服务端可选）：\n");
+  output.write("[1] SQLite（本地默认，Home 内单文件，无需外部服务）\n");
+  output.write("[2] 本机 PostgreSQL（已运行则填写连接信息，否则可安装/配置）\n");
+  output.write("[3] Docker PostgreSQL\n");
+  output.write("[4] 外部 PostgreSQL（提供连接 URL）\n");
+  const selected = explicitMode
+    || (explicitlyConfiguredUrl ? "external" : await question("请选择数据库方案", "1"));
+  const normalized = selected.toLowerCase();
+
+  if (["1", "sqlite"].includes(normalized)) {
+    output.write("- 已选择 SQLite 本地默认；不会探测或修改任何 PostgreSQL 进程\n");
     return { ...sqliteFallback("用户选择 SQLite", true), probes };
   }
 
-  output.write("- 未发现本机 PostgreSQL\n");
-  const native = nativePostgresInstaller();
-  const docker = await probeDocker();
-  probes.push(docker);
-  output.write(`[1] 本机 PostgreSQL${native.available ? "（安装/配置，需要 sudo）" : `（不可用：${native.reason}）`}\n`);
-  output.write(`[2] Docker PostgreSQL${docker.status === "available" ? "" : `（不可用：${docker.reason}）`}\n`);
-  output.write("[3] SQLite（Home 内单文件）\n");
-  output.write("[4] 外部 PostgreSQL（提供连接 URL）\n");
-  const selected = explicitMode || await question("请选择数据库方案", native.available ? "1" : docker.status === "available" ? "2" : "3");
   try {
-    if (["1", "native"].includes(selected.toLowerCase())) {
+    if (["2", "local", "native", "postgresql"].includes(normalized)) {
+      output.write("正在探测本机 PostgreSQL 127.0.0.1:5432…\n");
+      const localProbe = await probeTcpEndpoint({
+        probe: "database.postgresql.discovery",
+        host: "127.0.0.1",
+        port: 5432,
+        required: false,
+      });
+      probes.push(localProbe);
+      if (localProbe.status === "available") {
+        output.write("✓ 发现本机 5432 端口；仍需认证并验证目标数据库\n");
+        const discovered = await promptExistingPostgres({
+          configuredUrl: reuseExistingDatabaseUrl && ["local", "native_apt"].includes(existingCatalog?.source)
+            ? configuredUrl
+            : "",
+          nonInteractive,
+          probes,
+          source: "local",
+          label: "本机 PostgreSQL",
+        });
+        if (discovered.catalog.provider === "postgresql") {
+          output.write("✓ PostgreSQL 端口可访问；认证将在 Runtime 准备后复检\n");
+        } else {
+          output.write(`! ${discovered.catalog.fallback_reason}，将回退 SQLite\n`);
+        }
+        return { ...discovered, probes };
+      }
+      output.write("- 未发现本机 PostgreSQL\n");
+      const native = nativePostgresInstaller();
       if (!native.available) throw new CliError(native.reason, { code: "native_postgres_installer_unavailable" });
       output.write("CLI 将通过 sudo apt 安装/配置 PostgreSQL 并写入连接信息；初始化完成后，服务生命周期仍归用户和操作系统管理。\n");
       const connection = await promptInstalledDatabase();
@@ -608,7 +604,9 @@ export async function discoverCoreDatabase({
       output.write("✓ 本机 PostgreSQL 已准备完成\n");
       return { catalog: installed.catalog, databaseUrl: installed.databaseUrl, probes: [...probes, installed.probe] };
     }
-    if (["2", "docker"].includes(selected.toLowerCase())) {
+    if (["3", "docker"].includes(normalized)) {
+      const docker = await probeDocker();
+      probes.push(docker);
       if (docker.status !== "available") throw new CliError(docker.reason, { code: "docker_required" });
       output.write("CLI 将创建 Docker PostgreSQL 并写入连接信息；初始化完成后，服务生命周期由 Docker 管理。\n");
       const currentDocker = existingCatalog?.source === "docker" ? existingCatalog : {};
@@ -629,7 +627,7 @@ export async function discoverCoreDatabase({
       output.write("✓ Docker PostgreSQL 已准备完成\n");
       return { catalog: installed.catalog, databaseUrl: installed.databaseUrl, probes: [...probes, installed.probe] };
     }
-    if (["4", "external"].includes(selected.toLowerCase())) {
+    if (["4", "external"].includes(normalized)) {
       const discovered = await promptExistingPostgres({
         configuredUrl: reuseExistingDatabaseUrl && existingCatalog?.source === "external" ? configuredUrl : "",
         nonInteractive,
@@ -637,13 +635,14 @@ export async function discoverCoreDatabase({
         source: "external",
         label: "外部 PostgreSQL",
       });
-      if (discovered.catalog.mode === "postgresql") {
+      if (discovered.catalog.provider === "postgresql") {
         output.write("✓ 外部 PostgreSQL 端口可访问；认证将在 Runtime 准备后复检\n");
       } else {
         output.write(`! ${discovered.catalog.fallback_reason}，将使用 SQLite\n`);
       }
       return { ...discovered, probes };
     }
+    throw new CliError(`unknown database selection: ${selected}`, { code: "argument_error" });
   } catch (error) {
     const reason = error?.message || String(error);
     probes.push({
@@ -656,8 +655,6 @@ export async function discoverCoreDatabase({
     output.write("- 已回退 SQLite，PuddingClaw 仍可继续初始化\n");
     return { ...sqliteFallback(reason), probes };
   }
-  output.write("- 已选择 SQLite，Backend 将使用 Home 内的数据库文件\n");
-  return { ...sqliteFallback("用户选择 SQLite", true), probes };
 }
 
 export async function discoverExtensionInfrastructure({
@@ -676,6 +673,7 @@ export async function discoverExtensionInfrastructure({
     home,
     existingDatabaseUrl,
     existingCatalog,
+    promptWhenUnspecified: false,
   });
   const result = {
     catalog: coreDatabase.catalog,

@@ -14,6 +14,13 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from db import get_sessionmaker
 from knowledge.models import SemanticDimensionBuildJob
+from knowledge.queue_repository import (
+    LeaseLostError,
+    bind_lease_owner,
+    heartbeat_loop,
+    new_worker_id,
+    reset_lease_owner,
+)
 from knowledge.semantic_dimension_jobs import (
     claim_next_semantic_dimension_build_job,
     mark_semantic_dimension_build_failed,
@@ -66,6 +73,7 @@ class SemanticDimensionBuildWorkerManager:
         self._task: asyncio.Task | None = None
         self._stop_event: asyncio.Event | None = None
         self._base_dir: Path | None = None
+        self._worker_id: str | None = None
 
     def start(self, base_dir: Path) -> None:
         if os.getenv("PUDDINGCLAW_DISABLE_SEMANTIC_DIMENSION_WORKER", "").strip().lower() in {"1", "true", "yes", "on"}:
@@ -74,6 +82,7 @@ class SemanticDimensionBuildWorkerManager:
         if self._task is not None and not self._task.done():
             return
         self._base_dir = base_dir
+        self._worker_id = new_worker_id("semantic-dimension-build")
         self._stop_event = asyncio.Event()
         self._task = asyncio.create_task(self._run_loop(), name="semantic-dimension-build-worker")
         logger.info("[semantic-dimension-worker] started")
@@ -109,19 +118,54 @@ class SemanticDimensionBuildWorkerManager:
 
     async def _run_once(self, sessionmaker: async_sessionmaker[AsyncSession], base_dir: Path) -> bool:
         async with sessionmaker() as session:
-            job = await claim_next_semantic_dimension_build_job(session)
+            job = await claim_next_semantic_dimension_build_job(session, worker_id=self._worker_id)
             if job is None:
                 return False
             job_id = job.id
+            worker_id = job.lease_owner or self._worker_id or ""
 
+        stop_hb = asyncio.Event()
+        lost = asyncio.Event()
+        hb_task = asyncio.create_task(
+            heartbeat_loop(
+                sessionmaker,
+                SemanticDimensionBuildJob,
+                job_id,
+                worker_id,
+                stop_event=stop_hb,
+                lost_event=lost,
+            ),
+            name=f"semantic-dimension-build-heartbeat-{job_id}",
+        )
+        token = bind_lease_owner(worker_id)
+        completed = False
         try:
-            await self._process_job(sessionmaker, base_dir, job_id)
-        except Exception as exc:
-            logger.exception("[semantic-dimension-worker] failed job_id=%s", job_id)
-            async with sessionmaker() as session:
-                job = await session.get(SemanticDimensionBuildJob, job_id)
-                if job is not None and job.status == "running":
-                    await mark_semantic_dimension_build_failed(session, job, exc)
+            try:
+                await self._process_job(sessionmaker, base_dir, job_id)
+                completed = True
+            except LeaseLostError:
+                logger.warning("[semantic-dimension-worker] 租约已丢失，跳过终态写入 job_id=%s", job_id)
+            except Exception as exc:
+                logger.exception("[semantic-dimension-worker] failed job_id=%s", job_id)
+                if not lost.is_set():
+                    async with sessionmaker() as session:
+                        job = await session.get(SemanticDimensionBuildJob, job_id)
+                        if job is not None and job.status == "running":
+                            try:
+                                await mark_semantic_dimension_build_failed(session, job, exc)
+                                completed = True
+                            except LeaseLostError:
+                                logger.warning("[semantic-dimension-worker] 租约已丢失，跳过失败状态写入 job_id=%s", job_id)
+        finally:
+            reset_lease_owner(token)
+            stop_hb.set()
+            hb_task.cancel()
+            try:
+                await hb_task
+            except asyncio.CancelledError:
+                pass
+        if lost.is_set() and not completed:
+            logger.warning("[semantic-dimension-worker] 租约已丢失且未写入终态，任务将由回收方重新执行 job_id=%s", job_id)
         return True
 
     async def _process_job(self, sessionmaker: async_sessionmaker[AsyncSession], base_dir: Path, job_id: str) -> None:

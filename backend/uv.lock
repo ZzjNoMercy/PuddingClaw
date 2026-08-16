@@ -2843,7 +2843,6 @@ dependencies = [
     { name = "aiohttp" },
     { name = "aiosqlite" },
     { name = "anyio" },
-    { name = "asyncpg" },
     { name = "beautifulsoup4" },
     { name = "cryptography" },
     { name = "deepagents" },
@@ -2921,6 +2920,9 @@ mineru = [
 multimodal = [
     { name = "dashscope" },
 ]
+postgres = [
+    { name = "asyncpg" },
+]
 
 [package.dev-dependencies]
 deepagents-test = [
@@ -2940,7 +2942,7 @@ requires-dist = [
     { name = "aiohttp", specifier = ">=3.13.0" },
     { name = "aiosqlite", specifier = ">=0.22.0" },
     { name = "anyio", specifier = ">=4.12.0" },
-    { name = "asyncpg", specifier = ">=0.29.0" },
+    { name = "asyncpg", marker = "extra == 'postgres'", specifier = ">=0.29.0" },
     { name = "beautifulsoup4", specifier = ">=4.14.0" },
     { name = "cryptography", specifier = ">=49.0.0" },
     { name = "dashscope", marker = "extra == 'multimodal'", specifier = ">=1.24.0" },
@@ -3004,7 +3006,7 @@ requires-dist = [
     { name = "xlrd", marker = "extra == 'knowledge'", specifier = ">=2.0.1" },
     { name = "xxhash", specifier = ">=3.4.0" },
 ]
-provides-extras = ["evaluation", "knowledge", "analytics", "mineru", "milvus", "multimodal"]
+provides-extras = ["postgres", "evaluation", "knowledge", "analytics", "mineru", "milvus", "multimodal"]
 
 [package.metadata.requires-dev]
 deepagents-test = [

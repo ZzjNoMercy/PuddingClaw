@@ -16,8 +16,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from capabilities import (  # noqa: E402
     Capabilities,
     CapabilityStatus,
+    _check_external_datasources,
     _check_http_get,
     _check_http_get_sync,
+    _check_pgvector,
+    _check_postgres_sync,
     detect_capabilities,
     detect_capabilities_sync,
     invalidate_capabilities,
@@ -80,7 +83,7 @@ async def test_detect_capabilities_no_services(httpx_mock):
     httpx_mock.add_exception(httpx.ConnectError("Connection refused"), url="http://localhost:8002/health")
     caps = await detect_capabilities(force=True)
     assert isinstance(caps, Capabilities)
-    assert caps.database.available is False
+    assert caps.core_database.available is False
     assert caps.pgvector.available is False
     assert caps.docker.available is False
     assert caps.milvus.available is False
@@ -142,18 +145,22 @@ async def test_capability_status_to_dict():
 async def test_capabilities_to_dict():
     """Capabilities.to_dict 输出正确。"""
     caps = Capabilities(
-        database=CapabilityStatus(available=True),
-        pgvector=CapabilityStatus(available=True, reason="pgvector 0.8.5"),
+        core_database=CapabilityStatus(available=True, details={"mode": "sqlite", "scope": "core"}),
+        pgvector=CapabilityStatus(available=True, reason="pgvector 0.8.5", details={"scope": "gbrain"}),
         docker=CapabilityStatus(available=True),
         milvus=CapabilityStatus(available=False, reason="refused"),
         mineru=CapabilityStatus(available=True),
+        external_datasources=CapabilityStatus(available=True, details={"scope": "datasource"}),
     )
     assert caps.to_dict() == {
-        "database": {"available": True, "reason": None},
-        "pgvector": {"available": True, "reason": "pgvector 0.8.5"},
+        "core_database": {"available": True, "reason": None, "details": {"mode": "sqlite", "scope": "core"}},
+        "pgvector": {"available": True, "reason": "pgvector 0.8.5", "details": {"scope": "gbrain"}},
+        "external_datasources": {"available": True, "reason": None, "details": {"scope": "datasource"}},
         "docker": {"available": True, "reason": None},
         "milvus": {"available": False, "reason": "refused"},
         "mineru": {"available": True, "reason": None},
+        # Deprecated alias of core_database, kept for one version.
+        "database": {"available": True, "reason": None, "details": {"mode": "sqlite", "scope": "core"}},
     }
 
 
@@ -195,7 +202,7 @@ async def test_detect_capabilities_sync_inside_event_loop_does_not_leak_coroutin
         warnings.simplefilter("always")
         caps = detect_capabilities_sync(force=True)
 
-    assert caps.database.reason == "mock postgres"
+    assert caps.core_database.reason == "mock postgres"
     assert caps.docker.reason == "mock docker"
     assert not [
         warning for warning in caught
@@ -217,6 +224,32 @@ async def test_http_health_check_ignores_environment_proxy():
     mock_client.assert_called_once_with(timeout=3.0, trust_env=False)
 
 
+def test_core_database_sqlite_reports_core_scope(monkeypatch):
+    """SQLite 模式下 core_database 可用且 scope=core。"""
+    monkeypatch.setenv("PUDDINGCLAW_DATABASE_MODE", "sqlite")
+    status = _check_postgres_sync(None)
+    assert status.available is True
+    assert status.details == {"mode": "sqlite", "scope": "core"}
+
+
+def test_external_datasources_reports_scope():
+    """外部数据源能力条目标注 scope=datasource。"""
+    status = _check_external_datasources()
+    assert status.details is not None
+    assert status.details["scope"] == "datasource"
+
+
+def test_external_datasources_missing_asyncpg_degrades_gracefully():
+    """asyncpg 未安装时返回降级状态与安装提示，而不是抛错。"""
+    with mock.patch.dict(sys.modules, {"asyncpg": None}):
+        status = _check_external_datasources()
+    assert status.available is False
+    assert "pip install puddingclaw-backend[postgres]" in (status.reason or "")
+    assert status.details is not None
+    assert status.details["driver"] == "missing"
+    assert status.details["scope"] == "datasource"
+
+
 def test_sync_http_health_check_ignores_environment_proxy():
     """同步健康检查同样不能走环境代理。"""
 
@@ -229,3 +262,29 @@ def test_sync_http_health_check_ignores_environment_proxy():
         timeout=3.0,
         trust_env=False,
     )
+
+
+@pytest.mark.asyncio
+async def test_pgvector_without_gbrain_config_reports_optional_capability(tmp_path, monkeypatch):
+    """gbrain 未配置时 pgvector 探测返回明确的可选能力状态，不回退 Core URL。"""
+    monkeypatch.setenv("PUDDINGCLAW_KNOWLEDGE_DIR", str(tmp_path))
+    monkeypatch.setenv("PUDDINGCLAW_DATABASE_URL", "postgresql+asyncpg://u:p@127.0.0.1:5432/core")
+    status = await _check_pgvector()
+    assert status.available is False
+    assert status.reason == "gbrain 未配置（可选能力）"
+    assert status.details is not None
+    assert status.details["scope"] == "gbrain"
+
+
+@pytest.mark.asyncio
+async def test_pgvector_rejects_non_postgres_gbrain_dsn(tmp_path, monkeypatch):
+    """gbrain 配置里的非 PostgreSQL DSN 不应被当作可探测目标。"""
+    gbrain_home = tmp_path / "llm-wiki" / ".puddingclaw" / "gbrain-home" / ".gbrain"
+    gbrain_home.mkdir(parents=True)
+    (gbrain_home / "config.json").write_text('{"database_url": "sqlite:///x.db"}', encoding="utf-8")
+    monkeypatch.setenv("PUDDINGCLAW_KNOWLEDGE_DIR", str(tmp_path))
+    status = await _check_pgvector()
+    assert status.available is False
+    assert status.reason == "gbrain 配置的数据库 URL 不是 PostgreSQL DSN"
+    assert status.details is not None
+    assert status.details["scope"] == "gbrain"

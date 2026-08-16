@@ -206,10 +206,12 @@ async function main() {
       await fs.mkdir(wheelDirectory, { recursive: true });
       await run("uv", ["build", "--wheel", "--out-dir", wheelDirectory], { cwd: backendRoot });
       const exportExtras = {
+        // Core 默认 SQLite：harness 不含 asyncpg。knowledge/analytics/full
+        // 可能连接 PostgreSQL 数据源或启用 gbrain(pgvector)，追加 postgres extra。
         harness: [],
-        knowledge: ["--extra", "knowledge"],
-        analytics: ["--extra", "analytics"],
-        full: ["--extra", "knowledge", "--extra", "analytics"],
+        knowledge: ["--extra", "knowledge", "--extra", "postgres"],
+        analytics: ["--extra", "analytics", "--extra", "postgres"],
+        full: ["--extra", "knowledge", "--extra", "analytics", "--extra", "postgres"],
       };
       requirementsSources = {};
       for (const [profile, extras] of Object.entries(exportExtras)) {

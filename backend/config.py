@@ -57,12 +57,15 @@ _DEFAULT_CONFIG: dict[str, Any] = {
     },
     "database": {
         # Shared Core database for runtime state and extension metadata.
-        # Knowledge additionally requires pgvector when PostgreSQL is selected.
+        # SQLite local file is the zero-config default; PostgreSQL stays a
+        # server-side option. Knowledge additionally requires pgvector when
+        # PostgreSQL is selected.
         #
         # Settings page is the normal desktop source of truth. Only the
-        # CLI Runtime uses the PUDDINGCLAW_DATABASE_MODE / URL / SOURCE
-        # deployment contract to override it.
-        "mode": "bundled",  # sqlite | bundled | external
+        # CLI Runtime uses the PUDDINGCLAW_DATABASE_PROVIDER / MODE / URL /
+        # SOURCE deployment contract to override it.
+        "provider": "sqlite",  # sqlite | postgresql
+        "source": "local_file",  # local_file | bundled | external
         "host": "127.0.0.1",
         "port": 5432,
         "database": "puddingclaw",
@@ -1225,13 +1228,40 @@ def get_database_qa_config() -> dict[str, Any]:
     }
 
 
+def _raw_database_overrides() -> dict[str, Any]:
+    """Read the user-written database section without merged defaults.
+
+    Merged config always contains provider/source defaults, so only the raw
+    override file can tell an explicit new-schema provider apart from a
+    legacy ``mode``-only document.
+    """
+
+    config_path = _config_path()
+    try:
+        if not config_path.exists():
+            return {}
+        data = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    database = data.get("database")
+    return database if isinstance(database, dict) else {}
+
+
 def get_database_config() -> dict[str, Any]:
     """Read catalog database connection config.
 
     Settings page / config.json is the normal desktop source of truth. CLI
-    Runtime can override mode, source and URL through the PUDDINGCLAW_DATABASE_*
-    deployment contract. Generic DATABASE_URL / POSTGRES_URL are ignored here:
-    they are too easy to inherit from Docker shells and make the UI look wrong.
+    Runtime can override provider, mode, source and URL through the
+    PUDDINGCLAW_DATABASE_* deployment contract. Generic DATABASE_URL /
+    POSTGRES_URL are ignored here: they are too easy to inherit from Docker
+    shells and make the UI look wrong.
+
+    The canonical schema is ``provider`` (sqlite | postgresql) plus ``source``
+    (local_file | bundled | external). Legacy ``mode`` (sqlite | bundled |
+    external) documents are still read, and the returned dict keeps a derived
+    ``mode`` for backward-compatible callers.
     """
 
     import os
@@ -1240,13 +1270,36 @@ def get_database_config() -> dict[str, Any]:
     env_url = (os.getenv("PUDDINGCLAW_DATABASE_URL") or "").strip()
     env_mode = (os.getenv("PUDDINGCLAW_DATABASE_MODE") or "").strip().lower()
     env_source = (os.getenv("PUDDINGCLAW_DATABASE_SOURCE") or "").strip().lower()
+    env_provider = (os.getenv("PUDDINGCLAW_DATABASE_PROVIDER") or "").strip().lower()
     database = load_config().get("database", {})
+    raw_database = _raw_database_overrides()
     configured_url = str(database.get("url", "") or "").strip()
-    mode = str(database.get("mode", "bundled") or "bundled").strip() or "bundled"
     host = str(database.get("host", "127.0.0.1") or "127.0.0.1").strip()
     port = int(database.get("port") or 5432)
     db_name = str(database.get("database", "puddingclaw") or "puddingclaw").strip()
     username = str(database.get("username", "puddingclaw") or "puddingclaw").strip()
+
+    # Resolve provider/source. An explicit new-schema provider wins; a legacy
+    # mode-only document is mapped (sqlite -> sqlite/local_file, bundled ->
+    # postgresql/bundled, external -> postgresql/external).
+    provider = str(raw_database.get("provider", "") or "").strip().lower()
+    source = str(raw_database.get("source", "") or "").strip().lower()
+    legacy_mode = str(raw_database.get("mode", "") or "").strip().lower()
+    if provider not in {"sqlite", "postgresql"}:
+        if legacy_mode == "sqlite":
+            provider = "sqlite"
+            source = source or "local_file"
+        elif legacy_mode in {"bundled", "external"}:
+            provider = "postgresql"
+            source = source or legacy_mode
+        else:
+            provider = str(database.get("provider", "sqlite") or "sqlite").strip().lower()
+            if provider not in {"sqlite", "postgresql"}:
+                provider = "sqlite"
+            source = source or str(database.get("source", "") or "").strip().lower()
+    if not source:
+        source = "local_file" if provider == "sqlite" else "external"
+
     from provider_registry import LocalCredentialStore
 
     raw_password = str(database.get("password") or "")
@@ -1256,39 +1309,60 @@ def get_database_config() -> dict[str, Any]:
     password = LocalCredentialStore().get(password_ref) if password_ref else ""
     if not password:
         password = os.getenv("PUDDINGCLAW_DATABASE_PASSWORD", "")
-    if env_mode == "sqlite":
-        mode = "sqlite"
+    if env_mode == "sqlite" or env_provider == "sqlite":
+        provider = "sqlite"
+        source = env_source or "local_file"
     elif env_url:
         parsed = urlparse(env_url.replace("postgresql+asyncpg://", "postgresql://", 1))
         host = parsed.hostname or host
         port = int(parsed.port or port)
         db_name = unquote(parsed.path.lstrip("/")) or db_name
         username = unquote(parsed.username or username)
-        mode = "external" if env_source == "external" else "bundled"
+        provider = "postgresql"
+        source = "external" if env_source == "external" else (env_source or "bundled")
+    elif env_mode in {"postgresql", "bundled", "external"} or env_provider == "postgresql":
+        provider = "postgresql"
+        if env_mode in {"bundled", "external"}:
+            source = env_mode
+        elif env_source:
+            source = env_source
     assembled_url = ""
-    if mode in {"bundled", "external"}:
+    if provider == "postgresql":
         assembled_url = (
             "postgresql+asyncpg://"
             f"{quote(username)}:{quote(password)}@{host}:{port}/{quote(db_name)}"
         )
-    effective_config_url = "" if mode == "sqlite" else configured_url or assembled_url
-    environment_override = bool(env_url or env_mode)
+    effective_config_url = "" if provider == "sqlite" else configured_url or assembled_url
+    environment_override = bool(env_url or env_mode or env_provider)
+    # Backward-compatible legacy mode derived from provider/source.
+    if provider == "sqlite":
+        mode = "sqlite"
+    elif source == "external":
+        mode = "external"
+    else:
+        mode = "bundled"
     return {
+        "provider": provider,
+        "source": source,
         "mode": mode,
+        "catalog_path": (
+            str(PuddingClawPaths.from_environment().databases() / "catalog.sqlite3")
+            if provider == "sqlite"
+            else ""
+        ),
         "host": host,
         "port": port,
         "database": db_name,
         "username": username,
         "password": password,
         "password_ref": password_ref,
-        "source": env_source or ("config" if not environment_override else "unknown"),
-        "url": "" if mode == "sqlite" else env_url or effective_config_url,
+        "url": "" if provider == "sqlite" else env_url or effective_config_url,
         "configured_url": configured_url,
         "configured_by": (
             "environment"
             if environment_override
             else "config.json"
-            if effective_config_url
+            if raw_database
             else "default"
         ),
         "environment_override": environment_override,
@@ -1406,8 +1480,13 @@ def _redact_database_url(value: str) -> str:
     return value
 
 
-def update_settings(updates: dict[str, Any]) -> None:
-    """Update settings from frontend, handling partial updates and API key logic."""
+def update_settings(updates: dict[str, Any]) -> dict[str, Any] | None:
+    """Update settings from frontend, handling partial updates and API key logic.
+
+    Returns ``None`` normally, or a dict of extra response fields (for example
+    a migration warning when the database provider switches to SQLite) that
+    the API layer merges into its response payload.
+    """
     retired = {
         "ai_gateway",
         "gateway_llm",
@@ -1520,16 +1599,52 @@ def update_settings(updates: dict[str, Any]) -> None:
                     existing_query["entity_top_k_by_type"] = by_type
                 config["vanna"]["query"] = existing_query
 
+    response_extra: dict[str, Any] | None = None
     if "database" in updates:
         database_update = updates["database"]
         if "database" not in config:
             config["database"] = {}
         if isinstance(database_update, dict):
-            if "mode" in database_update:
-                mode = str(database_update.get("mode") or "bundled").strip() or "bundled"
-                config["database"]["mode"] = (
-                    "sqlite" if mode == "sqlite" else "external" if mode == "external" else "bundled"
-                )
+            previous_provider = get_database_config().get("provider")
+            requested_provider = ""
+            requested_source = ""
+            # Legacy GUI contract: mode sqlite | bundled | external. New
+            # contract: provider sqlite | postgresql + source. Both are
+            # accepted; provider/source win when both are present, and only
+            # the new fields are persisted.
+            legacy_mode = str(database_update.get("mode") or "").strip().lower()
+            if legacy_mode == "sqlite":
+                requested_provider, requested_source = "sqlite", "local_file"
+            elif legacy_mode == "external":
+                requested_provider, requested_source = "postgresql", "external"
+            elif legacy_mode:
+                requested_provider, requested_source = "postgresql", "bundled"
+            if "provider" in database_update:
+                provider_value = str(database_update.get("provider") or "").strip().lower()
+                if provider_value not in {"sqlite", "postgresql"}:
+                    raise ValueError("database.provider 必须是 sqlite 或 postgresql")
+                requested_provider = provider_value
+            if "source" in database_update:
+                requested_source = str(database_update.get("source") or "").strip().lower()
+            if requested_provider or requested_source or legacy_mode:
+                if not requested_provider:
+                    requested_provider = "sqlite" if requested_source == "local_file" else "postgresql"
+                if not requested_source:
+                    requested_source = "local_file" if requested_provider == "sqlite" else "external"
+                config["database"].pop("mode", None)
+                config["database"]["provider"] = requested_provider
+                config["database"]["source"] = requested_source
+                if previous_provider == "postgresql" and requested_provider == "sqlite":
+                    # No hard refusal here (the CLI `database configure` owns
+                    # the hard gate); the settings response must surface that
+                    # the new SQLite catalog starts empty.
+                    response_extra = {
+                        "requires_migration": True,
+                        "migration_warning": (
+                            "已从 PostgreSQL 切换为 SQLite：新的 Catalog 为空，"
+                            "原有数据不会自动迁移，请使用迁移流程完成数据搬迁。"
+                        ),
+                    }
             for key in ("host", "database", "username", "password", "url"):
                 if key in database_update:
                     value = str(database_update.get(key) or "").strip()
@@ -1771,6 +1886,7 @@ def update_settings(updates: dict[str, Any]) -> None:
 
     _strip_provider_credentials(config)
     save_config(config)
+    return response_extra
 
 
 def _normalize_harness_update(value: Any) -> dict[str, Any]:

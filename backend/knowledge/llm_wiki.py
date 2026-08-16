@@ -187,7 +187,13 @@ def _gbrain_postgres_summary(config_path: Path) -> dict[str, Any]:
 async def _read_gbrain_import_status(database_url: str, *, limit: int = 10) -> dict[str, Any]:
     """Read the gbrain runtime audit log without exposing its database URL."""
 
-    import asyncpg
+    try:
+        import asyncpg
+    except ImportError as exc:
+        raise RuntimeError(
+            "asyncpg 未安装：gbrain(pgvector) 导入状态读取需要可选依赖，"
+            "请安装 postgres extra（pip install 'puddingclaw-backend[postgres]' 或 uv sync --extra postgres）。"
+        ) from exc
 
     normalized_url = database_url.replace("postgresql+asyncpg://", "postgresql://", 1)
     connection = await asyncpg.connect(dsn=normalized_url, timeout=2)

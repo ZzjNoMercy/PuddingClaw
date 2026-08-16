@@ -1416,6 +1416,80 @@ def test_smart_mode_allows_only_controlled_network_tools(tmp_path):
     assert shell_result.reason == "smart_controlled_network:curl_public_https_read"
 
 
+@pytest.mark.parametrize("backend_mode", ["spawn", "kernel"])
+def test_smart_mode_allows_arxiv_pdf_download_with_redirect_and_verification(
+    tmp_path: Path,
+    backend_mode: str,
+) -> None:
+    context = RunPermissionContext.from_config_snapshot(
+        {
+            "permissions": {"approval_mode": "smart", "policy_epoch": 1},
+            "execution": {
+                "backend_mode": backend_mode,
+                "backend_id": f"{backend_mode}:project:test",
+                "filesystem_mode": "unrestricted",
+            },
+        }
+    )
+    pipeline = ToolExecutionPipeline(
+        known_tools={"execute"},
+        backend_mode=backend_mode,
+        permission_context=context,
+    )
+    command = (
+        'curl -L --fail --max-time 120 -A "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
+        'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36" '
+        '-o "agent_memory_survey.pdf" "https://arxiv.org/pdf/2602.06052" '
+        "&& file agent_memory_survey.pdf && ls -la agent_memory_survey.pdf"
+    )
+    request = ToolCallRequest(
+        tool_call={"id": "arxiv-pdf", "name": "execute", "args": {"command": command}},
+        tool=None,
+        state={},
+        runtime=SimpleNamespace(context={"workspace_path": str(tmp_path)}),
+    )
+
+    result = pipeline._preflight(request)
+
+    assert result.decision is PolicyDecision.ALLOW
+    assert result.reason == "smart_controlled_network:curl_public_https_read"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "curl -L -X POST https://example.com",
+        "curl -L -XPOST https://example.com",
+        "curl -L --data action=navigate https://example.com",
+        "curl -L -daction=navigate https://example.com",
+        "curl -L -HAuthorization:secret https://example.com",
+        "curl --location-trusted https://example.com",
+        "curl -L --user agent:secret https://example.com",
+        "curl -L --resolve example.com:443:127.0.0.1 https://example.com",
+        "curl -L --url http://127.0.0.1:10086/command https://example.com",
+    ],
+)
+def test_curl_redirect_with_mutation_or_authority_override_still_denies_webbridge_bypass(
+    tmp_path: Path,
+    command: str,
+) -> None:
+    pipeline = _smart_docker_pipeline(tmp_path)
+    request = ToolCallRequest(
+        tool_call={"id": "redirect-bypass", "name": "execute", "args": {"command": command}},
+        tool=None,
+        state={},
+        runtime=SimpleNamespace(context={"workspace_path": str(tmp_path)}),
+    )
+
+    result = pipeline._preflight(request)
+
+    assert result.decision is PolicyDecision.DENY
+    assert result.reason in {
+        "webbridge_daemon_direct_access_forbidden",
+        "webbridge_daemon_indirect_access_forbidden",
+    }
+
+
 @pytest.mark.parametrize(
     ("command", "network", "decision", "reason"),
     [
@@ -4175,7 +4249,6 @@ def test_smart_docker_still_asks_for_package_or_network_execution(tmp_path, comm
 @pytest.mark.parametrize(
     "command",
     [
-        "curl -L https://example.com/report",
         "curl -H 'Authorization: Bearer secret' https://example.com/report",
         "curl --data 'x=1' https://example.com/report",
         "curl https://127.0.0.1/report",

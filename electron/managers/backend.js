@@ -1,8 +1,8 @@
 const { spawn } = require('child_process');
-const path = require('path');
 const http = require('http');
 const { app } = require('electron');
 const { getBackendDir } = require('./paths');
+const cliManager = require('./cli');
 
 const BACKEND_DIR = getBackendDir();
 const BACKEND_PORT = 8888;
@@ -37,12 +37,10 @@ function getBackendCommand() {
     };
   }
 
-  // 生产模式：假设 .venv 已存在；首次启动前需要 uv sync
-  return {
-    cmd: path.join(BACKEND_DIR, '.venv', 'bin', 'python'),
-    args: ['-m', 'uvicorn', 'app:app', '--host', '0.0.0.0', '--port', String(BACKEND_PORT)],
-    cwd: BACKEND_DIR,
-  };
+  // 生产模式只使用 CLI 在用户目录准备的受管理 Runtime，不修改签名后的 App Resources。
+  const prepared = cliManager.getPreparedBackendCommand();
+  if (!prepared) throw new Error('CLI 管理的 Backend Runtime 尚未准备完成');
+  return prepared;
 }
 
 async function checkBackendStatus() {
@@ -54,43 +52,6 @@ async function checkBackendStatus() {
     req.on('timeout', () => {
       req.destroy();
       resolve('stopped');
-    });
-  });
-}
-
-async function ensureBackendVenv() {
-  const venvPython = path.join(BACKEND_DIR, '.venv', 'bin', 'python');
-  const fs = require('fs');
-
-  if (fs.existsSync(venvPython)) {
-    return true;
-  }
-
-  backendStatus = 'starting';
-  backendError = 'backend .venv 不存在，正在创建（首次启动需要几分钟）...';
-
-  return new Promise((resolve, reject) => {
-    const child = spawn('uv', ['sync', '--all-extras', '--group', 'dev', '--group', 'deepagents-test'], {
-      cwd: BACKEND_DIR,
-      env: {
-        ...process.env,
-        VIRTUAL_ENV: '',
-      },
-      stdio: 'pipe',
-    });
-
-    let output = '';
-    child.stdout.on('data', (data) => { output += data.toString(); });
-    child.stderr.on('data', (data) => { output += data.toString(); });
-
-    child.on('close', (code) => {
-      if (code === 0 && fs.existsSync(venvPython)) {
-        resolve(true);
-      } else {
-        backendStatus = 'error';
-        backendError = `创建 .venv 失败: ${output.slice(-500)}`;
-        reject(new Error(backendError));
-      }
     });
   });
 }
@@ -111,12 +72,11 @@ async function startBackend() {
 
   try {
     const isDev = !app.isPackaged;
-    if (!isDev) {
-      await ensureBackendVenv();
-    }
+    if (!isDev) await cliManager.ensurePreparedRuntime();
 
     const { cmd, args, cwd } = getBackendCommand();
 
+    const selectedProfile = cliManager.readSelectedProfile();
     backendProcess = spawn(cmd, args, {
       cwd,
       env: {
@@ -124,7 +84,11 @@ async function startBackend() {
         // Backend credentials and Provider Registry are user-local, never
         // stored in the packaged repository. Electron owns the cross-platform
         // userData path (including Windows APPDATA handling).
-        PUDDINGDATA_USER_DATA_DIR: app.getPath('userData'),
+        PUDDINGCLAW_HOME: cliManager.getPuddingClawHome(),
+        ...(selectedProfile ? {
+          PUDDINGCLAW_PROFILE: selectedProfile.profile,
+          PUDDINGCLAW_EXTENSIONS: JSON.stringify(selectedProfile.extensions),
+        } : {}),
         MINERU_URL: process.env.MINERU_URL || 'http://localhost:8002',
         VIRTUAL_ENV: '',
       },

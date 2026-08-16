@@ -8,6 +8,8 @@ Agent Harness protocol. Its default Home is `~/.puddingclaw`.
 npm install -g ./packages/puddingclaw-deploy-cli
 puddingclaw init
 puddingclaw init --profile harness --plan --json
+puddingclaw profile inspect full --json
+puddingclaw profile apply knowledge --json
 puddingclaw database configure
 puddingclaw database show --json
 puddingclaw doctor
@@ -30,15 +32,18 @@ is a separate, explicit release action and is not performed by build or verifica
 - No-argument interactive `init` for Harness-only and optional extensions, including
   separate Agent and image-analysis SubAgent model bindings. Credentials are validated
   and stored independently, or safely reused when both bindings share one Provider.
-- Ordered Knowledge discovery for SQLite/PostgreSQL, authenticated PostgreSQL and
-  pgvector checks, Milvus/Collection checks, required Embedding configuration when
-  vector indexing is selected, and optional MinerU health detection.
-- Core database discovery for every Profile, with four explicit schemes: local
-  PostgreSQL, Docker PostgreSQL, SQLite, or external PostgreSQL. Interactive init
-  collects the applicable port/database/user/password fields; an empty password is
-  generated securely. Existing local/external connections ask before creating a
-  missing database. No package, container, database, or unknown process is changed
-  without the user's selection and confirmation.
+- SQLite is the zero-config Core Catalog for every Profile. Normal `init` writes the
+  local-file catalog directly and does not prompt for or probe PostgreSQL/Docker.
+- PostgreSQL discovery is opt-in through explicit init database flags or
+  `puddingclaw database configure`, with four supported schemes: local PostgreSQL,
+  Docker PostgreSQL, SQLite, or external PostgreSQL. The PostgreSQL flow collects
+  and validates the applicable connection fields and asks before creating a missing
+  database. No package, container, database, or unknown process is changed without
+  the user's explicit selection and confirmation.
+- Ordered Knowledge discovery for optional Milvus/Collection checks, required
+  Embedding configuration when vector indexing is selected, and optional MinerU
+  health detection. PostgreSQL/pgvector checks run only for an explicitly selected
+  PostgreSQL or gbrain path.
 - Database configuration remains mutable after init. `puddingclaw database
   configure` reuses the same decision and validation flow without rerunning
   Provider, Python, port, or extension setup. The previous connection remains
@@ -46,6 +51,9 @@ is a separate, explicit release action and is not performed by build or verifica
 - Read-only init plans covering the current Provider, Harness, Knowledge,
   Analytics, and Headless settings/probe groups; disabled extensions are removed
   from the selected plan.
+- Desktop onboarding profile inspection and application. `profile inspect` returns
+  the selected plan plus explicit required, optional, and post-entry configuration
+  dependencies; `profile apply` is the only writer used by the Electron first-run UI.
 - Python 3.11/3.12 and uv detection, plus explicit one-click preparation of a
   pinned user-level uv and uv-managed Python 3.12 under the isolated Home.
 - Read-only port ownership probes, fail-closed non-interactive behavior, automatic or

@@ -14,6 +14,7 @@ from knowledge.import_jobs import update_job_progress
 from knowledge.llm_wiki import get_llm_wiki_service
 from knowledge.llm_wiki_compiler_agent import LlmWikiCompilerAgent
 from knowledge.models import KnowledgeImportEvent, KnowledgeImportJob
+from knowledge.queue_repository import LeaseLostError, require_current_lease
 from knowledge.service import KnowledgeServiceError
 
 BACKGROUND_INGEST_GROUNDING_RULES = (
@@ -164,6 +165,7 @@ async def process_llm_wiki_ingest_job(
             )
             gbrain_result = await asyncio.to_thread(wiki.compile_gbrain, import_pages=True)
             if not gbrain_result.get("ok"):
+                await require_current_lease(session, KnowledgeImportJob, job.id)
                 job.job_metadata = {
                     **(job.job_metadata or metadata),
                     "gbrain_import_ok": False,
@@ -174,11 +176,15 @@ async def process_llm_wiki_ingest_job(
                     f"Wiki 已发布，但 gbrain 入库未通过：{gbrain_result.get('phase') or 'unknown'}"
                 )
 
+        await require_current_lease(session, KnowledgeImportJob, job.id)
         job.status = "succeeded"
         job.current_step = "done"
         job.progress = 100
         job.finished_at = datetime.now(timezone.utc)
         job.error_message = None
+        job.lease_owner = None
+        job.lease_expires_at = None
+        job.heartbeat_at = None
         job.job_metadata = {
             **(job.job_metadata or metadata),
             "published_pages": published_pages,
@@ -208,5 +214,10 @@ async def process_llm_wiki_ingest_job(
         await session.commit()
         await session.refresh(job)
         return job
+    except LeaseLostError:
+        # The queue lease protocol must surface to the worker unchanged;
+        # LeaseLostError is a RuntimeError and must not be converted into a
+        # business failure below.
+        raise
     except RuntimeError as exc:
         raise KnowledgeServiceError(str(exc)) from exc

@@ -13,11 +13,12 @@ from datetime import datetime, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from knowledge.models import SemanticDimensionBuildEvent, SemanticDimensionBuildJob, TaskNotification, new_id
-
+from knowledge.queue_repository import claim_next, current_lease_owner, new_worker_id, require_lease
+from runtime_control import assert_writes_allowed, writes_allowed
 
 ACTIVE_STATUSES = {"queued", "running"}
 RETRYABLE_STATUSES = {"failed", "cancelled"}
@@ -107,6 +108,7 @@ async def create_semantic_dimension_build_job(
     session_id: str = "",
     query_id: str = "",
 ) -> tuple[SemanticDimensionBuildJob, bool]:
+    await assert_writes_allowed(session)
     clean_dimension_id = str(dimension_id or "").removeprefix("dimension:").strip()
     clean_adapter = str(adapter or "").strip()
     if not clean_dimension_id:
@@ -180,22 +182,30 @@ async def list_semantic_dimension_build_events(
     return list(result.scalars())
 
 
-async def claim_next_semantic_dimension_build_job(session: AsyncSession) -> SemanticDimensionBuildJob | None:
-    result = await session.execute(
-        select(SemanticDimensionBuildJob)
-        .where(SemanticDimensionBuildJob.status == "queued")
-        .order_by(SemanticDimensionBuildJob.created_at.asc())
-        .limit(1)
+async def claim_next_semantic_dimension_build_job(
+    session: AsyncSession,
+    *,
+    worker_id: str | None = None,
+    lease_seconds: int | None = None,
+) -> SemanticDimensionBuildJob | None:
+    # Drain/maintenance gate: stop claiming new work; in-flight jobs keep
+    # heartbeating under the queue lease protocol.
+    if not await writes_allowed(session):
+        return None
+    # End the read transaction opened by the writes_allowed probe so the claim
+    # UPDATE starts a fresh transaction. Under SQLite WAL, upgrading a stale
+    # read snapshot to a write fails immediately with SQLITE_BUSY_SNAPSHOT,
+    # which busy_timeout does not cover.
+    await session.rollback()
+    job = await claim_next(
+        session,
+        SemanticDimensionBuildJob,
+        worker_id=worker_id or new_worker_id("manual"),
+        lease_seconds=lease_seconds,
+        extra_sets={"current_step": "load_source_profiles", "progress": 5, "finished_at": None, "error_message": None},
     )
-    job = result.scalar_one_or_none()
     if job is None:
         return None
-    job.status = "running"
-    job.current_step = "load_source_profiles"
-    job.progress = 5
-    job.started_at = _utcnow()
-    job.finished_at = None
-    job.error_message = None
     session.add(SemanticDimensionBuildEvent(job_id=job.id, level="info", message="开始构建语义维度"))
     await session.commit()
     await session.refresh(job)
@@ -210,7 +220,11 @@ async def update_semantic_dimension_build_progress(
     progress: int,
     message: str | None = None,
     event_metadata: dict[str, Any] | None = None,
+    lease_owner: str | None = None,
 ) -> None:
+    lease_owner = lease_owner or current_lease_owner()
+    if lease_owner is not None:
+        await require_lease(session, SemanticDimensionBuildJob, job.id, lease_owner)
     job.current_step = step
     job.progress = max(0, min(100, progress))
     if message:
@@ -232,7 +246,11 @@ async def mark_semantic_dimension_build_waiting_publish(
     staging_path: str,
     published_reference_path: str,
     result_summary: dict[str, Any],
+    lease_owner: str | None = None,
 ) -> None:
+    lease_owner = lease_owner or current_lease_owner()
+    if lease_owner is not None:
+        await require_lease(session, SemanticDimensionBuildJob, job.id, lease_owner)
     job.status = "waiting_for_publish_confirmation"
     job.current_step = "waiting_for_publish_confirmation"
     job.progress = 100
@@ -240,6 +258,9 @@ async def mark_semantic_dimension_build_waiting_publish(
     job.published_reference_path = published_reference_path
     job.result_summary = result_summary
     job.finished_at = _utcnow()
+    job.lease_owner = None
+    job.lease_expires_at = None
+    job.heartbeat_at = None
     session.add(
         SemanticDimensionBuildEvent(
             job_id=job.id,
@@ -274,7 +295,11 @@ async def mark_semantic_dimension_build_waiting_baseline_change(
     staging_path: str,
     published_reference_path: str,
     result_summary: dict[str, Any],
+    lease_owner: str | None = None,
 ) -> None:
+    lease_owner = lease_owner or current_lease_owner()
+    if lease_owner is not None:
+        await require_lease(session, SemanticDimensionBuildJob, job.id, lease_owner)
     job.status = "waiting_for_baseline_change_confirmation"
     job.current_step = "waiting_for_baseline_change_confirmation"
     job.progress = 100
@@ -282,6 +307,9 @@ async def mark_semantic_dimension_build_waiting_baseline_change(
     job.published_reference_path = published_reference_path
     job.result_summary = result_summary
     job.finished_at = _utcnow()
+    job.lease_owner = None
+    job.lease_expires_at = None
+    job.heartbeat_at = None
     session.add(SemanticDimensionBuildEvent(
         job_id=job.id,
         level="warning",
@@ -313,6 +341,9 @@ async def resolve_semantic_dimension_baseline_change(
         job.status = "cancelled"
         job.current_step = "cancelled"
         job.finished_at = _utcnow()
+        job.lease_owner = None
+        job.lease_expires_at = None
+        job.heartbeat_at = None
         session.add(SemanticDimensionBuildEvent(job_id=job.id, level="info", message="用户取消了本次规范基准变更。"))
         await session.commit()
         await session.refresh(job)
@@ -322,6 +353,9 @@ async def resolve_semantic_dimension_baseline_change(
     job.status = "waiting_for_publish_confirmation"
     job.current_step = "waiting_for_publish_confirmation"
     job.finished_at = _utcnow()
+    job.lease_owner = None
+    job.lease_expires_at = None
+    job.heartbeat_at = None
     session.add(SemanticDimensionBuildEvent(
         job_id=job.id,
         level="info",
@@ -337,11 +371,18 @@ async def mark_semantic_dimension_build_published(
     job: SemanticDimensionBuildJob,
     *,
     active_reference_path: str,
+    lease_owner: str | None = None,
 ) -> None:
+    lease_owner = lease_owner or current_lease_owner()
+    if lease_owner is not None:
+        await require_lease(session, SemanticDimensionBuildJob, job.id, lease_owner)
     job.status = "published"
     job.current_step = "published"
     job.progress = 100
     job.finished_at = _utcnow()
+    job.lease_owner = None
+    job.lease_expires_at = None
+    job.heartbeat_at = None
     session.add(
         SemanticDimensionBuildEvent(
             job_id=job.id,
@@ -365,13 +406,19 @@ async def mark_semantic_dimension_build_published(
 
 
 async def mark_semantic_dimension_build_failed(
-    session: AsyncSession, job: SemanticDimensionBuildJob, error: Exception | str
+    session: AsyncSession, job: SemanticDimensionBuildJob, error: Exception | str, *, lease_owner: str | None = None
 ) -> None:
+    lease_owner = lease_owner or current_lease_owner()
+    if lease_owner is not None:
+        await require_lease(session, SemanticDimensionBuildJob, job.id, lease_owner)
     message = str(error)
     job.status = "failed"
     job.current_step = "failed"
     job.error_message = message
     job.finished_at = _utcnow()
+    job.lease_owner = None
+    job.lease_expires_at = None
+    job.heartbeat_at = None
     session.add(SemanticDimensionBuildEvent(job_id=job.id, level="error", message=message))
     session.add(
         TaskNotification(
@@ -393,6 +440,7 @@ async def mark_semantic_dimension_build_failed(
 
 
 async def retry_semantic_dimension_build_job(session: AsyncSession, job_id: str) -> SemanticDimensionBuildJob:
+    await assert_writes_allowed(session)
     job = await get_semantic_dimension_build_job(session, job_id)
     if job is None:
         raise ValueError("Semantic dimension build job not found")
@@ -406,6 +454,9 @@ async def retry_semantic_dimension_build_job(session: AsyncSession, job_id: str)
     job.error_message = None
     job.started_at = None
     job.finished_at = None
+    job.lease_owner = None
+    job.lease_expires_at = None
+    job.heartbeat_at = None
     job.retry_count += 1
     session.add(SemanticDimensionBuildEvent(job_id=job.id, level="info", message="任务已重新加入队列"))
     await session.commit()
@@ -417,11 +468,19 @@ async def cancel_semantic_dimension_build_job(session: AsyncSession, job_id: str
     job = await get_semantic_dimension_build_job(session, job_id)
     if job is None:
         raise ValueError("Semantic dimension build job not found")
-    if job.status != "queued":
-        raise ValueError("Only queued semantic dimension build jobs can be cancelled")
-    job.status = "cancelled"
-    job.current_step = "cancelled"
-    job.finished_at = _utcnow()
+    result = await session.execute(
+        text(
+            "UPDATE semantic_dimension_build_jobs "
+            "SET status='cancelled', current_step='cancelled', finished_at=:finished_at, "
+            "lease_owner=NULL, lease_expires_at=NULL, heartbeat_at=NULL "
+            "WHERE id=:job_id AND status='queued'"
+        ),
+        {"finished_at": _utcnow(), "job_id": job.id},
+    )
+    if result.rowcount != 1:
+        if job.status != "queued":
+            raise ValueError("Only queued semantic dimension build jobs can be cancelled")
+        raise ValueError("Semantic dimension build job not found")
     session.add(SemanticDimensionBuildEvent(job_id=job.id, level="info", message="任务已取消"))
     await session.commit()
     await session.refresh(job)

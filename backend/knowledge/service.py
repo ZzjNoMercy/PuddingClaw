@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import fnmatch
 import hashlib
+import logging
 import mimetypes
 import os
 import posixpath
@@ -18,10 +19,13 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+import runtime_control
 from knowledge.indexer import build_markdown_chunk_manifest, refresh_local_knowledge_index
 from knowledge.mineru_client import MinerUClient, MinerUParseResult
 from knowledge.models import KnowledgeBase, KnowledgeDocument, new_id
 from knowledge.paths import get_knowledge_originals_dir, get_knowledge_root
+
+logger = logging.getLogger(__name__)
 
 MARKDOWN_SUFFIXES = {".md", ".markdown"}
 PDF_SUFFIXES = {".pdf"}
@@ -71,6 +75,21 @@ DEFAULT_MARKDOWN_GLOB = "**/*.md"
 
 class KnowledgeServiceError(ValueError):
     pass
+
+
+async def assert_writes_allowed_tolerant(session: AsyncSession) -> None:
+    """维护期拒写门控：draining/maintenance 时抛 MaintenanceModeError。
+
+    容错：runtime_control 表不存在或 DB 不可用等探测失败时放行，不阻塞正常
+    服务（运行时状态只读探测，不污染调用方 session）。
+    """
+
+    try:
+        await runtime_control.assert_writes_allowed(session)
+    except runtime_control.MaintenanceModeError:
+        raise
+    except Exception:  # noqa: BLE001 - 探测失败不阻塞正常服务
+        logger.warning("[knowledge] runtime_control 写入门控探测失败，放行本次写入", exc_info=True)
 
 
 def _ensure_directory_readable(path: Path) -> None:
@@ -885,6 +904,7 @@ class KnowledgeService:
         title: str | None = None,
         knowledge_base_id: str = DEFAULT_KNOWLEDGE_BASE_ID,
     ) -> KnowledgeDocument:
+        await assert_writes_allowed_tolerant(session)
         source = Path(source_path).expanduser().resolve()
         if not source.exists():
             raise KnowledgeServiceError(f"File not found: {source}")
@@ -962,6 +982,7 @@ class KnowledgeService:
         publish_targets: list[str] | None = None,
         publish_vector_now: bool = True,
     ) -> tuple[KnowledgeDocument, dict[str, Any]]:
+        await assert_writes_allowed_tolerant(session)
         safe_name = _slugify(filename or "document.md")
         if Path(safe_name).suffix.lower() not in MARKDOWN_SUFFIXES:
             raise KnowledgeServiceError("Only Markdown files (.md, .markdown) are supported by this ingestion endpoint.")
@@ -1083,6 +1104,7 @@ class KnowledgeService:
         knowledge_base_id: str = DEFAULT_KNOWLEDGE_BASE_ID,
         publish_targets: list[str] | None = None,
     ) -> tuple[KnowledgeDocument, dict[str, Any]]:
+        await assert_writes_allowed_tolerant(session)
         safe_name = _slugify(filename or "document")
         suffix = Path(safe_name).suffix.lower()
         if suffix not in GENERIC_UPLOAD_SUFFIXES:
@@ -1167,6 +1189,7 @@ class KnowledgeService:
         mineru_client: MinerUClient | None = None,
         publish_vector_now: bool = True,
     ) -> tuple[KnowledgeDocument, dict[str, Any]]:
+        await assert_writes_allowed_tolerant(session)
         safe_name = _slugify(filename or "document.pdf")
         if Path(safe_name).suffix.lower() not in PDF_SUFFIXES:
             raise KnowledgeServiceError("Only PDF files are supported by this ingestion endpoint.")

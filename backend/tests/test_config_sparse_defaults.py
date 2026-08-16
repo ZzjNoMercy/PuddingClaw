@@ -50,7 +50,8 @@ def test_canonical_defaults_match_reviewed_product_behavior(tmp_path, monkeypatc
     assert effective["harness"]["terminal"]["docker"]["memory_limit_mb"] == 4096
 
     # Machine identity, absolute paths and plaintext secrets are never product defaults.
-    assert effective["database"]["mode"] == "bundled"
+    assert effective["database"]["provider"] == "sqlite"
+    assert effective["database"]["source"] == "local_file"
     assert effective["database"]["username"] == "puddingclaw"
     assert effective["database"]["password"] == ""
     assert effective["knowledge"]["root_dir"] == ""
@@ -98,7 +99,7 @@ def test_blank_rubric_model_inherits_product_default_and_is_not_rewritten(tmp_pa
     config.update_settings({"database": {"mode": "external", "username": "pet"}})
     assert json.loads(config_path.read_text(encoding="utf-8")) == {
         "schema_version": 1,
-        "database": {"mode": "external", "username": "pet"},
+        "database": {"provider": "postgresql", "source": "external", "username": "pet"},
     }
 
 

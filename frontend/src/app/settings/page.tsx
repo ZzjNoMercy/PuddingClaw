@@ -63,6 +63,7 @@ import {
 import MemoryEditor from "@/components/settings/MemoryEditor";
 import CapabilitiesStatus from "@/components/settings/CapabilitiesStatus";
 import WorkerAccessKeysPanel from "@/components/settings/WorkerAccessKeysPanel";
+import SettingsAnchorLayout, { type SettingsAnchorSection } from "@/components/settings/SettingsAnchorLayout";
 import SettingsNavigation, { SETTINGS_CATEGORIES, settingsCategoryEnabled, type SettingsCategory } from "@/components/settings/SettingsNavigation";
 import { useRuntimeProfile } from "@/lib/useRuntimeProfile";
 import Navbar from "@/components/layout/Navbar";
@@ -97,12 +98,37 @@ const HARNESS_SECTIONS: HarnessSection[] = [
   { id: "runtime", label: "运行保护", description: "运行保护与权限策略", icon: ShieldCheck },
 ];
 
-const DATABASE_QA_SECTIONS: HarnessSection[] = [
+const DATABASE_QA_SECTIONS: SettingsAnchorSection[] = [
   { id: "preview", label: "结果预览", description: "直传、摘要与读取体量", icon: Database },
   { id: "storage", label: "持久化存储", description: "落盘、保留与导出", icon: FileText },
 ];
 
+const RAG_SECTIONS: SettingsAnchorSection[] = [
+  { id: "recall", label: "基础召回", description: "Top-K 与相似度阈值", icon: Search },
+  { id: "hybrid", label: "混合检索", description: "关键词、语义与图文融合", icon: Network },
+  { id: "rerank", label: "重排", description: "候选池与 Rerank", icon: Filter },
+];
+
+const KNOWLEDGE_SECTIONS: SettingsAnchorSection[] = [
+  { id: "directory", label: "本地目录", description: "知识库资产根目录", icon: FolderOpen },
+  { id: "wiki", label: "LLM Wiki", description: "编译与混合检索", icon: Bot },
+  { id: "gbrain", label: "GBrain", description: "模型与独立数据库", icon: Brain },
+  { id: "embedding", label: "多模态 Embedding", description: "模型绑定与批量数", icon: Network },
+  { id: "index", label: "检索索引", description: "向量服务与索引维护", icon: Database },
+];
+
 const SETTINGS_CATEGORY_KEY = "settings:activeCategory";
+const SETTINGS_CATEGORY_DESCRIPTIONS: Record<SettingsCategory, string> = {
+  ai: "统一管理模型供应商、接口、模型分类与默认工作负载。",
+  database: "PuddingClaw Core 的持久化连接，与知识库和智能问数扩展开关解耦。",
+  databaseQa: "控制查询结果如何进入模型、持久化、分页与导出。",
+  rag: "配置知识库检索的召回、图文融合与重排策略。",
+  knowledge: "管理本地知识库目录、Wiki 编译与向量索引。",
+  memory: "维护全局与项目级 Agent 记忆。",
+  harness: "管理 Agent 编排、上下文、执行预算与运行保护。",
+  worker: "管理 Worker Access Key 与 Headless API 调用记录。",
+  system: "查看核心服务、扩展能力与运行依赖状态。",
+};
 const DEFAULT_IMAGE_ANALYZER_PROMPT =
   "You are an image analysis specialist. When given an image, describe its contents in detail and answer any questions about it. Return your findings as concise, structured text.";
 
@@ -466,7 +492,7 @@ export default function SettingsPage() {
   const [dbQaAgentSqlFallbackEnabled, setDbQaAgentSqlFallbackEnabled] = useState(true);
 
   // Core database
-  const [databaseMode, setDatabaseMode] = useState<"sqlite" | "bundled" | "external">("bundled");
+  const [databaseMode, setDatabaseMode] = useState<"sqlite" | "bundled" | "external">("sqlite");
   const [databaseHost, setDatabaseHost] = useState("127.0.0.1");
   const [databasePort, setDatabasePort] = useState("5432");
   const [databaseName, setDatabaseName] = useState("puddingclaw");
@@ -474,7 +500,11 @@ export default function SettingsPage() {
   const [databasePassword, setDatabasePassword] = useState("");
   const [databaseConfiguredBy, setDatabaseConfiguredBy] = useState("default");
   const [databaseSource, setDatabaseSource] = useState("config");
+  const [databaseCatalogPath, setDatabaseCatalogPath] = useState("$PUDDINGCLAW_HOME/db/catalog.sqlite3");
   const [databaseEnvOverride, setDatabaseEnvOverride] = useState(false);
+  // 当前生效的存储提供方（sqlite / postgresql），用于切换前的二次确认；
+  // 与表单中的 databaseMode 区分：后者是用户尚未保存的选择。
+  const [databaseAppliedProvider, setDatabaseAppliedProvider] = useState<"sqlite" | "postgresql">("sqlite");
   const [databaseTesting, setDatabaseTesting] = useState(false);
   const [databaseTestResult, setDatabaseTestResult] = useState<{ ok: boolean; msg: string } | null>(null);
   const [knowledgeRootDir, setKnowledgeRootDir] = useState("");
@@ -547,7 +577,6 @@ export default function SettingsPage() {
   // Harness left-right anchor layout
   const [harnessFilter, setHarnessFilter] = useState("");
   const [activeHarnessSection, setActiveHarnessSection] = useState("subagent");
-  const [activeDatabaseQaSection, setActiveDatabaseQaSection] = useState("preview");
 
   // SubAgent / Harness
   const [subagentItems, setSubagentItems] = useState<SubAgentItem[]>([]);
@@ -612,13 +641,21 @@ export default function SettingsPage() {
         setDbQaAgentSqlFallbackEnabled(databaseQa?.database_agent_sql_fallback_enabled ?? true);
         // Core database. "bundled" is deployment provenance, not a third
         // database type users should select in the standalone settings UI.
+        // Newer backends report a `provider` field (sqlite / postgresql);
+        // prefer it over the legacy mode when present.
         const databaseEnvironmentOverride = Boolean(s.database?.environment_override);
-        const loadedDatabaseMode = s.database?.mode === "sqlite"
+        const databaseProvider = s.database?.provider;
+        const loadedDatabaseMode = databaseProvider === "sqlite"
           ? "sqlite"
-          : s.database?.mode === "external"
+          : databaseProvider === "postgresql"
             ? "external"
-            : "bundled";
+            : s.database?.mode === "sqlite"
+              ? "sqlite"
+              : s.database?.mode === "external"
+                ? "external"
+                : "bundled";
         setDatabaseMode(databaseEnvironmentOverride ? loadedDatabaseMode : loadedDatabaseMode === "sqlite" ? "sqlite" : "external");
+        setDatabaseAppliedProvider(loadedDatabaseMode === "sqlite" ? "sqlite" : "postgresql");
         setDatabaseHost(s.database?.host || "127.0.0.1");
         setDatabasePort(String(s.database?.port || 5432));
         setDatabaseName(s.database?.database || "puddingclaw");
@@ -628,6 +665,7 @@ export default function SettingsPage() {
         setDatabasePassword("");
         setDatabaseConfiguredBy(s.database?.configured_by || "default");
         setDatabaseSource(s.database?.source || "config");
+        setDatabaseCatalogPath(s.database?.catalog_path || "$PUDDINGCLAW_HOME/db/catalog.sqlite3");
         setDatabaseEnvOverride(databaseEnvironmentOverride);
         setKnowledgeRootDir(s.knowledge?.root_dir || "");
         setKnowledgeConfiguredBy(s.knowledge?.configured_by || "default");
@@ -1064,13 +1102,15 @@ export default function SettingsPage() {
           },
         }} : {}),
         ...(activeCategory === "database" ? { database: {
-          mode: databaseMode,
+          provider: databaseMode === "sqlite" ? "sqlite" : "postgresql",
+          source: databaseMode === "sqlite" ? "local_file" : "external",
           host: databaseHost || "127.0.0.1",
           port: positiveIntOrNull(databasePort) ?? 5432,
           database: databaseName || "puddingclaw",
           username: databaseUsername || "puddingclaw",
           password: databasePassword,
-          url: "",
+          // sqlite 模式下不发送 url 字段：空串会清掉 config.json 里用户手配的完整连接 URL。
+          ...(databaseMode === "sqlite" ? {} : { url: "" }),
         }} : {}),
         ...(runtimeExtensions?.knowledge ? { knowledge: {
           root_dir: knowledgeRootDir,
@@ -1148,12 +1188,25 @@ export default function SettingsPage() {
         },
         subagents: subagentItemsToConfig(subagentItems),
       };
-      await updateSettings(updates);
-      showToast("success", "设置已保存，将从下一次 Agent 运行生效");
+      const saveResult = await updateSettings(updates);
+      if (activeCategory === "database" && saveResult?.requires_migration) {
+        // 后端在 PostgreSQL → SQLite 切换时返回迁移警告：新 Catalog 为空，
+        // 必须明确告知用户，不能伪装成普通"保存成功"。
+        showToast("error", saveResult.migration_warning || "数据库提供方已切换：新的 Catalog 为空，原有数据不会自动迁移。");
+      } else {
+        showToast("success", "设置已保存，将从下一次 Agent 运行生效");
+      }
       const fresh = await getSettings();
       setDatabaseConfiguredBy(fresh.database?.configured_by || "default");
       setDatabaseSource(fresh.database?.source || "config");
+      setDatabaseCatalogPath(fresh.database?.catalog_path || "$PUDDINGCLAW_HOME/db/catalog.sqlite3");
       setDatabaseEnvOverride(Boolean(fresh.database?.environment_override));
+      const freshProvider = fresh.database?.provider;
+      setDatabaseAppliedProvider(
+        freshProvider === "postgresql" || freshProvider === "sqlite"
+          ? freshProvider
+          : fresh.database?.mode === "sqlite" ? "sqlite" : "postgresql",
+      );
       setKnowledgeConfiguredBy(fresh.knowledge?.configured_by || "default");
       setKnowledgeEnvOverride(Boolean(fresh.knowledge?.environment_override));
       setWikiHybridEnabled(fresh.knowledge?.llm_wiki?.retrieval?.hybrid_enabled ?? true);
@@ -1196,11 +1249,19 @@ export default function SettingsPage() {
   }, [showToast, wikiHybridEnabled, wikiHybridSaving]);
 
   const handleDatabaseModeChange = useCallback((mode: "sqlite" | "bundled" | "external") => {
+    if (mode === "sqlite" && databaseAppliedProvider === "postgresql" && databaseMode !== "sqlite") {
+      // 当前生效的是 PostgreSQL：切到 SQLite 会产生空 Catalog，先二次确认。
+      const confirmed = window.confirm(
+        "切换为 SQLite 将产生空 Catalog：PostgreSQL 中的原有数据不会自动迁移。确定继续切换吗？"
+      );
+      if (!confirmed) return;
+    }
     setDatabaseMode(mode);
     setDatabaseHost("127.0.0.1");
     setDatabasePort("5432");
     if (mode === "sqlite") {
-      setDatabaseName("catalog.sqlite3");
+      // SQLite 不使用数据库名字段（输入框禁用），回填合理默认而非文件名。
+      setDatabaseName("puddingclaw");
       setDatabaseUsername("");
       setDatabasePassword("");
     } else if (mode === "bundled") {
@@ -1208,11 +1269,11 @@ export default function SettingsPage() {
       setDatabaseUsername("puddingclaw");
       setDatabasePassword("");
     } else if (mode === "external") {
-      setDatabaseName("postgres");
+      setDatabaseName("puddingclaw");
       setDatabaseUsername("");
       setDatabasePassword("");
     }
-  }, []);
+  }, [databaseAppliedProvider, databaseMode]);
 
   const databaseConnectionPayload = useCallback((createIfMissing = false) => ({
     mode: databaseMode,
@@ -1226,8 +1287,27 @@ export default function SettingsPage() {
 
   const handleTestDatabase = useCallback(async () => {
     if (databaseMode === "sqlite") {
-      setDatabaseTestResult({ ok: true, msg: "SQLite 使用 PuddingClaw Home 内的 catalog.sqlite3，无需网络连接测试" });
-      showToast("success", "SQLite 配置可用");
+      setDatabaseTesting(true);
+      setDatabaseTestResult(null);
+      try {
+        const freshCapabilities = await getCapabilities();
+        setCapabilities(freshCapabilities);
+        const coreDatabase = freshCapabilities.core_database || freshCapabilities.database;
+        if (!coreDatabase?.available) {
+          const message = coreDatabase?.reason || "SQLite Catalog 当前不可用";
+          setDatabaseTestResult({ ok: false, msg: message });
+          showToast("error", message);
+          return;
+        }
+        setDatabaseTestResult({ ok: true, msg: `SQLite Catalog 可用：${databaseCatalogPath}` });
+        showToast("success", "SQLite Catalog 可用");
+      } catch (err) {
+        const message = err instanceof Error ? err.message : "SQLite Catalog 检查失败";
+        setDatabaseTestResult({ ok: false, msg: message });
+        showToast("error", message);
+      } finally {
+        setDatabaseTesting(false);
+      }
       return;
     }
     setDatabaseTesting(true);
@@ -1281,7 +1361,7 @@ export default function SettingsPage() {
     } finally {
       setDatabaseTesting(false);
     }
-  }, [databaseConnectionPayload, databaseMode, databaseName, runtimeExtensions?.knowledge, showToast]);
+  }, [databaseCatalogPath, databaseConnectionPayload, databaseMode, databaseName, runtimeExtensions?.knowledge, showToast]);
 
   const gbrainDatabaseConnectionPayload = useCallback((createIfMissing = false) => ({
     mode: "external" as const,
@@ -1568,6 +1648,11 @@ export default function SettingsPage() {
     && (!pendingModelCategoryEdit?.capability || option.capability === pendingModelCategoryEdit.capability)
     && (runtimeExtensions?.knowledge || option.capability === "llm")
   ));
+  const showPageSave = activeCategory === "databaseQa"
+    || activeCategory === "rag"
+    || activeCategory === "knowledge"
+    || activeCategory === "harness"
+    || (activeCategory === "database" && !databaseEnvOverride);
 
   return (
     <div className="h-screen app-bg">
@@ -1594,11 +1679,16 @@ export default function SettingsPage() {
 
         {/* Right: Settings Form */}
         <main className="workspace-content-frame flex min-w-0 flex-1 flex-col overflow-hidden">
-          <div className="flex-1 overflow-y-auto px-8 pb-8 pt-6">
-            <div className={`${
-              activeCategory === "ai" ? "max-w-none" : activeCategory === "databaseQa" || activeCategory === "harness" ? "max-w-6xl" : "max-w-2xl"
-            } mx-auto space-y-6`}>
-            {activeCategory === "ai" && (
+          <div className="flex-1 overflow-y-auto px-5 pb-10 pt-6 sm:px-8">
+            <div className="mx-auto w-full max-w-6xl space-y-6">
+              <SettingsWorkspaceHeader
+                category={activeCategory}
+                description={SETTINGS_CATEGORY_DESCRIPTIONS[activeCategory]}
+                onSave={handleSave}
+                saving={saving}
+                showSave={showPageSave}
+              />
+              {activeCategory === "ai" && (
               <section className="provider-light min-h-[calc(100vh-96px)] overflow-hidden rounded-2xl border border-slate-200 bg-white text-slate-900 shadow-xl shadow-slate-200/50" data-screen-label="模型服务">
                 <style jsx>{`
                   .provider-light :global([class*="border-white"]) { border-color: rgb(226 232 240 / 0.9) !important; }
@@ -1783,62 +1873,8 @@ export default function SettingsPage() {
               </section>
             )}
             {activeCategory === "databaseQa" && (
-              <div className="flex flex-col gap-5 lg:flex-row">
-                <aside className="flex w-full flex-col gap-4 lg:sticky lg:top-6 lg:w-56 lg:self-start lg:shrink-0">
-                  <div>
-                    <h1 className="text-[18px] font-semibold text-gray-900">智能问数</h1>
-                    <p className="mt-1 text-[11px] text-gray-500">结果上下文与完整数据</p>
-                  </div>
-                  <div className="flex flex-col gap-1">
-                    {DATABASE_QA_SECTIONS.map((section) => {
-                      const Icon = section.icon;
-                      const active = activeDatabaseQaSection === section.id;
-                      return (
-                        <button
-                          key={section.id}
-                          type="button"
-                          onClick={() => setActiveDatabaseQaSection(section.id)}
-                          className={`flex w-full items-start gap-3 rounded-xl px-3 py-2.5 text-left transition-all ${
-                            active
-                              ? "bg-[#002fa7]/[0.07] text-[#002fa7]"
-                              : "text-gray-600 hover:bg-black/[0.035] hover:text-gray-900"
-                          }`}
-                        >
-                          <Icon className="mt-0.5 h-4 w-4 shrink-0" />
-                          <div className="min-w-0">
-                            <p className="text-[12px] font-semibold">{section.label}</p>
-                            <p className="text-[10px] opacity-70">{section.description}</p>
-                          </div>
-                        </button>
-                      );
-                    })}
-                  </div>
-                </aside>
-
-                <div className="min-w-0 flex-1 space-y-5">
-                  <div className="flex min-h-12 items-center justify-between gap-4">
-                    <div>
-                      <h2 className="text-[18px] font-semibold text-gray-900">
-                        {activeDatabaseQaSection === "preview" ? "结果预览" : "持久化存储"}
-                      </h2>
-                      <p className="mt-1 text-[11px] text-gray-500">
-                        {activeDatabaseQaSection === "preview"
-                          ? "控制查询结果如何进入模型，以及单次读取体量。"
-                          : "控制完整结果是否落盘、保留多久，以及如何分页与导出。"}
-                      </p>
-                    </div>
-                    <button
-                      onClick={handleSave}
-                      disabled={saving}
-                      className="flex shrink-0 items-center gap-2 rounded-xl bg-[#002fa7] px-4 py-2.5 text-[12px] font-medium text-white shadow-sm transition-all hover:bg-[#002fa7]/90 disabled:opacity-50"
-                    >
-                      {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
-                      保存设置
-                    </button>
-                  </div>
-
-                {activeDatabaseQaSection === "preview" && (
-                  <>
+              <SettingsAnchorLayout prefix="database-qa" sections={DATABASE_QA_SECTIONS}>
+                <section id="database-qa-section-preview" className="scroll-mt-6 space-y-5">
                 <div className="overflow-hidden rounded-2xl border border-[#002fa7]/10 bg-[#002fa7]/[0.025]">
                   <div className="border-b border-[#002fa7]/10 px-5 py-3.5">
                     <p className="text-[12px] font-semibold text-gray-800">一条查询结果的处理顺序</p>
@@ -1982,11 +2018,10 @@ export default function SettingsPage() {
                     onChange={setDbQaAgentSqlFallbackEnabled}
                   />
                 </SettingsCard>
-                  </>
-                )}
+                </section>
 
-                {activeDatabaseQaSection === "storage" && (
-                <SettingsCard title="持久化存储" icon={FileText} color="#10b981">
+                <section id="database-qa-section-storage" className="scroll-mt-6">
+                  <SettingsCard title="持久化存储" icon={FileText} color="#10b981">
                   <ToggleRow
                     label="持久化结果集"
                     description="为超出直传条件的完整结果生成 result_id 和 JSONL；关闭后不落盘，也不提供后续分页与导出。"
@@ -2065,15 +2100,16 @@ export default function SettingsPage() {
                       />
                     </div>
                   </div>
-                </SettingsCard>
-                )}
-                </div>
-              </div>
+                  </SettingsCard>
+                </section>
+              </SettingsAnchorLayout>
             )}
 
             {/* RAG Settings */}
             {activeCategory === "rag" && (
-              <SettingsCard title="RAG 检索设置" icon={Database} color="#002fa7">
+              <SettingsAnchorLayout prefix="rag" sections={RAG_SECTIONS}>
+                <section id="rag-section-recall" className="scroll-mt-6">
+                <SettingsCard title="基础召回" icon={Search} color="#002fa7">
                 <div className="rounded-lg border border-black/[0.06] bg-white/50 px-3.5 py-3">
                   <p className="text-[12px] font-medium text-gray-700">知识库检索默认开启</p>
                   <p className="mt-0.5 text-[11px] leading-5 text-gray-500">
@@ -2110,7 +2146,11 @@ export default function SettingsPage() {
                     <span>严格 (1)</span>
                   </div>
                 </FormField>
-                <div className="rounded-xl border border-[#002fa7]/10 bg-[#002fa7]/[0.04] p-3.5 space-y-3">
+				</SettingsCard>
+				</section>
+				<section id="rag-section-hybrid" className="scroll-mt-6">
+				<SettingsCard title="混合检索" icon={Network} color="#002fa7">
+				<div className="rounded-xl border border-[#002fa7]/10 bg-[#002fa7]/[0.04] p-3.5 space-y-3">
 	                  <div className="min-w-0">
 	                    <p className="text-[12px] font-semibold text-gray-800">混合检索权重</p>
 	                    <p className="mt-0.5 text-[11px] text-gray-500">
@@ -2174,7 +2214,11 @@ export default function SettingsPage() {
 	                      <span>更偏图片</span>
 	                    </div>
 	                  </div>
-	                </div>
+				</div>
+				</SettingsCard>
+				</section>
+				<section id="rag-section-rerank" className="scroll-mt-6">
+				<SettingsCard title="重排 Rerank" icon={Filter} color="#002fa7">
                 <div className="rounded-xl border border-[#002fa7]/10 bg-white/70 p-3.5 space-y-3">
                   <div className="flex items-center justify-between gap-3">
                     <div>
@@ -2216,15 +2260,13 @@ export default function SettingsPage() {
                   </p>
                 </div>
               </SettingsCard>
+			  </section>
+			</SettingsAnchorLayout>
             )}
 
             {/* Core Database Settings */}
             {activeCategory === "database" && (
               <div className="space-y-5">
-                <div>
-                  <h1 className="text-[18px] font-semibold text-gray-900">数据库</h1>
-                  <p className="mt-1 text-[11px] text-gray-500">PuddingClaw Core 的持久化连接，与知识库和智能问数扩展开关解耦</p>
-                </div>
                 <SettingsCard title="核心数据库" icon={Database} color="#0f172a">
                   <div className="rounded-xl border border-slate-200 bg-slate-50 px-3.5 py-3">
                     <p className="text-[11px] leading-relaxed text-slate-600">
@@ -2249,12 +2291,12 @@ export default function SettingsPage() {
                     </div>
                   ) : null}
 
-                  <div className="grid gap-4 md:grid-cols-2">
+                  <div className="max-w-xl">
                     <FormField label={databaseEnvOverride ? "当前方案" : "存储方式"}>
                       {databaseEnvOverride ? (
                         <div className="form-input flex items-center bg-gray-50 text-gray-700">
                           {databaseMode === "sqlite"
-                            ? "SQLite · Home 内单文件"
+                            ? "SQLite · 本地默认"
                             : databaseSource === "native_apt" || databaseSource === "local"
                               ? "本机 PostgreSQL"
                               : databaseSource === "docker"
@@ -2267,73 +2309,101 @@ export default function SettingsPage() {
                           onChange={(e) => handleDatabaseModeChange(e.target.value as "sqlite" | "external")}
                           className="form-select"
                         >
-                          <option value="sqlite">SQLite · Home 内单文件</option>
-                          <option value="external">PostgreSQL · 填写连接信息</option>
+                          <option value="sqlite">SQLite · 本地默认（推荐）</option>
+                          <option value="external">PostgreSQL · 服务端/共享部署</option>
                         </select>
                       )}
                     </FormField>
-                    <FormField label="主机">
-                      <input
-                        value={databaseHost}
-                        onChange={(e) => setDatabaseHost(e.target.value)}
-                        disabled={databaseEnvOverride || databaseMode === "sqlite"}
-                        className="form-input disabled:cursor-not-allowed disabled:bg-gray-50 disabled:text-gray-400"
-                        placeholder="127.0.0.1"
-                      />
-                    </FormField>
-                    <FormField label="端口">
-                      <input
-                        type="number"
-                        min="1"
-                        max="65535"
-                        value={databasePort}
-                        onChange={(e) => setDatabasePort(e.target.value)}
-                        disabled={databaseEnvOverride || databaseMode === "sqlite"}
-                        className="form-input disabled:cursor-not-allowed disabled:bg-gray-50 disabled:text-gray-400"
-                        placeholder="5432"
-                      />
-                    </FormField>
-                    <FormField label="数据库名">
-                      <input
-                        value={databaseName}
-                        onChange={(e) => setDatabaseName(e.target.value)}
-                        disabled={databaseEnvOverride || databaseMode === "sqlite"}
-                        className="form-input disabled:cursor-not-allowed disabled:bg-gray-50 disabled:text-gray-400"
-                        placeholder="puddingclaw"
-                      />
-                    </FormField>
-                    <FormField label="用户名">
-                      <input
-                        value={databaseUsername}
-                        onChange={(e) => setDatabaseUsername(e.target.value)}
-                        disabled={databaseEnvOverride || databaseMode === "sqlite"}
-                        className="form-input disabled:cursor-not-allowed disabled:bg-gray-50 disabled:text-gray-400"
-                        placeholder="puddingclaw"
-                      />
-                    </FormField>
-                    <FormField label="密码">
-                      <input
-                        type="password"
-                        value={databasePassword}
-                        onChange={(e) => setDatabasePassword(e.target.value)}
-                        disabled={databaseEnvOverride || databaseMode === "sqlite"}
-                        className="form-input disabled:cursor-not-allowed disabled:bg-gray-50 disabled:text-gray-400"
-                        placeholder="留空表示保留已保存的密码"
-                      />
-                    </FormField>
                   </div>
 
-                  <div className="rounded-xl border border-blue-100 bg-blue-50/50 px-3.5 py-3 text-[11px] leading-relaxed text-blue-700">
-                    {databaseMode === "sqlite"
-                      ? "SQLite 位于 PuddingClaw Home 的 databases/catalog.sqlite3，不依赖数据库服务，适合 Harness-only 和轻量体验。"
-                      : databaseSource === "native_apt" || databaseSource === "local"
+                  {databaseMode === "sqlite" ? (
+                    <div className="rounded-xl border border-emerald-100 bg-emerald-50/50 px-4 py-3.5">
+                      <div className="flex items-start gap-3">
+                        <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-white text-emerald-700 shadow-sm ring-1 ring-emerald-100">
+                          <Database className="h-4.5 w-4.5" />
+                        </div>
+                        <div className="min-w-0 flex-1">
+                          <div className="flex flex-wrap items-center gap-2">
+                            <p className="text-[12px] font-semibold text-slate-800">本地 SQLite Catalog</p>
+                            <span className="rounded-full border border-emerald-200 bg-white/80 px-2 py-0.5 text-[10px] font-medium text-emerald-700">
+                              当前启用
+                            </span>
+                          </div>
+                          <p className="mt-1 text-[11px] leading-relaxed text-slate-600">
+                            Core 数据保存在本机单文件中，无需主机、端口、账号或独立数据库服务。
+                          </p>
+                          <div className="mt-3 rounded-lg border border-emerald-100 bg-white/70 px-3 py-2">
+                            <p className="text-[10px] font-medium uppercase tracking-wide text-slate-400">Catalog 文件</p>
+                            <p className="mt-1 break-all font-mono text-[11px] text-slate-700">{databaseCatalogPath}</p>
+                          </div>
+                          <p className="mt-2 text-[10px] leading-relaxed text-slate-500">
+                            gbrain / pgvector 与外部业务数据源是独立可选项，不会改变 Core 的存储方式。
+                          </p>
+                        </div>
+                      </div>
+                    </div>
+                  ) : (
+                    <>
+                      <div className="grid gap-4 md:grid-cols-2">
+                        <FormField label="主机">
+                          <input
+                            value={databaseHost}
+                            onChange={(e) => setDatabaseHost(e.target.value)}
+                            disabled={databaseEnvOverride}
+                            className="form-input disabled:cursor-not-allowed disabled:bg-gray-50 disabled:text-gray-400"
+                            placeholder="127.0.0.1"
+                          />
+                        </FormField>
+                        <FormField label="端口">
+                          <input
+                            type="number"
+                            min="1"
+                            max="65535"
+                            value={databasePort}
+                            onChange={(e) => setDatabasePort(e.target.value)}
+                            disabled={databaseEnvOverride}
+                            className="form-input disabled:cursor-not-allowed disabled:bg-gray-50 disabled:text-gray-400"
+                            placeholder="5432"
+                          />
+                        </FormField>
+                        <FormField label="数据库名">
+                          <input
+                            value={databaseName}
+                            onChange={(e) => setDatabaseName(e.target.value)}
+                            disabled={databaseEnvOverride}
+                            className="form-input disabled:cursor-not-allowed disabled:bg-gray-50 disabled:text-gray-400"
+                            placeholder="puddingclaw"
+                          />
+                        </FormField>
+                        <FormField label="用户名">
+                          <input
+                            value={databaseUsername}
+                            onChange={(e) => setDatabaseUsername(e.target.value)}
+                            disabled={databaseEnvOverride}
+                            className="form-input disabled:cursor-not-allowed disabled:bg-gray-50 disabled:text-gray-400"
+                            placeholder="puddingclaw"
+                          />
+                        </FormField>
+                        <FormField label="密码">
+                          <input
+                            type="password"
+                            value={databasePassword}
+                            onChange={(e) => setDatabasePassword(e.target.value)}
+                            disabled={databaseEnvOverride}
+                            className="form-input disabled:cursor-not-allowed disabled:bg-gray-50 disabled:text-gray-400"
+                            placeholder="留空表示保留已保存的密码"
+                          />
+                        </FormField>
+                      </div>
+                      <div className="rounded-xl border border-blue-100 bg-blue-50/50 px-3.5 py-3 text-[11px] leading-relaxed text-blue-700">
+                        {databaseSource === "native_apt" || databaseSource === "local"
                         ? "初始化向导通过系统包安装或复用本机 PostgreSQL，创建应用所需的角色与数据库并写入连接信息；后续服务生命周期归用户和操作系统管理。"
                         : databaseSource === "docker"
                           ? "初始化向导创建或复用 Docker PostgreSQL 并写入连接配置；后续服务生命周期由 Docker 管理。"
-                          : databaseMode === "external"
-                            ? "初始化向导验证并保存外部 PostgreSQL 的连接信息；Backend 后续只建立连接。"
-                            : "该 PostgreSQL 的连接信息来自初始化向导；实际来源会在 CLI 确认页和此处的“当前来源”中标明。"}
-                  </div>
+                          : "初始化向导验证并保存外部 PostgreSQL 的连接信息；Backend 后续只建立连接。"}
+                      </div>
+                    </>
+                  )}
 
                   <div className="flex flex-wrap items-center gap-2">
                     <button
@@ -2343,17 +2413,22 @@ export default function SettingsPage() {
                       className="inline-flex items-center gap-1.5 rounded-lg bg-gray-950 px-3 py-2 text-[11px] font-medium text-white hover:bg-black disabled:cursor-not-allowed disabled:opacity-50"
                     >
                       {databaseTesting ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Zap className="h-3.5 w-3.5" />}
-                      测试连接
+                      {databaseMode === "sqlite" ? "检查本地 Catalog" : "测试连接"}
                     </button>
                     <span className="text-[11px] text-gray-400">
-                      当前来源：{databaseConfiguredBy === "environment" ? "CLI Runtime" : databaseConfiguredBy}
-                      {databaseSource && databaseSource !== "config" ? ` · ${({
+                      当前来源：{({
+                        environment: "CLI Runtime",
+                        "config.json": "config.json",
+                        default: "内置默认",
+                      } as Record<string, string>)[databaseConfiguredBy] || databaseConfiguredBy}
+                      {` · ${({
+                        local_file: "本地 SQLite",
                         native_apt: "本机 PostgreSQL",
                         local: "本机 PostgreSQL",
                         docker: "Docker",
                         external: "外部 PostgreSQL",
                         fallback: "SQLite",
-                      } as Record<string, string>)[databaseSource] || databaseSource}` : ""}
+                      } as Record<string, string>)[databaseSource] || databaseSource}`}
                     </span>
                   </div>
                   {databaseTestResult ? (
@@ -2371,7 +2446,8 @@ export default function SettingsPage() {
 
             {/* Knowledge Base Settings */}
             {activeCategory === "knowledge" && (
-              <div className="space-y-5">
+              <SettingsAnchorLayout prefix="knowledge" sections={KNOWLEDGE_SECTIONS}>
+                <section id="knowledge-section-directory" className="scroll-mt-6">
                 <SettingsCard title="本地知识库目录" icon={FolderOpen} color="#002fa7">
                   <div className="rounded-xl border border-blue-100 bg-blue-50/50 px-3.5 py-3">
                     <p className="text-[11px] leading-relaxed text-blue-700">
@@ -2408,7 +2484,9 @@ export default function SettingsPage() {
                     <ExternalLink className="h-3.5 w-3.5" />
                   </Link>
                 </SettingsCard>
+                </section>
 
+                <section id="knowledge-section-wiki" className="scroll-mt-6">
                 <SettingsCard title="LLM Wiki" icon={Bot} color="#7c3aed">
                   <div className="flex items-center gap-2">
                     <Bot className="h-4 w-4 text-violet-600" />
@@ -2483,8 +2561,9 @@ export default function SettingsPage() {
                     <ExternalLink className="h-3.5 w-3.5" />
                   </Link>
                 </SettingsCard>
+                </section>
 
-                <div id="gbrain-database" className="scroll-mt-6">
+                <section id="knowledge-section-gbrain" className="scroll-mt-6">
                   <SettingsCard title="GBrain" icon={Brain} color="#0f766e">
                     <div className="rounded-xl border border-teal-100 bg-teal-50/50 px-3.5 py-3">
                       <p className="text-[11px] leading-relaxed text-teal-700">
@@ -2643,8 +2722,9 @@ export default function SettingsPage() {
                       </div>
                     ) : null}
                   </SettingsCard>
-                </div>
+                </section>
 
+                <section id="knowledge-section-embedding" className="scroll-mt-6">
                 <SettingsCard title="多模态 Embedding" icon={Database} color="#002fa7">
                   <div className="rounded-xl border border-slate-200 bg-slate-50 px-3.5 py-3">
                     <div className="flex flex-wrap items-center justify-between gap-3">
@@ -2679,7 +2759,9 @@ export default function SettingsPage() {
                     </FormField>
                   </div>
                 </SettingsCard>
+                </section>
 
+                <section id="knowledge-section-index" className="scroll-mt-6">
                 <SettingsCard title="知识库检索索引" icon={Database} color="#10b981">
                   <div className="flex items-center justify-between gap-4 rounded-lg border border-black/[0.06] bg-white/50 px-3.5 py-3">
                     <div>
@@ -2739,7 +2821,8 @@ export default function SettingsPage() {
                     </div>
                   </div>
                 </SettingsCard>
-              </div>
+                </section>
+              </SettingsAnchorLayout>
             )}
 
             {/* Agent / Harness Config */}
@@ -2747,11 +2830,6 @@ export default function SettingsPage() {
               <div className="flex flex-col lg:flex-row gap-5">
                 {/* Left: harness category sidebar */}
                 <aside className="flex w-full flex-col gap-4 lg:sticky lg:top-6 lg:w-56 lg:self-start lg:shrink-0">
-                  <div>
-                    <h1 className="text-[18px] font-semibold text-gray-900">Harness 设置</h1>
-                    <p className="mt-1 text-[11px] text-gray-500">管理 Agent 编排能力</p>
-                  </div>
-
                   <div>
                     <input
                       type="text"
@@ -3509,7 +3587,7 @@ export default function SettingsPage() {
               </div>
             )}
             {/* Worker Access */}
-            {activeCategory === "worker" && <WorkerAccessKeysPanel />}
+            {activeCategory === "worker" && <WorkerAccessKeysPanel extensions={runtimeExtensions} />}
 
             {/* Memory Editor */}
             {activeCategory === "memory" && (
@@ -3521,21 +3599,15 @@ export default function SettingsPage() {
             {/* System Status */}
             {activeCategory === "system" && (
               <SettingsCard title="系统状态" icon={Activity} color="#002fa7">
-                <CapabilitiesStatus refreshIntervalMs={30000} onChange={setCapabilities} extensions={runtimeExtensions} />
+                <CapabilitiesStatus
+                  refreshIntervalMs={30000}
+                  onChange={setCapabilities}
+                  extensions={runtimeExtensions}
+                  excludeKeys={["cli"]}
+                />
               </SettingsCard>
             )}
 
-            {/* Save Button */}
-            {activeCategory !== "ai" && activeCategory !== "databaseQa" && activeCategory !== "memory" && activeCategory !== "worker" && activeCategory !== "system" && !(activeCategory === "database" && databaseEnvOverride) && <div className="flex justify-end pt-2 pb-8">
-              <button
-                onClick={handleSave}
-                disabled={saving}
-                className="flex items-center gap-2 px-5 py-2.5 text-[13px] font-medium text-white bg-[#002fa7] hover:bg-[#001f7a] rounded-xl transition-all active:scale-95 disabled:opacity-50 shadow-lg shadow-[#002fa7]/15"
-              >
-                {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
-                保存设置
-              </button>
-            </div>}
           </div>
         </div>
       </main>
@@ -4014,6 +4086,50 @@ function ToggleRow({
       </span>
       <SwitchButton checked={checked} onChange={onChange} ariaLabel={label} disabled={disabled} />
     </div>
+  );
+}
+
+function SettingsWorkspaceHeader({
+  category,
+  description,
+  onSave,
+  saving,
+  showSave,
+}: {
+  category: SettingsCategory;
+  description: string;
+  onSave: () => void;
+  saving: boolean;
+  showSave: boolean;
+}) {
+  const definition = SETTINGS_CATEGORIES.find((item) => item.key === category);
+  const Icon = definition?.icon || Activity;
+
+  return (
+    <header className="flex flex-col gap-4 border-b border-black/[0.06] pb-6 sm:flex-row sm:items-start sm:justify-between">
+      <div className="flex min-w-0 items-start gap-3.5">
+        <span className="flex h-11 w-11 shrink-0 items-center justify-center rounded-2xl bg-[#002fa7]/[0.08] text-[#002fa7]">
+          <Icon className="h-5 w-5" />
+        </span>
+        <div className="min-w-0">
+          <h1 className="text-[22px] font-semibold tracking-tight text-gray-900">
+            {definition?.label || "设置"}
+          </h1>
+          <p className="mt-1 max-w-2xl text-[12px] leading-5 text-gray-500">{description}</p>
+        </div>
+      </div>
+      {showSave ? (
+        <button
+          type="button"
+          onClick={onSave}
+          disabled={saving}
+          className="inline-flex h-10 shrink-0 items-center justify-center gap-2 self-start rounded-xl bg-[#002fa7] px-4 text-[12px] font-medium text-white shadow-sm transition hover:bg-[#001f7a] disabled:cursor-wait disabled:opacity-50"
+        >
+          {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
+          保存设置
+        </button>
+      ) : null}
+    </header>
   );
 }
 

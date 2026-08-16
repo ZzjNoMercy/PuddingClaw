@@ -11,6 +11,7 @@ import { openRuntime, startRuntime, stopRuntime } from "./supervisor.js";
 import { writeError, writeHuman, writeJson } from "./output.js";
 import { workerCommand, workerDoctorCommand } from "./worker-commands.js";
 import { databaseCommand } from "./database-commands.js";
+import { profileCommand } from "./profile-commands.js";
 
 const { version: VERSION } = createRequire(import.meta.url)("../package.json");
 
@@ -24,9 +25,11 @@ const COMMAND_FLAGS = Object.freeze({
     "prepare_python", "profile", "provider", "provider_id", "provider_name", "python", "uv", "yes",
   ],
   database: [
-    "database_create_if_missing", "database_mode", "database_name", "database_port", "database_url",
-    "database_username", "non_interactive",
+    "confirm_empty_switch", "database_create_if_missing", "database_mode", "database_name",
+    "database_port", "database_url", "database_username", "drain_timeout", "non_interactive",
+    "skip_drain", "target_path", "url",
   ],
+  profile: [],
   agent: ["export", "input_json", "jsonl", "session"],
   start: ["port"],
   stop: ["force"],
@@ -59,7 +62,10 @@ function usage() {
     "  puddingclaw init [--profile <harness|knowledge|analytics|full>] [--port auto] [--python /path] [--uv /path] [--prepare-python] [--install-runtime]",
     "  puddingclaw init --profile <profile> --plan --json",
     "  puddingclaw config show|get|set ...",
+    "  puddingclaw profile inspect|apply <harness|knowledge|analytics|full> [--json]",
     "  puddingclaw database show|configure",
+    "  puddingclaw database migrate sqlite-to-postgres --url <pg-url> [--skip-drain] [--drain-timeout <s>]",
+    "  puddingclaw database migrate postgres-to-sqlite [--target-path <path>] [--skip-drain] [--drain-timeout <s>]",
     "  puddingclaw extension list|enable|disable ...",
     "  puddingclaw agent run <message> [--session <id>] [--export <dir>] [--json|--jsonl]",
     "  puddingclaw agent respond <run_id> --input-json - [--json]",
@@ -110,6 +116,7 @@ async function main({ positionals, flags }) {
   }
   if (command === "init") return { value: await runInit({ flags, paths }), code: 0 };
   if (command === "config") return { value: await configCommand(rest, paths), code: 0 };
+  if (command === "profile") return { value: await profileCommand(rest, paths), code: 0 };
   if (command === "database") return { value: await databaseCommand(rest, flags, paths), code: 0 };
   if (command === "extension") return { value: await extensionCommand(rest, paths), code: 0 };
   if (command === "runtime") return { value: await runtimeCommand(rest, paths), code: 0 };

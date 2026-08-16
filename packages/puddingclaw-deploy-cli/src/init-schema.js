@@ -7,7 +7,7 @@ import { CliError } from "./errors.js";
 const STEPS = Object.freeze([
   ["provider.agent", "Agent 模型与 Provider", null],
   ["provider.multimodal", "图片分析 SubAgent 多模态模型", null],
-  ["database.shared", "核心数据库（PostgreSQL 优先 / SQLite 保底）", null],
+  ["database.shared", "核心数据库（SQLite 本地默认 / PostgreSQL 服务端可选）", null],
   ["harness.context", "上下文工程", null],
   ["harness.prompt_cache", "Prompt 缓存", null],
   ["harness.completion", "Goal 与验收", null],
@@ -54,7 +54,7 @@ export function buildInitPlan(profile) {
     extensions,
     execution_order: steps.filter((step) => step.status === "selected").map((step) => step.id),
     branches: {
-      database: ["postgresql_detect", "existing_or_native_or_docker", "sqlite_fallback"],
+      database: ["sqlite_local_default", "postgresql_if_explicit", "sqlite_fallback_on_unreachable"],
       knowledge: extensions.knowledge
         ? ["catalog_storage", "pgvector_if_required", "milvus_optional", "embedding_if_milvus", "mineru_optional"]
         : [],

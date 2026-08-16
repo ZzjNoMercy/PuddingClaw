@@ -42,6 +42,49 @@ from tools.database.sql_execute_tool import DatabaseSqlExecuteTool
 from tools.database_knowledge_tool import _format_query_error
 
 
+def test_query_result_summary_exposes_missing_artifact_and_catalog(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    result_dir = tmp_path / "data" / "query-results"
+    monkeypatch.setattr(result_store_module, "RESULT_DIR", result_dir)
+    now = utcnow()
+    record = SimpleNamespace(
+        id="qr-missing-storage",
+        session_id="session-1",
+        tool_call_id="call-1",
+        question="question",
+        sql="select 1",
+        columns=["value"],
+        row_count=1,
+        profile_json={},
+        artifact_path="qr-missing-storage.jsonl",
+        artifact_format="jsonl",
+        status="ready",
+        created_at=now,
+        expires_at=now + timedelta(hours=1),
+    )
+
+    summary = result_store_module._record_to_summary(record)
+    assert summary["status"] == "missing_artifact"
+    assert summary["artifact_exists"] is False
+    assert summary["catalog_exists"] is False
+
+    result_dir.mkdir(parents=True)
+    (result_dir / record.artifact_path).write_text('{"value":1}\n', encoding="utf-8")
+    summary = result_store_module._record_to_summary(record)
+    assert summary["status"] == "missing_catalog"
+    assert summary["artifact_exists"] is True
+    assert summary["catalog_exists"] is False
+
+    catalog_dir = result_dir / ".catalog"
+    catalog_dir.mkdir()
+    (catalog_dir / f"{record.id}.json").write_text("{}", encoding="utf-8")
+    summary = result_store_module._record_to_summary(record)
+    assert summary["status"] == "ready"
+    assert summary["catalog_exists"] is True
+
+
 @pytest.fixture
 def user_semantic_definitions(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """Build user-owned semantic fixtures without restoring package assets."""

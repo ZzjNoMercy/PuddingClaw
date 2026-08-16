@@ -3,6 +3,7 @@ const path = require('path');
 const { spawn } = require('child_process');
 const backendManager = require('./managers/backend');
 const dockerManager = require('./managers/docker');
+const cliManager = require('./managers/cli');
 const { getFrontendStandaloneDir } = require('./managers/paths');
 
 let mainWindow;
@@ -33,10 +34,11 @@ async function startFrontendServer() {
   // 清理可能残留的 3000 端口
   require('child_process').execSync('lsof -ti:3000 | xargs kill 2>/dev/null || true');
 
-  frontendProcess = spawn('node', ['server.js'], {
+  frontendProcess = spawn(process.execPath, ['server.js'], {
     cwd: standaloneDir,
     env: {
       ...process.env,
+      ELECTRON_RUN_AS_NODE: '1',
       PORT: String(FRONTEND_PORT),
       BACKEND_INTERNAL_URL: 'http://localhost:8888',
     },
@@ -90,16 +92,23 @@ function createWindow() {
 
 app.whenReady().then(async () => {
   try {
+    if (process.platform === 'darwin' && app.dock) {
+      app.dock.setIcon(path.join(__dirname, 'assets', 'icon.png'));
+    }
+
     await startFrontendServer();
     createWindow();
 
-    // 开机自检：如果 backend 未运行，自动启动
-    const backendStatus = backendManager.getStatus();
-    if (backendStatus.status !== 'running') {
-      console.log('[auto] backend 未运行，开始自动启动...');
-      backendManager.startBackend().catch((err) => {
-        console.error('自动启动 backend 失败:', err);
-      });
+    // 首次打开先由前端完成模式选择。已有 CLI 配置时才自动启动 Backend。
+    const onboarding = await cliManager.getOnboardingState();
+    if (onboarding.initialized) {
+      const backendStatus = backendManager.getStatus();
+      if (backendStatus.status !== 'running') {
+        console.log('[auto] backend 未运行，开始自动启动...');
+        backendManager.startBackend().catch((err) => {
+          console.error('自动启动 backend 失败:', err);
+        });
+      }
     }
   } catch (err) {
     console.error('启动 frontend server 失败:', err);
@@ -216,6 +225,23 @@ ipcMain.handle('stop-infra', async () => {
 
 ipcMain.handle('get-infra-status', async () => {
   return dockerManager.checkInfraStatus();
+});
+
+// IPC: 首次启动模式选择与 CLI 依赖探测
+ipcMain.handle('get-onboarding-state', async () => cliManager.getOnboardingState());
+
+ipcMain.handle('inspect-onboarding-profile', async (_event, profile) => {
+  return cliManager.inspectProfile(profile);
+});
+
+ipcMain.handle('apply-onboarding-profile', async (_event, profile) => {
+  await backendManager.stopBackend();
+  const result = await cliManager.applyProfile(profile);
+  const backend = await backendManager.startBackend();
+  if (mainWindow) {
+    mainWindow.webContents.send('backend-status-change', backendManager.getStatus());
+  }
+  return { ...result, backend };
 });
 
 // 定时刷新状态

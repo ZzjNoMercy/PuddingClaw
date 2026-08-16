@@ -115,8 +115,10 @@ async def lifespan(app: FastAPI):
     print("🚀 Initializing PuddingClaw backend...")
 
     import capabilities
+    from backend_lease import BackendInstanceLease
     from cli_runtime import detect_cli_runtime
     from db import init_database
+    from db_maintenance import catalog_maintenance_manager
     from evaluation.worker_manager import evaluation_worker_manager
     from graph.agent import agent_manager
     from graph.attachment_store import attachment_store
@@ -139,6 +141,10 @@ async def lifespan(app: FastAPI):
 
     user_paths = PuddingClawPaths.from_environment()
     user_paths.ensure_layout()
+    backend_lease = BackendInstanceLease()
+    lease_acquired = backend_lease.acquire(user_paths.state())
+    if not lease_acquired:
+        print(f"⚠️ {backend_lease.diagnostic}")
     migration = migrate_runtime_home(BASE_DIR, user_paths)
     definitions_data_migration = migrate_definitions_and_data(BASE_DIR, user_paths)
     projects_memory_migration = migrate_projects_and_memory(BASE_DIR, user_paths)
@@ -228,6 +234,8 @@ async def lifespan(app: FastAPI):
         print("🗄️ Knowledge catalog database ready")
         if query_result_cleanup_manager is not None:
             query_result_cleanup_manager.start()
+        if lease_acquired:
+            catalog_maintenance_manager.start()
     elif knowledge_enabled or analytics_enabled:
         print("⚠️ Knowledge catalog database unavailable; knowledge management API will report degraded status")
     # Confirm database startup before spawning database-backed stdio MCP
@@ -258,9 +266,21 @@ async def lifespan(app: FastAPI):
         # conversation, so workers may only claim jobs after the harness owner
         # has been initialized.
         if knowledge_import_worker_manager is not None:
-            knowledge_import_worker_manager.start(user_paths.root)
+            if lease_acquired:
+                knowledge_import_worker_manager.start(user_paths.root)
+            else:
+                print(
+                    "⚠️ 本实例不启动知识导入后台 Worker：另一 Backend 实例持有 "
+                    f"{backend_lease.path}"
+                )
         if semantic_dimension_build_worker_manager is not None:
-            semantic_dimension_build_worker_manager.start(user_paths.root)
+            if lease_acquired:
+                semantic_dimension_build_worker_manager.start(user_paths.root)
+            else:
+                print(
+                    "⚠️ 本实例不启动语义维度构建后台 Worker：另一 Backend 实例持有 "
+                    f"{backend_lease.path}"
+                )
 
     print("✅ PuddingClaw backend ready")
     await evaluation_worker_manager.start_pending()
@@ -280,6 +300,8 @@ async def lifespan(app: FastAPI):
             await knowledge_import_worker_manager.stop()
         if knowledge_catalog_watcher is not None:
             await knowledge_catalog_watcher.stop()
+        await catalog_maintenance_manager.stop()
+        backend_lease.release()
 
 
 app = FastAPI(title="PuddingClaw", version="0.1.17", lifespan=lifespan)
@@ -314,6 +336,25 @@ async def extension_route_boundary(request, call_next):
         )
     return await call_next(request)
 
+
+from runtime_control import MaintenanceModeError  # noqa: E402
+
+
+@app.exception_handler(MaintenanceModeError)
+async def maintenance_mode_exception_handler(request, exc: MaintenanceModeError):
+    """Map drain/maintenance write rejections to a uniform 503 + Retry-After."""
+
+    return JSONResponse(
+        status_code=503,
+        headers={"Retry-After": str(exc.retry_after)},
+        content={
+            "detail": str(exc),
+            "write_mode": exc.write_mode,
+            "retry_after": exc.retry_after,
+        },
+    )
+
+
 from api.agent import router as agent_router
 from api.attachments import router as attachments_router
 from api.capabilities import router as capabilities_router
@@ -324,6 +365,7 @@ from api.connectors import router as connectors_router
 from api.eval_api import router as eval_router
 from api.evaluation import router as evaluation_router
 from api.files import router as files_router
+from api.maintenance import router as maintenance_router
 from api.mcp import router as mcp_router
 from api.permissions import router as permissions_router
 from api.projects import router as projects_router
@@ -351,6 +393,7 @@ app.include_router(eval_router, prefix="/api")
 app.include_router(evaluation_router, prefix="/api")
 app.include_router(stats_router, prefix="/api")
 app.include_router(mcp_router, prefix="/api")
+app.include_router(maintenance_router, prefix="/api")  # Core-level: registered unconditionally
 app.include_router(capabilities_router, prefix="/api")
 app.include_router(runtime_profile_router, prefix="/api")
 app.include_router(projects_router, prefix="/api")

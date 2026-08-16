@@ -206,6 +206,16 @@ function formatCellValue(value: unknown): string {
   return String(value);
 }
 
+function queryResultAvailable(result?: DatabaseQueryResultSummary): boolean {
+  return Boolean(
+    result
+    && !result.expired
+    && result.status === "ready"
+    && result.artifact_exists
+    && result.catalog_exists !== false
+  );
+}
+
 function sourceTypeLabel(asset: TableAsset): string {
   if (asset.source_type === "excel") return asset.sheet_name ? `Excel · ${asset.sheet_name}` : "Excel";
   if (asset.source_type === "csv") return "CSV";
@@ -341,7 +351,10 @@ export default function AnalyticsWorkbenchPage() {
     try {
       const results = await listDatabaseQueryResults(50);
       setQueryResults(results);
-      setSelectedQueryResultId((current) => current || results[0]?.result_id || "");
+      setSelectedQueryResultId((current) => {
+        if (current && results.some((item) => item.result_id === current)) return current;
+        return results.find(queryResultAvailable)?.result_id || results[0]?.result_id || "";
+      });
     } catch (error) {
       setToast({ type: "error", message: errorMessage(error) });
     } finally {
@@ -351,6 +364,11 @@ export default function AnalyticsWorkbenchPage() {
 
   const loadQueryResultPage = useCallback(async () => {
     if (!selectedQueryResultId) {
+      setQueryResultPage(null);
+      return;
+    }
+    const selectedSummary = queryResults.find((item) => item.result_id === selectedQueryResultId);
+    if (selectedSummary && !queryResultAvailable(selectedSummary)) {
       setQueryResultPage(null);
       return;
     }
@@ -368,7 +386,7 @@ export default function AnalyticsWorkbenchPage() {
     } finally {
       setQueryResultPageLoading(false);
     }
-  }, [queryResultPageNumber, queryResultPageSize, selectedQueryResultId]);
+  }, [queryResultPageNumber, queryResultPageSize, queryResults, selectedQueryResultId]);
 
   useEffect(() => {
     if (activeSection === "results") {
@@ -5651,7 +5669,14 @@ function DatabaseQueryResultsSection({
   onNextPage: () => void;
 }) {
   const selectedSummary = queryResults.find((item) => item.result_id === selectedQueryResultId);
-  const exportEnabled = queryResultPage?.export_enabled ?? selectedSummary?.export_enabled ?? false;
+  const selectedUnavailable = Boolean(selectedSummary && !queryResultAvailable(selectedSummary));
+  const exportEnabled = !selectedUnavailable
+    && (queryResultPage?.export_enabled ?? selectedSummary?.export_enabled ?? false);
+  const unavailableMessage = selectedSummary?.expired
+    ? "该查询结果已过期，请重新执行问数。"
+    : selectedSummary?.status === "missing_catalog" || selectedSummary?.catalog_exists === false
+      ? "查询结果的不可变目录凭证已丢失，无法安全读取；请重新执行问数。"
+      : "查询结果文件已被清理，数据库中仅保留历史元数据；请重新执行问数。";
 
   return (
     <section className="p-4">
@@ -5690,6 +5715,14 @@ function DatabaseQueryResultsSection({
             ) : (
               queryResults.map((item) => {
                 const active = item.result_id === selectedQueryResultId;
+                const available = queryResultAvailable(item);
+                const statusLabel = item.expired
+                  ? "已过期"
+                  : item.status === "missing_catalog" || item.catalog_exists === false
+                    ? "凭证缺失"
+                    : !item.artifact_exists || item.status === "missing_artifact"
+                      ? "文件已清理"
+                      : available ? "可用" : "不可用";
                 return (
                   <button
                     key={item.result_id}
@@ -5703,10 +5736,14 @@ function DatabaseQueryResultsSection({
                       <span className="truncate font-mono text-xs font-semibold text-gray-800">{item.result_id}</span>
                       <span
                         className={`shrink-0 rounded-full px-2 py-0.5 text-[10px] font-medium ${
-                          item.expired ? "bg-amber-50 text-amber-700" : "bg-emerald-50 text-emerald-700"
+                          item.expired
+                            ? "bg-amber-50 text-amber-700"
+                            : available
+                              ? "bg-emerald-50 text-emerald-700"
+                              : "bg-gray-100 text-gray-600"
                         }`}
                       >
-                        {item.expired ? "已过期" : "可用"}
+                        {statusLabel}
                       </span>
                     </div>
                     <p className="mt-1 line-clamp-1 text-[11px] leading-4 text-gray-500">{item.question || item.sql}</p>
@@ -5728,7 +5765,7 @@ function DatabaseQueryResultsSection({
                   <div className="min-w-0 flex-1">
                     <p className="truncate font-mono text-xs font-semibold text-gray-900">{selectedQueryResultId}</p>
                     <p className="mt-0.5 truncate text-[11px] text-gray-400">
-                      {queryResultPage?.row_count ?? "-"} 行 · 过期时间 {queryResultPage?.expires_at ? formatDateTime(queryResultPage.expires_at) : "-"}
+                      {queryResultPage?.row_count ?? selectedSummary?.row_count ?? "-"} 行 · 过期时间 {formatDateTime(queryResultPage?.expires_at || selectedSummary?.expires_at)}
                     </p>
                   </div>
                   <div className="flex items-center gap-2">
@@ -5749,7 +5786,7 @@ function DatabaseQueryResultsSection({
                     <button
                       type="button"
                       onClick={onRefreshPage}
-                      disabled={queryResultPageLoading}
+                      disabled={selectedUnavailable || queryResultPageLoading}
                       className="inline-flex h-8 items-center gap-1.5 rounded-xl bg-[#002fa7]/10 px-2.5 text-xs font-semibold text-[#002fa7] transition hover:bg-[#002fa7]/15 disabled:opacity-50"
                     >
                       <RefreshCw className={`h-3.5 w-3.5 ${queryResultPageLoading ? "animate-spin" : ""}`} />
@@ -5774,7 +5811,7 @@ function DatabaseQueryResultsSection({
                   <div className="flex items-center justify-end gap-1.5">
                     <button
                       type="button"
-                      disabled={!queryResultPage?.has_previous || queryResultPageLoading}
+                      disabled={selectedUnavailable || !queryResultPage?.has_previous || queryResultPageLoading}
                       onClick={onPreviousPage}
                       title="上一页"
                       className="inline-flex h-8 w-8 items-center justify-center rounded-xl border border-black/[0.08] bg-white text-gray-600 transition hover:bg-gray-50 disabled:cursor-not-allowed disabled:opacity-35"
@@ -5784,7 +5821,7 @@ function DatabaseQueryResultsSection({
                     <span className="min-w-12 text-center text-xs font-semibold text-gray-500">第 {queryResultPageNumber} 页</span>
                     <button
                       type="button"
-                      disabled={!queryResultPage?.has_next || queryResultPageLoading}
+                      disabled={selectedUnavailable || !queryResultPage?.has_next || queryResultPageLoading}
                       onClick={onNextPage}
                       title="下一页"
                       className="inline-flex h-8 w-8 items-center justify-center rounded-xl border border-black/[0.08] bg-white text-gray-600 transition hover:bg-gray-50 disabled:cursor-not-allowed disabled:opacity-35"
@@ -5795,7 +5832,15 @@ function DatabaseQueryResultsSection({
                 </div>
               </div>
 
-              {queryResultPage?.expired ? (
+              {selectedUnavailable ? (
+                <div className="flex min-h-[360px] flex-col items-center justify-center px-8 text-center">
+                  <div className="flex h-11 w-11 items-center justify-center rounded-2xl bg-amber-50 text-amber-600">
+                    <AlertCircle className="h-5 w-5" />
+                  </div>
+                  <p className="mt-3 text-sm font-semibold text-gray-800">历史结果不可读取</p>
+                  <p className="mt-1 max-w-md text-xs leading-5 text-gray-500">{unavailableMessage}</p>
+                </div>
+              ) : queryResultPage?.expired ? (
                 <div className="p-8 text-center text-sm text-amber-600">{queryResultPage.message || "结果已过期，请重新执行问数。"}</div>
               ) : (
                 <div className="max-h-[680px] overflow-auto">

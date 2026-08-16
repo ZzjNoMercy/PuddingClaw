@@ -7,17 +7,20 @@
     "start": "electron .",
     "dev": "../scripts/start-electron-dev.sh",
     "build": "electron-builder",
-    "build:dir": "electron-builder --dir"
+    "build:dir": "electron-builder --dir",
+    "build:dmg": "electron-builder --mac dmg --arm64"
   },
   "build": {
     "appId": "com.puddingclaw.app",
     "productName": "PuddingClaw",
+    "forceCodeSigning": true,
     "directories": {
       "output": "../dist-electron"
     },
     "files": [
       "main.js",
       "preload.js",
+      "assets/icon.png",
       "managers/**/*",
       "!node_modules/electron/**/*"
     ],
@@ -25,7 +28,7 @@
       {
         "from": "../frontend/.next-build/standalone",
         "to": "frontend/.next-build/standalone",
-        "filter": ["**/*"]
+        "filter": ["**/*", "!**/.env", "!**/.env.*"]
       },
       {
         "from": "../backend",
@@ -40,7 +43,6 @@
           "config.json",
           "higress_config_reader.py",
           "logging.yaml",
-          ".env",
           ".env.example",
           "api/**/*",
           "graph/**/*",
@@ -55,7 +57,10 @@
           "tools/**/*",
           "utils/**/*",
           "workspace/**/*",
-          "data/**/*"
+          "data/**/*",
+          "!**/__pycache__/**",
+          "!**/*.pyc",
+          "!**/.DS_Store"
         ]
       },
       {
@@ -70,17 +75,39 @@
         "from": "../data/higress",
         "to": "data/higress",
         "filter": ["**/*"]
+      },
+      {
+        "from": "../packages/puddingclaw-deploy-cli",
+        "to": "cli",
+        "filter": [
+          "package.json",
+          "worker.manifest.json",
+          "src/**/*",
+          "runtime-bundle/**/*",
+          "!**/__pycache__/**",
+          "!**/*.pyc",
+          "!**/.DS_Store"
+        ]
       }
     ],
     "mac": {
+      "icon": "assets/icon.png",
       "target": [
         {
-          "target": "dir",
+          "target": "dmg",
           "arch": ["arm64"]
         }
       ],
       "category": "public.app-category.developer-tools",
-      "identity": null
+      "hardenedRuntime": true,
+      "entitlements": "signing/entitlements.mac.plist",
+      "entitlementsInherit": "signing/entitlements.mac.inherit.plist",
+      "signIgnore": [
+        "/Contents/Resources/backend/",
+        "/Contents/Resources/cli/",
+        "/Contents/Resources/frontend/"
+      ],
+      "notarize": true
     },
     "asar": true,
     "asarUnpack": ["managers/**/*.js"]

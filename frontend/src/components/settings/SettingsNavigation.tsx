@@ -35,8 +35,8 @@ export const SETTINGS_CATEGORIES: Array<{
 }> = [
   { key: "ai", label: "模型服务", icon: Network, color: "#002fa7" },
   { key: "database", label: "数据库", icon: Database, color: "#002fa7" },
-  { key: "databaseQa", label: "智能问数设置", icon: BarChart3, color: "#002fa7" },
-  { key: "rag", label: "RAG 设置", icon: ScanSearch, color: "#002fa7" },
+  { key: "databaseQa", label: "智能问数", icon: BarChart3, color: "#002fa7" },
+  { key: "rag", label: "RAG", icon: ScanSearch, color: "#002fa7" },
   { key: "knowledge", label: "知识库", icon: FolderOpen, color: "#002fa7" },
   { key: "memory", label: "记忆管理", icon: Brain, color: "#002fa7" },
   { key: "harness", label: "Harness 配置", icon: Bot, color: "#002fa7" },

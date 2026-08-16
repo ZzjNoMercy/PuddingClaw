@@ -24,6 +24,13 @@ from knowledge.models import (
     new_id,
 )
 from knowledge.paths import get_knowledge_root
+from knowledge.queue_repository import (
+    claim_next,
+    current_lease_owner,
+    new_worker_id,
+    require_current_lease,
+    require_lease,
+)
 from knowledge.service import (
     DEFAULT_KNOWLEDGE_BASE_ID,
     GENERIC_UPLOAD_SUFFIXES,
@@ -33,6 +40,7 @@ from knowledge.service import (
     KnowledgeServiceError,
     _slugify,
 )
+from runtime_control import assert_writes_allowed, writes_allowed
 
 logger = logging.getLogger(__name__)
 
@@ -268,6 +276,7 @@ async def create_import_job(
     knowledge_base_id: str = DEFAULT_KNOWLEDGE_BASE_ID,
     publish_targets: list[str] | None = None,
 ) -> KnowledgeImportJob:
+    await assert_writes_allowed(session)
     service = KnowledgeService(base_dir)
     await service.ensure_default_knowledge_base(session)
     validate_supported_file(filename)
@@ -303,6 +312,7 @@ async def create_llm_wiki_ingest_job(
 ) -> KnowledgeImportJob:
     """Queue one immutable, Schema-bound LLM Wiki compilation."""
 
+    await assert_writes_allowed(session)
     from config import get_llm_wiki_compiler_agent_config
     from knowledge.llm_wiki import get_llm_wiki_service
 
@@ -408,6 +418,7 @@ async def create_vector_publish_job(
     base_dir: Path,
     source_job: KnowledgeImportJob,
 ) -> KnowledgeImportJob:
+    await assert_writes_allowed(session)
     service = KnowledgeService(base_dir)
     await service.ensure_default_knowledge_base(session)
     if not source_job.document_id:
@@ -477,6 +488,7 @@ async def create_document_vector_publish_job(
     base_dir: Path,
     document: KnowledgeDocument,
 ) -> KnowledgeImportJob:
+    await assert_writes_allowed(session)
     service = KnowledgeService(base_dir)
     await service.ensure_default_knowledge_base(session)
 
@@ -535,6 +547,7 @@ async def create_vanna_entity_import_job(
     max_values: int | None = None,
     knowledge_base_id: str = DEFAULT_KNOWLEDGE_BASE_ID,
 ) -> KnowledgeImportJob:
+    await assert_writes_allowed(session)
     service = KnowledgeService(base_dir)
     await service.ensure_default_knowledge_base(session)
 
@@ -715,6 +728,7 @@ async def list_related_import_events(
 
 
 async def retry_import_job(session: AsyncSession, job_id: str) -> KnowledgeImportJob:
+    await assert_writes_allowed(session)
     job = await get_import_job(session, job_id)
     if job is None:
         raise KnowledgeServiceError(f"Import job not found: {job_id}")
@@ -726,6 +740,9 @@ async def retry_import_job(session: AsyncSession, job_id: str) -> KnowledgeImpor
     job.error_message = None
     job.started_at = None
     job.finished_at = None
+    job.lease_owner = None
+    job.lease_expires_at = None
+    job.heartbeat_at = None
     job.retry_count += 1
     session.add(KnowledgeImportEvent(job_id=job.id, level="info", message="任务已重新加入队列"))
     await session.commit()
@@ -733,24 +750,30 @@ async def retry_import_job(session: AsyncSession, job_id: str) -> KnowledgeImpor
     return job
 
 
-async def claim_next_job(session: AsyncSession) -> KnowledgeImportJob | None:
-    stmt = (
-        select(KnowledgeImportJob)
-        .where(KnowledgeImportJob.status == "queued")
-        .order_by(KnowledgeImportJob.created_at.asc())
-        .limit(1)
-        .with_for_update(skip_locked=True)
+async def claim_next_job(
+    session: AsyncSession,
+    *,
+    worker_id: str | None = None,
+    lease_seconds: int | None = None,
+) -> KnowledgeImportJob | None:
+    # Drain/maintenance gate: stop claiming new work; in-flight jobs keep
+    # heartbeating under the queue lease protocol.
+    if not await writes_allowed(session):
+        return None
+    # End the read transaction opened by the writes_allowed probe so the claim
+    # UPDATE starts a fresh transaction. Under SQLite WAL, upgrading a stale
+    # read snapshot to a write fails immediately with SQLITE_BUSY_SNAPSHOT,
+    # which busy_timeout does not cover.
+    await session.rollback()
+    job = await claim_next(
+        session,
+        KnowledgeImportJob,
+        worker_id=worker_id or new_worker_id("manual"),
+        lease_seconds=lease_seconds,
+        extra_sets={"current_step": "starting", "progress": 5, "finished_at": None, "error_message": None},
     )
-    result = await session.execute(stmt)
-    job = result.scalar_one_or_none()
     if job is None:
         return None
-    job.status = "running"
-    job.current_step = "starting"
-    job.progress = 5
-    job.started_at = datetime.now(timezone.utc)
-    job.finished_at = None
-    job.error_message = None
     kind = job_kind(job)
     if kind == VECTOR_PUBLISH_KIND:
         message = "开始导入向量"
@@ -778,7 +801,11 @@ async def update_job_progress(
     event_metadata: dict[str, Any] | None = None,
     metadata_patch: dict[str, Any] | None = None,
     record_event: bool = True,
+    lease_owner: str | None = None,
 ) -> None:
+    lease_owner = lease_owner or current_lease_owner()
+    if lease_owner is not None:
+        await require_lease(session, KnowledgeImportJob, job.id, lease_owner)
     job.current_step = step
     job.progress = max(0, min(100, progress))
     if metadata_patch:
@@ -788,7 +815,16 @@ async def update_job_progress(
     await session.commit()
 
 
-async def mark_job_failed(session: AsyncSession, job: KnowledgeImportJob, error: Exception | str) -> None:
+async def mark_job_failed(
+    session: AsyncSession,
+    job: KnowledgeImportJob,
+    error: Exception | str,
+    *,
+    lease_owner: str | None = None,
+) -> None:
+    lease_owner = lease_owner or current_lease_owner()
+    if lease_owner is not None:
+        await require_lease(session, KnowledgeImportJob, job.id, lease_owner)
     message = str(error)
     job.status = "failed"
     job.current_step = "failed"
@@ -813,6 +849,9 @@ async def mark_job_failed(session: AsyncSession, job: KnowledgeImportJob, error:
                     event_metadata={"vector_job_id": job.id},
                 )
             )
+    job.lease_owner = None
+    job.lease_expires_at = None
+    job.heartbeat_at = None
     await session.commit()
 
 
@@ -924,11 +963,15 @@ async def process_vanna_entity_import_job(
         metadata_patch={"progress_detail": progress_detail, "result": result},
     )
 
+    await require_current_lease(session, KnowledgeImportJob, job.id)
     job.status = "succeeded"
     job.current_step = "done"
     job.progress = 100
     job.error_message = None
     job.finished_at = datetime.now(timezone.utc)
+    job.lease_owner = None
+    job.lease_expires_at = None
+    job.heartbeat_at = None
     job.job_metadata = {**(job.job_metadata or {}), "progress_detail": progress_detail, "result": result}
     session.add(
         KnowledgeImportEvent(
@@ -1059,12 +1102,16 @@ async def process_import_job(session: AsyncSession, *, base_dir: Path, job: Know
                 for asset in registered_assets
             ],
         }
+    await require_current_lease(session, KnowledgeImportJob, job.id)
     job.status = "succeeded"
     job.current_step = "done"
     job.progress = 100
     job.document_id = document.id
     job.error_message = None
     job.finished_at = datetime.now(timezone.utc)
+    job.lease_owner = None
+    job.lease_expires_at = None
+    job.heartbeat_at = None
     job.job_metadata = {**(job.job_metadata or {}), "ingestion": ingest, "document_virtual_path": document.virtual_path}
     session.add(KnowledgeImportEvent(job_id=job.id, level="info", message="导入完成", event_metadata={"document_id": document.id}))
     await session.commit()
@@ -1081,6 +1128,7 @@ async def process_vector_publish_job(session: AsyncSession, *, base_dir: Path, j
     source_job_id = metadata.get("source_job_id")
     source_job = await session.get(KnowledgeImportJob, source_job_id) if isinstance(source_job_id, str) else None
     if source_job is not None:
+        await require_current_lease(session, KnowledgeImportJob, job.id)
         source_job.job_metadata = {**(source_job.job_metadata or {}), "vector_job_status": "running"}
         await session.commit()
 
@@ -1129,6 +1177,7 @@ async def process_vector_publish_job(session: AsyncSession, *, base_dir: Path, j
             record_event=record_event,
         )
         if source_job is not None:
+            await require_current_lease(session, KnowledgeImportJob, job.id)
             source_job.job_metadata = {
                 **(source_job.job_metadata or {}),
                 "active_vector_job_id": job.id,
@@ -1216,11 +1265,15 @@ async def process_vector_publish_job(session: AsyncSession, *, base_dir: Path, j
                 )
             )
 
+    await require_current_lease(session, KnowledgeImportJob, job.id)
     job.status = "succeeded"
     job.current_step = "done"
     job.progress = 100
     job.error_message = None
     job.finished_at = datetime.now(timezone.utc)
+    job.lease_owner = None
+    job.lease_expires_at = None
+    job.heartbeat_at = None
     session.add(KnowledgeImportEvent(job_id=job.id, level="info", message="Milvus 向量导入完成", event_metadata=result))
     await session.commit()
     await session.refresh(job)

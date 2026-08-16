@@ -93,7 +93,11 @@ export interface KnowledgeSettings {
 
 export interface DatabaseSettings {
   mode: "sqlite" | "bundled" | "external";
+  /** 新版后端的存储提供方（sqlite / postgresql）；存在时优先于 mode 展示 */
+  provider?: string;
   source?: string;
+  /** SQLite 模式下实际生效的本地 Catalog 文件 */
+  catalog_path?: string;
   host: string;
   port: number;
   database: string;
@@ -268,7 +272,15 @@ export async function getSettings(): Promise<SystemSettings> {
   return resp.json();
 }
 
-export async function updateSettings(updates: Record<string, unknown>): Promise<void> {
+export interface UpdateSettingsResult {
+  success?: boolean;
+  message?: string;
+  /** 后端在数据库提供方切换（如 PostgreSQL → SQLite）时返回的迁移提示 */
+  requires_migration?: boolean;
+  migration_warning?: string;
+}
+
+export async function updateSettings(updates: Record<string, unknown>): Promise<UpdateSettingsResult> {
   const resp = await fetch(`${API_BASE}/settings`, {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
@@ -278,6 +290,7 @@ export async function updateSettings(updates: Record<string, unknown>): Promise<
     const data = await resp.json().catch(() => ({}));
     throw new Error(data.detail || `Failed to save settings: ${resp.status}`);
   }
+  return resp.json().catch(() => ({}));
 }
 
 export async function getProviders(): Promise<ProviderRegistry> {
@@ -444,12 +457,18 @@ export interface CapabilityStatus {
 }
 
 export interface Capabilities {
-  database: CapabilityStatus;
+  /** Core Catalog 数据库：默认本地 SQLite，PostgreSQL 为服务端可选（scope=core） */
+  core_database: CapabilityStatus;
+  /** gbrain / LLM Wiki 向量运行时（scope=gbrain） */
   pgvector: CapabilityStatus;
+  /** Analytics / 知识数据源连接外部业务数据库的能力（scope=datasource） */
+  external_datasources: CapabilityStatus;
   docker: CapabilityStatus;
   milvus: CapabilityStatus;
   mineru: CapabilityStatus;
   cli: CapabilityStatus;
+  /** @deprecated 旧版后端响应中 core_database 的别名，仅为兼容保留 */
+  database?: CapabilityStatus;
 }
 
 export async function getCapabilities(): Promise<Capabilities> {

@@ -2356,7 +2356,7 @@ def test_shell_bypass_variants_are_denied():
     commands = (
         "curl http://2130706433:10086/command",
         "curl http://0x7f000001:10086/command",
-        "curl -L https://example.com",
+        "curl -L -X POST https://example.com",
         "curl --config ./request.conf",
         "kimi-webbridge status",
         "python3 -c \"import base64; exec(base64.b64decode('obfuscated'))\"",

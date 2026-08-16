@@ -58,7 +58,13 @@ def normalize_pgvector_status(row: Mapping[str, Any]) -> dict[str, Any]:
 async def inspect_pgvector_dsn(database_url: str, *, timeout: float = 5.0) -> dict[str, Any]:
     """Inspect whether the target PostgreSQL server ships the vector extension."""
 
-    import asyncpg
+    try:
+        import asyncpg
+    except ImportError as exc:
+        raise RuntimeError(
+            "asyncpg 未安装：PostgreSQL Core / gbrain(pgvector) 需要可选依赖，"
+            "请安装 postgres extra（pip install 'puddingclaw-backend[postgres]' 或 uv sync --extra postgres）。"
+        ) from exc
 
     normalized = str(database_url or "").replace("postgresql+asyncpg://", "postgresql://", 1)
     conn = await asyncpg.connect(dsn=normalized, timeout=timeout)

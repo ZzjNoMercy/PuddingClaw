@@ -20,10 +20,16 @@ interface CapabilitiesStatusProps {
   refreshIntervalMs?: number;
   onChange?: (capabilities: Capabilities) => void;
   extensions: RuntimeExtensions | null;
+  includeKeys?: CapabilityServiceKey[];
+  excludeKeys?: CapabilityServiceKey[];
+  showSummary?: boolean;
 }
 
+/** 展示用的能力条目键；deprecated 的 "database" 别名不单独渲染 */
+export type CapabilityServiceKey = Exclude<keyof Capabilities, "database">;
+
 const SERVICE_META: Record<
-  keyof Capabilities,
+  CapabilityServiceKey,
   {
     label: string;
     description: string;
@@ -32,26 +38,38 @@ const SERVICE_META: Record<
     details: { label: string; value: string }[];
   }
 > = {
-  database: {
-    label: "核心数据库",
-    description: "SQLite 或 PostgreSQL 共享持久化存储",
+  core_database: {
+    label: "Core 数据库",
+    description: "Core Catalog 持久化：默认本地 SQLite，PostgreSQL 为服务端可选",
     icon: Database,
     color: "#0f766e",
     details: [
       { label: "功能", value: "Core 状态 / 扩展目录 / 任务与引用元数据" },
-      { label: "模式", value: "SQLite 本地文件或 PostgreSQL 服务" },
-      { label: "职责", value: "CLI 初始化时写连接配置；Backend 运行时只连接" },
+      { label: "模式", value: "本地默认 SQLite；服务端/共享部署可选 PostgreSQL" },
+      { label: "边界", value: "与 gbrain/pgvector、外部业务数据源相互独立" },
     ],
   },
   pgvector: {
     label: "pgvector 数据库扩展",
-    description: "LLM Wiki / GBrain 的向量字段与相似度检索",
+    description: "gbrain / LLM Wiki 的向量字段与相似度检索（独立可选运行时）",
     icon: Database,
     color: "#0891b2",
     details: [
+      { label: "归属", value: "gbrain 向量运行时，独立于 Core 数据库" },
       { label: "依赖级别", value: "PostgreSQL 必备服务端扩展，不由 uv 管理" },
       { label: "macOS", value: "brew install pgvector" },
       { label: "Docker", value: "Bundled PostgreSQL 镜像已默认包含 pgvector" },
+    ],
+  },
+  external_datasources: {
+    label: "外部数据源",
+    description: "Analytics / 知识库连接外部业务数据库的能力",
+    icon: Database,
+    color: "#b45309",
+    details: [
+      { label: "用途", value: "数据库问答 / 知识数据源的外部 PostgreSQL 连接" },
+      { label: "检测对象", value: "asyncpg 驱动是否可用，不探测具体数据源连通性" },
+      { label: "依赖安装", value: "pip install puddingclaw-backend[postgres]" },
     ],
   },
   docker: {
@@ -125,7 +143,7 @@ function ServiceCard({
   expanded,
   onToggle,
 }: {
-  serviceKey: keyof Capabilities;
+  serviceKey: CapabilityServiceKey;
   service: CapabilityStatus;
   expanded: boolean;
   onToggle: () => void;
@@ -243,14 +261,22 @@ function SummaryBar({
   );
 }
 
-export default function CapabilitiesStatus({ refreshIntervalMs = 30000, onChange, extensions }: CapabilitiesStatusProps) {
+export default function CapabilitiesStatus({
+  refreshIntervalMs = 30000,
+  onChange,
+  extensions,
+  includeKeys,
+  excludeKeys,
+  showSummary = true,
+}: CapabilitiesStatusProps) {
   const [capabilities, setCapabilities] = useState<Capabilities | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [lastChecked, setLastChecked] = useState<string | null>(null);
-  const [expanded, setExpanded] = useState<Record<keyof Capabilities, boolean>>({
-    database: false,
+  const [expanded, setExpanded] = useState<Record<CapabilityServiceKey, boolean>>({
+    core_database: false,
     pgvector: false,
+    external_datasources: false,
     docker: false,
     milvus: false,
     mineru: false,
@@ -262,6 +288,12 @@ export default function CapabilitiesStatus({ refreshIntervalMs = 30000, onChange
       setError(null);
       setLoading(true);
       const data = await getCapabilities();
+      // 兼容旧后端：只有 "database" 别名时归一到 core_database；
+      // 新后端两者都有，丢弃别名避免重复渲染。
+      if (!data.core_database && data.database) {
+        data.core_database = data.database;
+      }
+      delete data.database;
       setCapabilities(data);
       onChange?.(data);
       setLastChecked(
@@ -281,7 +313,7 @@ export default function CapabilitiesStatus({ refreshIntervalMs = 30000, onChange
     return () => clearInterval(timer);
   }, [fetchCapabilities, refreshIntervalMs]);
 
-  const toggleDetail = useCallback((key: keyof Capabilities) => {
+  const toggleDetail = useCallback((key: CapabilityServiceKey) => {
     setExpanded((prev) => ({ ...prev, [key]: !prev[key] }));
   }, []);
 
@@ -316,17 +348,21 @@ export default function CapabilitiesStatus({ refreshIntervalMs = 30000, onChange
 
   if (!capabilities) return null;
 
-  const visibleEntries = (Object.entries(capabilities) as [keyof Capabilities, CapabilityStatus][])
+  const visibleEntries = (Object.entries(capabilities) as [CapabilityServiceKey, CapabilityStatus][])
+    .filter(([key]) => !includeKeys || includeKeys.includes(key))
+    .filter(([key]) => !excludeKeys?.includes(key))
     .filter(([key]) => extensions?.knowledge || !["pgvector", "milvus", "mineru"].includes(key));
 
   return (
     <div className="space-y-4">
-      <SummaryBar
-        services={visibleEntries.map(([, status]) => status)}
-        loading={loading}
-        lastChecked={lastChecked}
-        onRefresh={fetchCapabilities}
-      />
+      {showSummary && (
+        <SummaryBar
+          services={visibleEntries.map(([, status]) => status)}
+          loading={loading}
+          lastChecked={lastChecked}
+          onRefresh={fetchCapabilities}
+        />
+      )}
       <div className="grid gap-3">
         {visibleEntries.map(([key, status]) => (
           <ServiceCard
@@ -340,8 +376,8 @@ export default function CapabilitiesStatus({ refreshIntervalMs = 30000, onChange
       </div>
       <p className="text-[11px] text-gray-500 leading-relaxed px-1">
         {extensions?.knowledge
-          ? "PostgreSQL 是 Core 共享数据库；知识库在此基础上额外使用 pgvector，并可按需启用 Milvus、MinerU。"
-          : "数据库作为 Harness Core 基础设施独立显示；知识库专属的 pgvector、Milvus 与 MinerU 不探测也不显示。"}
+          ? "Core 默认使用本地 SQLite，PostgreSQL 为服务端/共享部署可选项；gbrain/pgvector 是独立可选运行时，其状态不影响 Core 健康。外部数据源条目仅反映连接驱动能力，不代表具体数据源连通性。"
+          : "Core 默认使用本地 SQLite，PostgreSQL 为服务端/共享部署可选项；知识库专属的 pgvector、Milvus 与 MinerU 不探测也不显示。"}
         模型请求统一通过内部网关路由，不参与外部服务健康检测。
       </p>
     </div>

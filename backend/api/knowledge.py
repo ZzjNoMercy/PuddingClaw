@@ -73,6 +73,7 @@ from knowledge.service import (
     _slugify,
     document_to_dict,
 )
+from runtime_control import MaintenanceModeError
 from tools.pandas_knowledge_tool import PandasKnowledgeQueryTool
 
 router = APIRouter(prefix="/knowledge", tags=["knowledge"])
@@ -285,6 +286,8 @@ async def save_knowledge_database_source(
         return {"source": source}
     except KnowledgeDatabaseSourceError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except MaintenanceModeError:
+        raise
     except Exception as exc:
         raise HTTPException(status_code=503, detail=f"Failed to save database source: {exc}") from exc
 
@@ -987,6 +990,8 @@ async def import_local_markdown(
         return {"document": document_to_dict(document)}
     except KnowledgeServiceError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except MaintenanceModeError:
+        raise
     except Exception as exc:
         raise HTTPException(status_code=503, detail=f"Knowledge database unavailable: {exc}") from exc
 
@@ -1046,6 +1051,8 @@ async def import_knowledge_document(
     except KnowledgeServiceError as exc:
         logger.warning("[knowledge-import] rejected filename=%s: %s", filename, exc)
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except MaintenanceModeError:
+        raise
     except Exception as exc:
         logger.exception("[knowledge-import] failed filename=%s", filename)
         raise HTTPException(status_code=503, detail=f"Knowledge import failed: {exc}") from exc
@@ -1081,6 +1088,8 @@ async def upload_pdf_document(
     except KnowledgeServiceError as exc:
         logger.warning("[knowledge-upload-pdf] rejected filename=%s: %s", filename, exc)
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except MaintenanceModeError:
+        raise
     except Exception as exc:
         logger.exception("[knowledge-upload-pdf] failed filename=%s", filename)
         raise HTTPException(status_code=503, detail=f"PDF ingestion failed: {exc}") from exc

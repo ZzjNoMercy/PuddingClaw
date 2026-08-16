@@ -393,6 +393,8 @@ def test_database_settings_live_in_config_json(tmp_path, monkeypatch):
 
     database = config.get_database_config()
     assert database["mode"] == "external"
+    assert database["provider"] == "postgresql"
+    assert database["source"] == "external"
     assert database["url"] == "postgresql+asyncpg://alice:secret@127.0.0.1:15432/pudding"
     assert database["configured_by"] == "config.json"
     assert database["environment_override"] is False
@@ -411,7 +413,8 @@ def test_database_settings_live_in_config_json(tmp_path, monkeypatch):
     )
     saved = json.loads(config_path.read_text(encoding="utf-8"))
     assert "mode" not in saved["database"]
-    assert config.load_config()["database"]["mode"] == "bundled"
+    assert config.load_config()["database"]["provider"] == "postgresql"
+    assert config.load_config()["database"]["source"] == "bundled"
     assert saved["database"]["url"].startswith("postgresql+asyncpg://puddingclaw:")
 
 
@@ -484,9 +487,103 @@ def test_cli_sqlite_mode_overrides_postgres_defaults(tmp_path, monkeypatch):
     database = config.get_database_config()
 
     assert database["mode"] == "sqlite"
+    assert database["provider"] == "sqlite"
+    assert database["source"] == "fallback"
     assert database["url"] == ""
     assert database["configured_by"] == "environment"
     assert database["environment_override"] is True
+
+
+def test_zero_config_database_defaults_to_sqlite(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.json"
+    config_path.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(config, "CONFIG_FILE", config_path)
+    for name in (
+        "PUDDINGCLAW_DATABASE_URL",
+        "PUDDINGCLAW_DATABASE_MODE",
+        "PUDDINGCLAW_DATABASE_SOURCE",
+        "PUDDINGCLAW_DATABASE_PROVIDER",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    database = config.get_database_config()
+
+    assert database["provider"] == "sqlite"
+    assert database["source"] == "local_file"
+    assert database["mode"] == "sqlite"
+    assert database["url"] == ""
+    assert database["configured_by"] == "default"
+    assert database["environment_override"] is False
+
+
+def test_explicit_sqlite_database_reports_local_catalog(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps({"database": {"provider": "sqlite", "source": "local_file"}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(config, "CONFIG_FILE", config_path)
+    monkeypatch.setenv("PUDDINGCLAW_HOME", str(tmp_path))
+    for name in (
+        "PUDDINGCLAW_DATABASE_URL",
+        "PUDDINGCLAW_DATABASE_MODE",
+        "PUDDINGCLAW_DATABASE_SOURCE",
+        "PUDDINGCLAW_DATABASE_PROVIDER",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    database = config.get_database_config()
+
+    assert database["configured_by"] == "config.json"
+    assert database["catalog_path"] == str(tmp_path / "db" / "catalog.sqlite3")
+
+
+def test_database_provider_env_override(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps({"database": {"provider": "sqlite", "source": "local_file"}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(config, "CONFIG_FILE", config_path)
+    monkeypatch.delenv("PUDDINGCLAW_DATABASE_URL", raising=False)
+    monkeypatch.delenv("PUDDINGCLAW_DATABASE_MODE", raising=False)
+    monkeypatch.setenv("PUDDINGCLAW_DATABASE_PROVIDER", "postgresql")
+
+    database = config.get_database_config()
+
+    assert database["provider"] == "postgresql"
+    assert database["url"].startswith("postgresql+asyncpg://")
+    assert database["environment_override"] is True
+
+
+def test_switching_postgres_to_sqlite_flags_requires_migration(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "database": {
+                    "mode": "external",
+                    "url": "postgresql+asyncpg://alice:secret@127.0.0.1:15432/pudding",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(config, "CONFIG_FILE", config_path)
+    monkeypatch.delenv("PUDDINGCLAW_DATABASE_URL", raising=False)
+    monkeypatch.delenv("PUDDINGCLAW_DATABASE_MODE", raising=False)
+
+    extra = config.update_settings({"database": {"provider": "sqlite"}})
+
+    assert extra is not None
+    assert extra["requires_migration"] is True
+    assert extra["migration_warning"]
+    saved = json.loads(config_path.read_text(encoding="utf-8"))
+    assert "mode" not in saved["database"]
+    # provider/source match the new product defaults, so they persist sparse.
+    loaded = config.load_config()
+    assert loaded["database"]["provider"] == "sqlite"
+    assert loaded["database"]["source"] == "local_file"
 
 
 def test_default_agent_thinking_and_rubric_use_flash(tmp_path, monkeypatch):

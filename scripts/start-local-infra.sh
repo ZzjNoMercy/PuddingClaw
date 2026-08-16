@@ -4,6 +4,8 @@
 #   PuddingClaw - 本地基础设施启动脚本
 #   frontend/backend/MinerU 在本机运行；
 #   Docker 启动 Milvus，并可选启动 PuddingClaw bundled PostgreSQL。
+#   注意：Core 默认 SQLite，无需 PostgreSQL；bundled PostgreSQL 仅供显式选择
+#   PostgreSQL Core 或启用 gbrain(pgvector) 的场景使用。
 # ============================================
 
 set -e
@@ -179,6 +181,29 @@ update_settings({"database": {
     "password": password,
     "url": "",
 }})
+PY
+}
+
+# Home 现有数据库配置是否已是 PostgreSQL（provider/mode/url 任一可识别）。
+home_database_uses_postgres() {
+    python3 - <<'PY'
+import json
+import os
+import sys
+from pathlib import Path
+
+home = Path(os.environ.get("PUDDINGCLAW_HOME") or (Path.home() / ".puddingclaw"))
+try:
+    config = json.loads((home / "config.json").read_text(encoding="utf-8"))
+except Exception:
+    sys.exit(1)
+database = config.get("database") or {}
+provider = str(database.get("provider") or "").strip().lower()
+mode = str(database.get("mode") or "").strip().lower()
+url = str(database.get("url") or "").strip().lower()
+if provider == "postgresql" or mode in {"bundled", "external", "postgresql"} or url.startswith("postgresql"):
+    sys.exit(0)
+sys.exit(1)
 PY
 }
 
@@ -398,8 +423,25 @@ else
     DB_CONFIG_PASSWORD="${LOCAL_POSTGRES_PASSWORD}"
 fi
 
-update_database_config "$DB_CONFIG_MODE" "127.0.0.1" "$POSTGRES_PORT" "$DB_CONFIG_DB" "$DB_CONFIG_USER" "$DB_CONFIG_PASSWORD"
-echo -e "${GREEN}[完成] 已根据 PostgreSQL 检测结果更新 Home 稀疏配置：${DB_CONFIG_MODE}${NC}"
+# Core 默认 SQLite：只有用户显式选择 PostgreSQL（PUDDINGCLAW_POSTGRES_MODE=bundled/external）
+# 或 Home 已有 PostgreSQL 配置时，才把数据库配置写进 Home。detect 默认路径不改写，
+# 避免 SQLite 默认用户跑一遍本脚本就被静默切到空 PG Catalog。
+WRITE_DB_CONFIG="false"
+case "$POSTGRES_MODE" in
+    bundled|external)
+        WRITE_DB_CONFIG="true"
+        ;;
+esac
+if [ "$WRITE_DB_CONFIG" = "false" ] && home_database_uses_postgres; then
+    WRITE_DB_CONFIG="true"
+fi
+
+if [ "$WRITE_DB_CONFIG" = "true" ]; then
+    update_database_config "$DB_CONFIG_MODE" "127.0.0.1" "$POSTGRES_PORT" "$DB_CONFIG_DB" "$DB_CONFIG_USER" "$DB_CONFIG_PASSWORD"
+    echo -e "${GREEN}[完成] 已根据 PostgreSQL 配置更新 Home 稀疏配置：${DB_CONFIG_MODE}${NC}"
+else
+    echo -e "${BLUE}[信息] 未显式选择 PostgreSQL，保留 Home 现有数据库配置（Core 默认 SQLite）。${NC}"
+fi
 
 if ! docker compose -f docker-compose.infra.yml up -d "${COMPOSE_SERVICES[@]}"; then
     echo ""
@@ -460,12 +502,18 @@ echo "  # 或使用已有 conda 环境：MINERU_PORT=8002 scripts/start-mineru-h
 echo "  # MinerU 地址会写入 PUDDINGCLAW_HOME/config.json 的稀疏覆盖"
 echo ""
 echo -e "${BLUE}[提示] 本机 backend 推荐环境变量：${NC}"
-if [ "$START_BUNDLED_POSTGRES" = "true" ]; then
-    echo "  已写入 Home 稀疏配置；backend 会使用 Settings 中的数据库配置。"
-    echo "  如需命令行强制覆盖，可设置："
-    echo "  PUDDINGCLAW_DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@127.0.0.1:${POSTGRES_PORT}/${POSTGRES_DB}"
+if [ "$WRITE_DB_CONFIG" = "true" ]; then
+    if [ "$START_BUNDLED_POSTGRES" = "true" ]; then
+        echo "  已写入 Home 稀疏配置；backend 会使用 Settings 中的数据库配置。"
+        echo "  如需命令行强制覆盖，可设置："
+        echo "  PUDDINGCLAW_DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@127.0.0.1:${POSTGRES_PORT}/${POSTGRES_DB}"
+    else
+        echo "  已写入 Home 稀疏配置；如需覆盖，可在 Settings -> 知识库 -> Catalog Database 中调整。"
+    fi
 else
-    echo "  已写入 Home 稀疏配置；如需覆盖，可在 Settings -> 知识库 -> Catalog Database 中调整。"
+    echo "  未改写 Home 数据库配置（Core 默认 SQLite）。"
+    echo "  如需 PostgreSQL Core：在 Settings -> 知识库 -> Catalog Database 中配置，"
+    echo "  或以 PUDDINGCLAW_POSTGRES_MODE=bundled|external 重新运行本脚本。"
 fi
 echo ""
 echo -e "${GREEN}[完成] 基础设施启动命令已执行。${NC}"

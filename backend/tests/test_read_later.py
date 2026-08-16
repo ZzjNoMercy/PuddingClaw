@@ -1,11 +1,14 @@
 import asyncio
 from pathlib import Path
 
-from sqlalchemy import select
+import pytest
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+from knowledge.import_jobs import claim_next_job
 from knowledge.llm_wiki_compiler_agent import COMPILER_SYSTEM_PROMPT
 from knowledge.models import Base, KnowledgeDocument, KnowledgeImportJob, ReadLaterItem
+from knowledge.queue_repository import LeaseLostError, bind_lease_owner, reset_lease_owner
 from knowledge.read_later import (
     _extract_markdown,
     canonicalize_url,
@@ -355,6 +358,69 @@ def test_delete_read_later_removes_owned_capture_but_preserves_job_history(tmp_p
         assert preserved_job.status == "cancelled"
         assert not markdown_path.exists()
         assert not assets_dir.exists()
+        await engine.dispose()
+
+    asyncio.run(run())
+
+
+def test_read_later_terminal_write_requires_live_lease(tmp_path: Path, monkeypatch):
+    """w1 claims -> lease expires -> w2 reclaims -> w1 上下文里终态写入被拦截。"""
+
+    monkeypatch.setenv("PUDDINGCLAW_KNOWLEDGE_DIR", str(tmp_path / "knowledge"))
+
+    async def run() -> None:
+        engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'read-later-lease.db'}")
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+        sessions = async_sessionmaker(engine, expire_on_commit=False)
+
+        async with sessions() as session:
+            _item, job, deduplicated = await create_read_later_item(
+                session, base_dir=tmp_path, url="https://example.org/lease-guard"
+            )
+            assert deduplicated is False and job is not None
+            job_id = job.id
+        async with sessions() as session:
+            claimed = await claim_next_job(session, worker_id="worker-1", lease_seconds=120)
+            assert claimed is not None and claimed.id == job_id
+        async with sessions() as session:
+            await session.execute(
+                text("UPDATE knowledge_import_jobs SET lease_expires_at = datetime('now', '-1 seconds') WHERE id = :job_id"),
+                {"job_id": job_id},
+            )
+            await session.commit()
+        async with sessions() as session:
+            reclaimed = await claim_next_job(session, worker_id="worker-2", lease_seconds=120)
+            assert reclaimed is not None and reclaimed.lease_owner == "worker-2"
+
+        # 正文过短走 link_only 终态分支；跳过已带守卫的进度写入，让流程直达终态写入点。
+        monkeypatch.setattr(
+            FetchURLTool,
+            "_request_once",
+            classmethod(lambda cls, url: _FetchedResponse(200, {"content-type": "text/html"}, b"<html><title>Login</title><body>login</body></html>")),
+        )
+
+        async def _noop_progress(*args, **kwargs) -> None:
+            return None
+
+        monkeypatch.setattr("knowledge.read_later.update_job_progress", _noop_progress)
+
+        async with sessions() as session:
+            stale_job = await session.get(KnowledgeImportJob, job_id)
+            assert stale_job is not None
+            token = bind_lease_owner("worker-1")
+            try:
+                with pytest.raises(LeaseLostError):
+                    await process_read_later_capture_job(session, base_dir=tmp_path, job=stale_job)
+            finally:
+                reset_lease_owner(token)
+            await session.rollback()
+
+        async with sessions() as session:
+            stored = await session.get(KnowledgeImportJob, job_id)
+            assert stored is not None
+            assert stored.status == "running"
+            assert stored.lease_owner == "worker-2"
         await engine.dispose()
 
     asyncio.run(run())

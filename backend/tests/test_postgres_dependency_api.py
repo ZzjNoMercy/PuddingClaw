@@ -7,7 +7,8 @@ from api.config_api import DatabaseConnectionRequest, _test_database_connection
 
 @pytest.mark.asyncio
 async def test_database_connection_reports_missing_pgvector(monkeypatch) -> None:
-    import asyncpg
+    # asyncpg 已移入可选的 postgres extra；未安装时跳过本测试。
+    asyncpg = pytest.importorskip("asyncpg")
 
     class FakeConnection:
         async def fetchval(self, _query):

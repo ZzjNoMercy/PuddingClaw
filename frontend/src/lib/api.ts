@@ -3062,6 +3062,7 @@ export interface DatabaseQueryResultSummary {
   status: string;
   expired: boolean;
   artifact_exists: boolean;
+  catalog_exists?: boolean;
   export_enabled?: boolean;
   created_at: string;
   expires_at: string;

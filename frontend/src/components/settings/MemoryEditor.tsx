@@ -11,7 +11,6 @@ import {
 } from "@/lib/api";
 import {
   AlertCircle,
-  Brain,
   CheckCircle2,
   FolderOpen,
   Globe2,
@@ -173,28 +172,6 @@ export default function MemoryEditor() {
 
   return (
     <div className="flex h-full min-h-[560px] flex-col overflow-hidden rounded-2xl border border-black/[0.06] bg-white/70 shadow-sm backdrop-blur-xl">
-      <header className="flex shrink-0 flex-wrap items-center justify-between gap-4 border-b border-black/[0.06] px-5 py-4">
-        <div className="flex min-w-0 items-center gap-3">
-          <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-violet-100 text-violet-700">
-            <Brain className="h-5 w-5" />
-          </span>
-          <div className="min-w-0">
-            <h2 className="text-[15px] font-semibold text-gray-900">Memory 管理</h2>
-            <p className="mt-0.5 text-[11px] text-gray-500">
-              管理 Agent 会跨任务复用的持久事实、偏好、纠正和决定。
-            </p>
-          </div>
-        </div>
-        <div className="flex items-center gap-2 text-[10px] text-gray-500">
-          <span className="rounded-full bg-violet-50 px-2.5 py-1 font-medium text-violet-700">
-            {selectedTokenCount.toLocaleString()} Token
-          </span>
-          <span className="rounded-full bg-gray-100 px-2.5 py-1">
-            {selectedScope.kind === "global" ? "全局作用域" : "项目作用域"}
-          </span>
-        </div>
-      </header>
-
       <div className="flex min-h-0 flex-1 flex-col md:flex-row">
         <aside className="flex max-h-52 w-full shrink-0 flex-col border-b border-black/[0.06] bg-slate-50/55 p-3 md:max-h-none md:w-64 md:border-b-0 md:border-r">
           <p className="px-2 pb-2 pt-1 text-[10px] font-semibold uppercase tracking-widest text-gray-400">
@@ -247,11 +224,17 @@ export default function MemoryEditor() {
             <div className="min-w-0">
               <div className="flex items-center gap-2">
                 {selectedScope.kind === "global" ? (
-                  <Globe2 className="h-4 w-4 shrink-0 text-violet-600" />
+                  <Globe2 className="h-4 w-4 shrink-0 text-[#002fa7]" />
                 ) : (
-                  <FolderOpen className="h-4 w-4 shrink-0 text-blue-600" />
+                  <FolderOpen className="h-4 w-4 shrink-0 text-[#002fa7]" />
                 )}
                 <h3 className="truncate text-[13px] font-semibold text-gray-800">{selectedScope.label}</h3>
+                <span className="shrink-0 rounded-full bg-[#002fa7]/[0.07] px-2 py-0.5 text-[9px] font-medium text-[#002fa7]">
+                  {selectedTokenCount.toLocaleString()} Token
+                </span>
+                <span className="hidden shrink-0 rounded-full bg-gray-100 px-2 py-0.5 text-[9px] text-gray-500 sm:inline-flex">
+                  {selectedScope.kind === "global" ? "全局作用域" : "项目作用域"}
+                </span>
                 {isDirty && <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-amber-400" />}
               </div>
               <p className="mt-0.5 truncate pl-6 text-[10px] text-gray-400">{selectedScope.description}</p>
@@ -369,8 +352,8 @@ function ScopeButton({
           : "text-gray-500 hover:bg-white/65 hover:text-gray-800"
       }`}
     >
-      {active && <span className="absolute inset-y-2 left-0 w-[3px] rounded-r-full bg-violet-500" />}
-      <Icon className={`h-3.5 w-3.5 shrink-0 ${scope.kind === "global" ? "text-violet-600" : "text-blue-500"}`} />
+      {active && <span className="absolute inset-y-2 left-0 w-[3px] rounded-r-full bg-[#002fa7]" />}
+      <Icon className="h-3.5 w-3.5 shrink-0 text-[#002fa7]" />
       <span className="min-w-0 flex-1">
         <span className="block truncate text-[12px] font-medium">{scope.label}</span>
         <span className="mt-0.5 block truncate text-[9px] text-gray-400">{tokens.toLocaleString()} Token</span>

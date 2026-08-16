@@ -19,7 +19,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from knowledge.import_jobs import create_llm_wiki_ingest_job, update_job_progress
 from knowledge.models import KnowledgeDocument, KnowledgeImportEvent, KnowledgeImportJob, ReadLaterItem, new_id
-from knowledge.service import DEFAULT_KNOWLEDGE_BASE_ID, KnowledgeService, KnowledgeServiceError
+from knowledge.queue_repository import require_current_lease
+from knowledge.service import (
+    DEFAULT_KNOWLEDGE_BASE_ID,
+    KnowledgeService,
+    KnowledgeServiceError,
+    assert_writes_allowed_tolerant,
+)
 from tools.fetch_url_tool import MAX_REDIRECTS, FetchURLTool, _validated_url
 
 READ_LATER_CAPTURE_KIND = "read_later_capture"
@@ -137,6 +143,7 @@ async def create_read_later_item(
     tags: list[str] | None = None,
     knowledge_base_id: str = DEFAULT_KNOWLEDGE_BASE_ID,
 ) -> tuple[ReadLaterItem, KnowledgeImportJob | None, bool]:
+    await assert_writes_allowed_tolerant(session)
     canonical_url = canonicalize_url(url)
     service = KnowledgeService(base_dir)
     await service.ensure_default_knowledge_base(session)
@@ -434,6 +441,7 @@ async def process_read_later_capture_job(
     try:
         metadata, body, final_url = await asyncio.to_thread(_fetch_and_parse, item.original_url)
     except Exception as exc:  # extraction or safety failure keeps the bookmark usable as a link
+        await require_current_lease(session, KnowledgeImportJob, job.id)
         item.parse_status = "link_only"
         item.error_message = str(exc)
         item.fetched_at = datetime.now(timezone.utc)
@@ -441,6 +449,9 @@ async def process_read_later_capture_job(
         job.current_step = "link_only"
         job.progress = 100
         job.finished_at = datetime.now(timezone.utc)
+        job.lease_owner = None
+        job.lease_expires_at = None
+        job.heartbeat_at = None
         job.job_metadata = {**(job.job_metadata or {}), "parse_status": "link_only"}
         session.add(KnowledgeImportEvent(job_id=job.id, level="warning", message=f"正文未解析，已保留链接：{exc}"))
         await session.commit()
@@ -515,12 +526,16 @@ async def process_read_later_capture_job(
         item.error_message = ""
 
     item.fetched_at = datetime.now(timezone.utc)
+    await require_current_lease(session, KnowledgeImportJob, job.id)
     job.status = "succeeded"
     job.current_step = "done" if item.parse_status == "ready" else "link_only"
     job.progress = 100
     job.document_id = item.document_id
     job.title = item.title or job.title
     job.finished_at = datetime.now(timezone.utc)
+    job.lease_owner = None
+    job.lease_expires_at = None
+    job.heartbeat_at = None
     job.job_metadata = {**(job.job_metadata or {}), "parse_status": item.parse_status}
     session.add(KnowledgeImportEvent(job_id=job.id, level="info", message="网页已整理为 Markdown" if item.parse_status == "ready" else item.error_message))
     await session.commit()
@@ -592,6 +607,7 @@ async def delete_read_later_item(
     Raw snapshots, published Wiki pages, GBrain data and task history intentionally remain.
     """
 
+    await assert_writes_allowed_tolerant(session)
     service = KnowledgeService(base_dir)
     document = await session.get(KnowledgeDocument, item.document_id) if item.document_id else None
     owns_document = bool(

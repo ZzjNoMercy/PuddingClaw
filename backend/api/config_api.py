@@ -1,6 +1,7 @@
 """Configuration API — settings management + connection testing."""
 
 import asyncio
+import logging
 import re
 from typing import Any
 
@@ -9,11 +10,31 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, ConfigDict
 from starlette.concurrency import run_in_threadpool
 
+import runtime_control
 from config import get_settings_for_display, update_settings
 from postgres_dependencies import PGVECTOR_STATUS_SQL, normalize_pgvector_status
 from provider_registry import get_provider_registry
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
+
+
+async def _assert_database_settings_write_allowed() -> None:
+    """维护期（draining/maintenance）禁止改 settings 的 database 段。
+
+    容错：DB 未初始化或 runtime_control 表不存在等探测失败时放行，不阻塞
+    正常服务；命中维护期时抛 MaintenanceModeError，由全局 handler 映射 503。
+    """
+
+    try:
+        from db import get_sessionmaker
+
+        async with get_sessionmaker()() as session:
+            await runtime_control.assert_writes_allowed(session)
+    except runtime_control.MaintenanceModeError:
+        raise
+    except Exception:  # noqa: BLE001 - 探测失败不阻塞正常服务
+        logger.warning("[settings] runtime_control 写入门控探测失败，放行 database 段更新", exc_info=True)
 
 
 # ── Settings CRUD ──────────────────────────────────────────
@@ -70,12 +91,16 @@ async def put_settings(request: SettingsUpdateRequest):
     """Update settings (partial update supported)."""
     try:
         updates = request.model_dump(exclude_none=True)
-        update_settings(updates)
+        if "database" in updates:
+            await _assert_database_settings_write_allowed()
+        extra = update_settings(updates)
         import capabilities
         capabilities.invalidate_capabilities()
-        return {"success": True, "message": "Settings saved"}
+        return {"success": True, "message": "Settings saved", **(extra or {})}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
+    except runtime_control.MaintenanceModeError:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to save settings: {e}")
 
@@ -227,7 +252,16 @@ async def _test_database_connection(request: DatabaseConnectionRequest) -> dict[
     import time
     from urllib.parse import quote
 
-    import asyncpg
+    try:
+        import asyncpg
+    except ImportError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "asyncpg 未安装：PostgreSQL 连接测试需要可选依赖，"
+                "请安装 postgres extra（pip install 'puddingclaw-backend[postgres]' 或 uv sync --extra postgres）。"
+            ),
+        ) from exc
 
     start = time.time()
     host = (request.host or "127.0.0.1").strip()

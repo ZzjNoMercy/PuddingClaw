@@ -5,14 +5,11 @@ aiohappyeyeballs==2.6.2
 aiohttp==3.14.1
     # via
     #   langchain-community
-    #   llama-index-core
     #   puddingclaw-backend
 aiosignal==1.4.0
     # via aiohttp
 aiosqlite==0.22.1
-    # via
-    #   llama-index-core
-    #   puddingclaw-backend
+    # via puddingclaw-backend
 annotated-doc==0.0.4
     # via fastapi
 annotated-types==0.7.0
@@ -31,23 +28,15 @@ anyio==4.14.0
     #   sse-starlette
     #   starlette
     #   watchfiles
-asyncpg==0.31.0
-    # via puddingclaw-backend
 attrs==26.1.0
     # via
     #   aiohttp
     #   jsonschema
     #   referencing
-banks==2.4.3
-    # via llama-index-core
 beautifulsoup4==4.15.0
     # via puddingclaw-backend
-bm25s==0.3.9
-    # via llama-index-retrievers-bm25
 bracex==2.6
     # via wcmatch
-cachetools==7.1.4
-    # via pymilvus
 certifi==2026.6.17
     # via
     #   httpcore
@@ -58,13 +47,10 @@ cffi==2.0.0 ; platform_python_implementation != 'PyPy'
 charset-normalizer==3.4.7
     # via requests
 click==8.4.1
-    # via
-    #   nltk
-    #   uvicorn
-colorama==0.4.6
+    # via uvicorn
+colorama==0.4.6 ; sys_platform == 'win32'
     # via
     #   click
-    #   griffecli
     #   tqdm
     #   uvicorn
 cryptography==49.0.0
@@ -72,17 +58,8 @@ cryptography==49.0.0
     #   google-auth
     #   puddingclaw-backend
     #   pyjwt
-dataclasses-json==0.6.7
-    # via llama-index-core
 deepagents==0.6.12
     # via puddingclaw-backend
-deprecated==1.3.1
-    # via
-    #   banks
-    #   llama-index-core
-    #   llama-index-instrumentation
-dirtyjson==1.0.8
-    # via llama-index-core
 distro==1.9.0
     # via
     #   anthropic
@@ -91,51 +68,28 @@ distro==1.9.0
     #   openai
 docstring-parser==0.18.0
     # via anthropic
-et-xmlfile==2.0.0
-    # via openpyxl
 fastapi==0.138.0
     # via puddingclaw-backend
 filelock==3.29.4
-    # via
-    #   huggingface-hub
-    #   puddingclaw-backend
-    #   transformers
+    # via puddingclaw-backend
 filetype==1.2.0
     # via
-    #   banks
     #   langchain-google-genai
-    #   llama-index-core
     #   puddingclaw-backend
 frozenlist==1.8.0
     # via
     #   aiohttp
     #   aiosignal
-fsspec==2026.6.0
-    # via
-    #   huggingface-hub
-    #   llama-index-core
 google-auth==2.55.0
     # via google-genai
 google-genai==2.10.0
     # via langchain-google-genai
 greenlet==3.5.2
     # via sqlalchemy
-griffe==2.1.0
-    # via banks
-griffecli==2.1.0
-    # via griffe
-griffelib==2.1.0
-    # via
-    #   griffe
-    #   griffecli
-grpcio==1.81.1
-    # via pymilvus
 h11==0.16.0
     # via
     #   httpcore
     #   uvicorn
-hf-xet==1.5.1 ; platform_machine == 'aarch64' or platform_machine == 'amd64' or platform_machine == 'arm64' or platform_machine == 'x86_64'
-    # via huggingface-hub
 html2text==2025.4.15
     # via puddingclaw-backend
 httpcore==1.0.9
@@ -148,7 +102,6 @@ httpx==0.28.1
     #   google-genai
     #   langgraph-sdk
     #   langsmith
-    #   llama-index-core
     #   mcp
     #   openai
     #   puddingclaw-backend
@@ -156,26 +109,16 @@ httpx-sse==0.4.3
     # via
     #   langchain-community
     #   mcp
-huggingface-hub==0.36.2
-    # via
-    #   tokenizers
-    #   transformers
 idna==3.18
     # via
     #   anyio
     #   httpx
     #   requests
     #   yarl
-jieba==0.42.1
-    # via puddingclaw-backend
-jinja2==3.1.6
-    # via banks
 jiter==0.15.0
     # via
     #   anthropic
     #   openai
-joblib==1.5.3
-    # via nltk
 jsonpatch==1.33
     # via langchain-core
 jsonpointer==3.1.1
@@ -251,101 +194,38 @@ langsmith==0.9.2
     #   langchain-community
     #   langchain-core
     #   puddingclaw-backend
-llama-index-core==0.14.22
-    # via
-    #   llama-index-embeddings-openai
-    #   llama-index-retrievers-bm25
-    #   puddingclaw-backend
-llama-index-embeddings-openai==0.6.0
-    # via puddingclaw-backend
-llama-index-instrumentation==0.5.0
-    # via llama-index-workflows
-llama-index-retrievers-bm25==0.7.1
-    # via puddingclaw-backend
-llama-index-workflows==2.22.1
-    # via llama-index-core
 lxml==6.1.1
     # via puddingclaw-backend
-markupsafe==3.0.3
-    # via jinja2
-marshmallow==3.26.2
-    # via dataclasses-json
 mcp==1.28.0
     # via langchain-mcp-adapters
 multidict==6.7.1
     # via
     #   aiohttp
     #   yarl
-mypy-extensions==1.1.0
-    # via typing-inspect
-narwhals==2.23.0
-    # via plotly
-nest-asyncio==1.6.0
-    # via llama-index-core
-networkx==3.6.1
-    # via llama-index-core
-nltk==3.9.4
-    # via llama-index-core
 numpy==2.4.6 ; python_full_version < '3.12'
-    # via
-    #   bm25s
-    #   langchain-community
-    #   llama-index-core
-    #   pandas
-    #   rank-bm25
-    #   transformers
+    # via langchain-community
 numpy==2.5.0 ; python_full_version >= '3.12'
-    # via
-    #   bm25s
-    #   langchain-community
-    #   llama-index-core
-    #   pandas
-    #   rank-bm25
-    #   transformers
+    # via langchain-community
 openai==2.43.0
     # via
     #   langchain-openai
-    #   llama-index-embeddings-openai
     #   puddingclaw-backend
-openpyxl==3.1.5
-    # via puddingclaw-backend
 orjson==3.11.9
     # via
     #   langgraph-sdk
     #   langsmith
-    #   pymilvus
 ormsgpack==1.12.2
     # via langgraph-checkpoint
 packaging==26.2
     # via
-    #   huggingface-hub
     #   langchain-core
     #   langsmith
-    #   marshmallow
-    #   plotly
-    #   transformers
-pandas==3.0.3
-    # via
-    #   puddingclaw-backend
-    #   pymilvus
 pillow==12.2.0
-    # via
-    #   llama-index-core
-    #   puddingclaw-backend
-platformdirs==4.10.0
-    # via
-    #   banks
-    #   llama-index-core
-plotly==6.8.0
     # via puddingclaw-backend
 propcache==0.5.2
     # via
     #   aiohttp
     #   yarl
-protobuf==6.33.6
-    # via pymilvus
-pyarrow==24.0.0
-    # via puddingclaw-backend
 pyasn1==0.6.3
     # via pyasn1-modules
 pyasn1-modules==0.4.2
@@ -355,7 +235,6 @@ pycparser==3.0 ; implementation_name != 'PyPy' and platform_python_implementatio
 pydantic==2.13.4
     # via
     #   anthropic
-    #   banks
     #   fastapi
     #   google-genai
     #   langchain
@@ -365,9 +244,6 @@ pydantic==2.13.4
     #   langchain-google-genai
     #   langgraph
     #   langsmith
-    #   llama-index-core
-    #   llama-index-instrumentation
-    #   llama-index-workflows
     #   mcp
     #   openai
     #   puddingclaw-backend
@@ -381,17 +257,10 @@ pydantic-settings==2.14.2
     #   puddingclaw-backend
 pyjwt==2.13.0
     # via mcp
-pymilvus==2.6.15
-    # via puddingclaw-backend
-pystemmer==2.2.0.3
-    # via llama-index-retrievers-bm25
-python-dateutil==2.9.0.post0
-    # via pandas
 python-dotenv==1.2.2
     # via
     #   puddingclaw-backend
     #   pydantic-settings
-    #   pymilvus
     #   uvicorn
 python-multipart==0.0.32
     # via
@@ -401,55 +270,33 @@ pywin32==312 ; sys_platform == 'win32'
     # via mcp
 pyyaml==6.0.3
     # via
-    #   huggingface-hub
     #   langchain-classic
     #   langchain-community
     #   langchain-core
-    #   llama-index-core
     #   puddingclaw-backend
-    #   transformers
     #   uvicorn
-rank-bm25==0.2.2
-    # via puddingclaw-backend
 referencing==0.37.0
     # via
     #   jsonschema
     #   jsonschema-specifications
 regex==2026.5.9
-    # via
-    #   nltk
-    #   tiktoken
-    #   transformers
+    # via tiktoken
 requests==2.34.2
     # via
     #   google-auth
     #   google-genai
-    #   huggingface-hub
     #   langchain-classic
     #   langchain-community
     #   langsmith
-    #   llama-index-core
     #   puddingclaw-backend
-    #   pymilvus
     #   requests-toolbelt
     #   tiktoken
-    #   transformers
 requests-toolbelt==1.0.0
     # via langsmith
 rpds-py==2026.5.1
     # via
     #   jsonschema
     #   referencing
-safetensors==0.8.0
-    # via
-    #   puddingclaw-backend
-    #   transformers
-setuptools==81.0.0 ; sys_platform != 'emscripten' and sys_platform != 'win32'
-    # via llama-index-core
-setuptools==82.0.1 ; sys_platform == 'emscripten' or sys_platform == 'win32'
-    # via llama-index-core
-six==1.17.0
-    # via python-dateutil
 sniffio==1.3.1
     # via
     #   anthropic
@@ -462,12 +309,7 @@ sqlalchemy==2.0.51
     # via
     #   langchain-classic
     #   langchain-community
-    #   llama-index-core
     #   puddingclaw-backend
-sqlglot==30.13.0
-    # via puddingclaw-backend
-sqlparse==0.5.5
-    # via puddingclaw-backend
 sse-starlette==3.4.5
     # via
     #   mcp
@@ -477,36 +319,20 @@ starlette==1.3.1
     #   fastapi
     #   mcp
     #   sse-starlette
-tabulate==0.10.0
-    # via puddingclaw-backend
 tenacity==9.1.4
     # via
     #   google-genai
     #   langchain-community
     #   langchain-core
-    #   llama-index-core
     #   puddingclaw-backend
 tiktoken==0.13.0
     # via
     #   langchain-openai
-    #   llama-index-core
     #   puddingclaw-backend
-tinytag==2.2.1
-    # via llama-index-core
-tokenizers==0.22.2
-    # via
-    #   puddingclaw-backend
-    #   transformers
 tqdm==4.68.3
     # via
-    #   huggingface-hub
-    #   llama-index-core
-    #   nltk
     #   openai
     #   puddingclaw-backend
-    #   transformers
-transformers==4.57.6
-    # via puddingclaw-backend
 typing-extensions==4.15.0
     # via
     #   aiohttp
@@ -516,14 +342,10 @@ typing-extensions==4.15.0
     #   beautifulsoup4
     #   fastapi
     #   google-genai
-    #   grpcio
-    #   huggingface-hub
     #   langchain-core
     #   langchain-mcp-adapters
     #   langchain-protocol
     #   langsmith
-    #   llama-index-core
-    #   llama-index-workflows
     #   mcp
     #   openai
     #   pydantic
@@ -531,20 +353,13 @@ typing-extensions==4.15.0
     #   referencing
     #   sqlalchemy
     #   starlette
-    #   typing-inspect
     #   typing-inspection
-typing-inspect==0.9.0
-    # via
-    #   dataclasses-json
-    #   llama-index-core
 typing-inspection==0.4.2
     # via
     #   fastapi
     #   mcp
     #   pydantic
     #   pydantic-settings
-tzdata==2026.2 ; sys_platform == 'emscripten' or sys_platform == 'win32'
-    # via pandas
 urllib3==2.7.0
     # via
     #   puddingclaw-backend
@@ -570,12 +385,6 @@ websockets==15.0.1
     #   langgraph-sdk
     #   langsmith
     #   uvicorn
-wrapt==2.2.2
-    # via
-    #   deprecated
-    #   llama-index-core
-xlrd==2.0.2
-    # via puddingclaw-backend
 xxhash==3.7.0
     # via
     #   langgraph

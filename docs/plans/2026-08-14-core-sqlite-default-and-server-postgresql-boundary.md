@@ -1,6 +1,6 @@
 # PuddingClaw Core SQLite 默认化与服务端 PostgreSQL 边界方案
 
-> 状态：Draft（代码与测试现状已核对，待实施）
+> 状态：Implemented（2026-08-15 主体落地，含对抗式审查与两轮修复；遗留差距见 §14）
 >
 > 日期：2026-08-14
 >
@@ -11,7 +11,7 @@
 PuddingClaw Core 应采用以下数据库策略：
 
 - 桌面端、本地单用户和单 Backend 实例默认使用 SQLite，数据库位于
-  `$PUDDINGCLAW_HOME/databases/catalog.sqlite3`。
+  `$PUDDINGCLAW_HOME/db/catalog.sqlite3`。
 - Core 不再把 PostgreSQL 作为所有初始化 Profile 的优先或必选基础设施。
 - PostgreSQL 保留为服务端能力：用于多 Backend 副本、多独立 Worker、共享服务、高可用和多租户部署。
 - 任务中心的展示、通知、任务状态和事件不依赖 PostgreSQL；队列领取改为同时支持 SQLite 和 PostgreSQL
@@ -47,7 +47,7 @@ Core Catalog 当前保存的是规模较小、结构化的应用元数据和任�
 代码已经具备 SQLite 主链路：
 
 - [`backend/db.py`](../../backend/db.py) 在没有 PostgreSQL URL 时解析
-  `$PUDDINGCLAW_HOME/databases/catalog.sqlite3`。
+  `$PUDDINGCLAW_HOME/db/catalog.sqlite3`。
 - [`backend/knowledge/models.py`](../../backend/knowledge/models.py) 使用 SQLAlchemy 通用
   `String`、`Text`、`JSON`、`DateTime`、索引和唯一约束，没有把 Core 模型绑定到 JSONB、ARRAY、
   PostgreSQL UUID 或 pgvector 类型。
@@ -429,33 +429,33 @@ CLI 通过受认证的本地控制 API 获取并续租 maintenance lease。所�
 
 ### P0：让 SQLite 成为可靠 Core
 
-- [ ] 启动时校验 SQLite `>= 3.35.0`，版本不足时 fail closed 并给出升级提示。
-- [ ] 增加 SQLite PRAGMA、WAL、busy timeout 和外键连接配置。
-- [ ] 建立 Core schema migration 基线，替换仅依赖 `create_all` 的升级路径。
-- [ ] 抽取 Queue Repository。
-- [ ] 将知识导入和语义维度任务改为原子领取、lease、heartbeat、过期回收和期望状态更新。
-- [ ] 增加 Backend 单实例 lease。
-- [ ] 增加 SQLite 并发领取、崩溃恢复、取消竞争和重试测试。
-- [ ] 增加在线备份、完整性检查和恢复命令。
+- [x] 启动时校验 SQLite `>= 3.35.0`，版本不足时 fail closed 并给出升级提示。（`backend/db.py::_verify_sqlite_runtime`）
+- [x] 增加 SQLite PRAGMA、WAL、busy timeout 和外键连接配置。（`db.py` connect/begin 事件；isolation_level=None + 显式 BEGIN 保证 DDL 事务性）
+- [x] 建立 Core schema migration 基线，替换仅依赖 `create_all` 的升级路径。（`backend/schema_migrations.py`，当前 v3；fresh/legacy/中断恢复均有测试）
+- [x] 抽取 Queue Repository。（`backend/knowledge/queue_repository.py`：SQLite `UPDATE...RETURNING` / PG `SKIP LOCKED`，业务层无方言 SQL）
+- [x] 将知识导入和语义维度任务改为原子领取、lease、heartbeat、过期回收和期望状态更新。
+- [x] 增加 Backend 单实例 lease。（`backend/backend_lease.py`，flock `$PUDDINGCLAW_HOME/state/backend.lease`，拿不到不启动后台 Worker）
+- [x] 增加 SQLite 并发领取、崩溃恢复、取消竞争和重试测试。（`tests/test_queue_lease_protocol.py` 等）
+- [x] 增加在线备份、完整性检查和恢复命令。（`backend/catalog_backup.py`，`python -m catalog_backup backup|verify|restore|list`）
 
 ### P1：默认值和产品入口切换
 
-- [ ] CLI 本地 Profile 默认 SQLite，不再先探测 PostgreSQL。
-- [ ] GUI 将 SQLite 标记为本地推荐选项，PostgreSQL 标记为服务端/共享部署选项。
-- [ ] 拆分 database provider 与 deployment source 配置。
-- [ ] 拆分 Core、gbrain/pgvector 和外部数据源的能力状态。
-- [ ] 更新 README、Compose、初始化文档和故障排查文案。
-- [ ] 将 `asyncpg` 从所有 Profile 的 Core 必选依赖中移出。
+- [x] CLI 本地 Profile 默认 SQLite，不再先探测 PostgreSQL。
+- [x] GUI 将 SQLite 标记为本地推荐选项，PostgreSQL 标记为服务端/共享部署选项。
+- [x] 拆分 database provider 与 deployment source 配置。（旧 `mode` 兼容读取，新写入只写 provider/source）
+- [x] 拆分 Core、gbrain/pgvector 和外部数据源的能力状态。（`capabilities.py`：core_database/pgvector(scope=gbrain)/external_datasources）
+- [x] 更新 README、Compose、初始化文档和故障排查文案。
+- [x] 将 `asyncpg` 从所有 Profile 的 Core 必选依赖中移出。（`postgres` extra；harness 不含，knowledge/analytics/full 含）
 
 ### P2：迁移与服务端模式
 
-- [ ] 增加数据库级 `core_runtime_control`、drain/maintenance lease 和受认证控制 API。
-- [ ] 提供 PostgreSQL Core → SQLite 迁移、校验和回滚。
-- [ ] 提供 SQLite → PostgreSQL 升级迁移、校验和回滚。
-- [ ] 提供显式 Server/K8s Profile，默认 PostgreSQL。
-- [ ] Web 与 Worker 角色拆分，验证多副本 Queue lease。
-- [ ] K8s 校验拒绝多副本 SQLite 和未验证 RWX 文件系统。
-- [ ] 若产品进入多租户阶段，另立租户隔离 ADR 和安全验收计划。
+- [x] 增加数据库级 `core_runtime_control`、drain/maintenance lease 和受认证控制 API。（协议与 API 已落地；**认证未实现**，与本地控制面其他写 API 同级，见 §14）
+- [x] 提供 PostgreSQL Core → SQLite 迁移、校验和回滚。（`backend/catalog_migration.py` + `puddingclaw database migrate`；PG 实机路径需 `PUDDINGCLAW_TEST_PG_URL` 联调）
+- [x] 提供 SQLite → PostgreSQL 升级迁移、校验和回滚。（同上）
+- [ ] 提供显式 Server/K8s Profile，默认 PostgreSQL。（未做，见 §14）
+- [~] Web 与 Worker 角色拆分，验证多副本 Queue lease。（现有 `PUDDINGCLAW_DISABLE_*_WORKER` 反向开关 + Backend 单实例 lease + 队列 CAS；无显式角色模型，Queue fencing 已有 SQLite 对抗测试和一次 PostgreSQL 实机复验）
+- [ ] K8s 校验拒绝多副本 SQLite 和未验证 RWX 文件系统。（未做，deploy CLI 尚无 K8s 目标）
+- [ ] 若产品进入多租户阶段，另立租户隔离 ADR 和安全验收计划。（不适用本阶段）
 
 ## 11. 验收标准
 
@@ -522,3 +522,40 @@ CLI 通过受认证的本地控制 API 获取并续租 maintenance lease。所�
 - 细化 `2026-08-11-user-home-sessions-and-skills-migration.md` 中 SQLite/K8s 的部署要求：桌面默认 SQLite，
   K8s 默认 PostgreSQL；K8s SQLite 只允许显式单副本和经验证单写块存储。
 - 不改变 LLM Wiki/gbrain 现有独立 PostgreSQL + pgvector 决策，只解除它与 Core 数据库选择的耦合。
+
+## 14. 实施状态（2026-08-15）
+
+### 14.1 落地文件地图
+
+- Core DB 层：`backend/db.py`（PRAGMA/WAL/版本校验 fail closed/显式 BEGIN 事务配方）、`backend/schema_migrations.py`（版本化迁移 runner，v1 baseline → v2 队列 lease 列 → v3 `core_runtime_control`）。
+- 队列协议：`backend/knowledge/queue_repository.py`（CAS/lease/heartbeat/ContextVar 守卫），集成于 `import_jobs.py`、`semantic_dimension_jobs.py`、`import_worker.py`、`semantic_dimension_worker.py`、`vanna_entity_job_runner.py`、`read_later.py`、`llm_wiki_job_runner.py`。
+- 单实例与运维：`backend/backend_lease.py`（flock）、`backend/db_maintenance.py`（定期 WAL checkpoint）、`backend/app.py`（lifespan 接线 + `MaintenanceModeError` 全局 503 + Retry-After）。
+- 备份恢复：`backend/catalog_backup.py`（VACUUM INTO + manifest + integrity check + 原子恢复）。
+- 停写协议：`backend/runtime_control.py` + `backend/api/maintenance.py`（drain/maintenance/release，CAS generation + 数据库时间 lease）。
+- 数据库互迁：`backend/catalog_migration.py`（导出/导入/行数+主键+内容 digest+FK+integrity 校验/原子切配置/回滚保留）+ CLI `puddingclaw database migrate`。
+- 配置与入口：`backend/config.py`（provider/source，旧 mode 兼容）、`backend/capabilities.py`（core_database / pgvector(scope=gbrain) / external_datasources）、deploy CLI init 默认 SQLite、`database configure` 切换守卫、`asyncpg` 移入 `postgres` extra、compose postgres 进 `profiles: ["postgres"]`、electron 按 config.json/deploy.json 条件启动 bundled postgres。
+
+### 14.2 验证结果
+
+- 后端全量：`2690 passed, 16 skipped`（含新增 queue lease、schema migration、SQLite runtime、备份恢复、runtime control、catalog migration、import worker 测试）。
+- deploy CLI：`npm test` 58/58（含切换守卫在真实 `$PUDDINGCLAW_HOME/db/catalog.sqlite3` 路径上的拦截测试）。
+- 前端 `tsc --noEmit` 通过；`uv build` wheel 内容含全部新模块；`docker compose config -q` 两种 profile 通过。
+- 两轮子代理对抗式审查（P0 正确性 + P1/P2 验收）发现的 Critical/High 项全部修复并有测试锁定。
+
+### 14.3 已知差距与遗留项
+
+- maintenance 控制 API 与本地其他写 API 一样无认证（本地控制面同级）；"受认证控制 API" 待服务端模式立项时统一补。
+- maintenance 期 mutation 门控覆盖主要入口（任务入队/领取、知识文档写入、稍后读、数据源、settings database 段），并非全部 Core 写路径。
+- 无显式 Server/K8s Profile 与 K8s replicas/RWX 校验（deploy CLI 暂无 K8s 目标）；Queue fencing 已做一次 PG 实机复验，但尚无常驻自动化 PG 多副本端到端环境。
+- PG 实机互迁路径需 `PUDDINGCLAW_TEST_PG_URL` 跑 `tests/test_catalog_migration.py` 中的实机用例。
+- `update_job_progress` 等读-写路径在 WAL 下理论存在 SQLITE_BUSY_SNAPSHOT 窗口（claim 热路径已修）；worker 循环兜底重试。
+- 发布前需重建 embedded runtime bundle（构建脚本已正确：harness 不含 asyncpg，knowledge/analytics/full 含 postgres extra）。
+
+### 14.4 迁移与 Queue fencing 复验（2026-08-16）
+
+- 完成一次 Backend 停机条件下的本地 PostgreSQL → SQLite 迁移：12 张 Core 表共 928 行；逐表行数、主键集合和内容摘要一致，SQLite `foreign_key_check` 为 0、`integrity_check=ok`、schema version 为 3。源 PostgreSQL、迁移前 `pg_dump`、旧 SQLite 和旧配置均保留用于回滚。
+- 修复迁移内容摘要对数据库 collation 的隐式依赖：不再依赖数据库 `ORDER BY` 的字符串顺序，而是在 Python 中按规范化主键确定性排序；覆盖包含 `-` / `_` 主键且输入逆序的回归测试。
+- `require_lease` 从“先 SELECT 校验、后普通 commit”改为事务内条件 `UPDATE ... RETURNING` fence：条件同时包含 `status='running'`、匹配的 `lease_owner` 和未过期 lease，并持有行写锁直到业务提交或回滚；PostgreSQL claimant 使用 `SKIP LOCKED` 跳过被 fence 的行，SQLite 由写事务串行化。
+- heartbeat 与只读 lease 检查同样要求 lease 未过期；lease 到期本身即撤销旧 Worker 权限，无需等待新 Worker 先完成 reclaim。Worker 内部额外的 source-job/gbrain 进度提交也已接入当前 lease fence。
+- 新增 SQLite 对抗测试覆盖“过期 owner 不能 heartbeat/fence”与“终态 fence 到 commit 之间不能被 reclaim”；Queue/Worker/runtime-control 相关测试 30 项通过。另在独立临时 PostgreSQL database 上完成真实 `SKIP LOCKED` 多 Worker 竞态验证，验证后已删除临时库。
+- 后端全量回归共执行 2693 个非跳过用例：首次运行 `2692 passed, 1 failed, 16 skipped`，唯一失败为既有 gbrain CLI 临时目录清理竞态，隔离重跑通过；本次 Queue/迁移相关测试无失败。

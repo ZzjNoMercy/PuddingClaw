@@ -17,7 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 
 from config import get_database_config
 from knowledge.models import KnowledgeBase, KnowledgeDatabaseSource, utcnow
-from knowledge.service import DEFAULT_KNOWLEDGE_BASE_ID
+from knowledge.service import DEFAULT_KNOWLEDGE_BASE_ID, assert_writes_allowed_tolerant
 
 
 def _credential_store():
@@ -248,6 +248,7 @@ async def upsert_database_source(
     *,
     knowledge_base_id: str = DEFAULT_KNOWLEDGE_BASE_ID,
 ) -> dict[str, Any]:
+    await assert_writes_allowed_tolerant(session)
     await ensure_default_base(session, knowledge_base_id)
     data = _sanitize_payload(payload)
     existing = await session.get(KnowledgeDatabaseSource, data["id"])
