@@ -1,8 +1,10 @@
 """Knowledge database source catalog.
 
 User configured databases and selected tables are knowledge assets, so they
-belong in the catalog database instead of config.json. The project PostgreSQL
-source is derived from config.json and exposed as a built-in default.
+belong in the catalog database instead of config.json. When the Core Catalog
+itself uses PostgreSQL, that connection can also be exposed as a built-in
+source. A SQLite Core Catalog is an application-internal store and must not be
+presented as an analytics database asset.
 """
 
 from __future__ import annotations
@@ -36,6 +38,17 @@ class KnowledgeDatabaseSourceError(RuntimeError):
 
 _SOURCE_ID_RE = re.compile(r"^[a-zA-Z0-9_-]{3,80}$")
 _SUPPORTED_TYPES = {"postgresql"}
+
+
+def _project_postgres_enabled() -> bool:
+    """Return whether the Core Catalog is a real PostgreSQL connection."""
+
+    return str(get_database_config().get("provider") or "").lower() == "postgresql"
+
+
+def _assert_project_postgres_enabled() -> None:
+    if not _project_postgres_enabled():
+        raise KnowledgeDatabaseSourceError("Core Catalog 当前使用 SQLite，不存在项目默认 PostgreSQL 数据源。")
 
 
 def _normalize_tables(tables: list[str] | None) -> list[str]:
@@ -224,7 +237,10 @@ async def list_database_sources(
     stored = list(result.scalars())
     project_saved = next((source for source in stored if source.id == "project_postgres"), None)
     others = [source for source in stored if source.id != "project_postgres"]
-    return [_project_postgres_source(project_saved), *[_public_source_dict(source) for source in others]]
+    public_others = [_public_source_dict(source) for source in others]
+    if not _project_postgres_enabled():
+        return public_others
+    return [_project_postgres_source(project_saved), *public_others]
 
 
 async def get_database_source(
@@ -234,6 +250,7 @@ async def get_database_source(
     knowledge_base_id: str = DEFAULT_KNOWLEDGE_BASE_ID,
 ) -> KnowledgeDatabaseSource | dict[str, Any]:
     if source_id == "project_postgres":
+        _assert_project_postgres_enabled()
         source = await session.get(KnowledgeDatabaseSource, source_id)
         return _project_postgres_connection_source(source)
     source = await session.get(KnowledgeDatabaseSource, source_id)
@@ -253,6 +270,7 @@ async def upsert_database_source(
     data = _sanitize_payload(payload)
     existing = await session.get(KnowledgeDatabaseSource, data["id"])
     if data["id"] == "project_postgres":
+        _assert_project_postgres_enabled()
         project = _project_postgres_source()
         data.update(
             {

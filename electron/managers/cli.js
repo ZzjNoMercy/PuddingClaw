@@ -36,7 +36,7 @@ function runCli(args, { timeoutMs = 20_000 } = {}) {
   const cliEntry = getCliEntry();
   return new Promise((resolve, reject) => {
     if (!fs.existsSync(cliEntry)) {
-      reject(new Error(`未找到 PuddingClaw CLI: ${cliEntry}`));
+      reject(new Error(`未找到客户端运行组件: ${cliEntry}`));
       return;
     }
     const child = spawn(process.execPath, [cliEntry, ...args, '--json'], {
@@ -48,7 +48,7 @@ function runCli(args, { timeoutMs = 20_000 } = {}) {
     let stderr = '';
     const timer = setTimeout(() => {
       child.kill('SIGTERM');
-      reject(new Error('CLI 探测超时'));
+      reject(new Error('环境检测超时'));
     }, timeoutMs);
     child.stdout.on('data', (chunk) => { stdout += chunk.toString(); });
     child.stderr.on('data', (chunk) => { stderr += chunk.toString(); });
@@ -62,11 +62,11 @@ function runCli(args, { timeoutMs = 20_000 } = {}) {
       try {
         payload = JSON.parse(stdout.trim() || '{}');
       } catch {
-        reject(new Error(`CLI 返回了无效 JSON: ${(stderr || stdout).slice(-500)}`));
+        reject(new Error(`客户端运行组件返回了无效响应: ${(stderr || stdout).slice(-500)}`));
         return;
       }
       if (code !== 0 || payload.status === 'error') {
-        reject(new Error(payload.error || stderr.trim() || `CLI 退出码 ${code}`));
+        reject(new Error(payload.error || stderr.trim() || `客户端运行组件退出码 ${code}`));
         return;
       }
       resolve(payload);

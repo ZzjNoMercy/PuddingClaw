@@ -39,7 +39,7 @@ function getBackendCommand() {
 
   // 生产模式只使用 CLI 在用户目录准备的受管理 Runtime，不修改签名后的 App Resources。
   const prepared = cliManager.getPreparedBackendCommand();
-  if (!prepared) throw new Error('CLI 管理的 Backend Runtime 尚未准备完成');
+  if (!prepared) throw new Error('客户端运行环境尚未准备完成');
   return prepared;
 }
 

@@ -18,6 +18,10 @@ test("desktop profile inspection exposes explicit required and optional dependen
     assert.ok(result.dependencies.some((item) => item.id === "knowledge.milvus" && !item.required));
     assert.ok(result.dependencies.some((item) => item.id === "analytics.datasource" && !item.required));
     assert.ok(result.dependencies.every((item) => item.source === "cli"));
+    const userFacingCopy = result.dependencies
+      .flatMap((item) => [item.label, item.detail, ...item.remediation])
+      .join(" ");
+    assert.doesNotMatch(userFacingCopy, /\bCLI\b/);
   } finally {
     await fs.rm(home, { recursive: true, force: true });
   }

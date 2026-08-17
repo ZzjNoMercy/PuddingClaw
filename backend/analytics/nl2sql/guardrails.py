@@ -433,17 +433,15 @@ def _read_rule_markdown_from_text(content: str) -> tuple[GuardrailRule, str, str
     return GuardrailRule.model_validate(payload), body, content
 
 
-def _ensure_default_rule_docs() -> None:
+def _ensure_guardrail_dirs() -> None:
     GUARDRAILS_RULES_DIR.mkdir(parents=True, exist_ok=True)
     GUARDRAILS_DRAFTS_DIR.mkdir(parents=True, exist_ok=True)
-    if list(GUARDRAILS_RULES_DIR.glob(f"**/{GUARDRAIL_FILENAME}")):
-        return
-    for rule in DEFAULT_GUARDRAILS.guardrails:
-        _write_rule_markdown(rule)
 
 
 def _load_markdown_guardrails() -> GuardrailRuleSet:
-    _ensure_default_rule_docs()
+    # User-owned guardrails are opt-in assets.  Do not materialize the
+    # application-specific DEFAULT_GUARDRAILS into every new user's home.
+    _ensure_guardrail_dirs()
     rules: list[GuardrailRule] = []
     diagnostics: list[dict[str, str]] = []
     seen_ids: set[str] = set()

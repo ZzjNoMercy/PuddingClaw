@@ -81,7 +81,7 @@ export async function inspectProfile(profile, paths, {
   if (uv.status !== "available") uv = probeUv();
   const rawHome = await probeHome(paths.home, { create: false });
   const home = rawHome.code === "ENOENT"
-    ? { ...rawHome, status: "planned", reason: "选择模式后由 CLI 创建" }
+    ? { ...rawHome, status: "planned", reason: "确认模式后自动创建" }
     : rawHome;
   const [activeRuntime, embeddedRuntime, prepared, docker] = await Promise.all([
     loadActiveRuntime(paths).catch(() => null),
@@ -96,11 +96,11 @@ export async function inspectProfile(profile, paths, {
   const dependencies = [
     dependency({
       id: "runtime.cli",
-      label: "PuddingClaw CLI",
+      label: "PuddingClaw 客户端组件",
       group: "core",
       required: true,
       status: "available",
-      detail: "模式计划、依赖探测和 Runtime 准备均由当前 CLI 执行",
+      detail: "桌面客户端运行环境已就绪",
     }),
     dependency({
       id: "runtime.node",
@@ -109,7 +109,7 @@ export async function inspectProfile(profile, paths, {
       required: true,
       status: node.status,
       detail: node.status === "available" ? `Node.js ${node.version}` : "当前 Node.js 版本不受支持",
-      remediation: node.status === "available" ? [] : ["升级桌面壳或安装 Node.js 20+"],
+      remediation: node.status === "available" ? [] : ["请重新安装最新版 PuddingClaw 客户端"],
     }),
     dependency({
       id: "runtime.home",
@@ -126,8 +126,8 @@ export async function inspectProfile(profile, paths, {
       group: "core",
       required: true,
       status: python.status,
-      detail: python.selected ? `${python.selected.version} · ${python.selected.command}` : "未发现兼容 Python",
-      remediation: python.remediation || [],
+      detail: python.selected ? `${python.selected.version} · ${python.selected.command}` : "尚未准备兼容的 Python 运行环境",
+      remediation: python.selected ? [] : ["确认模式后由客户端自动准备"],
     }),
     dependency({
       id: "runtime.uv",
@@ -135,8 +135,8 @@ export async function inspectProfile(profile, paths, {
       group: "core",
       required: true,
       status: uv.status,
-      detail: uv.selected ? `uv ${uv.selected.version}` : "未发现 uv；一键准备时可安装到用户目录",
-      remediation: uv.remediation || [],
+      detail: uv.selected ? `uv ${uv.selected.version}` : "依赖管理组件尚未准备",
+      remediation: uv.selected ? [] : ["确认模式后由客户端自动准备"],
     }),
     dependency({
       id: "runtime.bundle",
@@ -159,8 +159,8 @@ export async function inspectProfile(profile, paths, {
       status: runtimePrepared || !packaged ? "available" : "needs_action",
       detail: runtimePrepared
         ? `已准备 ${prepared.dependency_profile} 依赖集`
-        : packaged ? `需要由 CLI 准备 ${requestedDependencyProfile} 依赖集` : "源码开发环境由 backend/.venv 提供",
-      remediation: runtimePrepared || !packaged ? [] : ["选择模式后运行一键准备"],
+        : packaged ? "当前模式的运行环境尚未准备" : "源码开发环境由 backend/.venv 提供",
+      remediation: runtimePrepared || !packaged ? [] : ["确认模式后由客户端自动准备"],
     }),
     dependency({
       id: "catalog.sqlite",
@@ -222,7 +222,7 @@ export async function inspectProfile(profile, paths, {
         required: false,
         status: milvus.status === "available" ? "available" : "optional_unavailable",
         detail: milvus.status === "available" ? "127.0.0.1:19530 可达" : "可选；不可用时仍可使用文件与精确检索",
-        remediation: milvus.status === "available" ? [] : ["需要向量检索时通过 CLI/Docker 启动 Milvus"],
+        remediation: milvus.status === "available" ? [] : ["如需向量检索，可稍后在知识库设置中启用"],
       }),
       dependency({
         id: "knowledge.mineru",
@@ -265,7 +265,7 @@ export async function inspectProfile(profile, paths, {
           ? "available"
           : "not_configured",
         detail: "只有连接 PostgreSQL 业务数据源时需要；文件问数不依赖",
-        remediation: ["需要 PostgreSQL 数据源时由 CLI 准备 analytics/full 依赖集"],
+        remediation: ["连接 PostgreSQL 数据源时由客户端按需准备"],
       }),
     );
   }

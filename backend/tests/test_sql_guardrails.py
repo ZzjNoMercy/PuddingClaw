@@ -354,6 +354,18 @@ def test_guardrail_rules_are_loaded_from_markdown_assets(tmp_path, monkeypatch) 
     assert first["document_content"].startswith("---")
 
 
+def test_empty_guardrail_directory_does_not_seed_application_defaults(tmp_path, monkeypatch) -> None:
+    definitions = tmp_path / "definitions"
+    monkeypatch.setattr(guardrail_module, "GUARDRAILS_ROOT", definitions / "sql-guardrails")
+    monkeypatch.setattr(guardrail_module, "GUARDRAILS_RULES_DIR", definitions / "sql-guardrails" / "rules")
+    monkeypatch.setattr(guardrail_module, "GUARDRAILS_DRAFTS_DIR", definitions / "sql-guardrails" / "drafts")
+
+    payload = list_guardrail_rules()
+
+    assert payload["guardrails"] == []
+    assert list((definitions / "sql-guardrails" / "rules").glob("**/guardrail.md")) == []
+
+
 def test_guardrail_raw_markdown_upsert(tmp_path, monkeypatch) -> None:
     definitions = tmp_path / "definitions"
     monkeypatch.setattr(guardrail_module, "GUARDRAILS_ROOT", definitions / "sql-guardrails")
