@@ -11,8 +11,32 @@ from graph.permission_policy import (
     RunPermissionContext,
     compile_permission_rules,
     evaluate_permission_rules,
+    resolve_filesystem_mode,
 )
 from harness.tool_execution import ToolExecutionPipeline
+
+
+@pytest.mark.parametrize(
+    ("approval_mode", "backend_mode", "configured_mode", "expected"),
+    [
+        ("smart", "spawn", None, "unrestricted"),
+        ("smart", "kernel", None, "unrestricted"),
+        ("smart", "spawn", "restricted", "restricted"),
+        ("strict", "spawn", "unrestricted", "restricted"),
+        ("smart", "docker", "unrestricted", "restricted"),
+    ],
+)
+def test_filesystem_mode_resolution_is_shared_by_every_run_surface(
+    approval_mode: str,
+    backend_mode: str,
+    configured_mode: str | None,
+    expected: str,
+) -> None:
+    assert resolve_filesystem_mode(
+        approval_mode=approval_mode,
+        backend_mode=backend_mode,
+        configured_mode=configured_mode,
+    ) == expected
 
 
 def test_allow_rule_is_constrained_by_effect_envelope() -> None:

@@ -62,13 +62,39 @@ def test_headless_request_rejects_caller_selected_model():
         HeadlessRunRequest(message="分析销售", analytics_model_id="sales")
 
 
-def test_headless_authority_defaults_to_restricted_without_explicit_opt_in(monkeypatch):
+def test_headless_authority_does_not_define_a_separate_filesystem_mode(monkeypatch):
     monkeypatch.delenv("PUDDINGCLAW_HEADLESS_AUTHORITY_PROFILE", raising=False)
-    monkeypatch.delenv("PUDDINGCLAW_HEADLESS_FILESYSTEM_MODE", raising=False)
 
     authority = headless_authority_from_environment()
     assert authority["profile"] == ""
-    assert authority["filesystem_mode"] == "restricted"
+    assert "filesystem_mode" not in authority
+
+
+def test_headless_permission_projection_preserves_shell_access_intent() -> None:
+    payload = {
+        "id": "permission-shell",
+        "type": "shell_directory_access",
+        "command": 'mkdir -p "/tmp/report"',
+        "path": "/tmp/report",
+        "paths": ["/tmp/report"],
+        "grant_specs": [
+            {
+                "target": "/tmp/report",
+                "access": "write",
+                "delete": False,
+                "capabilities": ["write", "recursive", "shell_access"],
+            }
+        ],
+        "capabilities": ["write", "recursive", "shell_access"],
+        "grant_bindings": {"filesystem_mode": "restricted"},
+    }
+
+    projected = headless_api._needs_input("permission_required", payload)
+
+    assert projected is not None
+    assert projected["grant_specs"] == payload["grant_specs"]
+    assert projected["capabilities"] == payload["capabilities"]
+    assert projected["grant_bindings"] == payload["grant_bindings"]
 
 
 def test_model_routing_candidates_are_limited_by_worker_key(monkeypatch):
@@ -201,6 +227,7 @@ async def test_headless_run_binds_platform_workspace_path(tmp_path, monkeypatch)
     )
 
     assert response["project_id"] == consumed["project_id"]
+    assert "filesystem_mode" not in consumed
     assert session_manager.get_metadata(response["session_id"])["workspace_path"] == str(workspace.resolve())
 
 

@@ -326,6 +326,9 @@ class _HeadlessExecution:
                             "command",
                             "path",
                             "paths",
+                            "grant_specs",
+                            "capabilities",
+                            "grant_bindings",
                             "risk",
                             "reason",
                             "options",
@@ -783,6 +786,9 @@ def _needs_input(event_name: str, payload: dict[str, Any]) -> dict[str, Any] | N
                 "command": command or None,
                 "path": path or None,
                 "paths": payload.get("paths") or [],
+                "grant_specs": payload.get("grant_specs") or [],
+                "capabilities": payload.get("capabilities") or [],
+                "grant_bindings": payload.get("grant_bindings") or {},
                 "risk": payload.get("risk"),
                 "reason": payload.get("reason"),
                 "options": payload.get("options") or ["once"],
@@ -813,7 +819,6 @@ async def _consume_run(
     analytics_model_id: str,
     analytics_model_match: dict[str, Any],
     worker_key_id: str = "",
-    filesystem_mode: str = "restricted",
 ) -> dict[str, Any]:
     stream = deepagents_agent_manager.astream(
         message=request.message,
@@ -830,7 +835,6 @@ async def _consume_run(
         authority_profile=str(authority.get("profile") or "restricted"),
         authority_directories=list(authority.get("directories") or []),
         authority_network_origins=list(authority.get("network_origins") or []),
-        filesystem_mode=filesystem_mode,
         query_created_at=request_received_at,
     )
     execution = _HeadlessExecution(
@@ -1172,7 +1176,6 @@ async def create_headless_run(
                 analytics_model_id=selected,
                 analytics_model_match=model_route.to_dict(),
                 worker_key_id=str(principal.get("key_id") or ""),
-                filesystem_mode=str(authority.get("filesystem_mode") or "restricted"),
             )
         except asyncio.TimeoutError:
             response = {

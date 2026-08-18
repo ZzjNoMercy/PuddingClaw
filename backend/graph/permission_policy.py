@@ -6,8 +6,8 @@ import hashlib
 import json
 from collections.abc import Mapping
 from dataclasses import dataclass
-from fnmatch import fnmatchcase
 from enum import StrEnum
+from fnmatch import fnmatchcase
 from typing import Any
 
 
@@ -56,7 +56,7 @@ class PermissionRule:
         value: Mapping[str, Any],
         *,
         source: str = "session",
-    ) -> "PermissionRule":
+    ) -> PermissionRule:
         if not isinstance(value, Mapping):
             raise PermissionRuleError("permission rule must be an object")
         tool = str(value.get("tool") or "*").strip().lower()
@@ -375,6 +375,24 @@ def normalize_approval_mode(value: Any) -> ApprovalMode:
         raise ValueError(f"Unsupported approval mode: {value!r}") from exc
 
 
+def resolve_filesystem_mode(
+    *,
+    approval_mode: Any,
+    backend_mode: str,
+    configured_mode: Any = None,
+) -> str:
+    """Resolve one filesystem policy for interactive and Headless Runs alike."""
+
+    if normalize_approval_mode(approval_mode) is not ApprovalMode.SMART:
+        return "restricted"
+    if str(backend_mode or "spawn").strip().lower() not in {"spawn", "kernel"}:
+        return "restricted"
+    configured = str(configured_mode or "").strip().lower()
+    if configured in {"restricted", "unrestricted"}:
+        return configured
+    return "unrestricted"
+
+
 def permission_policy_snapshot(
     permissions: Mapping[str, Any] | None,
 ) -> dict[str, Any]:
@@ -437,16 +455,11 @@ class RunPermissionContext:
         current_permissions = permission_policy_snapshot(frozen_permissions)
         execution = payload.get("execution")
         execution = execution if isinstance(execution, Mapping) else {}
-        configured_filesystem = str(execution.get("filesystem_mode") or "").strip().lower()
-        if configured_filesystem not in {"restricted", "unrestricted"}:
-            # Backward-compatible snapshots from the pre-alignment schema
-            # derive the interactive smart-local contract once, at restore.
-            configured_filesystem = (
-                "unrestricted"
-                if normalize_approval_mode(current_permissions["approval_mode"]) is ApprovalMode.SMART
-                and str(execution.get("backend_mode") or "spawn") in {"spawn", "kernel"}
-                else "restricted"
-            )
+        configured_filesystem = resolve_filesystem_mode(
+            approval_mode=current_permissions["approval_mode"],
+            backend_mode=str(execution.get("backend_mode") or "spawn"),
+            configured_mode=execution.get("filesystem_mode"),
+        )
         return cls(
             approval_mode=normalize_approval_mode(current_permissions["approval_mode"]),
             policy_epoch=int(current_permissions["policy_epoch"]),

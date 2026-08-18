@@ -126,7 +126,7 @@ from graph.middlewares.user_agents_prompt import UserAgentsPromptMiddleware
 from graph.middlewares.user_input_boundary import UserInputBoundaryMiddleware
 from graph.middlewares.workspace_path_router import WorkspacePathRouterMiddleware
 from graph.permission_middleware import ExternalFilePermissionMiddleware
-from graph.permission_policy import RunPermissionContext
+from graph.permission_policy import RunPermissionContext, resolve_filesystem_mode
 from graph.permission_resume import permission_resume_registry
 from graph.permissioned_filesystem_backend import PermissionedCompositeBackend
 from graph.prompt_cache import CONTROL_SOURCE, is_prompt_control_message
@@ -4907,7 +4907,7 @@ class DeepAgentsAgentManager:
                 continue
             exchange_query_id = str(item.get("query_id") or "").strip()
             if not exchange_query_id:
-                exchange_query_id = hashlib.sha256(f"{pending_user}\n{assistant}".encode("utf-8")).hexdigest()[:20]
+                exchange_query_id = hashlib.sha256(f"{pending_user}\n{assistant}".encode()).hexdigest()[:20]
             content = f"## 用户\n\n{pending_user}\n\n## Agent\n\n{assistant}"
             documents.append(
                 {
@@ -7239,18 +7239,13 @@ class DeepAgentsAgentManager:
             # The durable Run snapshot remains fail-closed if a legacy or
             # concurrently removed Session cannot provide its policy.
             session_approval_mode = "strict"
-        resolved_filesystem_mode = (
-            "restricted"
-            if interaction_mode == "interactive" and session_approval_mode != "smart"
-            else (
-                filesystem_mode
-                if filesystem_mode in {"restricted", "unrestricted"}
-                else (
-                    "unrestricted"
-                    if authority_profile == "smart" and session_approval_mode == "smart"
-                    else "restricted"
-                )
-            )
+        resolved_filesystem_mode = resolve_filesystem_mode(
+            approval_mode=session_approval_mode,
+            # The concrete runner is bound below. Spawn is the neutral local
+            # default; the second resolution uses the actual backend and will
+            # force non-Spawn/Kernel runners back to restricted.
+            backend_mode="spawn",
+            configured_mode=filesystem_mode,
         )
         segments: list[dict[str, Any]] = []
         active_segment: dict[str, Any] = {}
@@ -7905,27 +7900,16 @@ class DeepAgentsAgentManager:
                 {
                     "backend_mode": backend_mode,
                     "backend_id": str(getattr(agent_backend, "execution_backend_id", "")),
-                    "filesystem_mode": (
-                        str(
+                    "filesystem_mode": resolve_filesystem_mode(
+                        approval_mode=(
+                            (run_record.config_snapshot.get("permissions") or {}).get("approval_mode")
+                            or "smart"
+                        ),
+                        backend_mode=backend_mode,
+                        configured_mode=(
                             (run_record.config_snapshot.get("interaction") or {}).get("filesystem_mode")
                             or (run_record.config_snapshot.get("execution") or {}).get("filesystem_mode")
-                            or ""
-                        )
-                        if str(
-                            (run_record.config_snapshot.get("interaction") or {}).get("filesystem_mode")
-                            or (run_record.config_snapshot.get("execution") or {}).get("filesystem_mode")
-                            or ""
-                        )
-                        in {"restricted", "unrestricted"}
-                        else (
-                            "unrestricted"
-                            if str(
-                                (run_record.config_snapshot.get("permissions") or {}).get("approval_mode") or "smart"
-                            )
-                            == "smart"
-                            and backend_mode in {"spawn", "kernel"}
-                            else "restricted"
-                        )
+                        ),
                     ),
                     "workspace_id": workspace_id,
                     "scratch_host_path": str(getattr(agent_backend, "execution_scratch_host_path", "")),

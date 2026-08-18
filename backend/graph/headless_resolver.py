@@ -16,9 +16,9 @@ from urllib.parse import urlsplit
 
 from graph.database_sql_revision_resume import database_sql_revision_resume_registry
 from graph.dimension_build_resume import dimension_build_resume_registry
+from graph.kernel_fallback_resume import kernel_fallback_resume_registry
 from graph.logical_dataset_resume import logical_dataset_resume_registry
 from graph.permission_resume import permission_resume_registry
-from graph.kernel_fallback_resume import kernel_fallback_resume_registry
 from graph.skill_plan_resume import skill_plan_resume_registry
 from graph.skill_secret_resume import skill_secret_resume_registry
 from graph.user_input_resume import user_input_resume_registry
@@ -194,14 +194,8 @@ def headless_authority_from_environment() -> dict[str, Any]:
     raw_dirs = os.getenv("PUDDINGCLAW_HEADLESS_ALLOWED_DIRECTORIES", "")
     raw_origins = os.getenv("PUDDINGCLAW_HEADLESS_ALLOWED_NETWORK_ORIGINS", "")
     configured_profile = os.getenv("PUDDINGCLAW_HEADLESS_AUTHORITY_PROFILE", "").strip().lower()
-    configured_filesystem = os.getenv("PUDDINGCLAW_HEADLESS_FILESYSTEM_MODE", "").strip().lower()
     return {
-        # Missing deployment configuration is deliberately not equivalent to
-        # trusted-local.  The headless path has no interactive risk card.
         "profile": configured_profile,
-        "filesystem_mode": configured_filesystem
-        if configured_filesystem in {"restricted", "unrestricted"}
-        else "restricted",
         "directories": [item.strip() for item in raw_dirs.split(",") if item.strip()],
         "network_origins": [item.strip() for item in raw_origins.split(",") if item.strip()],
     }
