@@ -24,6 +24,7 @@ from knowledge.models import (
     KnowledgeImportJob,
     KnowledgeSourceItem,
     ReadLaterItem,
+    iso_utc,
     new_id,
 )
 from knowledge.queue_repository import require_current_lease
@@ -132,10 +133,10 @@ def read_later_to_dict(item: ReadLaterItem, *, content: str | None = None) -> di
         "source_item_id": item.source_item_id,
         "raw_snapshot_path": item.raw_snapshot_path,
         "wiki_job_id": item.wiki_job_id,
-        "fetched_at": item.fetched_at.isoformat() if item.fetched_at else None,
-        "read_at": item.read_at.isoformat() if item.read_at else None,
-        "created_at": item.created_at.isoformat() if item.created_at else None,
-        "updated_at": item.updated_at.isoformat() if item.updated_at else None,
+        "fetched_at": iso_utc(item.fetched_at),
+        "read_at": iso_utc(item.read_at),
+        "created_at": iso_utc(item.created_at),
+        "updated_at": iso_utc(item.updated_at),
     }
     if content is not None:
         payload["content"] = content

@@ -199,6 +199,12 @@ def test_feishu_incremental_revision_hash_and_full_scan_deletion(tmp_path, monke
                     },
                 ]
 
+            async def get_doc_meta(self, _session, _source, *, doc_token, doc_type="docx"):
+                return {}
+
+            async def get_user_display_names(self, _session, _source, *, open_ids):
+                return {}
+
         engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'sync.db'}")
         async with engine.begin() as connection:
             await connection.run_sync(Base.metadata.create_all)
@@ -296,5 +302,207 @@ def test_feishu_http_client_retries_rate_limit() -> None:
         payload = await client.request_json("GET", api_base_url="https://open.feishu.cn", path="/retry")
         assert payload["data"]["ok"] is True
         assert calls == 2
+
+    asyncio.run(run())
+
+
+def test_feishu_empty_body_is_not_imported(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("PUDDINGCLAW_KNOWLEDGE_DIR", str(tmp_path / "knowledge"))
+
+    async def run() -> None:
+        from pathlib import Path
+
+        class FakeApi:
+            def __init__(self) -> None:
+                self.revision = 1
+                self.body = ""
+                self.nodes = [
+                    {
+                        "space_id": "space-1",
+                        "node_token": "wiki-node-empty",
+                        "obj_token": "docx-empty",
+                        "obj_type": "docx",
+                        "title": "目录页",
+                        "has_child": False,
+                        "obj_edit_time": "1700000000",
+                    }
+                ]
+
+            async def list_nodes(self, _session, _source, *, space_id, parent_node_token=None):
+                return list(self.nodes)
+
+            async def get_node(self, *_args, **_kwargs):
+                raise AssertionError("root node lookup not expected")
+
+            async def get_docx_document(self, _session, _source, *, document_id):
+                return {"title": "目录页", "revision_id": self.revision}
+
+            async def list_docx_blocks(self, _session, _source, *, document_id, document_revision_id):
+                blocks = [{"block_id": "page", "block_type": 1, "children": ["text"]}]
+                if self.body:
+                    blocks.append(
+                        {
+                            "block_id": "text",
+                            "block_type": 2,
+                            "text": {"elements": [{"text_run": {"content": self.body}}]},
+                        }
+                    )
+                return blocks
+
+            async def get_doc_meta(self, _session, _source, *, doc_token, doc_type="docx"):
+                return {}
+
+            async def get_user_display_names(self, _session, _source, *, open_ids):
+                return {}
+
+        engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'sync.db'}")
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+        sessions = async_sessionmaker(engine, expire_on_commit=False)
+        api = FakeApi()
+        async with sessions() as session:
+            source = await create_source_connection(
+                session,
+                connector_key="feishu_wiki",
+                name="产品知识库",
+                auth_type="tenant",
+                config={"space_id": "space-1", "publish_vector": False},
+            )
+            source.status = "ready"
+
+            first = await create_sync_run(session, source=source, mode="incremental")
+            await session.commit()
+            await process_feishu_sync_run(session, base_dir=tmp_path, run=first, api=api)
+            assert first.status == "succeeded"
+            assert first.stats_json["empty"] == 1
+            assert first.stats_json["changed"] == 0
+            item = (await session.execute(select(KnowledgeSourceItem))).scalar_one()
+            assert item.status == "empty"
+            assert item.document_id is None
+            assert (await session.execute(select(KnowledgeDocument))).scalar_one_or_none() is None
+
+            api.revision = 2
+            api.body = "正文内容"
+            second = await create_sync_run(session, source=source, mode="incremental")
+            await session.commit()
+            await process_feishu_sync_run(session, base_dir=tmp_path, run=second, api=api)
+            assert second.stats_json["changed"] == 1
+            assert second.stats_json["empty"] == 0
+            document = (await session.execute(select(KnowledgeDocument))).scalar_one()
+            assert item.status == "ready"
+            assert item.document_id == document.id
+            assert Path(document.storage_path).exists()
+
+            api.revision = 3
+            api.body = ""
+            third = await create_sync_run(session, source=source, mode="incremental")
+            await session.commit()
+            await process_feishu_sync_run(session, base_dir=tmp_path, run=third, api=api)
+            assert third.stats_json["changed"] == 1  # previously imported doc was tombstoned
+            assert item.status == "empty"
+            assert item.document_id is None
+            assert document.status == "deleted"
+            assert not Path(document.storage_path).exists()
+            assert Path(document.doc_metadata["tombstone_path"]).exists()
+        await engine.dispose()
+
+    asyncio.run(run())
+
+
+def test_feishu_sync_persists_document_card_metadata(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("PUDDINGCLAW_KNOWLEDGE_DIR", str(tmp_path / "knowledge"))
+
+    async def run() -> None:
+        from pathlib import Path
+
+        class FakeApi:
+            def __init__(self) -> None:
+                self.nodes = [
+                    {
+                        "space_id": "space-1",
+                        "node_token": "wiki-node-meta",
+                        "obj_token": "docx-meta",
+                        "obj_type": "docx",
+                        "title": "产品手册",
+                        "has_child": False,
+                        "creator": "ou_creator",
+                        "obj_create_time": "1700000000",
+                        "obj_edit_time": "1700001000",
+                    }
+                ]
+
+            async def list_nodes(self, _session, _source, *, space_id, parent_node_token=None):
+                return list(self.nodes)
+
+            async def get_node(self, *_args, **_kwargs):
+                raise AssertionError("root node lookup not expected")
+
+            async def get_docx_document(self, _session, _source, *, document_id):
+                return {"title": "产品手册", "revision_id": 7}
+
+            async def list_docx_blocks(self, _session, _source, *, document_id, document_revision_id):
+                return [
+                    {"block_id": "page", "block_type": 1, "children": ["text", "img"]},
+                    {
+                        "block_id": "text",
+                        "block_type": 2,
+                        "text": {"elements": [{"text_run": {"content": "正文"}}]},
+                    },
+                    {"block_id": "img", "block_type": 27, "image": {"token": "img-token"}},
+                ]
+
+            async def download_media_assets(self, _session, _source, *, file_tokens, max_bytes_each=None):
+                return {"img-token": (b"png-bytes", "image/png", 'inline; filename="cover.png"')}
+
+            async def get_doc_meta(self, _session, _source, *, doc_token, doc_type="docx"):
+                assert doc_token == "docx-meta"
+                return {
+                    "doc_token": "docx-meta",
+                    "doc_type": "docx",
+                    "title": "产品手册",
+                    "owner_id": "ou_owner",
+                    "create_time": "1700000100",
+                    "latest_modify_user": "ou_owner",
+                    "latest_modify_time": "1700002000",
+                    "url": "https://sample.feishu.cn/docx/docx-meta",
+                }
+
+            async def get_user_display_names(self, _session, _source, *, open_ids):
+                return {"ou_owner": "张三"}
+
+        engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'sync.db'}")
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+        sessions = async_sessionmaker(engine, expire_on_commit=False)
+        api = FakeApi()
+        async with sessions() as session:
+            source = await create_source_connection(
+                session,
+                connector_key="feishu_wiki",
+                name="产品知识库",
+                auth_type="tenant",
+                config={"space_id": "space-1", "publish_vector": False},
+            )
+            source.status = "ready"
+            run_ = await create_sync_run(session, source=source, mode="incremental")
+            await session.commit()
+            await process_feishu_sync_run(session, base_dir=tmp_path, run=run_, api=api)
+            assert run_.status == "succeeded"
+
+            document = (await session.execute(select(KnowledgeDocument))).scalar_one()
+            feishu_meta = document.doc_metadata["feishu"]
+            # drive metadata wins over wiki node fields where both exist
+            assert feishu_meta["author_id"] == "ou_owner"
+            assert feishu_meta["author_name"] == "张三"
+            assert feishu_meta["published_at"] == "2023-11-14T22:15:00+00:00"
+            assert feishu_meta["updated_at"] == "2023-11-14T22:46:40+00:00"
+            assert document.origin_url == "https://sample.feishu.cn/docx/docx-meta"
+            assert "cover" not in feishu_meta
+
+            content = Path(document.storage_path).read_text(encoding="utf-8")
+            assert "author: 张三" in content
+            assert "published_at: '2023-11-14T22:15:00+00:00'" in content
+            assert "source_url: https://sample.feishu.cn/docx/docx-meta" in content
+        await engine.dispose()
 
     asyncio.run(run())

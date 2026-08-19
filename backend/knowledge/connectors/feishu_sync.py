@@ -36,6 +36,11 @@ def _unix_datetime(value: Any) -> datetime | None:
         return None
 
 
+def _iso_from_unix(value: Any) -> str | None:
+    parsed = _unix_datetime(value)
+    return parsed.isoformat() if parsed is not None else None
+
+
 def _safe_revision(document: dict[str, Any], node: dict[str, Any]) -> str:
     value = document.get("revision_id")
     if value in {None, ""}:
@@ -58,6 +63,7 @@ class FeishuWikiSync:
         self.base_dir = base_dir
         self.api = api or FeishuOpenApi()
         self.service = KnowledgeService(base_dir)
+        self._user_display_cache: dict[str, str | None] = {}
 
     async def run(
         self,
@@ -93,7 +99,7 @@ class FeishuWikiSync:
         # which busy_timeout does not cover. Commit (not rollback) so the
         # loaded ORM objects stay usable (rollback would expire them).
         await session.commit()
-        stats = {"discovered": len(nodes), "changed": 0, "unchanged": 0, "failed": 0, "deleted": 0, "unsupported": 0}
+        stats = {"discovered": len(nodes), "changed": 0, "unchanged": 0, "failed": 0, "deleted": 0, "unsupported": 0, "empty": 0}
         run.stats_json = stats
         run.current_step = "syncing_items"
         await session.commit()
@@ -112,16 +118,18 @@ class FeishuWikiSync:
                 await session.commit()
                 return run
             try:
-                item_changed = await self._sync_node(
+                outcome = await self._sync_node(
                     session,
                     source=source,
                     run=run,
                     node=node,
                     path=path,
                 )
-                if item_changed is None:
+                if outcome == "unsupported":
                     stats["unsupported"] += 1
-                elif item_changed:
+                elif outcome == "empty":
+                    stats["empty"] += 1
+                elif outcome == "changed":
                     stats["changed"] += 1
                     changed = True
                 else:
@@ -150,12 +158,17 @@ class FeishuWikiSync:
         run.progress = 96
         await session.commit()
         vector_result: dict[str, Any] = {"refreshed": False, "reason": "no changes"}
-        if changed and bool(config.get("publish_vector", True)):
+        if changed and not bool(config.get("publish_vector", True)):
+            vector_result = {"refreshed": False, "reason": "publish_vector disabled"}
+        elif changed:
             try:
                 vector_result = await asyncio.to_thread(refresh_local_knowledge_index, self.base_dir)
             except Exception as exc:  # local documents remain usable even if Milvus is temporarily unavailable
                 vector_result = {"refreshed": False, "error": f"{type(exc).__name__}: {exc}"}
                 source.last_error_json = {"stage": "indexing", "message": str(exc)}
+
+        if vector_result.get("refreshed"):
+            await self._stamp_vector_index(session, source=source, vector_result=vector_result)
 
         now = datetime.now(timezone.utc)
         run.status = "succeeded_with_errors" if stats["failed"] or vector_result.get("error") else "succeeded"
@@ -164,6 +177,9 @@ class FeishuWikiSync:
         run.stats_json = {**stats, "vector_index": vector_result}
         run.finished_at = now
         source.status = "ready" if stats["failed"] == 0 else "error"
+        if run.status == "succeeded":
+            # A clean run supersedes earlier failures; drop the stale banner.
+            source.last_error_json = {}
         source.last_synced_at = now
         source.last_sync_run_id = run.id
         await self._lease_fence(session, run, terminal=True)
@@ -259,7 +275,7 @@ class FeishuWikiSync:
         run: KnowledgeSyncRun,
         node: dict[str, Any],
         path: list[str],
-    ) -> bool | None:
+    ) -> str:
         node_token = str(node.get("node_token") or "")
         obj_token = str(node.get("obj_token") or "")
         obj_type = str(node.get("obj_type") or "").lower()
@@ -281,7 +297,7 @@ class FeishuWikiSync:
             )
             item.status = "unsupported"
             await session.flush()
-            return None
+            return "unsupported"
 
         document_meta = await self.api.get_docx_document(session, source, document_id=obj_token)
         revision = _safe_revision(document_meta, node)
@@ -296,6 +312,11 @@ class FeishuWikiSync:
         normalized_markdown = ""
         warnings: list[str] = []
         content_hash = ""
+        doc_meta: dict[str, Any] = {}
+        author_id: str | None = None
+        author_name: str | None = None
+        published_at: str | None = None
+        updated_at: str | None = None
         if not unchanged_remote:
             blocks = await self.api.list_docx_blocks(
                 session,
@@ -315,6 +336,16 @@ class FeishuWikiSync:
                 warnings=converted.warnings,
             )
             content_hash = hashlib.sha256(normalized_markdown.encode("utf-8")).hexdigest()
+            # Display metadata for the document card. Both calls degrade to
+            # empty results when the app lacks the drive/contact scopes, in
+            # which case the wiki node fields below serve as fallback.
+            doc_meta = await self.api.get_doc_meta(session, source, doc_token=obj_token, doc_type="docx")
+            author_id = str(doc_meta.get("owner_id") or node.get("creator") or "") or None
+            author_name = await self._resolve_user_name(session, source, author_id)
+            published_at = _iso_from_unix(doc_meta.get("create_time") or node.get("obj_create_time") or node.get("node_create_time"))
+            updated_at = _iso_from_unix(doc_meta.get("latest_modify_time") or node.get("obj_edit_time"))
+            if doc_meta.get("url"):
+                source_url = str(doc_meta["url"])
 
         # Drop the read snapshot held across the fetch phase so the write
         # phase starts a fresh transaction (upgrading a stale WAL snapshot to
@@ -345,7 +376,24 @@ class FeishuWikiSync:
                 source_url=source_url,
                 revision=revision,
             )
-            return False
+            return "unchanged"
+        if not normalized_markdown.strip():
+            # The document converted to an empty body (e.g. a wiki container
+            # page holding only a child-doc list block). Skip ingestion and,
+            # if a previous sync had imported content for it, tombstone that
+            # document so the local copy disappears too.
+            item.status = "empty"
+            item.revision = revision
+            item.content_sha256 = content_hash
+            removed_document = False
+            if existing is not None and existing.document_id:
+                document = await session.get(KnowledgeDocument, existing.document_id)
+                if document is not None and document.status != "deleted":
+                    self._tombstone_document(source=source, document=document)
+                    removed_document = True
+                item.document_id = None
+            await session.flush()
+            return "changed" if removed_document else "empty"
         if run.mode != "reindex" and existing is not None and existing.content_sha256 == content_hash and existing.document_id:
             item.revision = revision
             item.status = "ready"
@@ -364,7 +412,7 @@ class FeishuWikiSync:
                 source_url=source_url,
                 revision=revision,
             )
-            return False
+            return "unchanged"
         title = str(document_meta.get("title") or node.get("title") or "未命名")
         frontmatter = {
             "title": title,
@@ -377,6 +425,12 @@ class FeishuWikiSync:
             "wiki_path": path,
             "synced_at": datetime.now(timezone.utc).isoformat(),
         }
+        if author_name or author_id:
+            frontmatter["author"] = author_name or author_id
+        if published_at:
+            frontmatter["published_at"] = published_at
+        if updated_at:
+            frontmatter["updated_at"] = updated_at
         markdown = f"---\n{yaml.safe_dump(frontmatter, allow_unicode=True, sort_keys=False).strip()}\n---\n\n{normalized_markdown}"
         content = markdown.encode("utf-8")
         document, _ingest = await self.service.ingest_markdown_upload(
@@ -401,6 +455,10 @@ class FeishuWikiSync:
                 "obj_token": obj_token,
                 "revision_id": revision,
                 "wiki_path": path,
+                "author_id": author_id,
+                "author_name": author_name,
+                "published_at": published_at,
+                "updated_at": updated_at,
                 "assets": local_assets,
                 "normalization_warnings": warnings,
             },
@@ -424,7 +482,7 @@ class FeishuWikiSync:
                 path=path,
                 asset=pdf_asset,
             )
-        return True
+        return "changed"
 
     async def _run_local_reindex(
         self,
@@ -456,6 +514,7 @@ class FeishuWikiSync:
             "failed": 0,
             "deleted": 0,
             "unsupported": 0,
+            "empty": 0,
         }
         # End the read transaction before vector indexing; the write below
         # must not upgrade a snapshot held across the (slow) index refresh.
@@ -467,6 +526,8 @@ class FeishuWikiSync:
             vector_result = {"refreshed": False, "error": f"{type(exc).__name__}: {exc}"}
             stats["failed"] = 1
             source.last_error_json = {"stage": "indexing", "message": str(exc)}
+        if vector_result.get("refreshed"):
+            await self._stamp_vector_index(session, source=source, vector_result=vector_result)
         now = datetime.now(timezone.utc)
         run.status = "succeeded_with_errors" if stats["failed"] else "succeeded"
         run.current_step = "completed"
@@ -474,6 +535,8 @@ class FeishuWikiSync:
         run.stats_json = {**stats, "vector_index": vector_result}
         run.finished_at = now
         source.status = "error" if stats["failed"] else "ready"
+        if run.status == "succeeded":
+            source.last_error_json = {}
         source.last_synced_at = now
         source.last_sync_run_id = run.id
         await self._lease_fence(session, run, terminal=True)
@@ -482,6 +545,26 @@ class FeishuWikiSync:
         run.heartbeat_at = None
         await session.commit()
         return run
+
+    @staticmethod
+    async def _stamp_vector_index(
+        session: AsyncSession,
+        *,
+        source: KnowledgeSourceConnection,
+        vector_result: dict[str, Any],
+    ) -> None:
+        """Record a successful index refresh on the source's vector-published documents."""
+        documents = (
+            await session.execute(
+                select(KnowledgeDocument).where(
+                    KnowledgeDocument.source_connection_id == source.id,
+                    KnowledgeDocument.status == "ready",
+                )
+            )
+        ).scalars().all()
+        for document in documents:
+            if "vector" in (document.publish_targets or []):
+                document.doc_metadata = {**(document.doc_metadata or {}), "vector_index": vector_result}
 
     @staticmethod
     async def _mark_attachment_children_seen(
@@ -675,19 +758,35 @@ class FeishuWikiSync:
             if item.document_id:
                 document = await session.get(KnowledgeDocument, item.document_id)
                 if document is not None:
-                    document.status = "deleted"
-                    path = Path(document.storage_path)
-                    if path.is_file():
-                        tombstone = self.service.knowledge_dir / ".tombstones" / source.id / f"{document.id}.md.deleted"
-                        tombstone.parent.mkdir(parents=True, exist_ok=True)
-                        shutil.move(str(path), str(tombstone))
-                        document.doc_metadata = {
-                            **(document.doc_metadata or {}),
-                            "tombstone_path": str(tombstone),
-                        }
+                    self._tombstone_document(source=source, document=document)
             deleted += 1
         await session.flush()
         return deleted
+
+    def _tombstone_document(self, *, source: KnowledgeSourceConnection, document: KnowledgeDocument) -> None:
+        document.status = "deleted"
+        path = Path(document.storage_path)
+        if path.is_file():
+            tombstone = self.service.knowledge_dir / ".tombstones" / source.id / f"{document.id}.md.deleted"
+            tombstone.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(path), str(tombstone))
+            document.doc_metadata = {
+                **(document.doc_metadata or {}),
+                "tombstone_path": str(tombstone),
+            }
+
+    async def _resolve_user_name(
+        self,
+        session: AsyncSession,
+        source: KnowledgeSourceConnection,
+        open_id: str | None,
+    ) -> str | None:
+        if not open_id:
+            return None
+        if open_id not in self._user_display_cache:
+            names = await self.api.get_user_display_names(session, source, open_ids=[open_id])
+            self._user_display_cache[open_id] = names.get(open_id)
+        return self._user_display_cache[open_id]
 
     @staticmethod
     async def _item_for_node(

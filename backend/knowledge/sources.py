@@ -19,6 +19,7 @@ from knowledge.models import (
     KnowledgeSourceConnection,
     KnowledgeSourceItem,
     KnowledgeSyncRun,
+    iso_utc,
     new_id,
 )
 from knowledge.service import DEFAULT_KNOWLEDGE_BASE_ID, KnowledgeServiceError, assert_writes_allowed_tolerant
@@ -330,11 +331,11 @@ def source_to_dict(source: KnowledgeSourceConnection, *, item_count: int | None 
         "config": dict(source.config_json or {}),
         "schedule": dict(source.schedule_json or {}),
         "last_sync_run_id": source.last_sync_run_id,
-        "last_synced_at": source.last_synced_at.isoformat() if source.last_synced_at else None,
+        "last_synced_at": iso_utc(source.last_synced_at),
         "last_error": dict(source.last_error_json or {}),
         "builtin": source.connector_key in _BUILTIN_NAMES,
-        "created_at": source.created_at.isoformat() if source.created_at else None,
-        "updated_at": source.updated_at.isoformat() if source.updated_at else None,
+        "created_at": iso_utc(source.created_at),
+        "updated_at": iso_utc(source.updated_at),
     }
     if item_count is not None:
         payload["item_count"] = item_count
@@ -359,11 +360,35 @@ def source_item_to_dict(item: KnowledgeSourceItem) -> dict[str, Any]:
         "status": status,
         "metadata": dict(item.metadata_json or {}),
         "permissions": dict(item.permissions_json or {}),
-        "remote_created_at": item.remote_created_at.isoformat() if item.remote_created_at else None,
-        "remote_updated_at": item.remote_updated_at.isoformat() if item.remote_updated_at else None,
-        "created_at": item.created_at.isoformat() if item.created_at else None,
-        "updated_at": item.updated_at.isoformat() if item.updated_at else None,
+        "remote_created_at": iso_utc(item.remote_created_at),
+        "remote_updated_at": iso_utc(item.remote_updated_at),
+        "created_at": iso_utc(item.created_at),
+        "updated_at": iso_utc(item.updated_at),
     }
+
+
+async def list_recent_sync_runs(
+    session: AsyncSession,
+    *,
+    knowledge_base_id: str = DEFAULT_KNOWLEDGE_BASE_ID,
+    limit: int = 50,
+) -> list[dict[str, Any]]:
+    """Recent sync runs across all sources of a base, with source display fields."""
+    stmt = (
+        select(KnowledgeSyncRun, KnowledgeSourceConnection.name, KnowledgeSourceConnection.connector_key)
+        .join(KnowledgeSourceConnection, KnowledgeSyncRun.source_connection_id == KnowledgeSourceConnection.id)
+        .where(KnowledgeSourceConnection.knowledge_base_id == knowledge_base_id)
+        .order_by(KnowledgeSyncRun.created_at.desc())
+        .limit(max(1, min(limit, 200)))
+    )
+    result = await session.execute(stmt)
+    payload: list[dict[str, Any]] = []
+    for run, source_name, connector_key in result.all():
+        entry = sync_run_to_dict(run)
+        entry["source_name"] = source_name
+        entry["connector_key"] = connector_key
+        payload.append(entry)
+    return payload
 
 
 def sync_run_to_dict(run: KnowledgeSyncRun) -> dict[str, Any]:
@@ -378,10 +403,10 @@ def sync_run_to_dict(run: KnowledgeSyncRun) -> dict[str, Any]:
         "stats": dict(run.stats_json or {}),
         "error": dict(run.error_json or {}),
         "attempt": run.attempt,
-        "started_at": run.started_at.isoformat() if run.started_at else None,
-        "finished_at": run.finished_at.isoformat() if run.finished_at else None,
-        "created_at": run.created_at.isoformat() if run.created_at else None,
-        "updated_at": run.updated_at.isoformat() if run.updated_at else None,
+        "started_at": iso_utc(run.started_at),
+        "finished_at": iso_utc(run.finished_at),
+        "created_at": iso_utc(run.created_at),
+        "updated_at": iso_utc(run.updated_at),
     }
 
 

@@ -707,8 +707,10 @@ async def publish_document_vector(
     document = await session.get(KnowledgeDocument, document_id)
     if document is None:
         raise HTTPException(status_code=404, detail=f"Knowledge document not found: {document_id}")
-    if document.source_type != "pdf_mineru":
-        raise HTTPException(status_code=400, detail="当前入口只用于重建已导入 PDF 的向量索引。")
+    if document.status != "ready":
+        raise HTTPException(status_code=400, detail="文档尚未就绪，暂时不能重建向量索引。")
+    if not document.storage_path:
+        raise HTTPException(status_code=400, detail="文档没有可用的本地内容，无法重建向量索引。")
 
     try:
         vector_job = await create_document_vector_publish_job(session, base_dir=BASE_DIR, document=document)

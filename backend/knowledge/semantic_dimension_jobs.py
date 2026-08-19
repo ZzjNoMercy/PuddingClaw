@@ -16,7 +16,7 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from knowledge.models import SemanticDimensionBuildEvent, SemanticDimensionBuildJob, TaskNotification, new_id
+from knowledge.models import SemanticDimensionBuildEvent, SemanticDimensionBuildJob, TaskNotification, iso_utc, new_id
 from knowledge.queue_repository import claim_next, current_lease_owner, new_worker_id, require_lease
 from runtime_control import assert_writes_allowed, writes_allowed
 
@@ -32,6 +32,9 @@ def _utcnow() -> datetime:
 def _display_time(value: datetime | None) -> str | None:
     if value is None:
         return None
+    if value.tzinfo is None:
+        # SQLite drops tzinfo on read; catalog datetimes are UTC.
+        value = value.replace(tzinfo=timezone.utc)
     return f"{value.astimezone(DISPLAY_TIMEZONE):%Y-%m-%d %H:%M:%S}（北京时间）"
 
 
@@ -62,13 +65,13 @@ def semantic_dimension_job_to_dict(job: SemanticDimensionBuildJob) -> dict[str, 
         "result_summary": job.result_summary or {},
         "error_message": job.error_message,
         "retry_count": job.retry_count,
-        "created_at": job.created_at.isoformat() if job.created_at else None,
+        "created_at": iso_utc(job.created_at),
         "created_at_display": _display_time(job.created_at),
-        "updated_at": job.updated_at.isoformat() if job.updated_at else None,
+        "updated_at": iso_utc(job.updated_at),
         "updated_at_display": _display_time(job.updated_at),
-        "started_at": job.started_at.isoformat() if job.started_at else None,
+        "started_at": iso_utc(job.started_at),
         "started_at_display": _display_time(job.started_at),
-        "finished_at": job.finished_at.isoformat() if job.finished_at else None,
+        "finished_at": iso_utc(job.finished_at),
         "finished_at_display": _display_time(job.finished_at),
     }
 
@@ -80,7 +83,7 @@ def semantic_dimension_event_to_dict(event: SemanticDimensionBuildEvent) -> dict
         "level": event.level,
         "message": event.message,
         "metadata": event.event_metadata or {},
-        "created_at": event.created_at.isoformat() if event.created_at else None,
+        "created_at": iso_utc(event.created_at),
     }
 
 
@@ -93,8 +96,8 @@ def task_notification_to_dict(notification: TaskNotification) -> dict[str, Any]:
         "title": notification.title,
         "body": notification.body,
         "payload": notification.payload or {},
-        "created_at": notification.created_at.isoformat() if notification.created_at else None,
-        "read_at": notification.read_at.isoformat() if notification.read_at else None,
+        "created_at": iso_utc(notification.created_at),
+        "read_at": iso_utc(notification.read_at),
     }
 
 

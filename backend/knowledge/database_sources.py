@@ -18,7 +18,7 @@ from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 
 from config import get_database_config
-from knowledge.models import KnowledgeBase, KnowledgeDatabaseSource, utcnow
+from knowledge.models import KnowledgeBase, KnowledgeDatabaseSource, iso_utc, utcnow
 from knowledge.service import DEFAULT_KNOWLEDGE_BASE_ID, assert_writes_allowed_tolerant
 
 
@@ -111,8 +111,8 @@ def _project_postgres_source(saved: KnowledgeDatabaseSource | None = None) -> di
         source["name"] = saved.name or source["name"]
         source["description"] = saved.description or source["description"]
         source["selected_tables"] = saved.selected_tables or []
-        source["created_at"] = saved.created_at.isoformat() if saved.created_at else None
-        source["updated_at"] = saved.updated_at.isoformat() if saved.updated_at else None
+        source["created_at"] = iso_utc(saved.created_at)
+        source["updated_at"] = iso_utc(saved.updated_at)
     return _public_source_dict(source)
 
 
@@ -147,8 +147,8 @@ def _public_source_dict(source: KnowledgeDatabaseSource | dict[str, Any]) -> dic
             "password": "",
             "selected_tables": source.selected_tables or [],
             "builtin": bool((source.source_metadata or {}).get("builtin")),
-            "created_at": source.created_at.isoformat() if source.created_at else None,
-            "updated_at": source.updated_at.isoformat() if source.updated_at else None,
+            "created_at": iso_utc(source.created_at),
+            "updated_at": iso_utc(source.updated_at),
         }
         payload["password_configured"] = bool(metadata.get("credential_ref") or source.password)
     else:

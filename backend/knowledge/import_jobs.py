@@ -22,6 +22,7 @@ from knowledge.models import (
     KnowledgeImportEvent,
     KnowledgeImportJob,
     KnowledgeSourceItem,
+    iso_utc,
     new_id,
 )
 from knowledge.paths import get_knowledge_root
@@ -162,10 +163,10 @@ def job_to_dict(job: KnowledgeImportJob) -> dict[str, Any]:
         "error_message": job.error_message,
         "retry_count": job.retry_count,
         "metadata": _job_metadata_for_api(job),
-        "created_at": job.created_at.isoformat() if job.created_at else None,
-        "updated_at": job.updated_at.isoformat() if job.updated_at else None,
-        "started_at": job.started_at.isoformat() if job.started_at else None,
-        "finished_at": job.finished_at.isoformat() if job.finished_at else None,
+        "created_at": iso_utc(job.created_at),
+        "updated_at": iso_utc(job.updated_at),
+        "started_at": iso_utc(job.started_at),
+        "finished_at": iso_utc(job.finished_at),
     }
 
 
@@ -227,10 +228,10 @@ def job_to_list_dict(job: KnowledgeImportJob) -> dict[str, Any]:
         "error_message": job.error_message,
         "retry_count": job.retry_count,
         "metadata": slim_metadata,
-        "created_at": job.created_at.isoformat() if job.created_at else None,
-        "updated_at": job.updated_at.isoformat() if job.updated_at else None,
-        "started_at": job.started_at.isoformat() if job.started_at else None,
-        "finished_at": job.finished_at.isoformat() if job.finished_at else None,
+        "created_at": iso_utc(job.created_at),
+        "updated_at": iso_utc(job.updated_at),
+        "started_at": iso_utc(job.started_at),
+        "finished_at": iso_utc(job.finished_at),
     }
 
 
@@ -241,7 +242,7 @@ def event_to_dict(event: KnowledgeImportEvent) -> dict[str, Any]:
         "level": event.level,
         "message": event.message,
         "metadata": event.event_metadata,
-        "created_at": event.created_at.isoformat() if event.created_at else None,
+        "created_at": iso_utc(event.created_at),
     }
 
 

@@ -28,6 +28,7 @@ import {
   startFeishuUserOAuth,
   startKnowledgeSourceSync,
   testFeishuApp,
+  updateKnowledgeSource,
   type FeishuSpace,
   type FeishuWikiNode,
   type KnowledgeSource,
@@ -133,6 +134,7 @@ export default function FeishuConnectionWizard({ open, existingSource = null, on
   const [busy, setBusy] = useState(false);
   const [loadingToken, setLoadingToken] = useState("");
   const [error, setError] = useState("");
+  const [nameSaved, setNameSaved] = useState(false);
   const [redirectUri, setRedirectUri] = useState("/knowledge/feishu/oauth/callback");
   const oauthCompletedRef = useRef(false);
   const prevSpaceIdRef = useRef("");
@@ -162,6 +164,7 @@ export default function FeishuConnectionWizard({ open, existingSource = null, on
     setPublishVector(existingSource ? existingSource.config.publish_vector !== false : true);
     prevSpaceIdRef.current = existingSpaceId;
     setError("");
+    setNameSaved(false);
   }, [existingSource]);
 
   useEffect(() => {
@@ -228,17 +231,39 @@ export default function FeishuConnectionWizard({ open, existingSource = null, on
     }
   }
 
+  async function saveName() {
+    const name = sourceName.trim();
+    if (!source || !name || name === source.name) return;
+    setBusy(true);
+    setError("");
+    try {
+      const updated = await updateKnowledgeSource(source.id, { name });
+      setSource(updated);
+      setNameSaved(true);
+      await onConnected(updated);
+    } catch (nextError) {
+      setError(messageOf(nextError));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function authorize() {
     if (!appCredentialId) return;
     setBusy(true);
     setError("");
     try {
-      const created = source || await createKnowledgeSource({
+      let created = source || await createKnowledgeSource({
         connector_key: "feishu_wiki",
         name: sourceName.trim() || "飞书知识库",
         auth_type: authType,
         schedule: { interval_minutes: 0 },
       });
+      if (source && sourceName.trim() && sourceName.trim() !== created.name) {
+        // Non-auth metadata is saved independently of re-validation.
+        created = await updateKnowledgeSource(created.id, { name: sourceName.trim() });
+        setNameSaved(true);
+      }
       setSource(created);
       if (authType === "tenant") {
         const bound = await bindFeishuTenantAuth(created.id, appCredentialId);
@@ -370,7 +395,17 @@ export default function FeishuConnectionWizard({ open, existingSource = null, on
             <div className="mx-auto max-w-2xl space-y-6">
               <div>
                 <label className="block text-xs font-semibold text-gray-700">来源名称</label>
-                <input value={sourceName} onChange={(event) => setSourceName(event.target.value)} className="mt-2 h-11 w-full rounded-xl border border-black/10 px-3.5 text-sm outline-none focus:border-[#002fa7]/40 focus:ring-4 focus:ring-[#002fa7]/10" />
+                <div className="mt-2 flex items-center gap-2">
+                  <input value={sourceName} onChange={(event) => { setSourceName(event.target.value); setNameSaved(false); }} className="h-11 min-w-0 flex-1 rounded-xl border border-black/10 px-3.5 text-sm outline-none focus:border-[#002fa7]/40 focus:ring-4 focus:ring-[#002fa7]/10" />
+                  {existingSource && source ? (
+                    nameSaved && sourceName.trim() === source.name ? (
+                      <span className="inline-flex shrink-0 items-center gap-1 text-xs font-semibold text-emerald-600"><Check className="h-3.5 w-3.5" />已保存</span>
+                    ) : sourceName.trim() && sourceName.trim() !== source.name ? (
+                      <button type="button" disabled={busy} onClick={() => void saveName()} className="inline-flex h-11 shrink-0 items-center gap-2 rounded-xl border border-[#002fa7]/25 px-4 text-xs font-semibold text-[#002fa7] hover:bg-[#002fa7]/[0.04] disabled:opacity-40">保存名称</button>
+                    ) : null
+                  ) : null}
+                </div>
+                {existingSource ? <p className="mt-1.5 text-[11px] text-gray-400">名称等非授权信息可直接保存，无需重新验证身份。</p> : null}
               </div>
               <div className="grid gap-3 sm:grid-cols-2">
                 <button type="button" onClick={() => setAuthType("tenant")} className={`rounded-2xl border p-5 text-left transition ${authType === "tenant" ? "border-[#002fa7]/30 bg-[#002fa7]/[0.045] ring-2 ring-[#002fa7]/10" : "border-black/[0.07] hover:border-[#002fa7]/20"}`}>
@@ -403,7 +438,7 @@ export default function FeishuConnectionWizard({ open, existingSource = null, on
                   )) : <div className="px-3 py-8 text-center text-xs text-gray-400">当前身份看不到可同步的 Wiki 空间。</div>}
                 </div>
                 <label className="mt-4 block text-xs font-semibold text-gray-700">自动同步</label>
-                <select value={schedule} onChange={(event) => setSchedule(event.target.value)} className="mt-2 h-10 w-full rounded-xl border border-black/10 bg-white px-3 text-sm">
+                <select value={schedule} onChange={(event) => { setSchedule(event.target.value); event.currentTarget.blur(); }} className="mt-2 h-10 w-full rounded-xl border border-black/10 bg-white px-3 text-sm outline-none focus:border-[#002fa7]/40">
                   <option value="manual">仅手动</option><option value="15">每 15 分钟</option><option value="60">每小时</option><option value="360">每 6 小时</option><option value="1440">每天</option>
                 </select>
               </div>

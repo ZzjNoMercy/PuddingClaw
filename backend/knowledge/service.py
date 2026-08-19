@@ -22,7 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 import runtime_control
 from knowledge.indexer import build_markdown_chunk_manifest, refresh_local_knowledge_index
 from knowledge.mineru_client import MinerUClient, MinerUParseResult
-from knowledge.models import KnowledgeBase, KnowledgeDocument, new_id
+from knowledge.models import KnowledgeBase, KnowledgeDocument, iso_utc, new_id
 from knowledge.paths import get_knowledge_originals_dir, get_knowledge_root
 
 logger = logging.getLogger(__name__)
@@ -593,8 +593,8 @@ def document_to_dict(document: KnowledgeDocument) -> dict[str, Any]:
         "source_revision": document.source_revision,
         "publish_targets": document.publish_targets,
         "metadata": document.doc_metadata,
-        "created_at": document.created_at.isoformat() if document.created_at else None,
-        "updated_at": document.updated_at.isoformat() if document.updated_at else None,
+        "created_at": iso_utc(document.created_at),
+        "updated_at": iso_utc(document.updated_at),
     }
 
 
@@ -1114,6 +1114,8 @@ class KnowledgeService:
         vector_result = {"refreshed": False, "reason": "vector publish not requested"}
         if publish_vector_now and ("vector" in publish_targets or "local_vector" in publish_targets):
             vector_result = refresh_local_knowledge_index(self.base_dir)
+            if vector_result.get("refreshed"):
+                document.doc_metadata = {**(document.doc_metadata or {}), "vector_index": vector_result}
 
         return document, {
             "deduplicated": False,
@@ -1390,6 +1392,8 @@ class KnowledgeService:
         vector_result = {"refreshed": False, "reason": "vector publish not requested"}
         if publish_vector_now and ("vector" in publish_targets or "local_vector" in publish_targets):
             vector_result = refresh_local_knowledge_index(self.base_dir)
+            if vector_result.get("refreshed"):
+                document.doc_metadata = {**(document.doc_metadata or {}), "vector_index": vector_result}
 
         return document, {
             "deduplicated": False,

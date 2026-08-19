@@ -470,3 +470,11 @@ body {
   border-color: #002fa7;
   box-shadow: 0 0 0 3px rgba(0,47,167,0.08);
 }
+
+/* A native <select> keeps focus after its dropdown closes, so the browser's
+   default focus ring stays visible and reads as a stuck selection border.
+   Suppress the default outline globally; components that want a focus
+   affordance declare their own focus: styles. */
+select:focus {
+  outline: none;
+}

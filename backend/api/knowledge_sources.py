@@ -18,6 +18,7 @@ from knowledge.sources import (
     create_source_connection,
     create_sync_run,
     get_source_connection,
+    list_recent_sync_runs,
     list_source_connections,
     list_source_items,
     source_item_to_dict,
@@ -185,6 +186,15 @@ async def get_knowledge_source_items(
         return {"items": [source_item_to_dict(item) for item in items]}
     except KnowledgeServiceError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/sync-runs")
+async def get_knowledge_sync_runs(
+    knowledge_base_id: str = DEFAULT_KNOWLEDGE_BASE_ID,
+    limit: int = 50,
+    session: AsyncSession = Depends(get_db_session),
+):
+    return {"runs": await list_recent_sync_runs(session, knowledge_base_id=knowledge_base_id, limit=limit)}
 
 
 @router.get("/sources/{source_id}/runs")

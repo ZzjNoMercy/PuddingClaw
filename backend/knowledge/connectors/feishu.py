@@ -29,6 +29,7 @@ from knowledge.models import (
     FeishuOAuthSession,
     FeishuUserGrant,
     KnowledgeSourceConnection,
+    iso_utc,
     new_id,
 )
 from knowledge.service import KnowledgeServiceError, assert_writes_allowed_tolerant
@@ -182,10 +183,10 @@ def feishu_app_to_dict(app: FeishuAppCredential) -> dict[str, Any]:
         "tenant_key": app.tenant_key,
         "status": app.status,
         "credential_configured": bool(app.credential_ref),
-        "validated_at": app.validated_at.isoformat() if app.validated_at else None,
-        "rotated_at": app.rotated_at.isoformat() if app.rotated_at else None,
-        "created_at": app.created_at.isoformat() if app.created_at else None,
-        "updated_at": app.updated_at.isoformat() if app.updated_at else None,
+        "validated_at": iso_utc(app.validated_at),
+        "rotated_at": iso_utc(app.rotated_at),
+        "created_at": iso_utc(app.created_at),
+        "updated_at": iso_utc(app.updated_at),
     }
 
 
@@ -581,10 +582,10 @@ def feishu_user_grant_to_dict(grant: FeishuUserGrant) -> dict[str, Any]:
         "tenant_key": grant.tenant_key,
         "granted_scopes": list(grant.granted_scopes or []),
         "status": grant.status,
-        "access_expires_at": grant.access_expires_at.isoformat() if grant.access_expires_at else None,
-        "refresh_expires_at": grant.refresh_expires_at.isoformat() if grant.refresh_expires_at else None,
-        "created_at": grant.created_at.isoformat() if grant.created_at else None,
-        "updated_at": grant.updated_at.isoformat() if grant.updated_at else None,
+        "access_expires_at": iso_utc(grant.access_expires_at),
+        "refresh_expires_at": iso_utc(grant.refresh_expires_at),
+        "created_at": iso_utc(grant.created_at),
+        "updated_at": iso_utc(grant.updated_at),
     }
 
 
@@ -732,6 +733,7 @@ class FeishuOpenApi:
         path: str,
         *,
         params: dict[str, Any] | None = None,
+        json_body: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         app, grant = await self._binding(session, source)
         token = await self._token(session, app, grant, force_refresh=False)
@@ -743,6 +745,7 @@ class FeishuOpenApi:
                     path=path,
                     headers={"Authorization": f"Bearer {token}"},
                     params=params,
+                    json_body=json_body,
                 )
             except FeishuConnectorError as exc:
                 invalid_token = exc.status_code == 401 or exc.code in self._INVALID_TOKEN_CODES
@@ -866,6 +869,71 @@ class FeishuOpenApi:
                     raise FeishuConnectorError("飞书未返回素材下载地址。")
                 downloaded[token] = await self.http_client.download_trusted_url(url, max_bytes=max_bytes_each)
         return downloaded
+
+    async def get_doc_meta(
+        self,
+        session: AsyncSession,
+        source: KnowledgeSourceConnection,
+        *,
+        doc_token: str,
+        doc_type: str = "docx",
+    ) -> dict[str, Any]:
+        """Best-effort drive metadata (url/owner/timestamps). Returns {} when
+        the app lacks the drive metadata scope — callers must fall back to
+        wiki node fields."""
+        try:
+            payload = await self.request(
+                session,
+                source,
+                "POST",
+                "/open-apis/drive/v1/metas/batch_query",
+                json_body={
+                    "request_docs": [{"doc_token": doc_token, "doc_type": doc_type}],
+                    "with_url": True,
+                },
+            )
+        except FeishuConnectorError:
+            return {}
+        data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+        metas = data.get("metas") if isinstance(data.get("metas"), list) else []
+        for meta in metas:
+            if isinstance(meta, dict) and str(meta.get("doc_token") or "") == doc_token:
+                return meta
+        return {}
+
+    async def get_user_display_names(
+        self,
+        session: AsyncSession,
+        source: KnowledgeSourceConnection,
+        *,
+        open_ids: list[str],
+    ) -> dict[str, str]:
+        """Best-effort open_id -> display name. Returns {} when the app lacks
+        the contact scope."""
+        unique = [open_id for open_id in dict.fromkeys(open_ids) if open_id]
+        if not unique:
+            return {}
+        try:
+            payload = await self.request(
+                session,
+                source,
+                "GET",
+                "/open-apis/contact/v3/users/batch",
+                params={"user_ids": unique, "user_id_type": "open_id"},
+            )
+        except FeishuConnectorError:
+            return {}
+        data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+        items = data.get("items") if isinstance(data.get("items"), list) else []
+        names: dict[str, str] = {}
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            open_id = str(item.get("open_id") or "")
+            name = str(item.get("name") or "")
+            if open_id and name:
+                names[open_id] = name
+        return names
 
     async def _paginate(
         self,

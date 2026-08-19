@@ -30,6 +30,7 @@ import {
   retryKnowledgeImportJob,
   type KnowledgeImportJob,
 } from "@/lib/api";
+import { listKnowledgeSyncRuns, type KnowledgeSyncRun } from "@/lib/knowledgeSourcesApi";
 
 function formatBytes(value: number): string {
   if (!Number.isFinite(value) || value <= 0) return "0 B";
@@ -120,11 +121,24 @@ function filterLabel(filter: JobFilter): string {
   return "全部";
 }
 
+function syncModeLabel(mode: string): string {
+  if (mode === "full_scan") return "完整扫描";
+  if (mode === "reindex") return "重建索引";
+  return "增量同步";
+}
+
+function syncRunStatusLabel(status: string): string {
+  if (status === "succeeded") return "已完成";
+  if (status === "succeeded_with_errors") return "部分失败";
+  return jobStatusLabel(status);
+}
+
 export default function KnowledgeImportJobsPage() {
   const router = useRouter();
   const { sidebarOpen, toggleSidebar, sidebarWidth, setSidebarWidth } = useApp();
   const [mounted, setMounted] = useState(false);
   const [jobs, setJobs] = useState<KnowledgeImportJob[]>([]);
+  const [syncRuns, setSyncRuns] = useState<KnowledgeSyncRun[]>([]);
   const [loading, setLoading] = useState(true);
   const [retryingJobId, setRetryingJobId] = useState<string | null>(null);
   const [deletingJobId, setDeletingJobId] = useState<string | null>(null);
@@ -154,8 +168,9 @@ export default function KnowledgeImportJobsPage() {
   const refresh = useCallback(async (options?: { silent?: boolean }) => {
     if (!options?.silent) setLoading(true);
     try {
-      const nextJobs = await listKnowledgeImportJobs(100);
+      const [nextJobs, nextRuns] = await Promise.all([listKnowledgeImportJobs(100), listKnowledgeSyncRuns(50)]);
       setJobs(nextJobs);
+      setSyncRuns(nextRuns);
     } catch (error) {
       setToast({ type: "error", message: errorMessage(error) });
     } finally {
@@ -168,13 +183,15 @@ export default function KnowledgeImportJobsPage() {
   }, [refresh]);
 
   useEffect(() => {
-    if (!jobs.some((job) => job.status === "queued" || job.status === "running")) return;
+    const hasActiveJob = jobs.some((job) => job.status === "queued" || job.status === "running");
+    const hasActiveRun = syncRuns.some((run) => run.status === "queued" || run.status === "running");
+    if (!hasActiveJob && !hasActiveRun) return;
     const timer = window.setInterval(() => {
       if (globalThis.document?.visibilityState !== "visible") return;
       refresh({ silent: true });
     }, 10000);
     return () => window.clearInterval(timer);
-  }, [jobs, refresh]);
+  }, [jobs, syncRuns, refresh]);
 
   const retryJob = useCallback(
     async (jobId: string) => {
@@ -471,6 +488,58 @@ export default function KnowledgeImportJobsPage() {
                   </div>
                 ) : null}
               </section>
+
+              {syncRuns.length > 0 ? (
+                <section className="rounded-[32px] border border-black/[0.06] bg-white p-5 shadow-sm">
+                  <div>
+                    <h2 className="text-base font-semibold text-gray-950">连接器同步</h2>
+                    <p className="mt-1 text-xs text-gray-400">飞书等 Connector 的同步运行记录；逐条目的处理明细在「知识来源」对应面板查看。</p>
+                  </div>
+                  <div className="mt-4 space-y-3">
+                    {syncRuns.map((run) => (
+                      <div
+                        key={run.id}
+                        className="flex flex-col gap-3 rounded-[24px] border border-black/[0.06] bg-black/[0.018] p-4 sm:flex-row sm:items-center sm:justify-between"
+                      >
+                        <div className="flex min-w-0 items-start gap-3">
+                          <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-2xl bg-white shadow-sm ring-1 ring-black/[0.04]">
+                            {run.status === "running" || run.status === "queued" ? (
+                              <Loader2 className="h-5 w-5 animate-spin text-[#002fa7]" />
+                            ) : run.status === "failed" ? (
+                              <AlertCircle className="h-5 w-5 text-red-500" />
+                            ) : run.status === "succeeded_with_errors" ? (
+                              <AlertCircle className="h-5 w-5 text-amber-500" />
+                            ) : run.status === "cancelled" ? (
+                              <Clock3 className="h-5 w-5 text-gray-400" />
+                            ) : (
+                              <CheckCircle2 className="h-5 w-5 text-emerald-600" />
+                            )}
+                          </div>
+                          <div className="min-w-0">
+                            <div className="flex flex-wrap items-center gap-2">
+                              <p className="truncate text-sm font-semibold text-gray-950">{run.source_name || "未知来源"}</p>
+                              <span className="rounded-full bg-[#002fa7]/10 px-2.5 py-1 text-[11px] font-medium text-[#002fa7]">{syncModeLabel(run.mode)}</span>
+                              <span className={`rounded-full px-2.5 py-1 text-[11px] font-medium ring-1 ${jobStatusClass(run.status)}`}>{syncRunStatusLabel(run.status)}</span>
+                            </div>
+                            <p className="mt-1 text-xs text-gray-500">
+                              发现 {run.stats.discovered || 0} · 更新 {run.stats.changed || 0} · 跳过 {run.stats.unchanged || 0} · 删除 {run.stats.deleted || 0} · 失败 {run.stats.failed || 0}
+                            </p>
+                            <p className="mt-1 text-xs text-gray-400">{formatTime(run.started_at || run.created_at)}{run.error?.message ? ` · ${String(run.error.message)}` : ""}</p>
+                          </div>
+                        </div>
+                        {run.status === "running" || run.status === "queued" ? (
+                          <div className="w-40 shrink-0">
+                            <div className="h-2 overflow-hidden rounded-full bg-gray-100">
+                              <div className="h-full rounded-full bg-[#002fa7]" style={{ width: `${Math.max(0, Math.min(100, run.progress || 0))}%` }} />
+                            </div>
+                            <p className="mt-1 text-right text-[11px] text-gray-400">{run.progress || 0}%</p>
+                          </div>
+                        ) : null}
+                      </div>
+                    ))}
+                  </div>
+                </section>
+              ) : null}
             </div>
           </div>
         </main>

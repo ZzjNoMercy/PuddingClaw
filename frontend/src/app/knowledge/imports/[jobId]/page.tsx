@@ -22,6 +22,7 @@ import {
 import Navbar from "@/components/layout/Navbar";
 import Sidebar from "@/components/layout/Sidebar";
 import ResizeHandle from "@/components/layout/ResizeHandle";
+import FeishuSourceCard, { feishuMetaOf } from "@/components/knowledge/FeishuSourceCard";
 import { useApp } from "@/lib/store";
 import {
   getKnowledgeImportJob,
@@ -951,6 +952,7 @@ export default function KnowledgeImportJobDetailPage() {
   const chunkStart = chunks.length > 0 ? (currentChunkPage - 1) * CHUNKS_PER_PAGE + 1 : 0;
   const chunkEnd = Math.min(currentChunkPage * CHUNKS_PER_PAGE, chunks.length);
   const assets = metadataArray(document, "assets");
+  const feishuMeta = feishuMetaOf(document);
   const multimodal = document?.metadata?.multimodal;
   const imageCount = nestedNumber(multimodal, "image_asset_count") ?? assets.length;
   const originalPath = metadataString(document, "original_path") || job?.source_path || "-";
@@ -1171,6 +1173,9 @@ export default function KnowledgeImportJobDetailPage() {
 
               {activeTab === "overview" ? (
                 <section className="grid gap-5 lg:grid-cols-2">
+                  {feishuMeta ? (
+                    <FeishuSourceCard meta={feishuMeta} variant="panel" />
+                  ) : (
                   <div className="rounded-[28px] border border-black/[0.06] bg-white p-5 shadow-sm">
                     <h2 className="text-base font-semibold text-gray-950">文件信息</h2>
                     <div className="mt-5 space-y-4">
@@ -1186,6 +1191,7 @@ export default function KnowledgeImportJobDetailPage() {
                       <InfoRow label="原始文件" value={originalPath} title={originalPath} />
                     </div>
                   </div>
+                  )}
 
                   <div className="rounded-[28px] border border-black/[0.06] bg-white p-5 shadow-sm">
                     <h2 className="text-base font-semibold text-gray-950">解析统计</h2>
@@ -1307,6 +1313,12 @@ export default function KnowledgeImportJobDetailPage() {
                       </button>
                     ))}
                   </div>
+
+                  {resultTab === "markdown" && feishuMeta ? (
+                    <div className="mt-5">
+                      <FeishuSourceCard meta={feishuMeta} variant="card" />
+                    </div>
+                  ) : null}
 
                   <div className="mt-5 overflow-hidden rounded-[24px] border border-black/[0.06] bg-black/[0.018]">
                     {resultTab === "markdown" ? (

@@ -81,6 +81,8 @@ export interface KnowledgeSyncRun {
   created_at: string | null;
   started_at: string | null;
   finished_at: string | null;
+  source_name?: string;
+  connector_key?: string;
 }
 
 export interface FeishuAppCredential {
@@ -158,6 +160,10 @@ export async function listKnowledgeSourceRuns(sourceId: string): Promise<Knowled
   return (await requestJson<{ runs: KnowledgeSyncRun[] }>(
     `/sources/${encodeURIComponent(sourceId)}/runs?limit=20`,
   )).runs;
+}
+
+export async function listKnowledgeSyncRuns(limit = 50): Promise<KnowledgeSyncRun[]> {
+  return (await requestJson<{ runs: KnowledgeSyncRun[] }>(`/sync-runs?limit=${limit}`)).runs;
 }
 
 export async function startKnowledgeSourceSync(
