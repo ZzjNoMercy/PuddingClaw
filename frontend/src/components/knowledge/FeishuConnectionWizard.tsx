@@ -135,9 +135,13 @@ export default function FeishuConnectionWizard({ open, existingSource = null, on
   const [error, setError] = useState("");
   const [redirectUri, setRedirectUri] = useState("/knowledge/feishu/oauth/callback");
   const oauthCompletedRef = useRef(false);
+  const prevSpaceIdRef = useRef("");
 
   const reset = useCallback(() => {
     const existingAppId = typeof existingSource?.config.app_credential_id === "string" ? existingSource.config.app_credential_id : "";
+    const existingSpaceId = typeof existingSource?.config.space_id === "string" ? existingSource.config.space_id : "";
+    const existingRootToken = typeof existingSource?.config.root_node_token === "string" ? existingSource.config.root_node_token : "";
+    const existingInterval = Number(existingSource?.schedule?.interval_minutes || 0);
     setStep(existingAppId ? "authorization" : "credential");
     setAppId("");
     setAppSecret("");
@@ -148,14 +152,15 @@ export default function FeishuConnectionWizard({ open, existingSource = null, on
     setAppCredentialId(existingAppId);
     setSource(existingSource);
     setSpaces([]);
-    setSpaceId("");
+    setSpaceId(existingSpaceId);
     setNodes([]);
     setChildrenByParent({});
     setExpanded(new Set());
-    setRootNodeToken("");
+    setRootNodeToken(existingRootToken);
     setRootNodeTitle("");
-    setSchedule("60");
-    setPublishVector(true);
+    setSchedule(existingInterval > 0 ? String(existingInterval) : existingSource ? "manual" : "60");
+    setPublishVector(existingSource ? existingSource.config.publish_vector !== false : true);
+    prevSpaceIdRef.current = existingSpaceId;
     setError("");
   }, [existingSource]);
 
@@ -265,10 +270,15 @@ export default function FeishuConnectionWizard({ open, existingSource = null, on
       setNodes([]);
       return;
     }
-    setRootNodeToken("");
-    setRootNodeTitle("");
-    setChildrenByParent({});
-    setExpanded(new Set());
+    if (prevSpaceIdRef.current !== spaceId) {
+      // Space changed by the user: the saved root-node selection no longer
+      // applies. Initial mount (incl. edit-mode prefill) keeps it.
+      prevSpaceIdRef.current = spaceId;
+      setRootNodeToken("");
+      setRootNodeTitle("");
+      setChildrenByParent({});
+      setExpanded(new Set());
+    }
     setBusy(true);
     setError("");
     void listFeishuNodes(source.id, spaceId)
@@ -324,7 +334,7 @@ export default function FeishuConnectionWizard({ open, existingSource = null, on
       <div className="flex max-h-[92vh] w-full max-w-4xl flex-col overflow-hidden rounded-[28px] border border-white/70 bg-white shadow-2xl shadow-slate-950/15">
         <div className="flex items-start justify-between border-b border-black/[0.06] px-6 py-5 sm:px-8">
           <div>
-            <h2 className="text-xl font-semibold tracking-tight text-gray-950">连接飞书知识库</h2>
+            <h2 className="text-xl font-semibold tracking-tight text-gray-950">{existingSource ? "编辑飞书连接" : "连接飞书知识库"}</h2>
             <div className="mt-4 flex items-center gap-2">
               {["应用凭据", "授权身份", "同步范围"].map((label, index) => (
                 <div key={label} className="flex items-center gap-2">
@@ -363,11 +373,11 @@ export default function FeishuConnectionWizard({ open, existingSource = null, on
                 <input value={sourceName} onChange={(event) => setSourceName(event.target.value)} className="mt-2 h-11 w-full rounded-xl border border-black/10 px-3.5 text-sm outline-none focus:border-[#002fa7]/40 focus:ring-4 focus:ring-[#002fa7]/10" />
               </div>
               <div className="grid gap-3 sm:grid-cols-2">
-                <button type="button" disabled={!!existingSource} onClick={() => setAuthType("tenant")} className={`rounded-2xl border p-5 text-left transition disabled:cursor-default ${authType === "tenant" ? "border-[#002fa7]/30 bg-[#002fa7]/[0.045] ring-2 ring-[#002fa7]/10" : "border-black/[0.07] hover:border-[#002fa7]/20"}`}>
+                <button type="button" onClick={() => setAuthType("tenant")} className={`rounded-2xl border p-5 text-left transition ${authType === "tenant" ? "border-[#002fa7]/30 bg-[#002fa7]/[0.045] ring-2 ring-[#002fa7]/10" : "border-black/[0.07] hover:border-[#002fa7]/20"}`}>
                   <div className="flex items-center justify-between"><UsersRound className="h-5 w-5 text-[#002fa7]" />{authType === "tenant" ? <Check className="h-4 w-4 text-[#002fa7]" /> : null}</div>
                   <div className="mt-4 text-sm font-semibold">应用身份</div><p className="mt-1 text-xs leading-5 text-gray-500">使用 tenant_access_token。适合组织统一同步，能读取应用已获授权的内容。</p>
                 </button>
-                <button type="button" disabled={!!existingSource} onClick={() => setAuthType("user")} className={`rounded-2xl border p-5 text-left transition disabled:cursor-default ${authType === "user" ? "border-[#002fa7]/30 bg-[#002fa7]/[0.045] ring-2 ring-[#002fa7]/10" : "border-black/[0.07] hover:border-[#002fa7]/20"}`}>
+                <button type="button" onClick={() => setAuthType("user")} className={`rounded-2xl border p-5 text-left transition ${authType === "user" ? "border-[#002fa7]/30 bg-[#002fa7]/[0.045] ring-2 ring-[#002fa7]/10" : "border-black/[0.07] hover:border-[#002fa7]/20"}`}>
                   <div className="flex items-center justify-between"><UserRound className="h-5 w-5 text-[#002fa7]" />{authType === "user" ? <Check className="h-4 w-4 text-[#002fa7]" /> : null}</div>
                   <div className="mt-4 text-sm font-semibold">用户身份</div><p className="mt-1 text-xs leading-5 text-gray-500">通过 OAuth 获取 user_access_token。同步范围遵循该用户在飞书中的可见权限。</p>
                 </button>
@@ -404,7 +414,7 @@ export default function FeishuConnectionWizard({ open, existingSource = null, on
                     <NodeRow key={node.node_token} node={node} depth={0} selectedToken={rootNodeToken} childrenByParent={childrenByParent} expanded={expanded} loadingToken={loadingToken} onToggle={toggleNode} onSelect={(next) => { setRootNodeToken(next.node_token); setRootNodeTitle(next.title); }} />
                   )) : <div className="grid min-h-[220px] place-items-center text-xs text-gray-400">这个空间没有可读取的 Wiki 节点。</div>}
                 </div>
-                <div className="mt-3 flex flex-wrap items-center justify-between gap-3 rounded-xl bg-gray-50 px-4 py-3 text-xs"><span className="text-gray-500">同步范围：<strong className="text-gray-800">{selectedSpace?.name || "未选择"}{rootNodeTitle ? ` / ${rootNodeTitle}` : spaceId ? " / 整个空间" : ""}</strong></span><label className="flex items-center gap-2 font-medium text-gray-700"><input type="checkbox" checked={publishVector} onChange={(event) => setPublishVector(event.target.checked)} className="accent-[#002fa7]" />同步后写入向量索引</label></div>
+                <div className="mt-3 flex flex-wrap items-center justify-between gap-3 rounded-xl bg-gray-50 px-4 py-3 text-xs"><span className="text-gray-500">同步范围：<strong className="text-gray-800">{selectedSpace?.name || (spaceId ? "已保存空间" : "未选择")}{rootNodeToken ? ` / ${rootNodeTitle || "指定根节点"}` : spaceId ? " / 整个空间" : ""}</strong></span><label className="flex items-center gap-2 font-medium text-gray-700"><input type="checkbox" checked={publishVector} onChange={(event) => setPublishVector(event.target.checked)} className="accent-[#002fa7]" />同步后写入向量索引</label></div>
               </div>
             </div>
           ) : null}

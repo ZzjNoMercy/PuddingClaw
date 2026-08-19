@@ -12,7 +12,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from api import feishu_connector as feishu_api
 from knowledge.connectors import feishu
-from knowledge.models import Base, FeishuAppCredential
+from knowledge.models import Base, FeishuAppCredential, KnowledgeSourceConnection
 from knowledge.sources import create_source_connection
 
 
@@ -272,6 +272,104 @@ def test_user_oauth_state_pkce_and_refresh_rotation_are_vault_only(tmp_path) -> 
             )
             assert "user-access" not in serialized
             assert "user-refresh" not in serialized
+        await engine.dispose()
+
+    asyncio.run(run())
+
+
+def test_editing_source_can_switch_auth_identity(tmp_path, monkeypatch) -> None:
+    async def run() -> None:
+        async def handler(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={"code": 0, "tenant_access_token": "t-switch-secret", "expire": 7200},
+            )
+
+        engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'feishu-switch.db'}")
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+        sessions = async_sessionmaker(engine, expire_on_commit=False)
+
+        async def session_override():
+            async with sessions() as session:
+                yield session
+
+        broker = feishu.TenantTokenBroker(feishu.FeishuHttpClient(transport=httpx.MockTransport(handler)))
+        monkeypatch.setattr(feishu_api, "tenant_token_broker", broker)
+        app = FastAPI()
+        app.include_router(feishu_api.router, prefix="/api")
+        app.dependency_overrides[feishu_api.get_db_session] = session_override
+
+        async with sessions() as session:
+            feishu_app = await feishu.save_feishu_app(
+                session,
+                app_id="cli_switch_app_123",
+                app_secret="switch-app-secret",
+            )
+            source = await create_source_connection(
+                session,
+                connector_key="feishu_wiki",
+                name="可切换身份的知识空间",
+                auth_type="user",
+            )
+            grant = feishu.FeishuUserGrant(
+                id="fgrant_switch_test",
+                app_credential_id=feishu_app.id,
+                source_connection_id=source.id,
+                principal_id="local",
+                token_credential_ref="vault://unused",
+            )
+            session.add(grant)
+            source.config_json = {
+                **(source.config_json or {}),
+                "app_credential_id": feishu_app.id,
+                "user_grant_id": grant.id,
+            }
+            source.credential_ref = f"feishu-user-grant:{grant.id}"
+            source.status = "ready"
+            await session.commit()
+            app_credential_id = feishu_app.id
+            source_id = source.id
+            grant_id = grant.id
+
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            # user -> tenant: bind must succeed, detach the grant, mark it stale.
+            bound = await client.post(
+                f"/api/knowledge/feishu/sources/{source_id}/tenant-auth",
+                json={"app_credential_id": app_credential_id},
+            )
+            assert bound.status_code == 200
+            assert bound.json()["source"]["auth_type"] == "tenant"
+
+            async with sessions() as session:
+                switched = await session.get(KnowledgeSourceConnection, source_id)
+                assert switched is not None
+                assert switched.auth_type == "tenant"
+                assert switched.status == "ready"
+                assert switched.credential_ref == f"feishu-app:{app_credential_id}"
+                assert "user_grant_id" not in (switched.config_json or {})
+                stale_grant = await session.get(feishu.FeishuUserGrant, grant_id)
+                assert stale_grant is not None
+                assert stale_grant.status == "needs_reauth"
+
+            # tenant -> user: oauth/start must flip the source to pending_auth.
+            started = await client.post(
+                f"/api/knowledge/feishu/sources/{source_id}/oauth/start",
+                json={
+                    "app_credential_id": app_credential_id,
+                    "redirect_uri": "http://127.0.0.1:3000/knowledge/feishu/oauth/callback",
+                },
+            )
+            assert started.status_code == 200
+            assert "authorization_url" in started.json()
+
+            async with sessions() as session:
+                switched_back = await session.get(KnowledgeSourceConnection, source_id)
+                assert switched_back is not None
+                assert switched_back.auth_type == "user"
+                assert switched_back.status == "pending_auth"
+                assert switched_back.credential_ref == ""
         await engine.dispose()
 
     asyncio.run(run())

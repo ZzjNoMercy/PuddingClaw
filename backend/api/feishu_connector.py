@@ -187,11 +187,26 @@ async def bind_feishu_tenant_auth(
     source = await session.get(KnowledgeSourceConnection, source_id)
     if source is None or source.connector_key != "feishu_wiki":
         raise HTTPException(status_code=404, detail="飞书知识 Source 不存在。")
-    if source.auth_type != "tenant":
-        raise HTTPException(status_code=409, detail="该 Source 配置为用户身份授权。")
     app = await _get_app(session, request.app_credential_id)
     try:
         await tenant_token_broker.get(session, app)
+        if source.auth_type != "tenant":
+            # Editing an existing source: switch user auth back to tenant auth.
+            # Tenant auth never reads user grants, so detach them here; the
+            # grant rows stay around (status needs_reauth) and complete_user_oauth
+            # reactivates the same grant if the user switches back.
+            source.auth_type = "tenant"
+            source.config_json = {
+                key: value for key, value in (source.config_json or {}).items() if key != "user_grant_id"
+            }
+            grants = (
+                await session.execute(
+                    select(FeishuUserGrant).where(FeishuUserGrant.source_connection_id == source.id)
+                )
+            ).scalars()
+            for grant in grants:
+                if grant.status == "active":
+                    grant.status = "needs_reauth"
         source.config_json = {**(source.config_json or {}), "app_credential_id": app.id}
         source.credential_ref = f"feishu-app:{app.id}"
         source.status = "ready"
@@ -226,6 +241,13 @@ async def start_feishu_user_oauth(
         path="/",
     )
     try:
+        if source.auth_type != "user":
+            # Editing an existing source: switch tenant auth to user auth.
+            # Mirror the initial pending_auth state; complete_user_oauth flips
+            # the source back to ready once the grant is active.
+            source.auth_type = "user"
+            source.credential_ref = ""
+            source.status = "pending_auth"
         result = await start_user_oauth(
             session,
             app=app,

@@ -4,6 +4,7 @@ import Link from "next/link";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   AlertCircle,
+  ChevronRight,
   ExternalLink,
   FileText,
   FileUp,
@@ -13,8 +14,9 @@ import {
   RefreshCw,
   RotateCcw,
   Search,
-  ShieldCheck,
+  Settings2,
   Unplug,
+  X,
 } from "lucide-react";
 
 import FeishuConnectionWizard from "@/components/knowledge/FeishuConnectionWizard";
@@ -68,7 +70,7 @@ function statusView(status: string): { label: string; className: string } {
 function SourceMark({ kind }: { kind: KnowledgeSource["connector_key"] }) {
   if (kind === "local_upload") return <span className="grid h-11 w-11 place-items-center rounded-2xl border border-black/[0.08] bg-white text-lg font-bold text-[#002fa7] shadow-sm">本</span>;
   if (kind === "web_capture") return <span className="grid h-11 w-11 place-items-center rounded-2xl border border-black/[0.08] bg-white text-lg font-bold text-[#002fa7] shadow-sm">网</span>;
-  return <span className="grid h-11 w-11 place-items-center rounded-2xl bg-[#3370ff] text-sm font-bold text-white shadow-sm shadow-blue-500/20">飞书</span>;
+  return <img src="/brands/feishu-logo.svg" alt="飞书" className="h-11 w-11 rounded-2xl border border-black/[0.06] bg-white object-cover shadow-sm" />;
 }
 
 function SourceList({ sources, selectedId, onSelect, onAdd }: {
@@ -96,8 +98,32 @@ function SourceList({ sources, selectedId, onSelect, onAdd }: {
           );
         })}
       </div>
-      <button type="button" onClick={onAdd} className="flex w-full items-center justify-center gap-2 border-t border-dashed border-black/[0.08] py-3.5 text-xs font-semibold text-[#002fa7] hover:bg-[#002fa7]/[0.025]"><Plus className="h-3.5 w-3.5" />添加资料来源</button>
     </section>
+  );
+}
+
+function ConnectorPicker({ open, onClose, onPickFeishu }: { open: boolean; onClose: () => void; onPickFeishu: () => void }) {
+  if (!open) return null;
+  return (
+    <div className="fixed inset-0 z-[110] grid place-items-center bg-slate-950/30 p-4 backdrop-blur-[2px]" role="dialog" aria-modal="true" aria-label="添加资料来源">
+      <div className="w-full max-w-lg rounded-[28px] border border-white/70 bg-white shadow-2xl shadow-slate-950/15">
+        <div className="flex items-start justify-between border-b border-black/[0.06] px-6 py-5">
+          <div><h2 className="text-lg font-semibold tracking-tight text-gray-950">添加资料来源</h2><p className="mt-1 text-xs text-gray-400">选择要连接的 Connector 类型</p></div>
+          <button type="button" onClick={onClose} aria-label="关闭" className="grid h-9 w-9 place-items-center rounded-xl bg-gray-50 text-gray-500 hover:bg-gray-100"><X className="h-4 w-4" /></button>
+        </div>
+        <div className="space-y-3 p-6">
+          <button type="button" onClick={onPickFeishu} className="flex w-full items-center gap-4 rounded-2xl border border-black/[0.07] p-4 text-left transition hover:border-[#002fa7]/25 hover:bg-[#002fa7]/[0.03]">
+            <img src="/brands/feishu-logo.svg" alt="飞书" className="h-11 w-11 shrink-0 rounded-2xl border border-black/[0.06] object-cover" />
+            <span className="min-w-0 flex-1">
+              <span className="block text-sm font-semibold text-gray-900">飞书知识库</span>
+              <span className="mt-0.5 block text-xs leading-5 text-gray-500">同步飞书 Wiki 空间文档，支持应用身份与用户身份（OAuth）授权。</span>
+            </span>
+            <ChevronRight className="h-4 w-4 shrink-0 text-gray-300" />
+          </button>
+          <div className="rounded-2xl border border-dashed border-black/[0.08] px-4 py-5 text-center text-xs text-gray-400">更多 Connector（Notion、语雀等）即将上线</div>
+        </div>
+      </div>
+    </div>
   );
 }
 
@@ -228,7 +254,7 @@ function FeishuPanel({ source, items, runs, onChanged, onReconnect }: { source: 
   const scopeLabel = typeof source.config.space_id === "string" ? `${source.config.space_id}${source.config.root_node_token ? " / 指定根节点" : " / 整个空间"}` : "尚未选择同步范围";
   return (
     <div className="space-y-5">
-      <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between"><div><div className="flex items-center gap-2"><span className={`h-2.5 w-2.5 rounded-full ${status.className}`} /><span className="text-xs font-semibold text-gray-600">{status.label}</span><span className="rounded-full bg-blue-50 px-2 py-1 text-[10px] font-semibold text-blue-700">{source.auth_type === "user" ? "用户身份" : "应用身份"}</span></div><p className="mt-2 text-xs leading-5 text-gray-400">{scopeLabel}</p></div><div className="flex flex-wrap gap-2">{["pending_auth", "needs_reauth"].includes(source.status) ? <button type="button" onClick={onReconnect} className="inline-flex h-9 items-center gap-2 rounded-xl border border-black/10 px-3 text-xs font-semibold text-gray-700"><ShieldCheck className="h-3.5 w-3.5" />重新连接</button> : null}{lastRun && ["queued", "running"].includes(lastRun.status) ? <button type="button" disabled={!!busyMode} onClick={() => void cancel()} className="inline-flex h-9 items-center gap-2 rounded-xl border border-red-200 px-3 text-xs font-semibold text-red-600 disabled:opacity-40">取消同步</button> : <><button type="button" disabled={!!busyMode || !["ready", "error"].includes(source.status)} onClick={() => void sync("reindex")} className="inline-flex h-9 items-center gap-2 rounded-xl border border-black/10 px-3 text-xs font-semibold text-gray-700 disabled:opacity-40">重建索引</button><button type="button" disabled={!!busyMode || !["ready", "error"].includes(source.status)} onClick={() => void sync("full_scan")} className="inline-flex h-9 items-center gap-2 rounded-xl border border-black/10 px-3 text-xs font-semibold text-gray-700 disabled:opacity-40"><RotateCcw className={`h-3.5 w-3.5 ${busyMode === "full_scan" ? "animate-spin" : ""}`} />完整扫描</button><button type="button" disabled={!!busyMode || !["ready", "error"].includes(source.status)} onClick={() => void sync("incremental")} className="inline-flex h-9 items-center gap-2 rounded-xl bg-[#002fa7] px-3.5 text-xs font-semibold text-white disabled:opacity-40"><RefreshCw className={`h-3.5 w-3.5 ${busyMode === "incremental" ? "animate-spin" : ""}`} />立即同步</button></>}</div></div>
+      <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between"><div><div className="flex items-center gap-2"><span className={`h-2.5 w-2.5 rounded-full ${status.className}`} /><span className="text-xs font-semibold text-gray-600">{status.label}</span><span className="rounded-full bg-blue-50 px-2 py-1 text-[10px] font-semibold text-blue-700">{source.auth_type === "user" ? "用户身份" : "应用身份"}</span></div><p className="mt-2 text-xs leading-5 text-gray-400">{scopeLabel}</p></div><div className="flex flex-wrap gap-2"><button type="button" onClick={onReconnect} className="inline-flex h-9 items-center gap-2 rounded-xl border border-black/10 px-3 text-xs font-semibold text-gray-700"><Settings2 className="h-3.5 w-3.5" />编辑连接</button>{lastRun && ["queued", "running"].includes(lastRun.status) ? <button type="button" disabled={!!busyMode} onClick={() => void cancel()} className="inline-flex h-9 items-center gap-2 rounded-xl border border-red-200 px-3 text-xs font-semibold text-red-600 disabled:opacity-40">取消同步</button> : <><button type="button" disabled={!!busyMode || !["ready", "error"].includes(source.status)} onClick={() => void sync("reindex")} className="inline-flex h-9 items-center gap-2 rounded-xl border border-black/10 px-3 text-xs font-semibold text-gray-700 disabled:opacity-40">重建索引</button><button type="button" disabled={!!busyMode || !["ready", "error"].includes(source.status)} onClick={() => void sync("full_scan")} className="inline-flex h-9 items-center gap-2 rounded-xl border border-black/10 px-3 text-xs font-semibold text-gray-700 disabled:opacity-40"><RotateCcw className={`h-3.5 w-3.5 ${busyMode === "full_scan" ? "animate-spin" : ""}`} />完整扫描</button><button type="button" disabled={!!busyMode || !["ready", "error"].includes(source.status)} onClick={() => void sync("incremental")} className="inline-flex h-9 items-center gap-2 rounded-xl bg-[#002fa7] px-3.5 text-xs font-semibold text-white disabled:opacity-40"><RefreshCw className={`h-3.5 w-3.5 ${busyMode === "incremental" ? "animate-spin" : ""}`} />立即同步</button></>}</div></div>
       {notice ? <div className={`rounded-xl px-4 py-3 text-xs ${notice.includes("已提交") ? "bg-emerald-50 text-emerald-700" : "bg-red-50 text-red-700"}`}>{notice}</div> : null}
       <div className="grid grid-cols-2 gap-3 lg:grid-cols-4"><Metric label="内容条目" value={source.item_count || items.length} /><Metric label="同步状态" value={lastRun ? statusView(lastRun.status).label : "尚未运行"} hint={lastRun?.current_step} /><Metric label="上次同步" value={relativeTime(source.last_synced_at)} /><Metric label="失败条目" value={lastRun?.stats.failed || 0} /></div>
       {lastRun ? <div className="grid grid-cols-2 gap-px overflow-hidden rounded-2xl border border-black/[0.06] bg-black/[0.06] sm:grid-cols-5">{[["发现", lastRun.stats.discovered || 0], ["更新", lastRun.stats.changed || 0], ["跳过", lastRun.stats.unchanged || 0], ["删除", lastRun.stats.deleted || 0], ["失败", lastRun.stats.failed || 0]].map(([label, value]) => <div key={String(label)} className="bg-white px-4 py-3"><div className="text-[10px] text-gray-400">{label}</div><div className="mt-1 text-base font-semibold text-gray-900">{value}</div></div>)}</div> : null}
@@ -247,6 +273,7 @@ export default function KnowledgeSourcesPage() {
   const [runs, setRuns] = useState<KnowledgeSyncRun[]>([]);
   const [loading, setLoading] = useState(true);
   const [wizardOpen, setWizardOpen] = useState(false);
+  const [pickerOpen, setPickerOpen] = useState(false);
   const [reconnectSource, setReconnectSource] = useState<KnowledgeSource | null>(null);
   const [notice, setNotice] = useState("");
 
@@ -303,13 +330,13 @@ export default function KnowledgeSourcesPage() {
         {mounted && sidebarOpen ? <ResizeHandle onResize={(delta) => setSidebarWidth((value: number) => Math.max(200, value + delta))} direction="left" /> : null}
         <main className="workspace-content-frame min-w-0 flex-1 overflow-y-auto">
           <div className="workspace-page-container flex flex-col gap-5">
-            <KnowledgeWorkspaceHeader section="sources" actions={<button type="button" onClick={() => { setReconnectSource(null); setWizardOpen(true); }} className="inline-flex h-10 items-center gap-2 rounded-xl bg-[#002fa7] px-4 text-xs font-semibold text-white shadow-sm shadow-[#002fa7]/15"><Plus className="h-4 w-4" />连接飞书</button>} />
+            <KnowledgeWorkspaceHeader section="sources" actions={<button type="button" onClick={() => setPickerOpen(true)} className="inline-flex h-10 items-center gap-2 rounded-xl bg-[#002fa7] px-4 text-xs font-semibold text-white shadow-sm shadow-[#002fa7]/15"><Plus className="h-4 w-4" />添加来源</button>} />
             <KnowledgeWorkspaceNav />
             <section className="grid grid-cols-2 gap-3 lg:grid-cols-4"><Metric label="资料来源" value={sources.length} hint={`${readyCount} 个可用`} /><Metric label="知识条目" value={totalItems} hint="跨来源统一计数" /><Metric label="内置来源" value={2} hint="本地上传与网页收藏" /><Metric label="最近同步" value={relativeTime(lastSynced)} /></section>
             {notice ? <div className="rounded-xl bg-red-50 px-4 py-3 text-xs text-red-700">{notice}</div> : null}
             {loading ? <div className="grid min-h-[360px] place-items-center"><Loader2 className="h-6 w-6 animate-spin text-[#002fa7]" /></div> : (
               <section className="grid min-w-0 gap-5 lg:grid-cols-[300px_minmax(0,1fr)]">
-                <SourceList sources={sources} selectedId={selected?.id || ""} onSelect={setSelectedId} onAdd={() => { setReconnectSource(null); setWizardOpen(true); }} />
+                <SourceList sources={sources} selectedId={selected?.id || ""} onSelect={setSelectedId} onAdd={() => setPickerOpen(true)} />
                 <div className="min-w-0 rounded-3xl border border-black/[0.06] bg-white p-5 shadow-sm sm:p-6">
                   {selected ? <div className="mb-6 flex items-center gap-3 border-b border-black/[0.055] pb-5"><SourceMark kind={selected.connector_key} /><div className="min-w-0"><h2 className="truncate text-lg font-semibold tracking-tight text-gray-950">{selected.name}</h2><div className="mt-1 flex items-center gap-2 text-[11px] text-gray-400"><span>{selected.builtin ? "内置来源" : "可同步 Connector"}</span><span>·</span><span>{selected.item_count || 0} 项</span></div></div></div> : null}
                   {!selected ? <div className="grid min-h-[300px] place-items-center text-sm text-gray-400"><div className="text-center"><Unplug className="mx-auto mb-3 h-7 w-7" />还没有资料来源</div></div> : selected.connector_key === "local_upload" ? <LocalUploadPanel source={selected} items={items} onChanged={changed} /> : selected.connector_key === "web_capture" ? <WebCapturePanel source={selected} onChanged={changed} /> : <FeishuPanel source={selected} items={items} runs={runs} onChanged={changed} onReconnect={() => { setReconnectSource(selected); setWizardOpen(true); }} />}
@@ -319,6 +346,7 @@ export default function KnowledgeSourcesPage() {
           </div>
         </main>
       </div>
+      <ConnectorPicker open={pickerOpen} onClose={() => setPickerOpen(false)} onPickFeishu={() => { setPickerOpen(false); setReconnectSource(null); setWizardOpen(true); }} />
       <FeishuConnectionWizard open={wizardOpen} existingSource={reconnectSource} onClose={() => setWizardOpen(false)} onConnected={async (next) => { await refreshSources(); setSelectedId(next.id); }} />
     </div>
   );
