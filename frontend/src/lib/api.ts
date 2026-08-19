@@ -397,6 +397,10 @@ export interface KnowledgeDocument {
   status: string;
   publish_targets: string[];
   metadata?: Record<string, unknown>;
+  source_connection_id?: string | null;
+  source_item_id?: string | null;
+  origin_url?: string | null;
+  source_revision?: string | null;
   created_at?: string | null;
   updated_at?: string | null;
 }

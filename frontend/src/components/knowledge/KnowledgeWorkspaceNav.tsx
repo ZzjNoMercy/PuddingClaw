@@ -2,12 +2,12 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { BookOpenCheck, Files, LayoutDashboard, ListChecks, Search, Sparkles } from "lucide-react";
+import { Files, LayoutDashboard, ListChecks, Search, Sparkles, Unplug } from "lucide-react";
 
 const items = [
   { href: "/knowledge", label: "概览", icon: LayoutDashboard, exact: true },
+  { href: "/knowledge/sources", label: "知识来源", icon: Unplug },
   { href: "/knowledge/library", label: "资料库", icon: Files },
-  { href: "/knowledge/read-later", label: "稍后读", icon: BookOpenCheck },
   { href: "/knowledge/schema", label: "LLM Wiki", icon: Sparkles },
   { href: "/knowledge/imports", label: "任务中心", icon: ListChecks },
   { href: "/knowledge/search", label: "搜索", icon: Search },

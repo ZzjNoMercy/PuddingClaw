@@ -4,7 +4,7 @@
 
     停写(drain) -> 一致性导出 -> 导入临时库 -> 校验 -> 原子切换配置 -> 保留回滚
 
-- 导出：源库一个读事务内按依赖顺序读出 12 张 Core 表，datetime 统一序列化为
+- 导出：源库一个读事务内按依赖顺序读出 Core 表，datetime 统一序列化为
   ISO 字符串（naive 按 UTC 视作 aware），JSON 列统一为原生对象。
 - 导入：目标库先在 ``migrate_to_latest`` 下建 schema，要求每张 Core 表为空
   （防重复导入产生重复行），全程一个事务，失败回滚不留半迁移。
@@ -87,7 +87,13 @@ logger = logging.getLogger(__name__)
 # 导出/导入顺序按表间依赖排列（被引用表在前）。
 EXPORT_TABLES: tuple[str, ...] = (
     "knowledge_bases",
+    "knowledge_source_connections",
     "knowledge_documents",
+    "knowledge_source_items",
+    "knowledge_sync_runs",
+    "feishu_app_credentials",
+    "feishu_user_grants",
+    "feishu_oauth_sessions",
     "read_later_items",
     "knowledge_database_sources",
     "knowledge_table_assets",

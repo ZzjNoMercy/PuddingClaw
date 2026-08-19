@@ -18,7 +18,14 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from knowledge.import_jobs import create_llm_wiki_ingest_job, update_job_progress
-from knowledge.models import KnowledgeDocument, KnowledgeImportEvent, KnowledgeImportJob, ReadLaterItem, new_id
+from knowledge.models import (
+    KnowledgeDocument,
+    KnowledgeImportEvent,
+    KnowledgeImportJob,
+    KnowledgeSourceItem,
+    ReadLaterItem,
+    new_id,
+)
 from knowledge.queue_repository import require_current_lease
 from knowledge.service import (
     DEFAULT_KNOWLEDGE_BASE_ID,
@@ -121,6 +128,8 @@ def read_later_to_dict(item: ReadLaterItem, *, content: str | None = None) -> di
         "tags": item.tags or [],
         "note": item.note,
         "document_id": item.document_id,
+        "source_connection_id": item.source_connection_id,
+        "source_item_id": item.source_item_id,
         "raw_snapshot_path": item.raw_snapshot_path,
         "wiki_job_id": item.wiki_job_id,
         "fetched_at": item.fetched_at.isoformat() if item.fetched_at else None,
@@ -147,6 +156,10 @@ async def create_read_later_item(
     canonical_url = canonicalize_url(url)
     service = KnowledgeService(base_dir)
     await service.ensure_default_knowledge_base(session)
+    from knowledge.sources import ensure_builtin_source_connections, upsert_source_item
+
+    sources = await ensure_builtin_source_connections(session, knowledge_base_id=knowledge_base_id)
+    source = sources["web_capture"]
     existing = (
         await session.execute(
             select(ReadLaterItem).where(
@@ -158,8 +171,19 @@ async def create_read_later_item(
     if existing is not None:
         return existing, None, True
 
+    item_id = new_id("later")
+    source_item = await upsert_source_item(
+        session,
+        source=source,
+        external_id=f"read-later:{item_id}",
+        external_type="web_page",
+        title=title.strip() or canonical_url,
+        source_url=canonical_url,
+        status="queued",
+        metadata={"reading_status": "unread"},
+    )
     item = ReadLaterItem(
-        id=new_id("later"),
+        id=item_id,
         knowledge_base_id=knowledge_base_id,
         original_url=url.strip(),
         canonical_url=canonical_url,
@@ -168,6 +192,8 @@ async def create_read_later_item(
         tags=list(dict.fromkeys(tag.strip() for tag in (tags or []) if tag.strip())),
         parse_status="queued",
         reading_status="unread",
+        source_connection_id=source.id,
+        source_item_id=source_item.id,
     )
     job = KnowledgeImportJob(
         id=new_id("job"),
@@ -182,6 +208,8 @@ async def create_read_later_item(
         publish_targets=["read_later"],
         current_step="queued",
         progress=0,
+        source_connection_id=source.id,
+        source_item_id=source_item.id,
         job_metadata={"kind": READ_LATER_CAPTURE_KIND, "read_later_item_id": item.id},
     )
     session.add_all([item, job, KnowledgeImportEvent(job_id=job.id, level="info", message="链接已收藏，等待后台解析")])
@@ -453,6 +481,15 @@ async def process_read_later_capture_job(
         job.lease_expires_at = None
         job.heartbeat_at = None
         job.job_metadata = {**(job.job_metadata or {}), "parse_status": "link_only"}
+        if item.source_item_id:
+            source_item = await session.get(KnowledgeSourceItem, item.source_item_id)
+            if source_item is not None:
+                source_item.status = "link_only"
+                source_item.metadata_json = {
+                    **(source_item.metadata_json or {}),
+                    "parse_error": str(exc),
+                    "reading_status": item.reading_status,
+                }
         session.add(KnowledgeImportEvent(job_id=job.id, level="warning", message=f"正文未解析，已保留链接：{exc}"))
         await session.commit()
         await session.refresh(job)
@@ -505,9 +542,15 @@ async def process_read_later_capture_job(
                 knowledge_base_id=item.knowledge_base_id,
                 publish_targets=["local_markdown", "read_later"],
                 publish_vector_now=False,
+                source_connection_id=item.source_connection_id,
+                source_item_id=item.source_item_id,
+                origin_url=item.canonical_url,
             )
         document.source_type = "read_later"
         document.source_path = item.original_url
+        document.source_connection_id = item.source_connection_id
+        document.source_item_id = item.source_item_id
+        document.origin_url = str(frontmatter["canonical_url"])
         document.doc_metadata = {
             **(document.doc_metadata or {}),
             "read_later_item_id": item.id,
@@ -524,6 +567,20 @@ async def process_read_later_capture_job(
         item.document_id = document.id
         item.parse_status = "ready"
         item.error_message = ""
+        if item.source_item_id:
+            source_item = await session.get(KnowledgeSourceItem, item.source_item_id)
+            if source_item is not None:
+                source_item.title = item.title
+                source_item.source_url = item.canonical_url
+                source_item.content_sha256 = document.content_sha256
+                source_item.document_id = document.id
+                source_item.status = "ready"
+                source_item.metadata_json = {
+                    **(source_item.metadata_json or {}),
+                    "reading_status": item.reading_status,
+                    "site_name": item.site_name,
+                    "author": item.author,
+                }
 
     item.fetched_at = datetime.now(timezone.utc)
     await require_current_lease(session, KnowledgeImportJob, job.id)
@@ -610,6 +667,7 @@ async def delete_read_later_item(
     await assert_writes_allowed_tolerant(session)
     service = KnowledgeService(base_dir)
     document = await session.get(KnowledgeDocument, item.document_id) if item.document_id else None
+    source_item = await session.get(KnowledgeSourceItem, item.source_item_id) if item.source_item_id else None
     owns_document = bool(
         document
         and document.source_type == "read_later"
@@ -636,12 +694,16 @@ async def delete_read_later_item(
             job.status = "cancelled"
             job.current_step = "cancelled"
             job.finished_at = datetime.now(timezone.utc)
+        if source_item is not None and job.source_item_id == source_item.id:
+            job.source_item_id = None
 
     markdown_path = Path(document.storage_path).resolve() if owns_document and document else None
     assets_dir = (service.knowledge_dir / "assets" / "read-later" / item.id).resolve()
     knowledge_root = service.knowledge_dir.resolve()
 
     await session.delete(item)
+    if source_item is not None:
+        await session.delete(source_item)
     if owns_document and document is not None:
         await session.delete(document)
     await session.commit()

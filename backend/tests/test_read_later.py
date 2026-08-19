@@ -7,7 +7,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from knowledge.import_jobs import claim_next_job
 from knowledge.llm_wiki_compiler_agent import COMPILER_SYSTEM_PROMPT
-from knowledge.models import Base, KnowledgeDocument, KnowledgeImportJob, ReadLaterItem
+from knowledge.models import Base, KnowledgeDocument, KnowledgeImportJob, KnowledgeSourceItem, ReadLaterItem
 from knowledge.queue_repository import LeaseLostError, bind_lease_owner, reset_lease_owner
 from knowledge.read_later import (
     _extract_markdown,
@@ -19,6 +19,7 @@ from knowledge.read_later import (
     retry_read_later_item,
 )
 from knowledge.service import KnowledgeService, KnowledgeServiceError
+from knowledge.sources import ensure_builtin_source_connections, upsert_source_item
 from tools.fetch_url_tool import FetchURLTool, UnsafePublicURL, _FetchedResponse
 
 
@@ -324,6 +325,22 @@ def test_delete_read_later_removes_owned_capture_but_preserves_job_history(tmp_p
             session.add(document)
             await session.flush()
             item.document_id = document.id
+            sources = await ensure_builtin_source_connections(session, knowledge_base_id=knowledge_base.id)
+            web_source = sources["web_capture"]
+            source_item = await upsert_source_item(
+                session,
+                source=web_source,
+                external_id=f"read-later:{item.id}",
+                external_type="web_page",
+                title=item.title,
+                source_url=item.canonical_url,
+                status="ready",
+                document_id=document.id,
+            )
+            item.source_connection_id = web_source.id
+            item.source_item_id = source_item.id
+            document.source_connection_id = web_source.id
+            document.source_item_id = source_item.id
 
             job = KnowledgeImportJob(
                 knowledge_base_id=knowledge_base.id,
@@ -335,6 +352,8 @@ def test_delete_read_later_removes_owned_capture_but_preserves_job_history(tmp_p
                 publish_targets=["read_later"],
                 current_step="fetching",
                 document_id=document.id,
+                source_connection_id=web_source.id,
+                source_item_id=source_item.id,
                 job_metadata={"read_later_item_id": item.id},
             )
             session.add(job)
@@ -343,6 +362,7 @@ def test_delete_read_later_removes_owned_capture_but_preserves_job_history(tmp_p
             result = await delete_read_later_item(session, base_dir=tmp_path, item=item)
             deleted_item = await session.get(ReadLaterItem, item.id)
             deleted_document = await session.get(KnowledgeDocument, document.id)
+            deleted_source_item = await session.get(KnowledgeSourceItem, source_item.id)
             preserved_job = await session.get(KnowledgeImportJob, job.id)
 
         assert result == {
@@ -353,8 +373,10 @@ def test_delete_read_later_removes_owned_capture_but_preserves_job_history(tmp_p
         }
         assert deleted_item is None
         assert deleted_document is None
+        assert deleted_source_item is None
         assert preserved_job is not None
         assert preserved_job.document_id is None
+        assert preserved_job.source_item_id is None
         assert preserved_job.status == "cancelled"
         assert not markdown_path.exists()
         assert not assets_dir.exists()

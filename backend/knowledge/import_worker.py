@@ -39,6 +39,7 @@ class KnowledgeImportWorkerManager:
         self._stop_event: asyncio.Event | None = None
         self._base_dir: Path | None = None
         self._worker_id: str | None = None
+        self._prefer_feishu = False
 
     def start(self, base_dir: Path) -> None:
         if os.getenv("PUDDINGCLAW_DISABLE_KNOWLEDGE_WORKER", "").strip().lower() in {"1", "true", "yes", "on"}:
@@ -82,10 +83,17 @@ class KnowledgeImportWorkerManager:
                 await asyncio.sleep(idle_sleep)
 
     async def _run_once(self, sessionmaker: async_sessionmaker[AsyncSession], base_dir: Path) -> bool:
+        # Alternate queue preference so a continuous upload stream cannot
+        # indefinitely starve scheduled connector runs.
+        if self._prefer_feishu:
+            self._prefer_feishu = False
+            if await self._run_feishu_sync_once(sessionmaker, base_dir):
+                return True
         async with sessionmaker() as session:
             job = await claim_next_job(session, worker_id=self._worker_id)
             if job is None:
-                return False
+                return await self._run_feishu_sync_once(sessionmaker, base_dir)
+            self._prefer_feishu = True
             job_id = job.id
             kind = job_kind(job)
             worker_id = job.lease_owner or self._worker_id or ""
@@ -153,6 +161,70 @@ class KnowledgeImportWorkerManager:
                         "[knowledge-worker] 租约已丢失，终态写入被租约守卫拦截，任务将由回收方重新执行 job_id=%s",
                         job_id,
                     )
+            return True
+        finally:
+            reset_lease_owner(token)
+            stop_hb.set()
+            hb_task.cancel()
+            try:
+                await hb_task
+            except asyncio.CancelledError:
+                pass
+
+    async def _run_feishu_sync_once(
+        self,
+        sessionmaker: async_sessionmaker[AsyncSession],
+        base_dir: Path,
+    ) -> bool:
+        from knowledge.connectors.feishu_sync import (
+            claim_next_feishu_sync_run,
+            mark_feishu_sync_failed,
+            process_feishu_sync_run,
+        )
+        from knowledge.models import KnowledgeSyncRun
+
+        async with sessionmaker() as session:
+            from knowledge.sources import enqueue_due_feishu_sync_runs
+
+            await enqueue_due_feishu_sync_runs(session)
+            await session.commit()
+            run = await claim_next_feishu_sync_run(session, worker_id=self._worker_id)
+            if run is None:
+                return False
+            run_id = run.id
+            worker_id = run.lease_owner or self._worker_id or ""
+            logger.info("[knowledge-worker] claimed Feishu sync run_id=%s source=%s", run.id, run.source_connection_id)
+
+        stop_hb = asyncio.Event()
+        lost = asyncio.Event()
+        hb_task = asyncio.create_task(
+            heartbeat_loop(
+                sessionmaker,
+                KnowledgeSyncRun,
+                run_id,
+                worker_id,
+                stop_event=stop_hb,
+                lost_event=lost,
+            ),
+            name=f"feishu-sync-heartbeat-{run_id}",
+        )
+        token = bind_lease_owner(worker_id)
+        try:
+            async with sessionmaker() as session:
+                run = await session.get(KnowledgeSyncRun, run_id)
+                if run is None:
+                    return True
+                try:
+                    await process_feishu_sync_run(session, base_dir=base_dir, run=run)
+                    logger.info("[knowledge-worker] completed Feishu sync run_id=%s", run_id)
+                except LeaseLostError:
+                    logger.warning("[knowledge-worker] Feishu sync lease lost run_id=%s", run_id)
+                except Exception as exc:
+                    logger.exception("[knowledge-worker] failed Feishu sync run_id=%s", run_id)
+                    try:
+                        await mark_feishu_sync_failed(session, run=run, error=exc)
+                    except LeaseLostError:
+                        logger.warning("[knowledge-worker] Feishu sync failure write fenced run_id=%s", run_id)
             return True
         finally:
             reset_lease_owner(token)

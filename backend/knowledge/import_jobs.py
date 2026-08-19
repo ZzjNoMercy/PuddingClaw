@@ -21,6 +21,7 @@ from knowledge.models import (
     KnowledgeDocument,
     KnowledgeImportEvent,
     KnowledgeImportJob,
+    KnowledgeSourceItem,
     new_id,
 )
 from knowledge.paths import get_knowledge_root
@@ -155,6 +156,9 @@ def job_to_dict(job: KnowledgeImportJob) -> dict[str, Any]:
         "current_step": job.current_step,
         "progress": job.progress,
         "document_id": job.document_id,
+        "source_connection_id": job.source_connection_id,
+        "source_item_id": job.source_item_id,
+        "sync_run_id": job.sync_run_id,
         "error_message": job.error_message,
         "retry_count": job.retry_count,
         "metadata": _job_metadata_for_api(job),
@@ -217,6 +221,9 @@ def job_to_list_dict(job: KnowledgeImportJob) -> dict[str, Any]:
         "current_step": job.current_step,
         "progress": job.progress,
         "document_id": job.document_id,
+        "source_connection_id": job.source_connection_id,
+        "source_item_id": job.source_item_id,
+        "sync_run_id": job.sync_run_id,
         "error_message": job.error_message,
         "retry_count": job.retry_count,
         "metadata": slim_metadata,
@@ -280,8 +287,23 @@ async def create_import_job(
     service = KnowledgeService(base_dir)
     await service.ensure_default_knowledge_base(session)
     validate_supported_file(filename)
+    from knowledge.sources import ensure_builtin_source_connections, upsert_source_item
+
+    sources = await ensure_builtin_source_connections(session, knowledge_base_id=knowledge_base_id)
+    source = sources["local_upload"]
+    job_id = source_path.parents[1].name if source_path.parent.name == "source" else new_id("job")
+    source_item = await upsert_source_item(
+        session,
+        source=source,
+        external_id=f"import-job:{job_id}",
+        external_type="file",
+        title=(title or "").strip() or filename,
+        status="queued",
+        content_sha256=source_sha256 or None,
+        metadata={"original_filename": filename},
+    )
     job = KnowledgeImportJob(
-        id=source_path.parents[1].name if source_path.parent.name == "source" else new_id("job"),
+        id=job_id,
         knowledge_base_id=knowledge_base_id,
         status="queued",
         file_name=filename,
@@ -293,6 +315,8 @@ async def create_import_job(
         publish_targets=publish_targets or ["local_markdown"],
         current_step="queued",
         progress=0,
+        source_connection_id=source.id,
+        source_item_id=source_item.id,
         job_metadata={"deepagents_backend": "/knowledge/"},
     )
     session.add(job)
@@ -1021,6 +1045,8 @@ async def process_import_job(session: AsyncSession, *, base_dir: Path, job: Know
             title=job.title,
             knowledge_base_id=job.knowledge_base_id,
             publish_targets=job.publish_targets,
+            source_connection_id=job.source_connection_id,
+            source_item_id=job.source_item_id,
         )
     elif suffix in MARKDOWN_SUFFIXES:
         document, ingest = await service.ingest_markdown_upload(
@@ -1030,6 +1056,8 @@ async def process_import_job(session: AsyncSession, *, base_dir: Path, job: Know
             title=job.title,
             knowledge_base_id=job.knowledge_base_id,
             publish_targets=job.publish_targets,
+            source_connection_id=job.source_connection_id,
+            source_item_id=job.source_item_id,
         )
         if "llm_wiki_raw" in (job.publish_targets or []):
             from knowledge.llm_wiki import LlmWikiError, get_llm_wiki_service
@@ -1076,6 +1104,8 @@ async def process_import_job(session: AsyncSession, *, base_dir: Path, job: Know
             title=job.title,
             knowledge_base_id=job.knowledge_base_id,
             publish_targets=job.publish_targets,
+            source_connection_id=job.source_connection_id,
+            source_item_id=job.source_item_id,
         )
     else:
         raise KnowledgeServiceError(f"Unsupported knowledge file type: {suffix or 'unknown'}")
@@ -1107,6 +1137,15 @@ async def process_import_job(session: AsyncSession, *, base_dir: Path, job: Know
     job.current_step = "done"
     job.progress = 100
     job.document_id = document.id
+    if job.source_connection_id and job.source_item_id:
+        source_item = await session.get(KnowledgeSourceItem, job.source_item_id)
+        if source_item is not None and source_item.source_connection_id == job.source_connection_id:
+            source_item.document_id = document.id
+            source_item.content_sha256 = document.content_sha256
+            source_item.title = document.title
+            source_item.status = "ready"
+            document.source_connection_id = job.source_connection_id
+            document.source_item_id = source_item.id
     job.error_message = None
     job.finished_at = datetime.now(timezone.utc)
     job.lease_owner = None

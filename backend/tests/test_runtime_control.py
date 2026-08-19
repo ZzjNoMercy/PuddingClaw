@@ -1,6 +1,6 @@
 """Tests for the database-level drain/maintenance runtime control protocol.
 
-Runs against a real SQLite file database migrated to schema v3, the same way
+Runs against a real SQLite file database migrated to the latest schema, the same way
 ``db.init_database()`` brings up the Core catalog.
 """
 
@@ -317,8 +317,8 @@ def test_pre_v3_database_is_treated_as_normal(tmp_path) -> None:
     asyncio.run(run())
 
 
-def test_migration_v3_on_legacy_database_with_data(tmp_path) -> None:
-    """A legacy (pre-version-table) catalog with data upgrades to v3 intact."""
+def test_migration_latest_on_legacy_database_with_data(tmp_path) -> None:
+    """A legacy (pre-version-table) catalog with data upgrades to the latest schema intact."""
 
     async def run() -> None:
         engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'catalog.db'}")
@@ -339,13 +339,13 @@ def test_migration_v3_on_legacy_database_with_data(tmp_path) -> None:
 
         async with engine.begin() as connection:
             applied = await connection.run_sync(schema_migrations.migrate_to_latest)
-        assert applied == [1, 2, 3]
+        assert applied == [1, 2, 3, 4]
 
         async with engine.connect() as connection:
             tables = await connection.run_sync(lambda conn: set(inspect(conn).get_table_names()))
             assert "core_runtime_control" in tables
             version = await connection.run_sync(schema_migrations.current_schema_version)
-            assert version == 3
+            assert version == 4
             name = await connection.scalar(text("SELECT name FROM knowledge_bases WHERE id = 'kb-1'"))
             assert name == "legacy"
 

@@ -411,11 +411,15 @@ from extensions import extension_enabled
 
 if extension_enabled("knowledge"):
     from api.brain_schema import router as brain_schema_router
+    from api.feishu_connector import router as feishu_connector_router
     from api.knowledge import router as knowledge_router
+    from api.knowledge_sources import router as knowledge_sources_router
     from api.llm_wiki import router as llm_wiki_router
     from api.read_later import router as read_later_router
 
     app.include_router(knowledge_router, prefix="/api")
+    app.include_router(knowledge_sources_router, prefix="/api")
+    app.include_router(feishu_connector_router, prefix="/api")
     app.include_router(brain_schema_router, prefix="/api")
     app.include_router(llm_wiki_router, prefix="/api")
     app.include_router(read_later_router, prefix="/api")

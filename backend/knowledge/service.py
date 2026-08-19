@@ -401,6 +401,35 @@ def _document_has_storage(document: KnowledgeDocument) -> bool:
     return bool(document.storage_path) and Path(document.storage_path).exists()
 
 
+def _document_owned_artifacts(document: KnowledgeDocument | None) -> set[str]:
+    if document is None:
+        return set()
+    paths = {str(document.storage_path or "")}
+    metadata = document.doc_metadata if isinstance(document.doc_metadata, dict) else {}
+    if document.source_type == "pdf_mineru":
+        paths.add(str(document.source_path or ""))
+        paths.add(str(metadata.get("original_path") or ""))
+        multimodal = metadata.get("multimodal") if isinstance(metadata.get("multimodal"), dict) else {}
+        paths.add(str(multimodal.get("image_assets_dir") or ""))
+    return {path for path in paths if path}
+
+
+def _cleanup_replaced_artifacts(knowledge_dir: Path, old_paths: set[str], keep_paths: set[Path]) -> None:
+    root = knowledge_dir.resolve()
+    keep = {path.resolve() for path in keep_paths}
+    for raw_path in old_paths:
+        path = Path(raw_path).expanduser().resolve()
+        if path in keep or not path.is_relative_to(root):
+            continue
+        try:
+            if path.is_dir():
+                shutil.rmtree(path)
+            elif path.exists():
+                path.unlink()
+        except OSError as exc:
+            logger.warning("[knowledge] failed to clean replaced artifact path=%s error=%s", path, exc)
+
+
 def _document_has_llamaindex_chunks(document: KnowledgeDocument) -> bool:
     metadata = document.doc_metadata if isinstance(document.doc_metadata, dict) else {}
     chunks = metadata.get("llamaindex_chunks")
@@ -453,6 +482,20 @@ def _build_or_update_document(existing: KnowledgeDocument | None = None, **field
     for key, value in fields.items():
         setattr(existing, key, value)
     return existing
+
+
+def _document_identity_stmt(
+    *,
+    knowledge_base_id: str,
+    content_sha256: str,
+    source_item_id: str | None,
+):
+    stmt = select(KnowledgeDocument).where(KnowledgeDocument.knowledge_base_id == knowledge_base_id)
+    if source_item_id:
+        return stmt.where(KnowledgeDocument.source_item_id == source_item_id)
+    # Compatibility callers without a Source identity keep the old idempotent
+    # upload behavior. Connector callers are never deduplicated across items.
+    return stmt.where(KnowledgeDocument.content_sha256 == content_sha256)
 
 
 def _safe_read_text(path: Path) -> str:
@@ -544,6 +587,10 @@ def document_to_dict(document: KnowledgeDocument) -> dict[str, Any]:
         "content_sha256": document.content_sha256,
         "size_bytes": document.size_bytes,
         "status": document.status,
+        "source_connection_id": document.source_connection_id,
+        "source_item_id": document.source_item_id,
+        "origin_url": document.origin_url,
+        "source_revision": document.source_revision,
         "publish_targets": document.publish_targets,
         "metadata": document.doc_metadata,
         "created_at": document.created_at.isoformat() if document.created_at else None,
@@ -930,6 +977,7 @@ class KnowledgeService:
             return existing
         if existing is not None:
             rebuild_document = existing
+        old_artifacts = _document_owned_artifacts(rebuild_document)
 
         date_part = datetime.now().strftime("%Y%m%d")
         target_dir = self.imported_dir / date_part
@@ -969,6 +1017,7 @@ class KnowledgeService:
             if existing is not None:
                 return existing
             raise
+        _cleanup_replaced_artifacts(self.knowledge_dir, old_artifacts, {target})
         return document
 
     async def ingest_markdown_upload(
@@ -981,6 +1030,10 @@ class KnowledgeService:
         knowledge_base_id: str = DEFAULT_KNOWLEDGE_BASE_ID,
         publish_targets: list[str] | None = None,
         publish_vector_now: bool = True,
+        source_connection_id: str | None = None,
+        source_item_id: str | None = None,
+        origin_url: str | None = None,
+        source_revision: str | None = None,
     ) -> tuple[KnowledgeDocument, dict[str, Any]]:
         await assert_writes_allowed_tolerant(session)
         safe_name = _slugify(filename or "document.md")
@@ -997,16 +1050,22 @@ class KnowledgeService:
                 raise KnowledgeServiceError(f"Knowledge base not found: {knowledge_base_id}")
 
         content_sha256 = hashlib.sha256(content).hexdigest()
-        existing_stmt = select(KnowledgeDocument).where(
-            KnowledgeDocument.knowledge_base_id == knowledge_base_id,
-            KnowledgeDocument.content_sha256 == content_sha256,
+        existing_stmt = _document_identity_stmt(
+            knowledge_base_id=knowledge_base_id,
+            content_sha256=content_sha256,
+            source_item_id=source_item_id,
         )
         existing = (await session.execute(existing_stmt)).scalar_one_or_none()
         rebuild_document = None
-        if existing is not None and _document_ready_for_dedup(existing):
+        if (
+            existing is not None
+            and existing.content_sha256 == content_sha256
+            and _document_ready_for_dedup(existing)
+        ):
             return existing, {"deduplicated": True, "vector_index": {"refreshed": False, "reason": "document already exists"}}
         if existing is not None:
             rebuild_document = existing
+        old_artifacts = _document_owned_artifacts(rebuild_document)
 
         date_part = datetime.now().strftime("%Y%m%d")
         target_dir = self.imported_dir / date_part
@@ -1029,6 +1088,10 @@ class KnowledgeService:
             size_bytes=target.stat().st_size,
             status="ready",
             publish_targets=publish_targets,
+            source_connection_id=source_connection_id,
+            source_item_id=source_item_id,
+            origin_url=origin_url,
+            source_revision=source_revision,
             doc_metadata={
                 "mode": "markdown_upload",
                 "original_filename": filename,
@@ -1046,6 +1109,7 @@ class KnowledgeService:
             if existing is not None:
                 return existing, {"deduplicated": True, "vector_index": {"refreshed": False, "reason": "document already exists"}}
             raise
+        _cleanup_replaced_artifacts(self.knowledge_dir, old_artifacts, {target})
 
         vector_result = {"refreshed": False, "reason": "vector publish not requested"}
         if publish_vector_now and ("vector" in publish_targets or "local_vector" in publish_targets):
@@ -1103,6 +1167,10 @@ class KnowledgeService:
         title: str | None = None,
         knowledge_base_id: str = DEFAULT_KNOWLEDGE_BASE_ID,
         publish_targets: list[str] | None = None,
+        source_connection_id: str | None = None,
+        source_item_id: str | None = None,
+        origin_url: str | None = None,
+        source_revision: str | None = None,
     ) -> tuple[KnowledgeDocument, dict[str, Any]]:
         await assert_writes_allowed_tolerant(session)
         safe_name = _slugify(filename or "document")
@@ -1122,16 +1190,18 @@ class KnowledgeService:
                 raise KnowledgeServiceError(f"Knowledge base not found: {knowledge_base_id}")
 
         content_sha256 = hashlib.sha256(content).hexdigest()
-        existing_stmt = select(KnowledgeDocument).where(
-            KnowledgeDocument.knowledge_base_id == knowledge_base_id,
-            KnowledgeDocument.content_sha256 == content_sha256,
+        existing_stmt = _document_identity_stmt(
+            knowledge_base_id=knowledge_base_id,
+            content_sha256=content_sha256,
+            source_item_id=source_item_id,
         )
         existing = (await session.execute(existing_stmt)).scalar_one_or_none()
         rebuild_document = None
-        if existing is not None and _document_has_storage(existing):
+        if existing is not None and existing.content_sha256 == content_sha256 and _document_has_storage(existing):
             return existing, {"deduplicated": True, "vector_index": {"refreshed": False, "reason": "document already exists"}}
         if existing is not None:
             rebuild_document = existing
+        old_artifacts = _document_owned_artifacts(rebuild_document)
 
         date_part = datetime.now().strftime("%Y%m%d")
         target_dir = self.imported_dir / date_part
@@ -1154,6 +1224,10 @@ class KnowledgeService:
             size_bytes=target.stat().st_size,
             status="ready",
             publish_targets=publish_targets,
+            source_connection_id=source_connection_id,
+            source_item_id=source_item_id,
+            origin_url=origin_url,
+            source_revision=source_revision,
             doc_metadata={
                 "mode": "generic_upload",
                 "original_filename": filename,
@@ -1170,6 +1244,7 @@ class KnowledgeService:
             if existing is not None:
                 return existing, {"deduplicated": True, "vector_index": {"refreshed": False, "reason": "document already exists"}}
             raise
+        _cleanup_replaced_artifacts(self.knowledge_dir, old_artifacts, {target})
 
         return document, {
             "deduplicated": False,
@@ -1188,6 +1263,10 @@ class KnowledgeService:
         publish_targets: list[str] | None = None,
         mineru_client: MinerUClient | None = None,
         publish_vector_now: bool = True,
+        source_connection_id: str | None = None,
+        source_item_id: str | None = None,
+        origin_url: str | None = None,
+        source_revision: str | None = None,
     ) -> tuple[KnowledgeDocument, dict[str, Any]]:
         await assert_writes_allowed_tolerant(session)
         safe_name = _slugify(filename or "document.pdf")
@@ -1204,16 +1283,22 @@ class KnowledgeService:
                 raise KnowledgeServiceError(f"Knowledge base not found: {knowledge_base_id}")
 
         original_sha256 = hashlib.sha256(content).hexdigest()
-        existing_stmt = select(KnowledgeDocument).where(
-            KnowledgeDocument.knowledge_base_id == knowledge_base_id,
-            KnowledgeDocument.content_sha256 == original_sha256,
+        existing_stmt = _document_identity_stmt(
+            knowledge_base_id=knowledge_base_id,
+            content_sha256=original_sha256,
+            source_item_id=source_item_id,
         )
         existing = (await session.execute(existing_stmt)).scalar_one_or_none()
         rebuild_document = None
-        if existing is not None and _document_ready_for_dedup(existing):
+        if (
+            existing is not None
+            and existing.content_sha256 == original_sha256
+            and _document_ready_for_dedup(existing)
+        ):
             return existing, {"deduplicated": True, "vector_index": {"refreshed": False, "reason": "document already exists"}}
         if existing is not None:
             rebuild_document = existing
+        old_artifacts = _document_owned_artifacts(rebuild_document)
 
         date_part = datetime.now().strftime("%Y%m%d")
         import_id = new_id("pdf")
@@ -1266,6 +1351,10 @@ class KnowledgeService:
             size_bytes=md_path.stat().st_size,
             status="ready",
             publish_targets=publish_targets,
+            source_connection_id=source_connection_id,
+            source_item_id=source_item_id,
+            origin_url=origin_url,
+            source_revision=source_revision,
             doc_metadata={
                 "mode": "multimodal_pdf",
                 "parser": "mineru",
@@ -1296,6 +1385,7 @@ class KnowledgeService:
             if existing is not None:
                 return existing, {"deduplicated": True, "vector_index": {"refreshed": False, "reason": "document already exists"}}
             raise
+        _cleanup_replaced_artifacts(self.knowledge_dir, old_artifacts, {md_path, original_path, assets_dir})
 
         vector_result = {"refreshed": False, "reason": "vector publish not requested"}
         if publish_vector_now and ("vector" in publish_targets or "local_vector" in publish_targets):
