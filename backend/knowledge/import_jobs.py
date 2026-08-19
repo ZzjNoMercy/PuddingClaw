@@ -797,6 +797,10 @@ async def claim_next_job(
         extra_sets={"current_step": "starting", "progress": 5, "finished_at": None, "error_message": None},
     )
     if job is None:
+        # The claim UPDATE takes the SQLite write lock even when no row
+        # matches; end the transaction so the lock is not held by an idle
+        # session (e.g. while the caller runs nested queue work).
+        await session.rollback()
         return None
     kind = job_kind(job)
     if kind == VECTOR_PUBLISH_KIND:

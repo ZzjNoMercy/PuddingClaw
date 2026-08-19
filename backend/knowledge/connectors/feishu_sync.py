@@ -745,6 +745,9 @@ async def claim_next_feishu_sync_run(
         extra_sets={"current_step": "starting", "progress": 1, "finished_at": None},
     )
     if run is None:
+        # The claim UPDATE takes the SQLite write lock even when no row
+        # matches; end the transaction so an idle session never holds it.
+        await session.rollback()
         return None
     await session.commit()
     await session.refresh(run)

@@ -91,13 +91,18 @@ class KnowledgeImportWorkerManager:
                 return True
         async with sessionmaker() as session:
             job = await claim_next_job(session, worker_id=self._worker_id)
-            if job is None:
-                return await self._run_feishu_sync_once(sessionmaker, base_dir)
-            self._prefer_feishu = True
-            job_id = job.id
-            kind = job_kind(job)
-            worker_id = job.lease_owner or self._worker_id or ""
-            logger.info("[knowledge-worker] claimed job_id=%s kind=%s file=%s", job.id, kind, job.file_name)
+            if job is not None:
+                self._prefer_feishu = True
+                job_id = job.id
+                kind = job_kind(job)
+                worker_id = job.lease_owner or self._worker_id or ""
+                logger.info("[knowledge-worker] claimed job_id=%s kind=%s file=%s", job.id, kind, job.file_name)
+        if job is None:
+            # Run the connector queue only after the claim session is closed;
+            # nesting it inside the ``async with`` above would keep the import
+            # claim transaction (and its SQLite write lock) open for the whole
+            # sync run.
+            return await self._run_feishu_sync_once(sessionmaker, base_dir)
 
         if kind == VANNA_ENTITY_IMPORT_KIND:
             await self._run_vanna_entity_job_subprocess(sessionmaker, base_dir, job_id, worker_id=worker_id)

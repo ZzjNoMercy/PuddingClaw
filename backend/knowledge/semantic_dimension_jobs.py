@@ -205,6 +205,9 @@ async def claim_next_semantic_dimension_build_job(
         extra_sets={"current_step": "load_source_profiles", "progress": 5, "finished_at": None, "error_message": None},
     )
     if job is None:
+        # The claim UPDATE takes the SQLite write lock even when no row
+        # matches; end the transaction so an idle session never holds it.
+        await session.rollback()
         return None
     session.add(SemanticDimensionBuildEvent(job_id=job.id, level="info", message="开始构建语义维度"))
     await session.commit()
