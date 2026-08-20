@@ -9,6 +9,7 @@ from typing import Any
 from web_search.adapters.base import (
     WebSearchAdapter,
     normalized_response_sources,
+    openai_compatible_http_client,
     response_payload,
     response_text,
     response_usage,
@@ -98,6 +99,9 @@ class GrokSearchAdapter(WebSearchAdapter):
             # the previous limit produced false connection failures in normal use.
             timeout=60.0,
             max_retries=0,
+            # Direct connections to api.x.ai are blocked on some networks; route
+            # through the shared explicit/macOS-system proxy when one exists.
+            http_client=openai_compatible_http_client(timeout=60.0),
         )
         prompt = (
             "Use the enabled server-side search tools to research the request. "

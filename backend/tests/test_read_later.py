@@ -112,6 +112,37 @@ def test_x_article_extraction_recovers_relay_images_without_duplicating_cover():
     assert "profile_images" not in markdown
 
 
+def test_x_status_extraction_uses_tweet_text_as_title_and_recovers_author():
+    html = r"""
+    <html><head>
+      <meta property="og:title" content="Adrian Punk (@AdrianPunk115) on X">
+      <meta property="og:description" content="Just shipped the new compaction pipeline.
+It cuts token usage by half.">
+      <meta property="og:site_name" content="X (formerly Twitter)">
+    </head><body>
+      <article><p>Just shipped the new compaction pipeline. It cuts token usage by half.</p></article>
+    </body></html>
+    """
+
+    metadata, _markdown = _extract_markdown(html, "https://x.com/AdrianPunk115/status/2089838277729890437")
+
+    assert metadata["title"] == "Just shipped the new compaction pipeline. It cuts token usage by half."
+    assert metadata["author"] == "Adrian Punk"
+
+
+def test_x_status_extraction_falls_back_to_og_title_without_description():
+    html = r"""
+    <html><head>
+      <meta property="og:title" content="Adrian Punk (@AdrianPunk115) on X">
+    </head><body><article><p>body</p></article></body></html>
+    """
+
+    metadata, _markdown = _extract_markdown(html, "https://x.com/AdrianPunk115/status/2089838277729890437")
+
+    assert metadata["title"] == "Adrian Punk (@AdrianPunk115) on X"
+    assert metadata["author"] == "Adrian Punk"
+
+
 def test_read_later_capture_extracts_article_and_registers_markdown(tmp_path: Path, monkeypatch):
     monkeypatch.setenv("PUDDINGCLAW_KNOWLEDGE_DIR", str(tmp_path / "knowledge"))
     async def run() -> None:

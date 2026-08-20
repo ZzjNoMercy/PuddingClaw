@@ -250,6 +250,56 @@ def test_grok_x_search_builds_media_understanding_parameters() -> None:
     ]
 
 
+def test_openai_compatible_http_client_follows_shared_proxy(monkeypatch) -> None:
+    import httpx
+
+    from web_search.adapters import base
+
+    monkeypatch.setattr(base, "resolved_https_proxy", lambda: "http://127.0.0.1:27890")
+    client = base.openai_compatible_http_client(timeout=1.0)
+    assert isinstance(client, httpx.Client)
+    client.close()
+
+    monkeypatch.setattr(base, "resolved_https_proxy", lambda: "")
+    assert base.openai_compatible_http_client(timeout=1.0) is None
+
+
+def test_grok_search_routes_openai_client_through_shared_proxy(monkeypatch) -> None:
+    import httpx
+    from openai import APIConnectionError
+
+    from web_search.adapters import base
+
+    captured: dict[str, Any] = {}
+
+    class _FakeResponses:
+        @staticmethod
+        def create(**_kwargs: Any) -> Any:
+            raise APIConnectionError(request=httpx.Request("POST", "https://api.x.ai/v1/responses"))
+
+    class _FakeOpenAI:
+        def __init__(self, **kwargs: Any) -> None:
+            captured.update(kwargs)
+
+        @property
+        def responses(self) -> _FakeResponses:
+            return _FakeResponses()
+
+    monkeypatch.setattr("openai.OpenAI", _FakeOpenAI)
+    monkeypatch.setattr(base, "resolved_https_proxy", lambda: "http://127.0.0.1:27890")
+
+    with pytest.raises(WebSearchError):
+        GrokSearchAdapter().search(
+            SearchRequest(query="ping", source="web", provider="grok"),
+            "xai-test-key",
+            {"web_search_enabled": True, "x_search_enabled": True},
+        )
+
+    http_client = captured.get("http_client")
+    assert isinstance(http_client, httpx.Client)
+    http_client.close()
+
+
 def test_grok_media_capabilities_do_not_fall_back_to_other_providers(tmp_path) -> None:
     registry = _ready_registry(tmp_path, "tavily", "grok")
     grok = FakeAdapter("grok")

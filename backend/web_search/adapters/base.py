@@ -14,6 +14,31 @@ _BARE_URL_RE = re.compile(r"https?://[^\s<>\)\]\}\[`'\"，。；：、（）【�
 _NUMERIC_CITATION_TITLE_RE = re.compile(r"^\[?\d+\]?$")
 
 
+def resolved_https_proxy() -> str:
+    """Return the shared explicit/macOS-system HTTPS proxy URL ("" when absent).
+
+    Search providers are typically unreachable from direct connections, so the
+    adapters follow the same proxy resolution as ``fetch_url``: an explicit
+    ``PUDDINGCLAW_HTTPS_PROXY``/``HTTPS_PROXY`` env wins, otherwise the macOS
+    system proxy is used. Normal traffic stays direct when neither exists.
+    """
+
+    from tools.fetch_url_tool import _configured_https_proxy_url
+
+    return _configured_https_proxy_url()
+
+
+def openai_compatible_http_client(*, timeout: float) -> Any | None:
+    """Build an httpx.Client bound to the shared HTTPS proxy, or None for SDK defaults."""
+
+    proxy_url = resolved_https_proxy()
+    if not proxy_url:
+        return None
+    import httpx
+
+    return httpx.Client(proxy=proxy_url, timeout=timeout, follow_redirects=True)
+
+
 class WebSearchAdapter(ABC):
     id: str
 

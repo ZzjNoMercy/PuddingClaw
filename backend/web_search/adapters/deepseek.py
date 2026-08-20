@@ -8,6 +8,7 @@ from typing import Any
 from web_search.adapters.base import (
     WebSearchAdapter,
     normalized_response_sources,
+    openai_compatible_http_client,
     response_payload,
     response_text,
     response_usage,
@@ -46,6 +47,7 @@ class DeepSeekSearchAdapter(WebSearchAdapter):
             base_url="https://api.deepseek.com",
             timeout=30.0,
             max_retries=0,
+            http_client=openai_compatible_http_client(timeout=30.0),
         )
         domain_note = ""
         if request.include_domains:

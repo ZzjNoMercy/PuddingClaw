@@ -7,7 +7,7 @@ from typing import Any
 
 import requests
 
-from web_search.adapters.base import WebSearchAdapter
+from web_search.adapters.base import WebSearchAdapter, resolved_https_proxy
 from web_search.models import AdapterResponse, SearchRequest, SearchResult, WebSearchError
 
 
@@ -37,11 +37,15 @@ class TavilySearchAdapter(WebSearchAdapter):
         if request.scope == "domestic":
             body["country"] = "china"
         try:
+            # requests already honors HTTPS_PROXY env; the explicit proxies
+            # mapping also covers the macOS system-proxy fallback.
+            proxy_url = resolved_https_proxy()
             response = requests.post(
                 "https://api.tavily.com/search",
                 json=body,
                 headers={"Accept": "application/json"},
                 timeout=18,
+                proxies={"http": proxy_url, "https": proxy_url} if proxy_url else None,
             )
             response.raise_for_status()
             payload = response.json()

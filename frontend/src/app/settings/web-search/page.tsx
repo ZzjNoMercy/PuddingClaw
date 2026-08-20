@@ -401,7 +401,7 @@ function ProviderCard({
       <p className="mt-4 min-h-10 text-[11px] leading-5 text-gray-500">{provider.description}</p>
 
       <div className="mt-3 flex flex-wrap gap-1.5">
-        {provider.id === "grok" ? <><CapabilityTag label="全球 Web" active={provider.options.web_search_enabled !== false} /><CapabilityTag label="X Search" active={provider.options.x_search_enabled !== false} /></> : null}
+        {provider.id === "grok" ? <><CapabilityTag label="全球公网" active={provider.options.web_search_enabled !== false} /><CapabilityTag label="X Search" active={provider.options.x_search_enabled !== false} /></> : null}
         {provider.id === "deepseek" ? <CapabilityTag label="国内公网" active /> : null}
         {provider.id === "tavily" ? <><CapabilityTag label="全球公网" active /><CapabilityTag label="国内可用" active /></> : null}
       </div>

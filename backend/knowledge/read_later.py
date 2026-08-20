@@ -86,6 +86,8 @@ _WECHAT_HEADING_PATTERN = re.compile(r"^(?:\d+[.、．]|[一二三四五六七�
 _X_ARTICLE_IMAGE_PATTERN = re.compile(
     r'original_img_url\s*:\s*"(?P<url>https:(?:\\/|/){2}pbs\.twimg\.com(?:\\/|/)media(?:\\/|/)[^"?]+(?:\?[^" ]*)?)"'
 )
+_X_HOSTS = {"x.com", "www.x.com", "twitter.com", "www.twitter.com"}
+_X_OG_TITLE_AUTHOR_PATTERN = re.compile(r"^(?P<name>.+?)\s*\(@(?P<handle>[^)]+)\)\s+on\s+(?:X|Twitter)\b", re.IGNORECASE)
 _TRACKING_PARAMS = {
     "fbclid", "gclid", "dclid", "msclkid", "mc_cid", "mc_eid", "igshid", "spm", "from",
 }
@@ -283,7 +285,7 @@ def _append_x_article_images(markdown: str, *, source_html: str, page_url: str) 
     """
 
     host = (urlsplit(page_url).hostname or "").lower()
-    if host not in {"x.com", "www.x.com", "twitter.com", "www.twitter.com"}:
+    if host not in _X_HOSTS:
         return markdown
 
     existing_urls = {
@@ -324,6 +326,15 @@ def _extract_markdown(html: str, url: str) -> tuple[dict[str, str], str]:
     if metadata["image_url"]:
         metadata["image_url"] = urljoin(url, metadata["image_url"])
     host = (urlsplit(url).hostname or "").lower()
+    if host in _X_HOSTS:
+        # X 的 og:title 只有「作者 (@handle) on X」，推文正文在 og:description 里，
+        # 用正文当标题，把作者从 og:title 里拆出来。
+        author_match = _X_OG_TITLE_AUTHOR_PATTERN.match(metadata["title"])
+        if author_match and not metadata["author"]:
+            metadata["author"] = author_match.group("name").strip()
+        tweet_text = re.sub(r"\s+", " ", metadata["description"]).strip()
+        if tweet_text:
+            metadata["title"] = tweet_text if len(tweet_text) <= 120 else f"{tweet_text[:117].rstrip()}..."
     is_wechat = host == "mp.weixin.qq.com" or host.endswith(".mp.weixin.qq.com")
     if is_wechat:
         root = soup.select_one("#js_content")
