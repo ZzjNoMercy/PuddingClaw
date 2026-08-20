@@ -48,6 +48,7 @@ backend/.pytest_cache/
 # Local dev tooling
 .codex-tmp/
 .playwright-cli/
+output/playwright/
 iterm2_workspace.iterm2arrangement
 
 # Private design notes and project documentation. Keep the public Session
