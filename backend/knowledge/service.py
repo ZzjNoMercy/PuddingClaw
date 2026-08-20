@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import fnmatch
 import hashlib
+import json
 import logging
 import mimetypes
 import os
@@ -23,6 +24,7 @@ import runtime_control
 from knowledge.indexer import build_markdown_chunk_manifest, refresh_local_knowledge_index
 from knowledge.mineru_client import MinerUClient, MinerUParseResult
 from knowledge.models import KnowledgeBase, KnowledgeDocument, iso_utc, new_id
+from knowledge.parsers import ParseRequest, ParserError, get_document_parser_registry
 from knowledge.paths import get_knowledge_originals_dir, get_knowledge_root
 
 logger = logging.getLogger(__name__)
@@ -313,8 +315,11 @@ def _rewrite_markdown_asset_links(
 
     def resolve_link(url: str) -> str:
         normalized = url.replace("\\", "/").strip()
-        if not normalized or re.match(r"^(?:https?:|data:|/knowledge/)", normalized, flags=re.IGNORECASE):
+        if not normalized or re.match(r"^(?:data:|/knowledge/)", normalized, flags=re.IGNORECASE):
             return url
+        # Cloud parsers download provider-hosted images before this step and
+        # register the original URL as an alias. Rewrite only URLs with a
+        # matching localized asset; unrelated external links stay untouched.
         return replacements.get(normalized, url)
 
     def replace_markdown_image(match: re.Match[str]) -> str:
@@ -1264,6 +1269,11 @@ class KnowledgeService:
         knowledge_base_id: str = DEFAULT_KNOWLEDGE_BASE_ID,
         publish_targets: list[str] | None = None,
         mineru_client: MinerUClient | None = None,
+        parser_id: str = "mineru_local",
+        parser_options: dict[str, Any] | None = None,
+        parser_progress_callback: Any | None = None,
+        parser_remote_state: dict[str, Any] | None = None,
+        parser_checkpoint_callback: Any | None = None,
         publish_vector_now: bool = True,
         source_connection_id: str | None = None,
         source_item_id: str | None = None,
@@ -1285,6 +1295,14 @@ class KnowledgeService:
                 raise KnowledgeServiceError(f"Knowledge base not found: {knowledge_base_id}")
 
         original_sha256 = hashlib.sha256(content).hexdigest()
+        parser_options = dict(parser_options or {})
+        parser_options_hash = hashlib.sha256(
+            json.dumps(parser_options, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        requested_parser_fingerprint = {
+            "id": parser_id,
+            "options_hash": parser_options_hash,
+        }
         existing_stmt = _document_identity_stmt(
             knowledge_base_id=knowledge_base_id,
             content_sha256=original_sha256,
@@ -1292,10 +1310,21 @@ class KnowledgeService:
         )
         existing = (await session.execute(existing_stmt)).scalar_one_or_none()
         rebuild_document = None
+        existing_parser = (existing.doc_metadata or {}).get("parser_trace") if existing is not None else None
+        if not isinstance(existing_parser, dict):
+            existing_parser = {
+                "id": "mineru_local" if existing is not None and existing.source_type == "pdf_mineru" else "",
+                "options_hash": hashlib.sha256(b"{}").hexdigest(),
+            }
+        same_parser_fingerprint = (
+            str(existing_parser.get("id") or "") == requested_parser_fingerprint["id"]
+            and str(existing_parser.get("options_hash") or "") == requested_parser_fingerprint["options_hash"]
+        )
         if (
             existing is not None
             and existing.content_sha256 == original_sha256
             and _document_ready_for_dedup(existing)
+            and same_parser_fingerprint
         ):
             return existing, {"deduplicated": True, "vector_index": {"refreshed": False, "reason": "document already exists"}}
         if existing is not None:
@@ -1311,12 +1340,40 @@ class KnowledgeService:
         original_path.write_bytes(content)
 
         assets_dir = self.knowledge_dir / "assets" / date_part / import_id
-        client = mineru_client or MinerUClient()
-        parse_result: MinerUParseResult = await client.parse_pdf_bytes(
-            filename=safe_name,
-            content=content,
-            assets_dir=assets_dir,
-        )
+        if mineru_client is not None:
+            legacy_result: MinerUParseResult = await mineru_client.parse_pdf_bytes(
+                filename=safe_name,
+                content=content,
+                assets_dir=assets_dir,
+            )
+            parsed_markdown = legacy_result.markdown
+            parsed_assets = legacy_result.assets or []
+            parser_version = "local-http-v1"
+            parser_metadata = {"response": legacy_result.raw_response}
+            structured_blocks: list[dict[str, Any]] = []
+            parser_warnings: list[str] = []
+        else:
+            try:
+                parse_result = await get_document_parser_registry().parse(
+                    parser_id,
+                    ParseRequest(
+                        filename=safe_name,
+                        content=content,
+                        assets_dir=assets_dir,
+                        options=parser_options,
+                        remote_state=dict(parser_remote_state or {}),
+                        checkpoint=parser_checkpoint_callback,
+                    ),
+                    on_progress=parser_progress_callback,
+                )
+            except ParserError as exc:
+                raise KnowledgeServiceError(str(exc)) from exc
+            parsed_markdown = parse_result.markdown
+            parsed_assets = [asset.as_dict() for asset in parse_result.assets]
+            parser_version = parse_result.parser_version
+            parser_metadata = parse_result.parser_metadata
+            structured_blocks = [dict(block) for block in parse_result.structured_blocks]
+            parser_warnings = list(parse_result.warnings)
         target_dir = self.imported_dir / date_part
         target_dir.mkdir(parents=True, exist_ok=True)
         md_path = _unique_path(target_dir, f"{_title_or_source_stem(title, safe_name)}.md")
@@ -1325,15 +1382,15 @@ class KnowledgeService:
         assets_virtual_prefix = f"/knowledge/assets/{date_part}/{import_id}"
         markdown_asset_prefix = Path(os.path.relpath(assets_dir, start=md_path.parent)).as_posix()
         markdown, rewritten_assets = _rewrite_markdown_asset_links(
-            parse_result.markdown,
-            assets=parse_result.assets or [],
+            parsed_markdown,
+            assets=parsed_assets,
             assets_virtual_prefix=assets_virtual_prefix,
             markdown_asset_prefix=markdown_asset_prefix,
             assets_dir=assets_dir,
         )
         markdown = markdown.strip()
         if not markdown:
-            raise KnowledgeServiceError("MinerU returned empty markdown.")
+            raise KnowledgeServiceError(f"{parser_id} returned empty markdown.")
 
         md_path.write_text(markdown + "\n", encoding="utf-8")
 
@@ -1344,7 +1401,7 @@ class KnowledgeService:
             rebuild_document,
             knowledge_base_id=knowledge_base_id,
             title=(title or Path(safe_name).stem).strip() or safe_name,
-            source_type="pdf_mineru",
+            source_type="pdf_mineru" if parser_id == "mineru_local" else f"pdf_{parser_id}",
             source_path=str(original_path),
             storage_path=str(md_path),
             virtual_path=virtual_path,
@@ -1359,12 +1416,20 @@ class KnowledgeService:
             source_revision=source_revision,
             doc_metadata={
                 "mode": "multimodal_pdf",
-                "parser": "mineru",
+                "parser": "mineru" if parser_id == "mineru_local" else parser_id,
+                "parser_trace": {
+                    "id": parser_id,
+                    "version": parser_version,
+                    "options_hash": parser_options_hash,
+                    "warnings": parser_warnings,
+                    "metadata": parser_metadata,
+                },
                 "original_filename": filename,
                 "original_path": str(original_path),
                 "original_sha256": original_sha256,
                 "markdown_sha256": _sha256(md_path),
-                "mineru": parse_result.raw_response,
+                "mineru": parser_metadata.get("response", {}) if parser_id == "mineru_local" else {},
+                "structured_blocks": structured_blocks,
                 "assets": rewritten_assets,
                 "llamaindex_chunks": llamaindex_chunks,
                 "multimodal": {

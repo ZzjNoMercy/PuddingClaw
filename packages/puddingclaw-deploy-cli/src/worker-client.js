@@ -38,9 +38,8 @@ function responseError(path, response, payload) {
 }
 
 export class WorkerClient {
-  constructor({ endpoint, token, timeoutMs = 600000 }) {
+  constructor({ endpoint, timeoutMs = 600000 }) {
     this.endpoint = endpoint.replace(/\/+$/, "");
-    this.token = token;
     this.timeoutMs = timeoutMs;
   }
 
@@ -60,7 +59,6 @@ export class WorkerClient {
         headers: {
           accept: "application/json",
           ...(body === undefined ? {} : { "content-type": "application/json" }),
-          authorization: `Bearer ${this.token}`,
         },
         ...(body === undefined ? {} : { body: JSON.stringify(body) }),
       });
@@ -98,7 +96,6 @@ export class WorkerClient {
         headers: {
           accept: "application/x-ndjson",
           "content-type": "application/json",
-          authorization: `Bearer ${this.token}`,
         },
         body: JSON.stringify(body ?? {}),
       });
@@ -123,6 +120,14 @@ export class WorkerClient {
           }
           if (event?.event === "result" && event.data && typeof event.data === "object") {
             lastResult = event.data;
+          } else if (event && typeof event === "object" && !event.event
+            && (typeof event.status === "string" || typeof event.outcome === "string")) {
+            // 0.1.16 and older Backends ignore ?stream=true and return the
+            // legacy single JSON boundary. Keep the thin CLI compatible while
+            // the new Backend is being rolled out.
+            lastResult = event;
+            if (onEvent) await onEvent({ event: "result", data: event });
+            continue;
           }
           if (onEvent) await onEvent(event);
         }

@@ -1,6 +1,6 @@
 [project]
 name = "puddingclaw-backend"
-version = "0.1.17"
+version = "0.1.19"
 description = "PuddingClaw backend API, agent, and knowledge base services"
 requires-python = ">=3.11,<3.13"
 license = { text = "MIT" }
@@ -71,6 +71,12 @@ evaluation = [
     # Official SWE-bench Docker verifier. Keep this exact and resolved through
     # uv.lock; evaluation workers never download Python code at run time.
     "swebench==4.1.0",
+]
+
+# Optional local document partitioning/OCR. It is installed explicitly from
+# the settings page so the default desktop runtime stays small.
+unstructured = [
+    "unstructured[docx,pdf]>=0.18,<0.22",
 ]
 
 knowledge = [
@@ -154,7 +160,7 @@ only-include = [
     "higress_config_reader.py",
     "runtime_control.py",
     "schema_migrations.py",
-    "worker_access.py",
+    "headless_activity.py",
     "extensions.py",
     "api",
     "analytics",

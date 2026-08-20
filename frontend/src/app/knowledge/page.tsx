@@ -8,11 +8,14 @@ import {
   ChevronDown,
   ChevronRight,
   CheckCircle2,
+  Cloud,
   Database,
   FileText,
   BookOpenCheck,
   FileUp,
   FolderOpen,
+  HardDrive,
+  KeyRound,
   Loader2,
   RefreshCw,
   Settings,
@@ -39,7 +42,8 @@ import {
   previewKnowledgeFile,
   publishKnowledgeDocumentVector,
   snapshotKnowledgeFileToLlmWikiRaw,
-  createKnowledgeImportJob,
+  commitKnowledgeImportSource,
+  stageKnowledgeImportSource,
   saveKnowledgeDatabaseSource,
   testKnowledgeDatabaseSource,
   type KnowledgeDatabaseSource,
@@ -49,6 +53,8 @@ import {
   type KnowledgeImportJob,
   type KnowledgeStatus,
   type KnowledgeTreeNode,
+  type DocumentParserStatus,
+  type StagedKnowledgeSource,
   type TableAsset,
 } from "@/lib/api";
 
@@ -70,6 +76,7 @@ function errorMessage(error: unknown): string {
 }
 
 function jobStatusLabel(job: KnowledgeImportJob): string {
+  if (job.status === "staged") return "待选择解析器";
   if (job.status === "queued") return "排队中";
   if (job.status === "running") return "处理中";
   if (job.status === "succeeded") return "已完成";
@@ -79,6 +86,7 @@ function jobStatusLabel(job: KnowledgeImportJob): string {
 }
 
 function jobStatusClass(job: KnowledgeImportJob): string {
+  if (job.status === "staged") return "bg-amber-50 text-amber-700";
   if (job.status === "succeeded") return "bg-emerald-50 text-emerald-700";
   if (job.status === "failed") return "bg-red-50 text-red-600";
   if (job.status === "running") return "bg-[#002fa7]/10 text-[#002fa7]";
@@ -233,6 +241,16 @@ export default function KnowledgePage() {
   const [includeInWikiRaw, setIncludeInWikiRaw] = useState(false);
   const [loading, setLoading] = useState(true);
   const [uploadingDocument, setUploadingDocument] = useState(false);
+  const [stagedSource, setStagedSource] = useState<StagedKnowledgeSource | null>(null);
+  const [parserChoices, setParserChoices] = useState<DocumentParserStatus[]>([]);
+  const [selectedParserId, setSelectedParserId] = useState("");
+  const [allowCloudParser, setAllowCloudParser] = useState(false);
+  const orderedParserChoices = useMemo(() => [...parserChoices].sort((left, right) => (
+    Number(right.selectable) - Number(left.selectable)
+    || Number(right.recommended) - Number(left.recommended)
+    || left.priority - right.priority
+  )), [parserChoices]);
+  const [parserModalOpen, setParserModalOpen] = useState(false);
   const [snapshottingRaw, setSnapshottingRaw] = useState(false);
   const [rebuildingDocumentId, setRebuildingDocumentId] = useState<string | null>(null);
   const [jobPage, setJobPage] = useState(1);
@@ -360,8 +378,35 @@ export default function KnowledgePage() {
   }, []);
 
   const uploadDocument = useCallback(async () => {
+    if (stagedSource && parserChoices.length > 0) {
+      setParserModalOpen(true);
+      return;
+    }
     if (!selectedFile) {
       setToast({ type: "error", message: "请先选择一个文件。" });
+      return;
+    }
+    setUploadingDocument(true);
+    setToast(null);
+    try {
+      const staged = await stageKnowledgeImportSource(selectedFile, uploadTitle.trim() || undefined);
+      setStagedSource(staged.source);
+      setParserChoices(staged.parsers);
+      setSelectedParserId(staged.parsers.find((item) => item.recommended && item.selectable)?.id || "");
+      setAllowCloudParser(false);
+      setParserModalOpen(true);
+    } catch (error) {
+      setToast({ type: "error", message: errorMessage(error) });
+    } finally {
+      setUploadingDocument(false);
+    }
+  }, [parserChoices.length, selectedFile, stagedSource, uploadTitle]);
+
+  const commitParserSelection = useCallback(async () => {
+    if (!stagedSource || !selectedParserId) return;
+    const selectedParser = parserChoices.find((item) => item.id === selectedParserId);
+    if (!selectedParser?.selectable) {
+      setToast({ type: "error", message: selectedParser?.reason || "请选择可用的解析器。" });
       return;
     }
     setUploadingDocument(true);
@@ -370,15 +415,20 @@ export default function KnowledgePage() {
       const publishTargets = ["local_markdown"];
       if (
         includeInWikiRaw &&
-        [".md", ".markdown"].some((suffix) => selectedFile.name.toLowerCase().endsWith(suffix))
+        [".md", ".markdown"].some((suffix) => stagedSource.file_name.toLowerCase().endsWith(suffix))
       ) {
         publishTargets.push("llm_wiki_raw");
       }
-      const job = await createKnowledgeImportJob(
-        selectedFile,
-        uploadTitle.trim() || undefined,
-        publishTargets
-      );
+      const job = await commitKnowledgeImportSource(stagedSource.id, {
+        parser_id: selectedParserId,
+        publish_targets: publishTargets,
+        title: uploadTitle.trim() || undefined,
+        allow_cloud: selectedParser.location === "cloud" && allowCloudParser,
+      });
+      setParserModalOpen(false);
+      setStagedSource(null);
+      setParserChoices([]);
+      setSelectedParserId("");
       setSelectedFile(null);
       setIncludeInWikiRaw(false);
       if (fileInputRef.current) fileInputRef.current.value = "";
@@ -390,10 +440,14 @@ export default function KnowledgePage() {
     } finally {
       setUploadingDocument(false);
     }
-  }, [includeInWikiRaw, refresh, selectedFile, uploadTitle]);
+  }, [allowCloudParser, includeInWikiRaw, parserChoices, refresh, selectedParserId, stagedSource, uploadTitle]);
 
   const clearSelectedFile = useCallback(() => {
     setSelectedFile(null);
+    setStagedSource(null);
+    setParserChoices([]);
+    setSelectedParserId("");
+    setParserModalOpen(false);
     setIncludeInWikiRaw(false);
     if (fileInputRef.current) {
       fileInputRef.current.value = "";
@@ -831,7 +885,7 @@ export default function KnowledgePage() {
               </div>
               <h3 className="mt-5 text-lg font-semibold text-gray-950">上传到知识库</h3>
               <p className="mt-2 max-w-md text-sm leading-6 text-gray-500">
-                选择 PDF 或 Markdown 文件。Excel / CSV 后续会在同一入口接入 Pandas Engine。
+                文件只上传一次。暂存探测后由你选择解析器，再创建后台导入任务。
               </p>
 
               <div className="mt-6 flex flex-wrap items-center justify-center gap-3">
@@ -862,7 +916,7 @@ export default function KnowledgePage() {
                   className="inline-flex h-11 items-center justify-center gap-2 rounded-2xl border border-black/[0.08] bg-gray-950 px-5 text-sm font-semibold text-white transition hover:bg-black disabled:cursor-not-allowed disabled:opacity-45"
                 >
                   {uploadingDocument ? <Loader2 className="h-4 w-4 animate-spin" /> : <CheckCircle2 className="h-4 w-4" />}
-                  导入知识库
+                  继续选择解析器
                 </button>
               </div>
 
@@ -896,7 +950,7 @@ export default function KnowledgePage() {
                   ) : null}
                 </div>
               ) : (
-                <p className="mt-5 text-xs text-gray-400">选择文件后，小爪子会自动处理。</p>
+                <p className="mt-5 text-xs text-gray-400">选择文件后先暂存，不会立即解析或发送到云端。</p>
               )}
             </div>
             )}
@@ -940,7 +994,7 @@ export default function KnowledgePage() {
                             </p>
                           </div>
                           <p className="mt-1 text-xs text-gray-400">
-                            {jobKindLabel(job)} · {job.current_step || job.status} · {formatBytes(job.file_size)}
+                            {jobKindLabel(job)} · {job.status === "staged" ? "等待选择解析器" : job.current_step || job.status} · {formatBytes(job.file_size)}
                           </p>
                         </div>
                         <span className={`shrink-0 rounded-full px-2.5 py-1 text-[11px] font-medium ${jobStatusClass(job)}`}>
@@ -957,6 +1011,11 @@ export default function KnowledgePage() {
                         <p className="mt-2 line-clamp-2 text-xs text-red-500" title={job.error_message}>
                           {job.error_message}
                         </p>
+                      ) : null}
+                      {job.status === "staged" ? (
+                        <div className="mt-2 flex items-center justify-end gap-1 text-xs font-semibold text-[#002fa7]">
+                          继续解析<ChevronRight className="h-3.5 w-3.5" />
+                        </div>
                       ) : null}
                     </Link>
                   ))
@@ -995,6 +1054,118 @@ export default function KnowledgePage() {
 
           </section>
         </section>
+
+        {parserModalOpen && stagedSource ? (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/35 p-4 backdrop-blur-sm">
+            <div className="flex max-h-[90vh] w-full max-w-4xl flex-col overflow-hidden rounded-[28px] bg-white shadow-2xl ring-1 ring-black/10">
+              <div className="flex items-start justify-between gap-4 border-b border-black/[0.06] px-6 py-5">
+                <div className="min-w-0">
+                  <p className="text-xs font-semibold uppercase tracking-[0.16em] text-[#002fa7]">选择解析器</p>
+                  <h2 className="mt-1 truncate text-xl font-semibold text-gray-950">{stagedSource.file_name}</h2>
+                  <p className="mt-1 text-xs text-gray-500">
+                    {formatBytes(stagedSource.size_bytes)}
+                    {stagedSource.page_count ? ` · 约 ${stagedSource.page_count} 页` : ""}
+                    {` · SHA ${stagedSource.sha256.slice(0, 12)}`}
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setParserModalOpen(false)}
+                  className="flex h-9 w-9 items-center justify-center rounded-full text-gray-500 transition hover:bg-gray-100 hover:text-gray-900"
+                  aria-label="关闭解析器选择"
+                >
+                  <X className="h-4 w-4" />
+                </button>
+              </div>
+
+              <div className="overflow-y-auto px-6 py-5">
+                <div className="mb-4 rounded-2xl border border-blue-100 bg-blue-50/60 px-4 py-3 text-xs leading-5 text-blue-700">
+                  探测阶段没有解析正文，也没有调用第三方服务。解析器只生成 Markdown、图片和结构元数据；切片、Embedding、Wiki 与 GBrain 仍走统一下游流水线。
+                </div>
+                <div className="grid gap-3 md:grid-cols-2">
+                  {orderedParserChoices.map((parser) => {
+                    const selected = parser.id === selectedParserId;
+                    return (
+                      <button
+                        key={parser.id}
+                        type="button"
+                        disabled={!parser.selectable}
+                        onClick={() => {
+                          setSelectedParserId(parser.id);
+                          if (parser.location !== "cloud") setAllowCloudParser(false);
+                        }}
+                        className={`relative rounded-2xl border p-4 text-left transition ${
+                          selected
+                            ? "border-[#002fa7] bg-[#002fa7]/[0.045] ring-2 ring-[#002fa7]/10"
+                            : parser.selectable
+                              ? "border-black/[0.08] bg-white hover:border-[#002fa7]/30 hover:bg-[#002fa7]/[0.02]"
+                              : "cursor-not-allowed border-black/[0.05] bg-gray-50 opacity-60"
+                        }`}
+                      >
+                        <div className="flex items-start gap-3">
+                          <span className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-xl ${parser.location === "cloud" ? "bg-violet-50 text-violet-600" : "bg-emerald-50 text-emerald-700"}`}>
+                            {parser.location === "cloud" ? <Cloud className="h-5 w-5" /> : <HardDrive className="h-5 w-5" />}
+                          </span>
+                          <span className="min-w-0 flex-1">
+                            <span className="flex flex-wrap items-center gap-2">
+                              <span className="text-sm font-semibold text-gray-950">{parser.name}</span>
+                              {parser.recommended ? <span className="rounded-full bg-emerald-50 px-2 py-0.5 text-[10px] font-semibold text-emerald-700">推荐</span> : null}
+                              <span className="rounded-full bg-gray-100 px-2 py-0.5 text-[10px] text-gray-500">{parser.location === "cloud" ? "云端" : "本地"}</span>
+                            </span>
+                            <span className="mt-1.5 block text-xs leading-5 text-gray-500">{parser.description}</span>
+                            <span className={`mt-2 block text-[11px] ${parser.selectable ? "text-emerald-700" : "text-amber-700"}`}>
+                              {parser.selectable
+                                ? parser.reason
+                                : parser.enabled
+                                  ? `已启用，但当前不可选：${parser.health_message || parser.reason}`
+                                  : `已停用：${parser.health_message || parser.reason}`}
+                            </span>
+                          </span>
+                          <span className={`mt-1 h-4 w-4 shrink-0 rounded-full border ${selected ? "border-[5px] border-[#002fa7]" : "border-gray-300"}`} />
+                        </div>
+                        {parser.requires_credential && !parser.credential_configured ? (
+                          <span className="mt-3 flex items-center gap-1.5 text-[11px] font-medium text-amber-700">
+                            <KeyRound className="h-3.5 w-3.5" />缺少 API Key，请先到设置配置
+                          </span>
+                        ) : null}
+                      </button>
+                    );
+                  })}
+                </div>
+
+                {parserChoices.find((item) => item.id === selectedParserId)?.location === "cloud" ? (
+                  <label className="mt-4 flex cursor-pointer items-start gap-3 rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-xs leading-5 text-amber-800">
+                    <input
+                      type="checkbox"
+                      checked={allowCloudParser}
+                      onChange={(event) => setAllowCloudParser(event.target.checked)}
+                      className="mt-0.5 h-4 w-4 accent-[#002fa7]"
+                    />
+                    <span>我确认原始文件将发送至第三方云端解析服务。系统不会在未勾选时静默上传或自动回退到云端。</span>
+                  </label>
+                ) : null}
+              </div>
+
+              <div className="flex flex-wrap items-center justify-between gap-3 border-t border-black/[0.06] px-6 py-4">
+                <Link href="/settings?category=knowledge&section=parsers#knowledge-section-parsers" className="text-xs font-medium text-[#002fa7] hover:text-[#001f7a]">
+                  管理解析器与密钥
+                </Link>
+                <div className="flex items-center gap-2">
+                  <button type="button" onClick={() => setParserModalOpen(false)} className="h-10 rounded-xl px-4 text-sm font-semibold text-gray-500 hover:bg-gray-100">稍后选择</button>
+                  <button
+                    type="button"
+                    onClick={commitParserSelection}
+                    disabled={uploadingDocument || !selectedParserId || (parserChoices.find((item) => item.id === selectedParserId)?.location === "cloud" && !allowCloudParser)}
+                    className="inline-flex h-10 items-center gap-2 rounded-xl bg-[#002fa7] px-5 text-sm font-semibold text-white transition hover:bg-[#001f7a] disabled:cursor-not-allowed disabled:opacity-45"
+                  >
+                    {uploadingDocument ? <Loader2 className="h-4 w-4 animate-spin" /> : <CheckCircle2 className="h-4 w-4" />}
+                    创建后台任务
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        ) : null}
 
         {databaseModalOpen ? (
           <div className="fixed inset-0 z-[120] flex items-center justify-center bg-black/35 px-4 py-6 backdrop-blur-sm">

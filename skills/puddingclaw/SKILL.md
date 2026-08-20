@@ -11,8 +11,8 @@ Delegate enterprise-data work to the local `puddingclaw` Node CLI. Keep the CLI 
 
 - Executable: `puddingclaw`
 - Distribution: `@puddingai/puddingclaw` (Node.js 20+)
-- Authentication: Worker Access Key in `PUDDINGCLAW_TOKEN`
-- Machine protocol: JSON on stdin and one JSON object on stdout
+- Authentication: none at the CLI boundary; the local PuddingClaw Backend owns model, data, and tool authorization
+- Machine protocol: JSON on stdin; choose one final JSON (`--json`) or public event JSONL (`--jsonl`) on stdout
 
 Treat the CLI as a managed connector when the host supports connectors or adapters. Invoke it with an argv array and stdin; do not construct a shell command from user content.
 
@@ -22,30 +22,9 @@ Treat the CLI as a managed connector when the host supports connectors or adapte
 2. If absent, ask before installing. Prefer the host's trusted package installer or the package bundled by a PuddingClaw deployment. Do not guess a registry, URL, or unpublished package source.
 3. Run `puddingclaw doctor --json`.
 4. If PuddingClaw is unreachable, ask the user to start the local PuddingClaw service.
-5. If the Worker Access Key is missing or rejected, follow the credential workflow below and rerun `doctor`.
+5. Do not ask for or configure a PuddingClaw Token. If the Backend rejects a request, report the local service error and stop.
 
 Do not repeatedly call `doctor` after the same failure.
-
-## Credential workflow
-
-Prefer the hosting Agent or Platform's protected credential store. It should:
-
-1. Explain that a PuddingClaw **Worker Access Key** is required. It is not an LLM provider key.
-2. Ask for it through the host's protected secret-input UI.
-3. Save it in the host's Connector Credential store, OS keychain, or equivalent encrypted secret store.
-4. Inject it only into the `puddingclaw` child process as `PUDDINGCLAW_TOKEN`.
-
-If the host has no credential store, use the local env-file fallback:
-
-1. Locate `.env.example` next to this `SKILL.md`.
-2. Copy it to `.env` in the same Skill directory only if `.env` does not exist.
-3. Set `.env` to mode `0600` on POSIX systems.
-4. Ask the user to enter the Worker Access Key through protected input or edit this local file directly.
-5. Use `node <skill-dir>/scripts/run.mjs doctor --json` to verify the connection.
-
-The launcher parses only `PUDDINGCLAW_TOKEN`, injects it into the child-process environment, and executes the real `puddingclaw` binary without a shell. Do not source `.env` as a shell script, and never overwrite it during Skill updates. The CLI remains independent of Skill installation paths.
-
-Never put a Worker Access Key in argv, prompt text, stdout, logs, summaries, or error messages. Never echo it back.
 
 ## Inspect available capabilities
 
@@ -55,18 +34,20 @@ Run:
 puddingclaw agent models list --json
 ```
 
-When using the Skill-local `.env`, replace `puddingclaw` with `node <skill-dir>/scripts/run.mjs` in this and subsequent command shapes.
-
-This command is informational. Do not select a model, pass a model identifier, or ask the user to configure an LLM model. The Backend filters analytics models by Worker Access Key and routes the question before starting a new Session.
+This command is informational. Do not select a model, pass a model identifier, or ask the user to configure an LLM model. The Backend owns the configured analytics-model catalog and routes the question before starting a new Session.
 
 ## Run a task
 
-Invoke exactly this command shape:
+When the host can consume incremental events, invoke:
 
 ```text
-argv:  ["puddingclaw", "agent", "run", "--input-json", "-", "--json"]
+argv:  ["puddingclaw", "agent", "run", "--input-json", "-", "--jsonl"]
 stdin: {"message":"..."}
 ```
+
+Parse stdout one complete line at a time. Public events include lifecycle, visible assistant `token`/segment updates, `tool_start`/`tool_end`, permission boundaries, `final_response`, `done`, and exactly one terminal `result`. Do not expect reasoning, provider previews, or internal Trace events. Persist the last processed event sequence or host event ID when the adapter provides one, and keep the host's own durable Run state as the disconnect-recovery source.
+
+If the host only supports a blocking tool result, use the same command with `--json`; stdout then contains one final JSON object. Never mix the two parsers.
 
 Optional stdin fields:
 
@@ -74,7 +55,7 @@ Optional stdin fields:
 - `request_id`: idempotency key for a retried submission.
 - `metadata`: host-owned correlation metadata; never include secrets.
 
-While the process is running, show a host-side state such as “PuddingClaw 正在处理”. The current CLI is intentionally non-streaming; do not parse partial stdout as progress.
+Show a host-side “PuddingClaw 正在处理” state immediately after spawn. Then project JSONL tool/content/HITL events as real Worker progress. Do not expose stderr as progress or model context.
 
 ## Preserve task continuity
 
@@ -83,8 +64,7 @@ Treat `session_id` as host-owned state for one logical task or conversation thre
 1. For a new task, omit `session_id` and read it from the completed CLI JSON response.
 2. Store the returned `session_id` with the host's Task/Thread record, together with `session_expires_at` when present.
 3. For a follow-up, correction, or retry that requires prior context, send that same `session_id` in stdin JSON.
-4. For an unrelated task, start a fresh Session. Never derive a default Session from the Worker Key name or share one Session across tasks.
-5. Do not store `session_id` in `.env`; `.env` is only a credential fallback and Session identity changes per task.
+4. For an unrelated task, start a fresh Session. Never derive a default Session from the caller name or share one Session across tasks.
 
 Headless Sessions expire after the Backend's inactivity TTL, which defaults to 24 hours and is refreshed whenever the Session is updated. If `session_expires_at` has passed, start a new Session and include the relevant prior context in the new message. If CLI JSON returns `outcome=session_expired` (`error_code=session_expired`, HTTP `410`), remove the stale mapping and do the same; never claim that the expired Session's hidden context was preserved.
 
@@ -98,14 +78,14 @@ Machine integrations should continue using stdin JSON rather than constructing a
 
 ## Interpret the result
 
-Parse stdout only after the process exits. It contains one JSON object.
+For `--json`, parse stdout after exit as one object. For `--jsonl`, consume complete lines during execution and interpret the final `event=result` payload with the same rules below.
 
 - `status == "completed"`: present `final_response` as the Worker answer. Fall back to `reply` only for an older compatible Worker that omits `final_response`.
 - `analytics_model_id` and `analytics_model_match`: Backend-selected audit output. Preserve them for tracing; never feed them back as CLI input. `analytics_model_match.status == "general"` means the Backend judged the question to be non-analytics (e.g. small talk or general knowledge) and answered it without binding an analytics model; in that case `analytics_model_id` is empty. This is a normal completed answer, not an error.
 - `reply`: aggregated visible content that may include intermediate assistant narration. Do not prefer it over `final_response`.
 - `outcome == "analytics_model_clarification_required"`: ask the user to clarify the actual business object, metric, time range, or analysis scenario, then submit the clarified question as a new request. Do not ask the user for a model ID and do not start a Session until the Backend finds one unique match.
-- `outcome == "analytics_model_unavailable"`: explain that the Worker Key has no usable model or its Session-bound model is no longer allowed; ask the user to contact the PuddingClaw administrator. Do not silently switch a continuous Session to another model.
-- `needs_input != null`: show the question or approval request, collect the user's answer, and continue with the returned `session_id` according to the payload.
+- `outcome == "analytics_model_unavailable"`: explain that PuddingClaw has no usable configured model or its Session-bound model is no longer available; ask the user to update PuddingClaw configuration. Do not silently switch a continuous Session to another model.
+- `needs_input != null`: show the approval request and collect an explicit user decision. Resume the same Run with `puddingclaw agent respond <run_id> --input-json - --jsonl`, passing `continuation_token`, a fresh idempotent `request_id`, and the complete `decisions` array. Use `--json` instead only for a blocking host.
 - `outcome == "session_expired"`: remove the Task/Thread mapping and create a new Session with the relevant visible context restated in the message.
 - `status == "error"` or a nonzero exit: summarize the structured error without exposing configuration values.
 - Preserve `run_id` and `session_id` in host metadata for tracing and follow-up, not in the main user-facing answer unless useful.
@@ -115,7 +95,7 @@ Do not claim success solely because the process returned JSON; check `status` an
 
 ## Cancellation and safety
 
-- Forward user cancellation as `SIGINT`; exit code `130` means cancelled.
+- Forward user cancellation as `SIGINT` or supervisor `SIGTERM`. Once `run_id` is known, follow process termination with `puddingclaw agent cancel <run_id> --json`; killing the local observer alone does not prove the Backend Run stopped. Exit code `130` means the local CLI was cancelled.
 - Never auto-answer a `needs_input` request that requires user judgment or approval.
 - Respect the Worker's own `approval_mode` and interrupt result. Do not bypass it by rewriting the task.
 - Use a fresh `request_id` for a new intent and reuse it only when retrying the same submission.

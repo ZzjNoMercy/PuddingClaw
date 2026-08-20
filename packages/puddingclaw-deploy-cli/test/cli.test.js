@@ -286,9 +286,7 @@ test("non-interactive Harness init enables its Worker and disables business exte
     assert.equal(config.infrastructure.catalog.probe_status, "skipped");
     assert.equal(config.infrastructure.milvus.enabled, false);
     const tokenFile = path.join(home, "secrets", "headless-token");
-    assert.match(await readFile(tokenFile, "utf8"), /^pck_[A-Za-z0-9_-]{32,}\n$/);
-    if (process.platform !== "win32") assert.equal((await stat(tokenFile)).mode & 0o777, 0o600);
-    assert.equal(JSON.stringify(config).includes("pck_"), false);
+    await assert.rejects(stat(tokenFile), { code: "ENOENT" });
   } finally {
     await rm(home, { recursive: true, force: true });
   }
@@ -585,11 +583,11 @@ test("doctor and status expose initialized state without probing disabled extens
     ], { home, env });
     assert.equal(initialized.code, 0, initialized.stderr);
     const doctor = await runCli(["doctor", "--json"], { home, env });
-    assert.equal(doctor.code, 2, doctor.stderr);
+    assert.equal(doctor.code, 0, doctor.stderr);
     const diagnostic = JSON.parse(doctor.stdout);
-    assert.equal(diagnostic.status, "needs_action");
+    assert.equal(diagnostic.status, "ok");
     assert.equal(diagnostic.configured, true);
-    assert.equal(diagnostic.authenticated, false);
+    assert.equal(diagnostic.authenticated, undefined);
     assert.equal(typeof diagnostic.reachable, "boolean");
     assert.equal(diagnostic.deployment.initialized, true);
     assert.equal(diagnostic.deployment.status, "ok");

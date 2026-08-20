@@ -9,8 +9,10 @@ import {
   CheckCircle2,
   ChevronRight,
   Clock3,
+  Cloud,
   Database,
   FileUp,
+  HardDrive,
   Link2,
   Loader2,
   RefreshCw,
@@ -30,15 +32,18 @@ import DocumentDetailModal, {
   type SourceKind,
 } from "@/components/knowledge/DocumentDetailModal";
 import {
-  createKnowledgeImportJob,
+  commitKnowledgeImportSource,
   createLlmWikiIngestJob,
   getLlmWikiWorkspaceStatus,
   listReadLaterItems,
   saveReadLaterUrl,
+  stageKnowledgeImportSource,
+  type DocumentParserStatus,
   type KnowledgeDocument,
   type KnowledgeImportJob,
   type LlmWikiWorkspaceStatus,
   type ReadLaterItem,
+  type StagedKnowledgeSource,
 } from "@/lib/api";
 import { listKnowledgeSources, type KnowledgeSource } from "@/lib/knowledgeSourcesApi";
 
@@ -51,6 +56,11 @@ type Props = {
 
 function isActive(job: KnowledgeImportJob) {
   return job.status === "queued" || job.status === "running";
+}
+
+function overviewJobStatus(job: KnowledgeImportJob): string {
+  if (job.status === "staged") return "待选择解析器";
+  return job.current_step || job.status;
 }
 
 function relativeTime(value: string | null | undefined): string {
@@ -80,7 +90,7 @@ export default function KnowledgeOverview({ documents, jobs, loading, onRefresh 
   const [searchQuery, setSearchQuery] = useState("");
   const [readLater, setReadLater] = useState<ReadLaterItem[]>([]);
   const [sources, setSources] = useState<KnowledgeSource[]>([]);
-  const [dialog, setDialog] = useState<"read-later" | "compile" | null>(null);
+  const [dialog, setDialog] = useState<"read-later" | "compile" | "parser" | null>(null);
   const [url, setUrl] = useState("");
   const [workspace, setWorkspace] = useState<LlmWikiWorkspaceStatus | null>(null);
   const [selectedRaw, setSelectedRaw] = useState<Set<string>>(new Set());
@@ -89,6 +99,15 @@ export default function KnowledgeOverview({ documents, jobs, loading, onRefresh 
   const [actionError, setActionError] = useState("");
   const [notice, setNotice] = useState("");
   const [detail, setDetail] = useState<{ doc: KnowledgeDocument; kind: SourceKind } | null>(null);
+  const [stagedSource, setStagedSource] = useState<StagedKnowledgeSource | null>(null);
+  const [parserChoices, setParserChoices] = useState<DocumentParserStatus[]>([]);
+  const [selectedParserId, setSelectedParserId] = useState("");
+  const [allowCloudParser, setAllowCloudParser] = useState(false);
+  const orderedParserChoices = useMemo(() => [...parserChoices].sort((left, right) => (
+    Number(right.selectable) - Number(left.selectable)
+    || Number(right.recommended) - Number(left.recommended)
+    || left.priority - right.priority
+  )), [parserChoices]);
 
   useEffect(() => {
     void listReadLaterItems().then(setReadLater).catch(() => setReadLater([]));
@@ -161,14 +180,41 @@ export default function KnowledgeOverview({ documents, jobs, loading, onRefresh 
     setBusy("upload");
     setActionError("");
     try {
-      await createKnowledgeImportJob(file, undefined, ["local_markdown"]);
-      setNotice(`已加入导入队列：${file.name}`);
-      onRefresh();
+      const staged = await stageKnowledgeImportSource(file);
+      setStagedSource(staged.source);
+      setParserChoices(staged.parsers);
+      setSelectedParserId(staged.parsers.find((item) => item.recommended && item.selectable)?.id || "");
+      setAllowCloudParser(false);
+      setDialog("parser");
     } catch (error) {
       setActionError(error instanceof Error ? error.message : "上传失败");
     } finally {
       setBusy(null);
       if (uploadInputRef.current) uploadInputRef.current.value = "";
+    }
+  }
+
+  async function commitUpload() {
+    if (!stagedSource || !selectedParserId) return;
+    const parser = parserChoices.find((item) => item.id === selectedParserId);
+    if (!parser?.selectable) return;
+    setBusy("upload");
+    setActionError("");
+    try {
+      await commitKnowledgeImportSource(stagedSource.id, {
+        parser_id: parser.id,
+        publish_targets: ["local_markdown"],
+        allow_cloud: parser.location === "cloud" && allowCloudParser,
+      });
+      setDialog(null);
+      setStagedSource(null);
+      setParserChoices([]);
+      setNotice(`已加入导入队列：${stagedSource.file_name}`);
+      onRefresh();
+    } catch (error) {
+      setActionError(error instanceof Error ? error.message : "提交导入失败");
+    } finally {
+      setBusy(null);
     }
   }
 
@@ -381,11 +427,12 @@ export default function KnowledgeOverview({ documents, jobs, loading, onRefresh 
         </div>
         <div className="mt-4 grid gap-2 sm:grid-cols-3">
           {latestJobs.length ? latestJobs.map((job) => (
-            <Link key={job.id} href={`/knowledge/imports/${job.id}`} className="flex items-center gap-3 rounded-2xl bg-black/[0.022] px-3 py-3 transition hover:bg-black/[0.04]">
-              <span className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-xl ${isActive(job) ? "bg-[#002fa7]/10 text-[#002fa7]" : "bg-emerald-50 text-emerald-700"}`}>
-                {isActive(job) ? <Clock3 className="h-4 w-4" /> : <CheckCircle2 className="h-4 w-4" />}
+            <Link key={job.id} href={`/knowledge/imports/${job.id}`} className="group flex items-center gap-3 rounded-2xl bg-black/[0.022] px-3 py-3 transition hover:bg-black/[0.04]">
+              <span className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-xl ${job.status === "staged" ? "bg-amber-50 text-amber-700" : isActive(job) ? "bg-[#002fa7]/10 text-[#002fa7]" : "bg-emerald-50 text-emerald-700"}`}>
+                {job.status === "staged" || isActive(job) ? <Clock3 className="h-4 w-4" /> : <CheckCircle2 className="h-4 w-4" />}
               </span>
-              <span className="min-w-0 flex-1"><strong className="block truncate text-xs text-gray-800">{job.title || job.file_name}</strong><span className="mt-0.5 block text-[10px] text-gray-400">{job.current_step || job.status}</span></span>
+              <span className="min-w-0 flex-1"><strong className="block truncate text-xs text-gray-800">{job.title || job.file_name}</strong><span className="mt-0.5 block text-[10px] text-gray-400">{overviewJobStatus(job)}</span></span>
+              {job.status === "staged" ? <span className="flex shrink-0 items-center gap-0.5 text-[10px] font-semibold text-[#002fa7]">继续解析<ChevronRight className="h-3 w-3 transition group-hover:translate-x-0.5" /></span> : null}
             </Link>
           )) : (
             <div className="rounded-2xl border border-dashed border-black/[0.08] px-4 py-7 text-center text-xs text-gray-400 sm:col-span-3">还没有后台任务</div>
@@ -418,14 +465,14 @@ export default function KnowledgeOverview({ documents, jobs, loading, onRefresh 
           >
             <div className="flex items-start gap-3 border-b border-black/[0.06] px-6 py-5">
               <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-2xl bg-[#002fa7]/[0.08] text-[#002fa7]">
-                {dialog === "read-later" ? <Link2 className="h-5 w-5" /> : <Sparkles className="h-5 w-5" />}
+                {dialog === "read-later" ? <Link2 className="h-5 w-5" /> : dialog === "parser" ? <FileUp className="h-5 w-5" /> : <Sparkles className="h-5 w-5" />}
               </span>
               <div className="min-w-0 flex-1">
                 <h2 id="quick-action-title" className="text-base font-semibold text-gray-950">
-                  {dialog === "read-later" ? "收藏链接" : "编译 Wiki"}
+                  {dialog === "read-later" ? "收藏链接" : dialog === "parser" ? "选择文档解析器" : "编译 Wiki"}
                 </h2>
                 <p className="mt-1 text-xs leading-5 text-gray-500">
-                  {dialog === "read-later" ? "保存后将在后台抓取并整理正文。" : "选择本次要交给 Wiki Compiler Agent 的 Raw。"}
+                  {dialog === "read-later" ? "保存后将在后台抓取并整理正文。" : dialog === "parser" ? "文件已经暂存；确认解析器后才会创建后台任务。" : "选择本次要交给 Wiki Compiler Agent 的 Raw。"}
                 </p>
               </div>
               <button type="button" onClick={() => setDialog(null)} disabled={Boolean(busy)} aria-label="关闭" className="flex h-8 w-8 items-center justify-center rounded-xl text-gray-400 hover:bg-black/[0.04] hover:text-gray-700 disabled:opacity-40">
@@ -448,6 +495,24 @@ export default function KnowledgeOverview({ documents, jobs, loading, onRefresh 
                     className="h-12 min-w-0 flex-1 bg-transparent text-sm outline-none placeholder:text-gray-400"
                   />
                 </div>
+              </div>
+            ) : dialog === "parser" ? (
+              <div className="px-6 py-5">
+                {stagedSource ? <p className="mb-3 truncate text-xs font-semibold text-gray-700">{stagedSource.file_name} · {Math.max(1, Math.round(stagedSource.size_bytes / 1024))} KB</p> : null}
+                <div className="max-h-72 space-y-2 overflow-y-auto pr-1">
+                  {orderedParserChoices.map((parser) => {
+                    const selected = selectedParserId === parser.id;
+                    return (
+                      <button key={parser.id} type="button" disabled={!parser.selectable} onClick={() => { setSelectedParserId(parser.id); if (parser.location !== "cloud") setAllowCloudParser(false); }} className={`flex w-full items-start gap-3 rounded-2xl border p-3 text-left transition ${selected ? "border-[#002fa7] bg-[#002fa7]/[0.06]" : parser.selectable ? "border-black/[0.07] hover:border-[#002fa7]/25" : "cursor-not-allowed border-black/[0.05] bg-gray-50 opacity-55"}`}>
+                        <span className={`mt-0.5 flex h-9 w-9 shrink-0 items-center justify-center rounded-xl ${parser.location === "cloud" ? "bg-violet-50 text-violet-600" : "bg-emerald-50 text-emerald-700"}`}>{parser.location === "cloud" ? <Cloud className="h-4 w-4" /> : <HardDrive className="h-4 w-4" />}</span>
+                        <span className="min-w-0 flex-1"><span className="flex flex-wrap items-center gap-2"><strong className="text-xs text-gray-900">{parser.name}</strong>{parser.recommended ? <span className="rounded-full bg-emerald-50 px-2 py-0.5 text-[9px] font-semibold text-emerald-700">推荐</span> : null}</span><span className="mt-1 block text-[10px] leading-4 text-gray-500">{parser.selectable ? parser.description : parser.enabled ? `已启用，但当前不可选：${parser.health_message || parser.reason}` : `已停用：${parser.health_message || parser.reason}`}</span></span>
+                        <span className={`mt-2 h-4 w-4 rounded-full border ${selected ? "border-[5px] border-[#002fa7]" : "border-gray-300"}`} />
+                      </button>
+                    );
+                  })}
+                </div>
+                {parserChoices.find((item) => item.id === selectedParserId)?.location === "cloud" ? <label className="mt-3 flex cursor-pointer items-start gap-2 rounded-xl bg-amber-50 px-3 py-2.5 text-[10px] leading-4 text-amber-800"><input type="checkbox" checked={allowCloudParser} onChange={(event) => setAllowCloudParser(event.target.checked)} className="mt-0.5 accent-[#002fa7]" /><span>我确认原始文件将发送至第三方云端服务；未勾选时禁止提交。</span></label> : null}
+                <Link href="/settings?category=knowledge&section=parsers#knowledge-section-parsers" className="mt-3 inline-block text-[10px] font-semibold text-[#002fa7]">管理解析器与密钥</Link>
               </div>
             ) : (
               <div className="px-6 py-5">
@@ -492,12 +557,12 @@ export default function KnowledgeOverview({ documents, jobs, loading, onRefresh 
               <button type="button" onClick={() => setDialog(null)} disabled={Boolean(busy)} className="h-10 rounded-xl px-4 text-sm font-semibold text-gray-500 hover:bg-black/[0.04] disabled:opacity-40">取消</button>
               <button
                 type="button"
-                onClick={() => void (dialog === "read-later" ? saveUrl() : compileWiki())}
-                disabled={Boolean(busy) || (dialog === "read-later" ? !url.trim() : !selectedRaw.size)}
+                onClick={() => void (dialog === "read-later" ? saveUrl() : dialog === "parser" ? commitUpload() : compileWiki())}
+                disabled={Boolean(busy) || (dialog === "read-later" ? !url.trim() : dialog === "parser" ? !selectedParserId || (parserChoices.find((item) => item.id === selectedParserId)?.location === "cloud" && !allowCloudParser) : !selectedRaw.size)}
                 className="inline-flex h-10 items-center gap-2 rounded-xl bg-[#002fa7] px-5 text-sm font-semibold text-white shadow-sm hover:bg-[#001f7a] disabled:cursor-not-allowed disabled:opacity-40"
               >
                 {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
-                {dialog === "read-later" ? "收藏" : importGbrain ? "编译并导入 GBrain" : "提交编译"}
+                {dialog === "read-later" ? "收藏" : dialog === "parser" ? "创建后台任务" : importGbrain ? "编译并导入 GBrain" : "提交编译"}
               </button>
             </div>
           </section>

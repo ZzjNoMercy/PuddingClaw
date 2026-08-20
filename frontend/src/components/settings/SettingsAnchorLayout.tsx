@@ -42,6 +42,34 @@ export default function SettingsAnchorLayout({
   }, [activeSection, sections]);
 
   useEffect(() => {
+    let frame = 0;
+    const syncSectionFromLocation = () => {
+      const querySection = new URLSearchParams(window.location.search).get("section") || "";
+      const hashPrefix = `#${prefix}-section-`;
+      const hashSection = window.location.hash.startsWith(hashPrefix)
+        ? window.location.hash.slice(hashPrefix.length)
+        : "";
+      const targetSection = querySection || hashSection;
+      if (!sections.some((section) => section.id === targetSection)) return;
+      setActiveSection(targetSection);
+      window.cancelAnimationFrame(frame);
+      frame = window.requestAnimationFrame(() => {
+        document.getElementById(`${prefix}-section-${targetSection}`)?.scrollIntoView({
+          behavior: "auto",
+          block: "start",
+        });
+      });
+    };
+
+    syncSectionFromLocation();
+    window.addEventListener("hashchange", syncSectionFromLocation);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      window.removeEventListener("hashchange", syncSectionFromLocation);
+    };
+  }, [prefix, sections]);
+
+  useEffect(() => {
     const observer = new IntersectionObserver(
       (entries) => {
         const visible = entries

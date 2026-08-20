@@ -68,7 +68,7 @@ function usage() {
     "  puddingclaw database migrate postgres-to-sqlite [--target-path <path>] [--skip-drain] [--drain-timeout <s>]",
     "  puddingclaw extension list|enable|disable ...",
     "  puddingclaw agent run <message> [--session <id>] [--export <dir>] [--json|--jsonl]",
-    "  puddingclaw agent respond <run_id> --input-json - [--json]",
+    "  puddingclaw agent respond <run_id> --input-json - [--json|--jsonl]",
     "  puddingclaw agent cancel <run_id> [--json]",
     "  puddingclaw agent models list [--json]",
     "  puddingclaw agent capabilities [--json]",
@@ -138,7 +138,6 @@ async function main({ positionals, flags }) {
     const deployment = await doctorCommand(paths);
     const worker = await workerDoctorCommand(paths);
     const workerReady = worker.value.configured === true
-      && worker.value.authenticated === true
       && worker.value.reachable === true;
     const value = {
       ...worker.value,

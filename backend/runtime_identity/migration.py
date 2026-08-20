@@ -656,22 +656,6 @@ def migrate_home_layout(paths: PuddingClawPaths) -> dict[str, Any]:
                 "copied": report["copied"] - before,
             })
 
-        from runtime_identity.paths import trusted_owner_user_id
-
-        legacy_access = paths.data() / "worker-access-keys.json"
-        owner_access = paths.owner_access(trusted_owner_user_id()) / "worker-access-keys.json"
-        if legacy_access.is_file():
-            owner_access.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-            owner_access.parent.chmod(0o700)
-            _copy_verified(
-                legacy_access,
-                owner_access,
-                paths.migrations() / f"{HOME_LAYOUT_MIGRATION_ID}-conflicts/access",
-                report,
-            )
-            if owner_access.is_file():
-                owner_access.chmod(0o600)
-
         report["completed_at"] = time.time()
         temporary = marker.with_name(f".{marker.name}.{os.getpid()}.tmp")
         temporary.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")

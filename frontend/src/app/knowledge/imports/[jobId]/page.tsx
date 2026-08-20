@@ -8,12 +8,16 @@ import {
   ArrowLeft,
   CheckCircle2,
   Clock3,
+  Cloud,
   Database,
   FileImage,
   FileText,
   BookOpenCheck,
+  HardDrive,
+  KeyRound,
   Layers3,
   Loader2,
+  Play,
   RefreshCw,
   Search,
   X,
@@ -25,10 +29,13 @@ import ResizeHandle from "@/components/layout/ResizeHandle";
 import FeishuSourceCard, { feishuMetaOf } from "@/components/knowledge/FeishuSourceCard";
 import { useApp } from "@/lib/store";
 import {
+  commitKnowledgeImportSource,
   getKnowledgeImportJob,
+  listDocumentParsers,
   publishKnowledgeImportJobVector,
   previewKnowledgeFile,
   searchKnowledge,
+  type DocumentParserStatus,
   type KnowledgeDocument,
   type KnowledgeFilePreview,
   type KnowledgeImportEvent,
@@ -48,6 +55,7 @@ type ImageContext = {
 };
 type ParsedImageAsset = { label: string; src: string; context?: ImageContext };
 type ImagePreview = ParsedImageAsset | null;
+type StructuredResult = Record<string, unknown> | unknown[];
 type ChunkPreview = {
   index: number;
   title: string;
@@ -87,6 +95,7 @@ function errorMessage(error: unknown): string {
 }
 
 function jobStatusLabel(status: string): string {
+  if (status === "staged") return "待选择解析器";
   if (status === "queued") return "排队中";
   if (status === "running") return "处理中";
   if (status === "succeeded") return "可用";
@@ -96,10 +105,218 @@ function jobStatusLabel(status: string): string {
 }
 
 function jobStatusClass(status: string): string {
+  if (status === "staged") return "bg-amber-50 text-amber-700 ring-amber-500/10";
   if (status === "succeeded") return "bg-emerald-50 text-emerald-700 ring-emerald-500/10";
   if (status === "failed") return "bg-red-50 text-red-600 ring-red-500/10";
   if (status === "running") return "bg-[#002fa7]/10 text-[#002fa7] ring-[#002fa7]/10";
   return "bg-gray-100 text-gray-600 ring-black/[0.04]";
+}
+
+function StagedImportDetail({
+  job,
+  onCommitted,
+  onNotice,
+}: {
+  job: KnowledgeImportJob;
+  onCommitted: (nextJob: KnowledgeImportJob) => void;
+  onNotice: (notice: { type: "success" | "error"; message: string }) => void;
+}) {
+  const [parsers, setParsers] = useState<DocumentParserStatus[]>([]);
+  const [selectedParserId, setSelectedParserId] = useState("");
+  const [title, setTitle] = useState(job.title || "");
+  const [allowCloud, setAllowCloud] = useState(false);
+  const [loadingParsers, setLoadingParsers] = useState(true);
+  const [committing, setCommitting] = useState(false);
+  const [parserError, setParserError] = useState("");
+
+  const orderedParsers = useMemo(
+    () =>
+      [...parsers].sort(
+        (left, right) =>
+          Number(right.selectable) - Number(left.selectable) ||
+          Number(right.recommended) - Number(left.recommended) ||
+          left.priority - right.priority
+      ),
+    [parsers]
+  );
+  const selectedParser = parsers.find((parser) => parser.id === selectedParserId);
+  const sourceMetadata = job.metadata?.source;
+  const source = sourceMetadata && typeof sourceMetadata === "object" ? (sourceMetadata as Record<string, unknown>) : {};
+  const pageCount = metadataNumber(source.page_count);
+  const expiresAt = typeof source.expires_at === "string" ? source.expires_at : "";
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoadingParsers(true);
+    setParserError("");
+    void listDocumentParsers(job.file_name)
+      .then((nextParsers) => {
+        if (cancelled) return;
+        setParsers(nextParsers);
+        const defaultParser =
+          nextParsers.find((parser) => parser.recommended && parser.selectable) ||
+          nextParsers.find((parser) => parser.selectable);
+        setSelectedParserId(defaultParser?.id || "");
+      })
+      .catch((error) => {
+        if (!cancelled) setParserError(errorMessage(error));
+      })
+      .finally(() => {
+        if (!cancelled) setLoadingParsers(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [job.file_name]);
+
+  const commit = async () => {
+    if (!selectedParser?.selectable) return;
+    if (selectedParser.location === "cloud" && !allowCloud) {
+      onNotice({ type: "error", message: "选择云端解析器前，需要确认允许发送原始文件。" });
+      return;
+    }
+    setCommitting(true);
+    try {
+      const nextJob = await commitKnowledgeImportSource(job.id, {
+        parser_id: selectedParser.id,
+        publish_targets: ["local_markdown"],
+        title: title.trim() || undefined,
+        allow_cloud: selectedParser.location === "cloud" ? allowCloud : false,
+      });
+      onNotice({ type: "success", message: `已使用 ${selectedParser.name} 开始解析。` });
+      onCommitted(nextJob);
+    } catch (error) {
+      onNotice({ type: "error", message: errorMessage(error) });
+    } finally {
+      setCommitting(false);
+    }
+  };
+
+  return (
+    <section className="grid gap-5 lg:grid-cols-[minmax(0,1.45fr)_minmax(300px,0.55fr)]">
+      <div className="rounded-[28px] border border-black/[0.06] bg-white p-5 shadow-sm sm:p-6">
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+          <div>
+            <h2 className="text-lg font-semibold text-gray-950">选择解析方式</h2>
+            <p className="mt-1 text-sm leading-6 text-gray-500">原文件已经暂存，不需要重新上传。选定解析器后才会创建后台任务。</p>
+          </div>
+          <Link
+            href="/settings?category=knowledge&section=parsers#knowledge-section-parsers"
+            className="shrink-0 text-xs font-semibold text-[#002fa7] transition hover:text-[#001f7a]"
+          >
+            管理解析器与密钥
+          </Link>
+        </div>
+
+        <label className="mt-5 block">
+          <span className="text-xs font-semibold text-gray-500">文档标题（可选）</span>
+          <input
+            value={title}
+            onChange={(event) => setTitle(event.target.value)}
+            placeholder={job.file_name}
+            className="mt-2 h-11 w-full rounded-2xl border border-black/[0.08] bg-white px-4 text-sm text-gray-900 outline-none transition placeholder:text-gray-300 focus:border-[#002fa7]/40 focus:ring-4 focus:ring-[#002fa7]/[0.08]"
+          />
+        </label>
+
+        <div className="mt-5">
+          <p className="text-xs font-semibold text-gray-500">文档解析器</p>
+          {loadingParsers ? (
+            <div className="mt-3 flex min-h-32 items-center justify-center rounded-2xl bg-black/[0.02] text-sm text-gray-400">
+              <Loader2 className="mr-2 h-4 w-4 animate-spin" />加载解析器
+            </div>
+          ) : parserError ? (
+            <div className="mt-3 rounded-2xl border border-red-500/15 bg-red-50 px-4 py-3 text-sm text-red-600">{parserError}</div>
+          ) : (
+            <div className="mt-3 grid gap-3 md:grid-cols-2">
+              {orderedParsers.map((parser) => {
+                const selected = parser.id === selectedParserId;
+                return (
+                  <button
+                    key={parser.id}
+                    type="button"
+                    disabled={!parser.selectable}
+                    onClick={() => {
+                      setSelectedParserId(parser.id);
+                      if (parser.location !== "cloud") setAllowCloud(false);
+                    }}
+                    className={`rounded-2xl border p-4 text-left transition ${
+                      selected
+                        ? "border-[#002fa7] bg-[#002fa7]/[0.045] ring-2 ring-[#002fa7]/10"
+                        : parser.selectable
+                          ? "border-black/[0.08] bg-white hover:border-[#002fa7]/30 hover:bg-[#002fa7]/[0.02]"
+                          : "cursor-not-allowed border-black/[0.05] bg-gray-50 opacity-60"
+                    }`}
+                  >
+                    <span className="flex items-start gap-3">
+                      <span className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-xl ${parser.location === "cloud" ? "bg-violet-50 text-violet-600" : "bg-emerald-50 text-emerald-700"}`}>
+                        {parser.location === "cloud" ? <Cloud className="h-5 w-5" /> : <HardDrive className="h-5 w-5" />}
+                      </span>
+                      <span className="min-w-0 flex-1">
+                        <span className="flex flex-wrap items-center gap-2">
+                          <span className="text-sm font-semibold text-gray-950">{parser.name}</span>
+                          {parser.recommended ? <span className="rounded-full bg-emerald-50 px-2 py-0.5 text-[10px] font-semibold text-emerald-700">推荐</span> : null}
+                          <span className="rounded-full bg-gray-100 px-2 py-0.5 text-[10px] text-gray-500">{parser.location === "cloud" ? "云端" : "本地"}</span>
+                        </span>
+                        <span className="mt-1.5 block text-xs leading-5 text-gray-500">{parser.description}</span>
+                        {!parser.selectable ? (
+                          <span className="mt-2 block text-[11px] text-amber-700">
+                            {parser.enabled ? `当前不可选：${parser.health_message || parser.reason}` : `已停用：${parser.health_message || parser.reason}`}
+                          </span>
+                        ) : null}
+                        {parser.requires_credential && !parser.credential_configured ? (
+                          <span className="mt-2 flex items-center gap-1.5 text-[11px] font-medium text-amber-700">
+                            <KeyRound className="h-3.5 w-3.5" />缺少 API Key
+                          </span>
+                        ) : null}
+                      </span>
+                      <span className={`mt-1 h-4 w-4 shrink-0 rounded-full border ${selected ? "border-[5px] border-[#002fa7]" : "border-gray-300"}`} />
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
+          )}
+        </div>
+
+        {selectedParser?.location === "cloud" ? (
+          <label className="mt-4 flex cursor-pointer items-start gap-3 rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-xs leading-5 text-amber-800">
+            <input type="checkbox" checked={allowCloud} onChange={(event) => setAllowCloud(event.target.checked)} className="mt-0.5 h-4 w-4 accent-[#002fa7]" />
+            <span>我确认原始文件将发送至第三方云端解析服务；未勾选时不会提交。</span>
+          </label>
+        ) : null}
+
+        <div className="mt-5 flex justify-end border-t border-black/[0.06] pt-5">
+          <button
+            type="button"
+            onClick={commit}
+            disabled={committing || !selectedParser?.selectable || (selectedParser.location === "cloud" && !allowCloud)}
+            className="inline-flex h-11 items-center justify-center gap-2 rounded-xl bg-[#002fa7] px-5 text-sm font-semibold text-white transition hover:bg-[#001f7a] disabled:cursor-not-allowed disabled:opacity-45"
+          >
+            {committing ? <Loader2 className="h-4 w-4 animate-spin" /> : <Play className="h-4 w-4" />}
+            开始解析
+          </button>
+        </div>
+      </div>
+
+      <aside className="rounded-[28px] border border-black/[0.06] bg-white p-5 shadow-sm">
+        <div className="flex items-center gap-3">
+          <span className="flex h-10 w-10 items-center justify-center rounded-2xl bg-amber-50 text-amber-700"><Clock3 className="h-5 w-5" /></span>
+          <div>
+            <h2 className="text-base font-semibold text-gray-950">文件已暂存</h2>
+            <p className="mt-0.5 text-xs text-gray-400">等待你确认解析方式</p>
+          </div>
+        </div>
+        <div className="mt-5 space-y-4">
+          <InfoRow label="文件名" value={job.file_name} />
+          <InfoRow label="文件类型" value={job.file_type.toUpperCase()} />
+          <InfoRow label="文件大小" value={formatBytes(job.file_size)} />
+          {pageCount > 0 ? <InfoRow label="页数" value={`约 ${pageCount} 页`} /> : null}
+          <InfoRow label="SHA" value={job.source_sha256 ? job.source_sha256.slice(0, 12) : "-"} title={job.source_sha256} />
+          {expiresAt ? <InfoRow label="保留至" value={formatTime(expiresAt)} /> : null}
+        </div>
+      </aside>
+    </section>
+  );
 }
 
 function isImportJobActive(job: KnowledgeImportJob | null): boolean {
@@ -140,6 +357,29 @@ function metadataNumber(value: unknown): number {
     return Number.isFinite(parsed) ? parsed : 0;
   }
   return 0;
+}
+
+function nonEmptyStructuredResult(value: unknown): StructuredResult | null {
+  if (Array.isArray(value)) return value.length > 0 ? value : null;
+  if (value && typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    return Object.keys(record).length > 0 ? record : null;
+  }
+  return null;
+}
+
+function structuredResultOf(document: KnowledgeDocument | null): StructuredResult | null {
+  const metadata = document?.metadata;
+  if (!metadata || typeof metadata !== "object") return null;
+  const direct = nonEmptyStructuredResult(metadata.structured_blocks);
+  if (direct) return direct;
+  const legacyMinerU = nonEmptyStructuredResult(metadata.mineru);
+  if (legacyMinerU) return legacyMinerU;
+  const parserTrace = metadata.parser_trace;
+  if (!parserTrace || typeof parserTrace !== "object") return null;
+  const parserMetadata = (parserTrace as Record<string, unknown>).metadata;
+  if (!parserMetadata || typeof parserMetadata !== "object") return null;
+  return nonEmptyStructuredResult((parserMetadata as Record<string, unknown>).response);
 }
 
 function vectorProgress(job: KnowledgeImportJob | null): {
@@ -871,9 +1111,7 @@ export default function KnowledgeImportJobDetailPage() {
       const detail = await getKnowledgeImportJob(jobId, includeEvents);
       setJob(detail.job);
       if (includeEvents) setEvents(detail.events);
-      if (includeEvents) {
-        setDocument(detail.document ?? null);
-      }
+      setDocument(detail.document ?? null);
     } catch (error) {
       if (!options?.silent) {
         setToast({ type: "error", message: errorMessage(error) });
@@ -952,10 +1190,29 @@ export default function KnowledgeImportJobDetailPage() {
   const chunkStart = chunks.length > 0 ? (currentChunkPage - 1) * CHUNKS_PER_PAGE + 1 : 0;
   const chunkEnd = Math.min(currentChunkPage * CHUNKS_PER_PAGE, chunks.length);
   const assets = metadataArray(document, "assets");
+  const structuredResult = useMemo(() => structuredResultOf(document), [document]);
   const feishuMeta = feishuMetaOf(document);
   const multimodal = document?.metadata?.multimodal;
   const imageCount = nestedNumber(multimodal, "image_asset_count") ?? assets.length;
   const originalPath = metadataString(document, "original_path") || job?.source_path || "-";
+  const parserTrace = useMemo(() => {
+    const jobParser = job?.metadata?.parser;
+    const documentParser = document?.metadata?.parser_trace;
+    const value =
+      documentParser && typeof documentParser === "object"
+        ? documentParser
+        : jobParser && typeof jobParser === "object"
+          ? jobParser
+          : null;
+    return value as Record<string, unknown> | null;
+  }, [document?.metadata?.parser_trace, job?.metadata?.parser]);
+  const parserId = typeof parserTrace?.id === "string"
+    ? parserTrace.id
+    : typeof parserTrace?.resolved_id === "string"
+      ? parserTrace.resolved_id
+      : "";
+  const parserVersion = typeof parserTrace?.version === "string" ? parserTrace.version : "";
+  const parserLocation = typeof parserTrace?.location === "string" ? parserTrace.location : "";
   const displayName = job?.title || job?.file_name || "导入任务";
   const vectorReady = Boolean(vectorIndex?.refreshed);
   const vectorMessage = vectorStatusMessage(vectorIndex);
@@ -1010,6 +1267,15 @@ export default function KnowledgeImportJobDetailPage() {
       setSearchLoading(false);
     }
   }, [searchQuery]);
+
+  const handleStagedCommitted = useCallback(
+    (nextJob: KnowledgeImportJob) => {
+      setJob(nextJob);
+      setEvents([]);
+      void refresh({ silent: true });
+    },
+    [refresh]
+  );
 
   return (
     <div className="h-screen app-bg text-gray-900">
@@ -1110,7 +1376,7 @@ export default function KnowledgeImportJobDetailPage() {
                   </button>
                 </div>
 
-                {job ? (
+                {job && job.status !== "staged" ? (
                   <div className="mt-5 h-2 overflow-hidden rounded-full bg-gray-100">
                     <div
                       className={`h-full rounded-full ${job.status === "failed" ? "bg-red-500" : "bg-[#002fa7]"}`}
@@ -1144,6 +1410,8 @@ export default function KnowledgeImportJobDetailPage() {
                     加载任务详情...
                   </div>
                 </section>
+              ) : job.status === "staged" ? (
+                <StagedImportDetail job={job} onCommitted={handleStagedCommitted} onNotice={setToast} />
               ) : currentIsLlmWikiJob ? (
                 <LlmWikiJobDetail job={job} events={events} />
               ) : currentIsVannaEntityJob ? (
@@ -1184,6 +1452,9 @@ export default function KnowledgeImportJobDetailPage() {
                       <InfoRow label="文件类型" value={currentIsVectorJob ? "-" : job?.file_type?.toUpperCase() || "-"} />
                       <InfoRow label="文件大小" value={job ? formatBytes(job.file_size) : "-"} />
                       <InfoRow label="当前步骤" value={job?.current_step || "-"} />
+                      {parserId ? <InfoRow label="文档解析器" value={parserId} /> : null}
+                      {parserVersion ? <InfoRow label="解析器版本" value={parserVersion} /> : null}
+                      {parserLocation ? <InfoRow label="运行位置" value={parserLocation === "cloud" ? "云端" : "本地"} /> : null}
                       <InfoRow label="任务编号" value={job?.id || "-"} />
                       {relatedSourceJobId ? <InfoRow label="原任务" value={relatedSourceJobId} /> : null}
                       <InfoRow label="开始时间" value={formatTime(job?.started_at)} />
@@ -1293,7 +1564,7 @@ export default function KnowledgeImportJobDetailPage() {
               {activeTab === "result" ? (
                 <section className="rounded-[28px] border border-black/[0.06] bg-white p-5 shadow-sm">
                   <div className="inline-flex flex-wrap gap-2 rounded-2xl bg-black/[0.025] p-1">
-                    {(["markdown", "source", "images", "structured"] as ResultTab[]).map((tab) => (
+                    {(["markdown", "source", "images", ...(structuredResult ? ["structured" as const] : [])] as ResultTab[]).map((tab) => (
                       <button
                         key={tab}
                         type="button"
@@ -1405,9 +1676,9 @@ export default function KnowledgeImportJobDetailPage() {
                         <p className="mt-3 text-sm leading-6 text-gray-500">
                           这里预留给 MinerU layout block、表格、标题层级和后续 AI 结构化提取结果。
                         </p>
-                        {document?.metadata?.mineru ? (
+                        {structuredResult ? (
                           <pre className="mt-4 max-h-[360px] overflow-auto rounded-2xl bg-gray-950 px-4 py-4 text-xs leading-5 text-gray-100">
-                            {JSON.stringify(document.metadata.mineru, null, 2)}
+                            {JSON.stringify(structuredResult, null, 2)}
                           </pre>
                         ) : (
                           <div className="mt-4 rounded-2xl border border-dashed border-black/[0.08] px-4 py-8 text-center text-sm text-gray-400">

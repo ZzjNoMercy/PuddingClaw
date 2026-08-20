@@ -76,9 +76,9 @@ is a separate, explicit release action and is not performed by build or verifica
   `puddingclaw agent ...` namespace: `run`, `respond`, `cancel`, `models list`,
   and `capabilities`, including sessions, JSONL progress,
   external approval continuation, and artifact export.
-- `init` creates a private local Worker token under the isolated Home. It is injected
-  only into the managed Backend and read by local Agent commands; it is never stored
-  in `deploy.json`/`runtime.json` or printed. An explicit `PUDDINGCLAW_TOKEN` takes priority.
+- Agent commands connect only to the local loopback Backend. They do not create,
+  read, inject, or transmit a Worker token; PuddingClaw owns model, data-source,
+  tool, and HITL authorization inside the Backend.
 
 `stop` does not trust PID files alone. Each launcher must answer a one-time challenge
 inside the CLI-managed Home before the CLI sends a signal; an unknown or stale PID is

@@ -12,6 +12,7 @@ import React, {
 import type { AttachmentPreviewSelection } from "./imageAttachments";
 import {
   streamAgent,
+  streamSessionEvents,
   getSessionTokenCount,
   getToolContextJobStatus,
   listSessions as apiListSessions,
@@ -1055,6 +1056,14 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     [],
   );
   const [sharedStreamingSessions, setSharedStreamingSessions] = useState<Set<string>>(new Set());
+  // Runs started by another client (Worker CLI, PuddingTeams, or another
+  // browser tab) do not own this tab's POST /agent stream.  Keep a small
+  // remote-run projection so the selected Session still shows live activity
+  // without requiring a manual refresh.
+  const [remoteRunningSessions, setRemoteRunningSessions] = useState<Set<string>>(new Set());
+  const remoteRunningSessionsRef = useRef<Set<string>>(new Set());
+  const headlessObserverSequencesRef = useRef<Record<string, number>>({});
+  const headlessObserverRunIdsRef = useRef<Record<string, string>>({});
   const [sessionId, setSessionIdRaw] = useState("default");
   const [userId] = useState(() => getOrCreateUserId());
   const [sessions, setSessions] = useState<SessionMeta[]>([]);
@@ -1372,8 +1381,12 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   // Derived: is the CURRENT session streaming?
   const isStreaming = streamingSessions.has(sessionId);
   const runningSessionIds = useMemo(
-    () => mergeRunningSessionIds(streamingSessions, sharedStreamingSessions),
-    [streamingSessions, sharedStreamingSessions],
+    () => {
+      const merged = mergeRunningSessionIds(streamingSessions, sharedStreamingSessions);
+      remoteRunningSessions.forEach((sid) => merged.add(sid));
+      return merged;
+    },
+    [remoteRunningSessions, sharedStreamingSessions, streamingSessions],
   );
   // The navbar is global, so it must also reflect work that continues after
   // switching away from the session that initiated it.
@@ -1825,6 +1838,15 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     loadMcpServers();
   }, [loadSessions, loadProjects, loadMcpServers]);
 
+  // Headless CLI/PuddingTeams can create Sessions without this browser being
+  // the initiating client. Refresh only the lightweight Session index so a
+  // new Worker conversation appears in the sidebar without a page reload; do
+  // not auto-switch away from the user's current conversation.
+  useEffect(() => {
+    const timer = window.setInterval(loadSessions, 3000);
+    return () => window.clearInterval(timer);
+  }, [loadSessions]);
+
   const setSessionId = useCallback(
     (id: string) => {
       // Switch view — do NOT abort any SSE streams (they continue in background)
@@ -2042,6 +2064,416 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     },
     [setCurrentProjectId, updateSessionGraph, updateSessionRunActivity, updateSessionTodos]
   );
+
+  // Reconcile Runs created outside this browser tab.  The durable Harness
+  // state is intentionally the source of truth here: it works for a local
+  // Worker CLI and for PuddingTeams without requiring either client to share
+  // an in-memory SSE connection with this page.
+  useEffect(() => {
+    if (!sessionId || sessionId === "default") return;
+    let stopped = false;
+    let previousActive = remoteRunningSessionsRef.current.has(sessionId);
+
+    const refreshExternalRun = async () => {
+      try {
+        const data = await apiGetSessionHarnessState(sessionId);
+        if (stopped) return;
+        const latestRun = data.latest_run_id && data.runs[data.latest_run_id]
+          ? data.runs[data.latest_run_id]
+          : null;
+        const active = runIsActive(latestRun);
+        const nextRemote = new Set(remoteRunningSessionsRef.current);
+        if (active) nextRemote.add(sessionId);
+        else nextRemote.delete(sessionId);
+        remoteRunningSessionsRef.current = nextRemote;
+        setRemoteRunningSessions(nextRemote);
+        currentRunsMapRef.current[sessionId] = latestRun;
+        if (sessionIdRef.current === sessionId) setCurrentRun(latestRun);
+
+        if (active) {
+          const status = String(latestRun?.status || "running");
+          const waiting = status === "waiting_hitl";
+          updateSessionRunActivity(sessionId, {
+            phase: waiting ? "permission" : status === "evaluating" ? "verification" : "running",
+            label: waiting
+              ? "等待人工审批"
+              : status === "preparing"
+                ? "正在准备任务上下文"
+                : status === "evaluating"
+                  ? "正在整理最终结果"
+                  : "Agent 正在执行",
+            detail: latestRun?.objective?.slice(0, 120),
+          });
+        } else if (previousActive) {
+          updateSessionRunActivity(sessionId, null);
+          // A remote Run persists its authoritative assistant message only at
+          // segment/terminal boundaries. Refresh once on the active→terminal
+          // transition so the answer appears without a page reload.
+          const history = await apiGetSessionHistory(sessionId);
+          if (stopped) return;
+          const loaded = history.messages?.length ? parseHistoryMessages(history.messages) : [];
+          messagesMapRef.current[sessionId] = loaded;
+          if (sessionIdRef.current === sessionId) setMessages(loaded);
+        }
+        previousActive = active;
+      } catch {
+        // A transient refresh failure must not clear the visible Run state;
+        // the next heartbeat retries and the Worker itself remains unaffected.
+      }
+    };
+
+    void refreshExternalRun();
+    const timer = window.setInterval(() => void refreshExternalRun(), 1500);
+    return () => {
+      stopped = true;
+      window.clearInterval(timer);
+    };
+  }, [sessionId, updateSessionRunActivity]);
+
+  const selectedSessionHasRemoteRun = remoteRunningSessions.has(sessionId);
+
+  // A Headless Run is owned by the Harness, not by the CLI connection that
+  // started it. Observe the retained/broadcast event log so this browser can
+  // render the same visible content, tools and HITL boundary in real time.
+  // Harness polling above remains the discovery and disconnect-recovery path.
+  useEffect(() => {
+    if (
+      !sessionId
+      || sessionId === "default"
+      || !selectedSessionHasRemoteRun
+      || streamingSessionsRef.current.has(sessionId)
+    ) {
+      return;
+    }
+
+    const latestRun = currentRunsMapRef.current[sessionId];
+    const runId = String(latestRun?.run_id || "");
+    const queryId = String(latestRun?.query_id || "");
+    if (!runId) return;
+
+    if (headlessObserverRunIdsRef.current[sessionId] !== runId) {
+      headlessObserverRunIdsRef.current[sessionId] = runId;
+      headlessObserverSequencesRef.current[sessionId] = 0;
+    }
+
+    const controller = new AbortController();
+    let stopped = false;
+    let targetAssistantId = "";
+    let pendingTokens = "";
+    let tokenTimer: number | null = null;
+    let reconnectTimer: number | null = null;
+
+    const updateTarget = (updater: (message: ChatMessage) => ChatMessage) => {
+      if (!targetAssistantId) return;
+      updateSessionMessages(sessionId, (previous) => previous.map((message) =>
+        message.id === targetAssistantId ? updater(message) : message
+      ));
+    };
+
+    const flushTokens = () => {
+      if (tokenTimer !== null) {
+        window.clearTimeout(tokenTimer);
+        tokenTimer = null;
+      }
+      const content = pendingTokens;
+      pendingTokens = "";
+      if (!content) return;
+      updateTarget((message) => {
+        const segments = message.segments?.length
+          ? [...message.segments]
+          : [{ content: "", runId }];
+        const last = segments.length - 1;
+        segments[last] = {
+          ...segments[last],
+          runId: segments[last].runId || runId,
+          content: `${segments[last].content || ""}${content}`,
+        };
+        return {
+          ...message,
+          content: segments.map((segment) => segment.content).filter(Boolean).join("\n\n"),
+          segments,
+        };
+      });
+    };
+
+    const queueToken = (content: string) => {
+      if (!content) return;
+      pendingTokens += content;
+      if (tokenTimer === null) {
+        tokenTimer = window.setTimeout(flushTokens, 32);
+      }
+    };
+
+    const loadAuthoritativeHistory = async (resetCurrentRun: boolean) => {
+      const history = await apiGetSessionHistory(sessionId);
+      if (stopped) return;
+      const loaded = history.messages?.length ? parseHistoryMessages(history.messages) : [];
+      let targetIndex = -1;
+      for (let index = loaded.length - 1; index >= 0; index -= 1) {
+        const message = loaded[index];
+        if (
+          message.role === "assistant"
+          && (
+            (queryId && message.queryId === queryId)
+            || message.segments?.some((segment) => segment.runId === runId)
+          )
+        ) {
+          targetIndex = index;
+          break;
+        }
+      }
+      if (targetIndex === -1 && !resetCurrentRun) {
+        for (let index = loaded.length - 1; index >= 0; index -= 1) {
+          if (loaded[index].role === "assistant") {
+            targetIndex = index;
+            break;
+          }
+        }
+      }
+      if (targetIndex === -1) {
+        targetAssistantId = `headless-live-${runId}`;
+        loaded.push({
+          id: targetAssistantId,
+          queryId: queryId || undefined,
+          role: "assistant",
+          content: "",
+          toolCalls: [],
+          timeline: [],
+          segments: [{ content: "", runId }],
+          timestamp: Date.now(),
+        });
+      } else {
+        targetAssistantId = loaded[targetIndex].id;
+        if (resetCurrentRun) {
+          loaded[targetIndex] = {
+            ...loaded[targetIndex],
+            queryId: queryId || loaded[targetIndex].queryId,
+            content: "",
+            reasoning: undefined,
+            toolCalls: [],
+            timeline: [],
+            segments: [{ content: "", runId }],
+            permissionRequests: [],
+            errorNotice: undefined,
+          };
+        }
+      }
+      assistantIdsRef.current.set(sessionId, targetAssistantId);
+      messagesMapRef.current[sessionId] = loaded;
+      if (sessionIdRef.current === sessionId) setMessages(loaded);
+    };
+
+    const updateTool = (eventName: "tool_start" | "tool_end", data: Record<string, unknown>) => {
+      updateTarget((message) => {
+        const tool = String(data.tool || "");
+        const toolCallId = String(data.id || "");
+        const calls = [...(message.toolCalls || [])];
+        const timeline = [...(message.timeline || [])];
+        const segments = message.segments?.length
+          ? [...message.segments]
+          : [{ content: "", runId }];
+        if (eventName === "tool_start") {
+          if (!toolCallId || !calls.some((call) => call.id === toolCallId)) {
+            const call: ToolCall = {
+              id: toolCallId,
+              tool,
+              input: String(data.input || ""),
+              status: "running",
+              startedAt: Date.now(),
+            };
+            calls.push(call);
+            addToolToTimeline(timeline, call);
+            const last = segments.length - 1;
+            const segmentTimeline = [...(segments[last].timeline || [])];
+            addToolToTimeline(segmentTimeline, call);
+            segments[last] = { ...segments[last], runId: segments[last].runId || runId, timeline: segmentTimeline };
+          }
+        } else {
+          let callIndex = toolCallId ? calls.findIndex((call) => call.id === toolCallId) : -1;
+          if (callIndex === -1) {
+            for (let index = calls.length - 1; index >= 0; index -= 1) {
+              if (calls[index].tool === tool && calls[index].status === "running") {
+                callIndex = index;
+                break;
+              }
+            }
+          }
+          const updates: Partial<ToolCall> = {
+            tool,
+            output: String(data.output || ""),
+            status: "done",
+            endedAt: Date.now(),
+            summary_source: data.summary_source as string | undefined,
+            is_error: Boolean(data.is_error),
+          };
+          if (callIndex !== -1) calls[callIndex] = { ...calls[callIndex], ...updates };
+          updateToolInTimeline(timeline, toolCallId, tool, updates);
+          for (let index = segments.length - 1; index >= 0; index -= 1) {
+            const segmentTimeline = [...(segments[index].timeline || [])];
+            const ownsCall = segmentTimeline.some((item) =>
+              item.type === "tool"
+              && ((toolCallId && item.toolCall.id === toolCallId)
+                || (!toolCallId && item.toolCall.tool === tool && item.toolCall.status === "running"))
+            );
+            if (!ownsCall) continue;
+            updateToolInTimeline(segmentTimeline, toolCallId, tool, updates);
+            segments[index] = { ...segments[index], timeline: segmentTimeline };
+            break;
+          }
+        }
+        return { ...message, toolCalls: calls, timeline, segments };
+      });
+    };
+
+    const scheduleReconnect = () => {
+      if (stopped || reconnectTimer !== null) return;
+      reconnectTimer = window.setTimeout(() => {
+        reconnectTimer = null;
+        if (!stopped) void observe(true);
+      }, 750);
+    };
+
+    const observe = async (reconnecting = false) => {
+      let sawTerminalEvent = false;
+      try {
+        const after = headlessObserverSequencesRef.current[sessionId] || 0;
+        if (!reconnecting) {
+          await loadAuthoritativeHistory(after === 0);
+        }
+        if (stopped) return;
+
+        for await (const event of streamSessionEvents(sessionId, controller.signal, after)) {
+          if (stopped) break;
+          const sequence = Number(event.id || 0);
+          if (Number.isFinite(sequence) && sequence > 0) {
+            headlessObserverSequencesRef.current[sessionId] = sequence;
+          }
+
+          if (event.event === "token") {
+            queueToken(String(event.data.content || ""));
+            continue;
+          }
+          flushTokens();
+
+          if (event.event === "run_starting") {
+            updateSessionRunActivity(sessionId, { phase: "running", label: "Worker 已接收任务" });
+          } else if (event.event === "task_preflight_started") {
+            updateSessionRunActivity(sessionId, { phase: "running", label: "正在准备任务上下文" });
+          } else if (event.event === "run_started") {
+            const run = event.data.run as unknown as HarnessRun;
+            if (run?.run_id) {
+              currentRunsMapRef.current[sessionId] = run;
+              if (sessionIdRef.current === sessionId) setCurrentRun(run);
+            }
+            updateSessionRunActivity(sessionId, { phase: "running", label: "Agent 正在处理" });
+          } else if (event.event === "segment_break") {
+            updateTarget((message) => ({
+              ...message,
+              segments: [...(message.segments || [{ content: "", runId }]), { content: "", runId }],
+            }));
+          } else if (event.event === "segment_content_replaced") {
+            const replacement = String(event.data.content || "");
+            updateTarget((message) => {
+              const segments = message.segments?.length ? [...message.segments] : [{ content: "", runId }];
+              const last = segments.length - 1;
+              segments[last] = { ...segments[last], content: replacement, runId: segments[last].runId || runId };
+              return {
+                ...message,
+                content: segments.map((segment) => segment.content).filter(Boolean).join("\n\n"),
+                segments,
+              };
+            });
+          } else if (event.event === "tool_start" || event.event === "tool_end") {
+            updateTool(event.event, event.data);
+            updateSessionRunActivity(sessionId, {
+              phase: "running",
+              label: event.event === "tool_start"
+                ? `正在执行：${String(event.data.tool || "工具")}`
+                : "Agent 正在继续处理",
+            });
+          } else if (event.event === "permission_required") {
+            const request = event.data as unknown as PermissionRequest;
+            updateSessionRunActivity(sessionId, { phase: "permission", label: "等待你的授权" });
+            updateTarget((message) => {
+              const requests = message.permissionRequests || [];
+              const matches = (item: PermissionRequest) => item.id === request.id
+                || Boolean(request.semantic_key && item.semantic_key === request.semantic_key);
+              return {
+                ...message,
+                permissionRequests: requests.some(matches)
+                  ? requests.map((item) => matches(item) ? request : item)
+                  : [...requests, request],
+              };
+            });
+          } else if (event.event === "permission_resolved") {
+            const requestId = String(event.data.request_id || "");
+            updateTarget((message) => ({
+              ...message,
+              permissionRequests: (message.permissionRequests || []).map((request) =>
+                request.id === requestId ? { ...request, status: "resolved" } : request
+              ),
+            }));
+            updateSessionRunActivity(sessionId, { phase: "continuing", label: "授权已处理，Agent 正在继续" });
+          } else if (event.event === "final_response") {
+            const finalContent = String(event.data.content || "");
+            updateTarget((message) => {
+              const segments = message.segments?.length ? [...message.segments] : [{ content: "", runId }];
+              const currentContent = segments.map((segment) => segment.content).filter(Boolean).join("\n\n");
+              if (finalContent && !currentContent) {
+                const last = segments.length - 1;
+                segments[last] = { ...segments[last], content: finalContent, runId: segments[last].runId || runId };
+              }
+              return {
+                ...message,
+                queryId: String(event.data.query_id || message.queryId || "") || undefined,
+                content: currentContent || finalContent || message.content,
+                segments,
+                verificationSummary: String(event.data.verification_summary || "") || message.verificationSummary,
+              };
+            });
+            updateSessionRunActivity(sessionId, { phase: "verification", label: "正在整理最终结果" });
+          } else if (event.event === "stream_reset_required") {
+            await loadAuthoritativeHistory(false);
+          } else if (event.event === "error") {
+            const message = String(event.data.message || event.data.error || "Agent 运行失败");
+            updateTarget((current) => markMessageError(current, message));
+            updateSessionRunActivity(sessionId, null);
+          } else if (event.event === "done") {
+            sawTerminalEvent = true;
+            updateSessionRunActivity(sessionId, null);
+          }
+        }
+
+        flushTokens();
+        if (stopped) return;
+        if (sawTerminalEvent || !runIsActive(currentRunsMapRef.current[sessionId])) {
+          await loadAuthoritativeHistory(false);
+        } else {
+          scheduleReconnect();
+        }
+      } catch (error) {
+        flushTokens();
+        if (!(error instanceof DOMException && error.name === "AbortError")) {
+          // Harness polling and Session History remain authoritative fallbacks.
+          updateSessionRunActivity(sessionId, { phase: "running", label: "正在恢复运行状态" });
+          scheduleReconnect();
+        }
+      }
+    };
+
+    void observe();
+    return () => {
+      stopped = true;
+      controller.abort();
+      if (tokenTimer !== null) window.clearTimeout(tokenTimer);
+      if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
+    };
+  }, [
+    selectedSessionHasRemoteRun,
+    sessionId,
+    updateSessionMessages,
+    updateSessionRunActivity,
+  ]);
 
   // Trace history is intentionally lazy: switching conversations reads only
   // messages. The large sidecar is fetched when the user opens Trace 看板.

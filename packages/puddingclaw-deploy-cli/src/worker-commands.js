@@ -8,7 +8,6 @@ import { DEFAULT_BACKEND_PORT, loadConfig } from "./config.js";
 import { writeJson } from "./output.js";
 import { readJson } from "./store.js";
 import { WorkerClient, WorkerClientError } from "./worker-client.js";
-import { readLocalWorkerToken } from "./local-worker-token.js";
 
 const WORKER_MANIFEST = createRequire(import.meta.url)("../worker.manifest.json");
 
@@ -36,17 +35,10 @@ export async function agentClientConfig(paths) {
   try { parsed = new URL(endpoint); } catch {
     throw new WorkerClientError("PUDDINGCLAW_URL is invalid", { code: "configuration_error" });
   }
-  if (parsed.protocol === "http:" && !["localhost", "127.0.0.1", "::1", "[::1]"].includes(parsed.hostname)) {
-    throw new WorkerClientError("remote Worker endpoint must use HTTPS", { code: "configuration_error" });
-  }
-  const token = String(
-    process.env.PUDDINGCLAW_TOKEN
-    || process.env.PUDDINGCLAW_HEADLESS_TOKEN
-    || await readLocalWorkerToken(paths)
-    || "",
-  ).trim();
-  if (!token) {
-    throw new WorkerClientError("PUDDINGCLAW_TOKEN is not configured", { code: "configuration_error" });
+  if (!["localhost", "127.0.0.1", "::1", "[::1]"].includes(parsed.hostname)) {
+    throw new WorkerClientError("PuddingClaw CLI only connects to a local loopback Backend", {
+      code: "configuration_error",
+    });
   }
   const requestedTimeout = Number(process.env.PUDDINGCLAW_TIMEOUT_S || 600);
   if (!Number.isFinite(requestedTimeout) || requestedTimeout <= 0) {
@@ -56,7 +48,6 @@ export async function agentClientConfig(paths) {
   }
   return {
     endpoint,
-    token,
     timeoutMs: Math.max(1000, requestedTimeout * 1000),
   };
 }
@@ -76,7 +67,6 @@ export async function workerDoctorCommand(paths) {
         agent_id: "puddingclaw",
         protocol_version: "1",
         configured: false,
-        authenticated: false,
         reachable: false,
         error_code: failure.code,
         error: failure.message,
@@ -97,8 +87,7 @@ export async function workerDoctorCommand(paths) {
         agent_id: "puddingclaw",
         protocol_version: "1",
         configured: true,
-        authenticated: false,
-        reachable: failure.code === "auth_error",
+        reachable: false,
         error_code: failure.code,
         error: failure.message,
       },
@@ -249,7 +238,7 @@ async function collectApprovalDecisions(response) {
   return decisions;
 }
 
-async function resumeWithCliApproval(client, response, { jsonMode, signal }) {
+async function resumeWithCliApproval(client, response, { jsonMode, signal, onEvent }) {
   let current = response;
   while (current?.status === "needs_input" && current?.outcome === "waiting_hitl") {
     if (jsonMode) return current;
@@ -262,7 +251,7 @@ async function resumeWithCliApproval(client, response, { jsonMode, signal }) {
         code: "protocol_error",
       });
     }
-    current = await client.request(`/api/headless/runs/${encodeURIComponent(runId)}/resume`, {
+    current = await client.streamJsonl(`/api/headless/runs/${encodeURIComponent(runId)}/resume?stream=true`, {
       method: "POST",
       body: {
         continuation_token: continuationToken,
@@ -270,6 +259,7 @@ async function resumeWithCliApproval(client, response, { jsonMode, signal }) {
         request_id: `puddingclaw-cli-response-${randomUUID()}`,
       },
       signal,
+      onEvent,
     });
   }
   return current;
@@ -294,6 +284,35 @@ function resultPresentation(response, flags) {
   return { value: response, forceJson: true, code: exitCodeForResponse(response) };
 }
 
+function progressMessage(event) {
+  const data = event?.data && typeof event.data === "object" ? event.data : {};
+  if (event?.event === "run_starting") return "Worker 已接收任务";
+  if (event?.event === "task_preflight_started") return "正在准备任务上下文";
+  if (event?.event === "task_preflight_completed") return "任务上下文已准备";
+  if (event?.event === "run_started") return "Agent 已开始执行";
+  if (event?.event === "permission_required") return "等待人工审批";
+  if (event?.event === "tool_start") {
+    const tool = data.tool || data.tool_name;
+    return `正在调用工具${tool ? `：${tool}` : ""}`;
+  }
+  if (event?.event === "tool_end") return "工具调用完成";
+  if (event?.event === "final_response") return "正在整理最终结果";
+  if (event?.event === "done" || event?.event === "result") return "任务完成";
+  return "Agent 正在执行";
+}
+
+const HUMAN_PROGRESS_EVENTS = new Set([
+  "run_starting",
+  "task_preflight_started",
+  "task_preflight_completed",
+  "run_started",
+  "permission_required",
+  "tool_start",
+  "tool_end",
+  "final_response",
+  "done",
+]);
+
 async function runCommand(args, flags, paths) {
   assertFlags(flags, ["input_json", "session", "export", "jsonl"]);
   const input = await readInput(flags);
@@ -316,8 +335,22 @@ async function runCommand(args, flags, paths) {
   const workspacePath = await ensureWorkspace(paths, input?.workspace_path);
   const client = new WorkerClient(await agentClientConfig(paths));
   const controller = new AbortController();
-  const onSignal = () => controller.abort();
+  let activeCancelHandle = "";
+  let remoteCancellation = null;
+  const onSignal = () => {
+    if (activeCancelHandle && !remoteCancellation) {
+      remoteCancellation = client.request(
+        `/api/headless/runs/${encodeURIComponent(activeCancelHandle)}/cancel`,
+        { method: "POST" },
+      ).catch(() => null);
+    }
+    controller.abort();
+  };
   process.once("SIGINT", onSignal);
+  // Process supervisors (including PuddingTeams) terminate a child with
+  // SIGTERM. Treat it exactly like Ctrl-C so the in-flight HTTP stream is
+  // aborted and the Backend can observe the disconnect/cancel path.
+  process.once("SIGTERM", onSignal);
   try {
     const body = {
       message: String(message),
@@ -327,31 +360,43 @@ async function runCommand(args, flags, paths) {
       ...(input?.request_id ? { request_id: String(input.request_id) } : {}),
     };
     let response;
+    const streamProgress = async (event) => {
+      const data = event?.data && typeof event.data === "object" ? event.data : {};
+      const run = data.run && typeof data.run === "object" ? data.run : {};
+      activeCancelHandle = String(run.run_id || data.run_id || activeCancelHandle || data.session_id || "");
+      if (event?.event === "result") return;
+      if (flags.jsonl) writeJson(event);
+      else if (!flags.json && HUMAN_PROGRESS_EVENTS.has(event?.event)) {
+        process.stderr.write(`${progressMessage(event)}\n`);
+      }
+    };
+    response = await client.streamJsonl("/api/headless/runs?stream=true", {
+      method: "POST",
+      body,
+      signal: controller.signal,
+      onEvent: streamProgress,
+    });
     if (flags.jsonl) {
-      response = await client.streamJsonl("/api/headless/runs?stream=true", {
-        method: "POST",
-        body,
-        signal: controller.signal,
-        onEvent: async (event) => { if (event?.event !== "result") writeJson(event); },
-      });
       response = await exportArtifacts(response, flags.export, workspacePath);
       writeJson({ event: "result", data: response });
       return { value: null, suppressOutput: true, code: exitCodeForResponse(response) };
     }
-    response = await client.request("/api/headless/runs", { method: "POST", body, signal: controller.signal });
     response = await resumeWithCliApproval(client, response, {
       jsonMode: Boolean(flags.json || flags.jsonl),
       signal: controller.signal,
+      onEvent: streamProgress,
     });
     response = await exportArtifacts(response, flags.export, workspacePath);
     return resultPresentation(response, flags);
   } finally {
+    if (remoteCancellation) await remoteCancellation;
     process.removeListener("SIGINT", onSignal);
+    process.removeListener("SIGTERM", onSignal);
   }
 }
 
 async function respondCommand(args, flags, paths) {
-  assertFlags(flags, ["input_json", "export"]);
+  assertFlags(flags, ["input_json", "export", "jsonl"]);
   if (args.length !== 1) throw new WorkerClientError("run_id is required", { code: "argument_error" });
   const input = await readInput(flags);
   const runId = String(args[0] || "").trim();
@@ -370,19 +415,52 @@ async function respondCommand(args, flags, paths) {
     }
   }
   const workspacePath = await ensureWorkspace(paths, input.workspace_path);
-  let response = await new WorkerClient(await agentClientConfig(paths)).request(
-    `/api/headless/runs/${encodeURIComponent(runId)}/resume`,
-    {
-      method: "POST",
-      body: {
-        continuation_token: input.continuation_token,
-        decisions: input.decisions,
-        ...(input.workspace_path !== undefined ? { workspace_path: workspacePath } : {}),
-        ...(input.request_id ? { request_id: String(input.request_id) } : {}),
+  const client = new WorkerClient(await agentClientConfig(paths));
+  const controller = new AbortController();
+  let remoteCancellation = null;
+  const onSignal = () => {
+    if (!remoteCancellation) {
+      remoteCancellation = client.request(
+        `/api/headless/runs/${encodeURIComponent(runId)}/cancel`,
+        { method: "POST" },
+      ).catch(() => null);
+    }
+    controller.abort();
+  };
+  process.once("SIGINT", onSignal);
+  process.once("SIGTERM", onSignal);
+  let response;
+  try {
+    response = await client.streamJsonl(
+      `/api/headless/runs/${encodeURIComponent(runId)}/resume?stream=true`,
+      {
+        method: "POST",
+        body: {
+          continuation_token: input.continuation_token,
+          decisions: input.decisions,
+          ...(input.workspace_path !== undefined ? { workspace_path: workspacePath } : {}),
+          ...(input.request_id ? { request_id: String(input.request_id) } : {}),
+        },
+        signal: controller.signal,
+        onEvent: async (event) => {
+          if (event?.event === "result") return;
+          if (flags.jsonl) writeJson(event);
+          else if (!flags.json && HUMAN_PROGRESS_EVENTS.has(event?.event)) {
+            process.stderr.write(`${progressMessage(event)}\n`);
+          }
+        }
       },
-    },
-  );
+    );
+  } finally {
+    if (remoteCancellation) await remoteCancellation;
+    process.removeListener("SIGINT", onSignal);
+    process.removeListener("SIGTERM", onSignal);
+  }
   response = await exportArtifacts(response, flags.export, workspacePath);
+  if (flags.jsonl) {
+    writeJson({ event: "result", data: response });
+    return { value: null, suppressOutput: true, code: exitCodeForResponse(response) };
+  }
   return resultPresentation(response, flags);
 }
 

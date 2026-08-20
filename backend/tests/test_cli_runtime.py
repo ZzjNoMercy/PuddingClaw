@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-import subprocess
 import ast
-import tomllib
+import subprocess
 from pathlib import Path
+
+import tomllib
 
 import cli_runtime
 
@@ -37,7 +38,7 @@ def test_cli_runtime_auto_installs_local_package(monkeypatch, tmp_path: Path):
     package_dir = tmp_path / "packages" / "puddingclaw-deploy-cli"
     (package_dir / "src").mkdir(parents=True)
     (package_dir / "package.json").write_text(
-        '{"name":"@puddingai/puddingclaw","version":"0.1.17",'
+        '{"name":"@puddingai/puddingclaw","version":"0.1.19",'
         '"bin":{"puddingclaw":"src/cli.js"}}',
         encoding="utf-8",
     )
@@ -78,7 +79,7 @@ def test_cli_version_json_is_reported_without_treating_schema_version_as_cli_ver
             return subprocess.CompletedProcess(
                 args,
                 0,
-                stdout='{"schema_version":"1","cli_version":"0.1.17"}',
+                stdout='{"schema_version":"1","cli_version":"0.1.19"}',
                 stderr="",
             )
         raise AssertionError(args)
@@ -86,7 +87,7 @@ def test_cli_version_json_is_reported_without_treating_schema_version_as_cli_ver
     status = cli_runtime.ensure_cli_runtime(tmp_path, runner=runner)
 
     assert status["installed"] is True
-    assert status["version"] == "0.1.17"
+    assert status["version"] == "0.1.19"
     assert status["version_mismatch"] is False
 
 

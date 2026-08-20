@@ -27,12 +27,15 @@ import Navbar from "@/components/layout/Navbar";
 import ResizeHandle from "@/components/layout/ResizeHandle";
 import Sidebar from "@/components/layout/Sidebar";
 import {
-  createKnowledgeImportJob,
+  commitKnowledgeImportSource,
   listKnowledgeDocuments,
   listReadLaterItems,
   saveReadLaterUrl,
+  stageKnowledgeImportSource,
+  type DocumentParserStatus,
   type KnowledgeDocument,
   type ReadLaterItem,
+  type StagedKnowledgeSource,
 } from "@/lib/api";
 import {
   listKnowledgeSourceItems,
@@ -68,6 +71,26 @@ function statusView(status: string): { label: string; className: string } {
   if (status === "error" || status === "succeeded_with_errors") return { label: "有错误", className: "bg-red-500" };
   if (status === "disabled") return { label: "已停用", className: "bg-gray-400" };
   return { label: status || "未知", className: "bg-red-500" };
+}
+
+function sourceItemStatusView(status: string): { label: string; className: string } {
+  if (status === "staged") return { label: "待解析", className: "bg-amber-50 text-amber-700" };
+  if (status === "indexed") return { label: "已索引", className: "bg-emerald-50 text-emerald-700" };
+  if (["queued", "processing", "running"].includes(status)) {
+    return { label: "处理中", className: "bg-blue-50 text-[#002fa7]" };
+  }
+  if (["failed", "error"].includes(status)) return { label: "失败", className: "bg-red-50 text-red-600" };
+  if (status === "ready" || status === "succeeded") return { label: "可用", className: "bg-emerald-50 text-emerald-700" };
+  return { label: status || "未知", className: "bg-gray-100 text-gray-600" };
+}
+
+function importJobIdOf(item: KnowledgeSourceItem): string {
+  for (const key of ["import_job_id", "job_id"]) {
+    const value = item.metadata?.[key];
+    if (typeof value === "string" && value.trim()) return value.trim();
+  }
+  const prefix = "import-job:";
+  return item.external_id.startsWith(prefix) ? item.external_id.slice(prefix.length) : "";
 }
 
 function SourceMark({ kind }: { kind: KnowledgeSource["connector_key"] }) {
@@ -138,20 +161,69 @@ function LocalUploadPanel({ source, items, onChanged, onOpenDoc }: { source: Kno
   const inputRef = useRef<HTMLInputElement>(null);
   const [uploading, setUploading] = useState(false);
   const [notice, setNotice] = useState("");
+  const [pendingFiles, setPendingFiles] = useState<File[]>([]);
+  const [stagedSource, setStagedSource] = useState<StagedKnowledgeSource | null>(null);
+  const [parsers, setParsers] = useState<DocumentParserStatus[]>([]);
+  const [selectedParserId, setSelectedParserId] = useState("");
+  const [allowCloud, setAllowCloud] = useState(false);
+  const pendingParseCount = items.filter((item) => item.status === "staged").length;
+  const indexedCount = items.filter((item) => item.status === "indexed").length;
+  const processingCount = items.filter((item) => ["queued", "processing", "running"].includes(item.status)).length;
+
+  async function stageNext(file: File) {
+    const staged = await stageKnowledgeImportSource(file);
+    setStagedSource(staged.source);
+    setParsers(staged.parsers);
+    setSelectedParserId(staged.parsers.find((item) => item.recommended && item.selectable)?.id || "");
+    setAllowCloud(false);
+  }
 
   async function upload(files: FileList | null) {
     if (!files?.length) return;
     setUploading(true);
     setNotice("");
     try {
-      for (const file of Array.from(files)) await createKnowledgeImportJob(file, undefined, ["local_markdown", "vector"]);
-      setNotice(`已提交 ${files.length} 个文件，后台将继续解析和索引。`);
-      await onChanged();
+      const queue = Array.from(files);
+      setPendingFiles(queue);
+      await stageNext(queue[0]);
+      setNotice(`已暂存 ${queue.length} 个文件中的第 1 个，请选择解析器。`);
     } catch (error) {
       setNotice(messageOf(error));
     } finally {
       setUploading(false);
       if (inputRef.current) inputRef.current.value = "";
+    }
+  }
+
+  async function commitCurrent() {
+    if (!stagedSource || !selectedParserId) return;
+    const selected = parsers.find((item) => item.id === selectedParserId);
+    if (!selected?.selectable) return;
+    setUploading(true);
+    setNotice("");
+    try {
+      await commitKnowledgeImportSource(stagedSource.id, {
+        parser_id: selectedParserId,
+        publish_targets: ["local_markdown", "vector"],
+        allow_cloud: selected.location === "cloud" && allowCloud,
+      });
+      const rest = pendingFiles.slice(1);
+      if (rest.length) {
+        setPendingFiles(rest);
+        await stageNext(rest[0]);
+        setNotice(`当前文件已提交；还剩 ${rest.length} 个文件，请继续选择解析器。`);
+      } else {
+        setPendingFiles([]);
+        setStagedSource(null);
+        setParsers([]);
+        setSelectedParserId("");
+        setNotice("全部文件已提交，后台将继续解析和索引。");
+        await onChanged();
+      }
+    } catch (error) {
+      setNotice(messageOf(error));
+    } finally {
+      setUploading(false);
     }
   }
 
@@ -162,8 +234,24 @@ function LocalUploadPanel({ source, items, onChanged, onOpenDoc }: { source: Kno
         <button type="button" onClick={() => inputRef.current?.click()} disabled={uploading} className="inline-flex h-11 shrink-0 items-center justify-center gap-2 rounded-xl bg-[#002fa7] px-5 text-sm font-semibold text-white shadow-sm disabled:opacity-50">{uploading ? <Loader2 className="h-4 w-4 animate-spin" /> : <FileUp className="h-4 w-4" />}选择文件</button>
         <input ref={inputRef} type="file" multiple className="hidden" onChange={(event) => void upload(event.target.files)} accept=".pdf,.md,.markdown,.txt,.doc,.docx,.ppt,.pptx,.xls,.xlsx,.csv,.tsv,image/*" />
       </div>
+      {stagedSource ? (
+        <div className="rounded-3xl border border-[#002fa7]/15 bg-white p-5 shadow-sm">
+          <div><p className="text-sm font-semibold text-gray-950">选择解析器 · {stagedSource.file_name}</p><p className="mt-1 text-xs text-gray-400">原始文件已暂存，不会再次上传。</p></div>
+          <div className="mt-3 grid gap-2 md:grid-cols-2">
+            {parsers.map((parser) => <button key={parser.id} type="button" disabled={!parser.selectable} onClick={() => { setSelectedParserId(parser.id); if (parser.location !== "cloud") setAllowCloud(false); }} className={`rounded-2xl border p-3 text-left ${selectedParserId === parser.id ? "border-[#002fa7] bg-[#002fa7]/[0.05]" : parser.selectable ? "border-black/[0.07]" : "cursor-not-allowed border-black/[0.05] bg-gray-50 opacity-55"}`}><span className="text-xs font-semibold text-gray-900">{parser.name}</span><span className="mt-1 block text-[10px] leading-4 text-gray-500">{parser.selectable ? parser.description : parser.health_message}</span></button>)}
+          </div>
+          {parsers.find((item) => item.id === selectedParserId)?.location === "cloud" ? <label className="mt-3 flex items-start gap-2 rounded-xl bg-amber-50 px-3 py-2 text-[10px] text-amber-800"><input type="checkbox" checked={allowCloud} onChange={(event) => setAllowCloud(event.target.checked)} className="mt-0.5 accent-[#002fa7]" />允许把当前文件发送至第三方云端解析服务</label> : null}
+          <div className="mt-4 flex justify-end"><button type="button" onClick={() => void commitCurrent()} disabled={uploading || !selectedParserId || (parsers.find((item) => item.id === selectedParserId)?.location === "cloud" && !allowCloud)} className="inline-flex h-10 items-center gap-2 rounded-xl bg-[#002fa7] px-4 text-xs font-semibold text-white disabled:opacity-45">{uploading ? <Loader2 className="h-4 w-4 animate-spin" /> : null}创建后台任务</button></div>
+        </div>
+      ) : null}
       {notice ? <div className={`rounded-xl px-4 py-3 text-xs ${notice.includes("已提交") ? "bg-emerald-50 text-emerald-700" : "bg-red-50 text-red-700"}`}>{notice}</div> : null}
-      <div className="grid grid-cols-2 gap-3 lg:grid-cols-4"><Metric label="文件数量" value={source.item_count || items.length} /><Metric label="已索引" value={items.filter((item) => item.status === "indexed").length} /><Metric label="处理中" value={items.filter((item) => ["queued", "processing"].includes(item.status)).length} /><Metric label="最近导入" value={relativeTime(items[0]?.updated_at)} /></div>
+      <div className="grid grid-cols-2 gap-3 lg:grid-cols-5">
+        <Metric label="文件总数" value={source.item_count ?? items.length} />
+        <Metric label="待解析" value={pendingParseCount} />
+        <Metric label="已索引" value={indexedCount} />
+        <Metric label="处理中" value={processingCount} />
+        <Metric label="最近导入" value={relativeTime(items[0]?.updated_at)} />
+      </div>
       <RecentItems items={items} empty="还没有上传文件。" onOpen={onOpenDoc} />
     </div>
   );
@@ -218,12 +306,56 @@ function WebCapturePanel({ source, onChanged, onOpenDoc }: { source: KnowledgeSo
 
 function RecentItems({ items, empty, onOpen }: { items: KnowledgeSourceItem[]; empty: string; onOpen?: (item: KnowledgeSourceItem) => void }) {
   return (
-    <div><div className="mb-3 flex items-center justify-between"><h3 className="text-sm font-semibold text-gray-900">最近内容</h3><span className="text-[11px] text-gray-400">最近更新优先</span></div><div className="overflow-hidden rounded-2xl border border-black/[0.06]">{items.length ? items.slice(0, 8).map((item) => {
-      const clickable = Boolean(onOpen && item.document_id);
-      return (
-        <button type="button" key={item.id} disabled={!clickable} onClick={() => clickable && onOpen?.(item)} className={`flex w-full items-center gap-3 border-b border-black/[0.05] px-4 py-3 text-left last:border-0 ${clickable ? "cursor-pointer transition hover:bg-[#002fa7]/[0.03]" : "cursor-default"}`}><span className="grid h-9 w-9 shrink-0 place-items-center rounded-xl bg-[#002fa7]/[0.05] text-[#002fa7]"><FileText className="h-4 w-4" /></span><span className="min-w-0 flex-1"><span className="block truncate text-sm font-medium text-gray-800">{item.title || item.external_id}</span><span className="mt-0.5 block truncate text-[10px] text-gray-400">{item.path?.join(" / ") || item.external_type} · {relativeTime(item.updated_at)}</span></span><span className="rounded-full bg-gray-100 px-2 py-1 text-[10px] font-semibold text-gray-600">{item.status}</span></button>
-      );
-    }) : <div className="px-5 py-12 text-center text-xs text-gray-400">{empty}</div>}</div></div>
+    <div>
+      <div className="mb-3 flex items-center justify-between">
+        <h3 className="text-sm font-semibold text-gray-900">最近内容</h3>
+        <span className="text-[11px] text-gray-400">最近更新优先</span>
+      </div>
+      <div className="overflow-hidden rounded-2xl border border-black/[0.06]">
+        {items.length ? items.slice(0, 8).map((item) => {
+          const importJobId = item.status === "staged" ? importJobIdOf(item) : "";
+          const canOpenDocument = Boolean(onOpen && item.document_id);
+          const status = sourceItemStatusView(item.status);
+          const content = (
+            <>
+              <span className={`grid h-9 w-9 shrink-0 place-items-center rounded-xl ${item.status === "staged" ? "bg-amber-50 text-amber-700" : "bg-[#002fa7]/[0.05] text-[#002fa7]"}`}>
+                <FileText className="h-4 w-4" />
+              </span>
+              <span className="min-w-0 flex-1">
+                <span className="block truncate text-sm font-medium text-gray-800">{item.title || item.external_id}</span>
+                <span className="mt-0.5 block truncate text-[10px] text-gray-400">
+                  {item.path?.join(" / ") || item.external_type} · {relativeTime(item.updated_at)}
+                </span>
+              </span>
+              <span className={`rounded-full px-2.5 py-1 text-[10px] font-semibold ${status.className}`}>{status.label}</span>
+              {importJobId || canOpenDocument ? <ChevronRight className="h-4 w-4 shrink-0 text-gray-300 transition group-hover:translate-x-0.5 group-hover:text-[#002fa7]" /> : null}
+            </>
+          );
+          if (importJobId) {
+            return (
+              <Link
+                key={item.id}
+                href={`/knowledge/imports/${encodeURIComponent(importJobId)}`}
+                className="group flex w-full items-center gap-3 border-b border-black/[0.05] px-4 py-3 text-left transition last:border-0 hover:bg-amber-50/45 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-[#002fa7]/30"
+              >
+                {content}
+              </Link>
+            );
+          }
+          return (
+            <button
+              type="button"
+              key={item.id}
+              disabled={!canOpenDocument}
+              onClick={() => canOpenDocument && onOpen?.(item)}
+              className={`group flex w-full items-center gap-3 border-b border-black/[0.05] px-4 py-3 text-left last:border-0 ${canOpenDocument ? "cursor-pointer transition hover:bg-[#002fa7]/[0.03]" : "cursor-default"}`}
+            >
+              {content}
+            </button>
+          );
+        }) : <div className="px-5 py-12 text-center text-xs text-gray-400">{empty}</div>}
+      </div>
+    </div>
   );
 }
 

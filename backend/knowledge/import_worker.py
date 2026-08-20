@@ -16,6 +16,7 @@ from knowledge.import_jobs import (
     READ_LATER_CAPTURE_KIND,
     VANNA_ENTITY_IMPORT_KIND,
     claim_next_job,
+    cleanup_succeeded_task_sources,
     job_kind,
     mark_job_failed,
     process_import_job,
@@ -71,6 +72,15 @@ class KnowledgeImportWorkerManager:
         assert self._base_dir is not None
         sessionmaker = get_sessionmaker()
         idle_sleep = float(os.getenv("PUDDINGCLAW_KNOWLEDGE_WORKER_POLL_SECONDS", "2") or "2")
+        try:
+            async with sessionmaker() as session:
+                cleaned = await cleanup_succeeded_task_sources(session, base_dir=self._base_dir)
+            if cleaned:
+                logger.info("[knowledge-worker] recovered %s completed task source cleanups", cleaned)
+        except Exception:
+            # Cleanup is storage hygiene.  It must never prevent the import
+            # worker from serving queued or retryable tasks.
+            logger.warning("[knowledge-worker] completed task source cleanup sweep failed", exc_info=True)
         while True:
             try:
                 did_work = await self._run_once(sessionmaker, self._base_dir)

@@ -24,9 +24,10 @@ from knowledge.import_jobs import (
 )
 from knowledge.indexer import _build_milvus_storage_context, _build_multimodal_nodes
 from knowledge.mineru_client import MinerUClient, MinerUParseResult
-from knowledge.models import Base
+from knowledge.models import Base, KnowledgeSourceItem
 from knowledge.paths import get_knowledge_root
 from knowledge.service import KnowledgeService, KnowledgeServiceError, _slugify
+from knowledge.sources import list_source_items
 from llm.multimodal_embedding import DashScopeMultiModalEmbedding
 from tools.search_knowledge_tool import LlamaIndexKnowledgeQueryTool
 
@@ -985,7 +986,9 @@ def test_import_job_delete_and_clear_remove_task_records_only(tmp_path: Path):
                 source_path=source_a,
                 file_size=source_a.stat().st_size,
                 source_sha256="",
+                status="staged",
             )
+            staged_source_item_id = job_a.source_item_id
             await create_import_job(
                 session,
                 base_dir=backend_dir,
@@ -996,6 +999,25 @@ def test_import_job_delete_and_clear_remove_task_records_only(tmp_path: Path):
             )
             await delete_import_job(session, job_a.id)
             assert await session.get(type(job_a), job_a.id) is None
+            assert await session.get(KnowledgeSourceItem, staged_source_item_id) is None
+
+            orphan_job = await create_import_job(
+                session,
+                base_dir=backend_dir,
+                filename="a.md",
+                source_path=source_a,
+                file_size=source_a.stat().st_size,
+                source_sha256="",
+                status="staged",
+            )
+            orphan_source_item_id = orphan_job.source_item_id
+            orphan_source_id = orphan_job.source_connection_id
+            await session.delete(orphan_job)
+            await session.commit()
+            assert await session.get(KnowledgeSourceItem, orphan_source_item_id) is not None
+            visible_items = await list_source_items(session, source_id=orphan_source_id)
+            assert orphan_source_item_id not in {item.id for item in visible_items}
+
             deleted = await clear_import_jobs(session)
             assert deleted == 1
 

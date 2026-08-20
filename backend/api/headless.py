@@ -1,4 +1,4 @@
-"""Authenticated synchronous Worker API for unattended PuddingClaw Runs."""
+"""Local synchronous Worker API for unattended PuddingClaw Runs."""
 
 from __future__ import annotations
 
@@ -39,11 +39,11 @@ from headless_session_lifecycle import (
 )
 from llm.model_client import ModelClientChatModel
 from projects.registry import project_registry
-from worker_access import WorkerAccessError, worker_access_log_store, worker_access_store
+from headless_activity import headless_activity_log_store
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/headless", tags=["headless-worker"])
-worker_access_router = APIRouter(tags=["worker-access-keys"])
+headless_activity_router = APIRouter(tags=["headless-activity"])
 BASE_DIR = Path(__file__).resolve().parent.parent
 _idempotency_lock = threading.RLock()
 _WORKER_PROJECT_NAME = "puddingclaw"
@@ -55,6 +55,33 @@ _BEIJING_TIMEZONE = ZoneInfo("Asia/Shanghai")
 _headless_executions: dict[str, _HeadlessExecution] = {}
 _headless_executions_lock = threading.RLock()
 _HEADLESS_EXECUTION_RETENTION_SECONDS = 3600.0
+_HEADLESS_EVENT_HISTORY_LIMIT = 32768
+_HEADLESS_SUBSCRIBER_QUEUE_LIMIT = 16384
+# Reasoning and internal diagnostics remain available through the normal Trace
+# system, but the public Worker stream is intentionally narrow: lifecycle,
+# visible assistant content, tool boundaries and HITL.  This is an allowlist so
+# a new internal event cannot accidentally become part of the external API.
+_HEADLESS_PUBLIC_EVENTS = frozenset(
+    {
+        "run_starting",
+        "task_preflight_started",
+        "task_preflight_completed",
+        "run_started",
+        "run_outcome",
+        "goal_run_continued",
+        "new_response",
+        "token",
+        "segment_break",
+        "segment_content_replaced",
+        "tool_start",
+        "tool_end",
+        "permission_required",
+        "permission_resolved",
+        "final_response",
+        "done",
+        "error",
+    }
+)
 
 
 def _claim_headless_session(session_id: str) -> bool:
@@ -207,7 +234,6 @@ class _HeadlessExecution:
         approval_mode: str,
         analytics_model_id: str,
         analytics_model_match: dict[str, Any],
-        worker_key_id: str,
     ) -> None:
         self.stream = stream
         self.session_id = session_id
@@ -215,7 +241,6 @@ class _HeadlessExecution:
         self.approval_mode = approval_mode
         self.analytics_model_id = analytics_model_id
         self.analytics_model_match = dict(analytics_model_match)
-        self.worker_key_id = worker_key_id
         self.token = secrets.token_urlsafe(32)
         self.run_id = ""
         self.query_id = ""
@@ -230,12 +255,116 @@ class _HeadlessExecution:
         self.cancelled = False
         self.done_at = 0.0
         self.resume_results: dict[str, tuple[str, dict[str, Any]]] = {}
-        self.events: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
+        self.event_sequence = 0
+        self.event_history: list[dict[str, Any]] = []
+        self.event_subscribers: set[asyncio.Queue[dict[str, Any] | None]] = set()
         self.error: BaseException | None = None
         self.updated = asyncio.Condition()
         self.task: asyncio.Task[None] | None = None
 
+    def _publish(self, item: dict[str, Any]) -> None:
+        """Publish one event to every observer without transferring ownership.
+
+        The CLI stream, PuddingTeams and the Web UI are observers of the same
+        Harness Run.  A slow/disconnected observer must never consume or block
+        events for another observer.
+        """
+
+        self.event_sequence += 1
+        envelope = {"seq": self.event_sequence, **item}
+        self.event_history.append(envelope)
+        if len(self.event_history) > _HEADLESS_EVENT_HISTORY_LIMIT:
+            del self.event_history[: len(self.event_history) - _HEADLESS_EVENT_HISTORY_LIMIT]
+        for queue in list(self.event_subscribers):
+            try:
+                queue.put_nowait(envelope)
+            except asyncio.QueueFull:
+                # Close only the lagging observer. It can reconnect and replay
+                # from the bounded history or fall back to Session History.
+                self.event_subscribers.discard(queue)
+                try:
+                    while True:
+                        queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+                try:
+                    queue.put_nowait(
+                        {
+                            "seq": self.event_sequence,
+                            "event": "stream_reset_required",
+                            "data": {"session_id": self.session_id},
+                        }
+                    )
+                    queue.put_nowait(None)
+                except asyncio.QueueFull:
+                    pass
+
+    def subscribe(self, *, after_seq: int = 0) -> asyncio.Queue[dict[str, Any] | None]:
+        """Atomically replay retained events and subscribe to future events."""
+
+        queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue(
+            maxsize=_HEADLESS_SUBSCRIBER_QUEUE_LIMIT
+        )
+        retained = [item for item in self.event_history if int(item.get("seq") or 0) > after_seq]
+        oldest_seq = int(self.event_history[0].get("seq") or 0) if self.event_history else 0
+        history_gap = bool(oldest_seq and oldest_seq > after_seq + 1)
+        replay_without_reset = _HEADLESS_SUBSCRIBER_QUEUE_LIMIT - 1
+        needs_reset = history_gap or len(retained) > replay_without_reset
+        replay_capacity = replay_without_reset - int(needs_reset)
+        replayed = retained[-replay_capacity:]
+        if needs_reset:
+            replay_start = int(replayed[0].get("seq") or oldest_seq) if replayed else oldest_seq
+            queue.put_nowait(
+                {
+                    "seq": max(0, replay_start - 1),
+                    "event": "stream_reset_required",
+                    "data": {
+                        "session_id": self.session_id,
+                        "oldest_seq": oldest_seq,
+                        "replay_start_seq": replay_start,
+                    },
+                }
+            )
+        # Always retain one slot for the terminal sentinel; a reset marker uses
+        # one more. This also leaves an active replay subscriber able to accept
+        # the next live event instead of being disconnected immediately.
+        for item in replayed:
+            queue.put_nowait(item)
+        if self.done:
+            queue.put_nowait(None)
+        else:
+            self.event_subscribers.add(queue)
+        return queue
+
+    def unsubscribe(self, queue: asyncio.Queue[dict[str, Any] | None]) -> None:
+        self.event_subscribers.discard(queue)
+
+    def _close_subscribers(self) -> None:
+        for queue in list(self.event_subscribers):
+            try:
+                queue.put_nowait(None)
+            except asyncio.QueueFull:
+                try:
+                    queue.get_nowait()
+                    queue.put_nowait(None)
+                except (asyncio.QueueEmpty, asyncio.QueueFull):
+                    pass
+        self.event_subscribers.clear()
+
     def start(self) -> None:
+        # Emit a first boundary before the Agent generator performs its
+        # preflight.  This forces an NDJSON/SSE response to flush immediately
+        # instead of making the caller wait for the first terminal boundary.
+        self._publish(
+            {
+                "event": "run_starting",
+                "data": {
+                    "session_id": self.session_id,
+                    "project_id": self.project_id,
+                    "status": "starting",
+                },
+            }
+        )
         self.task = asyncio.create_task(self._consume())
 
     async def _signal(self) -> None:
@@ -253,9 +382,10 @@ class _HeadlessExecution:
                     payload = {}
                 if not isinstance(payload, dict):
                     payload = {}
-                self.events.put_nowait({"event": name, "data": payload})
-                self.run_id = str(payload.get("run_id") or self.run_id)
-                self.query_id = str(payload.get("query_id") or self.query_id)
+                run_payload = payload.get("run") if isinstance(payload.get("run"), dict) else {}
+                self.run_id = str(payload.get("run_id") or run_payload.get("run_id") or self.run_id)
+                self.query_id = str(payload.get("query_id") or run_payload.get("query_id") or self.query_id)
+                boundary_signal = False
                 if name == "run_outcome":
                     self.outcome = payload
                 elif name == "verification_report":
@@ -274,7 +404,7 @@ class _HeadlessExecution:
                     if pending is not None and pending.get("request_id"):
                         self.pending_inputs[str(pending["request_id"])] = pending
                         self._persist_pending_state("pending")
-                        await self._signal()
+                        boundary_signal = True
                 elif name.endswith("_required"):
                     # External Headless continuation is deliberately limited
                     # to permissions. The graph auto-resolves other business
@@ -286,6 +416,12 @@ class _HeadlessExecution:
                     if request_id:
                         self.pending_inputs.pop(request_id, None)
                         self._persist_pending_state("resumed")
+                # Publish only after the execution state reflects this event;
+                # every observer therefore sees run_id/HITL state atomically.
+                if name in _HEADLESS_PUBLIC_EVENTS:
+                    self._publish({"event": name, "data": payload})
+                if boundary_signal:
+                    await self._signal()
         except BaseException as exc:
             if isinstance(exc, asyncio.CancelledError):
                 self.cancelled = True
@@ -299,7 +435,7 @@ class _HeadlessExecution:
             self.stream = None
             self.done = True
             self.done_at = time.time()
-            self.events.put_nowait(None)
+            self._close_subscribers()
             self._persist_pending_state("completed" if self.error is None else "failed")
             await self._signal()
 
@@ -441,14 +577,6 @@ class _HeadlessExecution:
         }
 
 
-class WorkerAccessKeyCreateRequest(BaseModel):
-    name: str = Field(min_length=1, max_length=120)
-    scopes: list[str] | None = None
-    allowed_analytics_models: list[str] = Field(default_factory=list, max_length=500)
-    authority_profile: str = "smart"
-    expires_at: float | None = None
-
-
 def _safe_model(item: dict[str, Any]) -> dict[str, Any]:
     return {
         key: item.get(key)
@@ -456,25 +584,21 @@ def _safe_model(item: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _model_options(principal: dict[str, Any]) -> list[dict[str, Any]]:
+def _model_options() -> list[dict[str, Any]]:
     from runtime_identity.paths import PuddingClawPaths
 
     snapshot = get_analytics_model_registry(PuddingClawPaths.from_environment().user_definitions()).list_models()
-    allowed = {str(item) for item in principal.get("allowed_analytics_models") or [] if str(item).strip()}
-    models = [_safe_model(item) for item in snapshot.get("models") or [] if isinstance(item, dict)]
-    if allowed:
-        models = [item for item in models if str(item.get("id")) in allowed]
-    return models
+    return [_safe_model(item) for item in snapshot.get("models") or [] if isinstance(item, dict)]
 
 
-def _model_routing_candidates(principal: dict[str, Any]) -> list[dict[str, Any]]:
-    """Return only allowed models, enriched with bounded routing guidance."""
+def _model_routing_candidates() -> list[dict[str, Any]]:
+    """Return configured models enriched with bounded routing guidance."""
 
     from runtime_identity.paths import PuddingClawPaths
 
     registry = get_analytics_model_registry(PuddingClawPaths.from_environment().user_definitions())
     candidates: list[dict[str, Any]] = []
-    for option in _model_options(principal):
+    for option in _model_options():
         candidate = dict(option)
         try:
             detail = registry.get_model(str(option.get("id") or ""))
@@ -486,10 +610,10 @@ def _model_routing_candidates(principal: dict[str, Any]) -> list[dict[str, Any]]
     return candidates
 
 
-async def _route_analytics_model(message: str, principal: dict[str, Any]) -> AnalyticsModelRoute:
-    """Resolve one allowed Analytics Model without giving the CLI selection authority."""
+async def _route_analytics_model(message: str) -> AnalyticsModelRoute:
+    """Resolve one configured Analytics Model without giving the CLI selection authority."""
 
-    candidates = _model_routing_candidates(principal)
+    candidates = _model_routing_candidates()
     deterministic = AnalyticsModelRouter.deterministic(message, candidates)
     if deterministic is not None:
         return deterministic
@@ -534,7 +658,7 @@ def _model_routing_needs_input(
     if route.reason == "bound_model_no_longer_allowed":
         prompt = "该连续任务绑定的分析模型已不可用，请联系管理员恢复权限或创建一个新任务。"
     elif unavailable:
-        prompt = "当前 Worker Key 没有可用的分析模型，请联系管理员配置模型权限。"
+        prompt = "当前 PuddingClaw 没有可用的分析模型，请先在 PuddingClaw 中完成模型配置。"
     else:
         prompt = "无法根据当前问题唯一匹配分析模型，请补充要分析的业务对象、指标或场景。"
     return {
@@ -616,22 +740,9 @@ def _resolve_worker_project(workspace_path: str | None) -> tuple[str, Path]:
     return record.project_id, path
 
 
-def _principal_for_scope(
-    authorization: str | None,
-    scope: str,
-) -> dict[str, Any]:
-    scheme, _, token = str(authorization or "").partition(" ")
-    if scheme.lower() != "bearer" or not token.strip():
-        raise HTTPException(status_code=401, detail="Worker Access Key required", headers={"WWW-Authenticate": "Bearer"})
-    principal = worker_access_store.authenticate(token, scope)
-    if principal is None:
-        raise HTTPException(status_code=403, detail="Worker Access Key is invalid, revoked, expired, or out of scope")
-    return principal
-
-
 def _is_loopback_request(request: Request) -> bool:
     host = str(request.client.host if request.client else "").strip().lower()
-    if host == "localhost":
+    if host in {"localhost", "testclient"}:
         return True
     try:
         return ipaddress.ip_address(host).is_loopback
@@ -639,20 +750,11 @@ def _is_loopback_request(request: Request) -> bool:
         return False
 
 
-def _admin(request: Request) -> None:
-    configured = os.getenv("PUDDINGCLAW_ADMIN_TOKEN", "").strip()
-    supplied = request.headers.get("x-puddingclaw-admin-key", "")
-    if not configured:
-        if _is_loopback_request(request):
-            return
-        raise HTTPException(
-            status_code=503,
-            detail="Remote Worker Access Key administration requires PUDDINGCLAW_ADMIN_TOKEN",
-        )
-    import hmac
+def _require_loopback_request(request: Request) -> None:
+    """Keep the credential-free Headless transport local to this machine."""
 
-    if not hmac.compare_digest(supplied, configured):
-        raise HTTPException(status_code=403, detail="Worker administrator authentication failed")
+    if not _is_loopback_request(request):
+        raise HTTPException(status_code=403, detail="Headless API is available only on the local machine")
 
 
 def _idempotency_path() -> Path:
@@ -672,15 +774,27 @@ def _idempotency_key(request: HeadlessRunRequest, header: str | None) -> str:
     return str(resolved_header or request.request_id or "").strip()
 
 
-def _request_hash(request: HeadlessRunRequest, *, principal: dict[str, Any]) -> str:
+def _request_hash(request: HeadlessRunRequest) -> str:
     payload = {
         "message": request.message,
         "session_id": request.session_id,
         "workspace_path": request.workspace_path,
         "metadata": request.metadata,
-        "key_id": principal.get("key_id"),
     }
     return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str).encode()).hexdigest()
+
+
+def _caller_identity(metadata: dict[str, Any] | None) -> tuple[str, str]:
+    """Return audit-only caller labels supplied by a trusted local host.
+
+    This is attribution, not authorization. The Headless API has one local
+    security boundary and never grants capabilities from these values.
+    """
+
+    values = metadata if isinstance(metadata, dict) else {}
+    caller_id = str(values.get("caller_id") or values.get("source") or "local-cli").strip()
+    caller_name = str(values.get("caller_name") or values.get("source_name") or "PuddingClaw CLI").strip()
+    return (caller_id or "local-cli")[:120], (caller_name or "PuddingClaw CLI")[:120]
 
 
 def _resume_request_hash(request: HeadlessResumeRequest) -> str:
@@ -818,8 +932,42 @@ async def _consume_run(
     request_received_at: float,
     analytics_model_id: str,
     analytics_model_match: dict[str, Any],
-    worker_key_id: str = "",
 ) -> dict[str, Any]:
+    execution = await _start_headless_execution(
+        request=request,
+        session_id=session_id,
+        project_id=project_id,
+        approval_mode=approval_mode,
+        authority=authority,
+        request_received_at=request_received_at,
+        analytics_model_id=analytics_model_id,
+        analytics_model_match=analytics_model_match,
+    )
+    try:
+        await execution.wait_for_boundary()
+    except BaseException:
+        await execution.cancel()
+        raise
+    return execution.response()
+
+
+async def _start_headless_execution(
+    *,
+    request: HeadlessRunRequest,
+    session_id: str,
+    project_id: str,
+    approval_mode: str,
+    authority: dict[str, Any],
+    request_received_at: float,
+    analytics_model_id: str,
+    analytics_model_match: dict[str, Any],
+) -> _HeadlessExecution:
+    """Create and start a live Headless Run without waiting for a boundary.
+
+    The HTTP transport can now return a StreamingResponse immediately.  The
+    existing synchronous `_consume_run` path remains a compatibility wrapper
+    for `--json` callers and HITL resume endpoints.
+    """
     stream = deepagents_agent_manager.astream(
         message=request.message,
         session_id=session_id,
@@ -844,38 +992,67 @@ async def _consume_run(
         approval_mode=approval_mode,
         analytics_model_id=analytics_model_id,
         analytics_model_match=analytics_model_match,
-        worker_key_id=worker_key_id,
     )
     _prune_headless_executions()
     with _headless_executions_lock:
         _headless_executions[session_id] = execution
     execution.start()
-    try:
-        await execution.wait_for_boundary()
-    except BaseException:
-        await execution.cancel()
-        raise
-    return execution.response()
+    return execution
 
 
 async def _stream_headless_execution(
     execution: _HeadlessExecution,
-    initial_response: dict[str, Any],
+    initial_response: dict[str, Any] | None = None,
+    *,
+    after_seq: int = 0,
 ):
     """Yield live Agent events, then one canonical result event."""
 
-    if execution.pending_inputs and not execution.done:
+    if initial_response is not None and execution.pending_inputs and not execution.done:
         yield {"event": "result", "data": initial_response}
         return
-    while True:
-        item = await execution.events.get()
-        if item is None:
-            break
-        yield item
-        if execution.pending_inputs and not execution.done:
-            yield {"event": "result", "data": execution.response()}
-            return
-    yield {"event": "result", "data": execution.response()}
+    subscriber = execution.subscribe(after_seq=after_seq)
+    try:
+        while True:
+            envelope = await subscriber.get()
+            if envelope is None:
+                break
+            yield {"event": envelope["event"], "data": envelope["data"]}
+            if (
+                envelope["event"] == "permission_required"
+                and execution.pending_inputs
+                and not execution.done
+            ):
+                yield {"event": "result", "data": execution.response()}
+                return
+        yield {"event": "result", "data": execution.response()}
+    finally:
+        execution.unsubscribe(subscriber)
+
+
+def get_headless_execution(session_id: str) -> _HeadlessExecution | None:
+    """Return the retained execution observed by CLI/Web subscribers."""
+
+    _prune_headless_executions()
+    with _headless_executions_lock:
+        return _headless_executions.get(session_id)
+
+
+async def observe_headless_execution(session_id: str, *, after_seq: int = 0):
+    """Observe one Headless Run without consuming another client's events."""
+
+    execution = get_headless_execution(session_id)
+    if execution is None:
+        return
+    subscriber = execution.subscribe(after_seq=after_seq)
+    try:
+        while True:
+            envelope = await subscriber.get()
+            if envelope is None:
+                break
+            yield envelope
+    finally:
+        execution.unsubscribe(subscriber)
 
 
 async def _resolve_external_permission(
@@ -958,8 +1135,8 @@ async def _resolve_external_permission(
 
 
 @router.get("/health")
-async def worker_health(authorization: str | None = Header(default=None)):
-    principal = _principal_for_scope(authorization, "worker:health")
+async def worker_health(request: Request):
+    _require_loopback_request(request)
     _maybe_cleanup_stale_headless_sessions()
     project_id, path = _ensure_worker_project()
     cli_status = current_cli_runtime_status(BASE_DIR)
@@ -968,57 +1145,57 @@ async def worker_health(authorization: str | None = Header(default=None)):
     return {
         "schema_version": "1",
         "agent_id": "puddingclaw",
-        "cli_version": "0.1.17",
+        "cli_version": "0.1.19",
         "protocol_version": "1",
         "configured": True,
-        "authenticated": True,
         "reachable": True,
-        "server_version": "0.1.17",
+        "server_version": "0.1.19",
         "project_id": project_id,
         "workspace_ready": path.is_dir(),
         "capabilities": ["data.query", "data.analysis", "data.nl2sql", "knowledge.query"],
         "operations": {"run": True, "continue": True, "respond": True, "cancel": True},
         "interaction_kinds": ["permission_request"],
         "progress": "jsonl",
-        "key_id": principal.get("key_id"),
+        "transport_scope": "local_loopback",
         "cli": cli_status,
     }
 
 
 @router.get("/models")
-async def worker_models(authorization: str | None = Header(default=None)):
-    principal = _principal_for_scope(authorization, "worker:models:read")
+async def worker_models(request: Request):
+    _require_loopback_request(request)
     return {
         "schema_version": "1",
         "model_type": "analytics_model",
         "required": False,
         "selection": "backend_auto",
-        "models": _model_options(principal),
+        "models": _model_options(),
     }
 
 
 @router.post("/runs")
 async def create_headless_run(
     request: HeadlessRunRequest,
-    authorization: str | None = Header(default=None),
+    http_request: Request,
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
     stream: bool = Query(default=False),
 ):
+    _require_loopback_request(http_request)
     request_received_at = time.time()
-    principal = _principal_for_scope(authorization, "worker:runs:create")
+    caller_id, caller_name = _caller_identity(request.metadata)
     try:
-        await worker_access_log_store.record(
-            key_id=str(principal.get("key_id") or "unknown-worker-key"),
-            key_name=str(principal.get("name") or principal.get("key_id") or "Unknown Worker Key"),
+        await headless_activity_log_store.record(
+            source_id=caller_id,
+            source_name=caller_name,
             query=request.message,
             created_at=request_received_at,
         )
     except Exception as exc:
         # Audit persistence must not make an otherwise valid Worker unavailable.
-        logger.warning("Failed to persist Worker access log: %s", type(exc).__name__)
-    models = _model_options(principal)
+        logger.warning("Failed to persist Headless activity log: %s", type(exc).__name__)
+    models = _model_options()
     key = _idempotency_key(request, idempotency_key)
-    request_hash = _request_hash(request, principal=principal)
+    request_hash = _request_hash(request)
     previous = _reserve_idempotency(key, request_hash)
     if previous is not None:
         if previous.get("status") == "completed" and isinstance(previous.get("response"), dict):
@@ -1039,8 +1216,7 @@ async def create_headless_run(
         configured_mode = "smart"
     authority_profile = str(
         authority.get("profile")
-        or principal.get("authority_profile")
-        or "restricted"
+        or "smart"
     ).strip().lower()
     approval_mode = configured_mode
     if not _claim_headless_session(session_id):
@@ -1051,8 +1227,8 @@ async def create_headless_run(
             if not session_manager.session_exists(session_id):
                 raise HTTPException(status_code=404, detail="Headless Session not found")
             metadata = session_manager.get_metadata(session_id)
-            if not metadata.get("headless_enabled") or metadata.get("worker_key_id") != principal.get("key_id"):
-                raise HTTPException(status_code=403, detail="Session is not authorized for this Worker")
+            if not metadata.get("headless_enabled"):
+                raise HTTPException(status_code=403, detail="Session is not a Headless CLI Session")
             bound_workspace = str(metadata.get("workspace_path") or "").strip()
             if request.workspace_path and bound_workspace:
                 requested_path = Path(request.workspace_path).expanduser()
@@ -1119,7 +1295,7 @@ async def create_headless_run(
                     "continuous_session_model",
                 )
             else:
-                model_route = await _route_analytics_model(request.message, principal)
+                model_route = await _route_analytics_model(request.message)
                 if model_route.status == "general":
                     selected = ""
                 else:
@@ -1135,7 +1311,7 @@ async def create_headless_run(
                     session_manager.update_metadata(session_id, {"analytics_model_id": selected})
         else:
             project_id, workspace_path = _resolve_worker_project(request.workspace_path)
-            model_route = await _route_analytics_model(request.message, principal)
+            model_route = await _route_analytics_model(request.message)
             if model_route.status == "general":
                 selected = ""
             else:
@@ -1152,7 +1328,8 @@ async def create_headless_run(
                     "runtime_mode": "headless_worker",
                     "headless_enabled": True,
                     "worker_id": "puddingclaw",
-                    "worker_key_id": principal.get("key_id"),
+                    "headless_caller_id": caller_id,
+                    "headless_caller_name": caller_name,
                     "interaction_mode": "external",
                     "analytics_model_id": selected,
                     "workspace_path": str(workspace_path),
@@ -1165,6 +1342,64 @@ async def create_headless_run(
         _maybe_cleanup_stale_headless_sessions(now=request_received_at)
         assert workspace_path is not None
         assert model_route is not None
+        if stream is True:
+            # Do not wait for the first Agent boundary here.  Starting the
+            # consumer task and returning the response immediately is what
+            # makes preflight, tool, reasoning and token events observable to
+            # CLI/Teams instead of replaying them after the Run completes.
+            execution = await _start_headless_execution(
+                request=request,
+                session_id=session_id,
+                project_id=project_id,
+                approval_mode=approval_mode,
+                authority={**authority, "profile": authority_profile},
+                request_received_at=request_received_at,
+                analytics_model_id=selected,
+                analytics_model_match=model_route.to_dict(),
+            )
+            streaming_lifecycle = True
+
+            if key:
+                async def finish_idempotency_at_boundary() -> None:
+                    try:
+                        await execution.wait_for_boundary()
+                        result = execution.response()
+                        _attach_session_lifecycle(result, session_id)
+                        _finish_idempotency(key, result)
+                    except BaseException:
+                        # A failed/cancelled execution must not leave a
+                        # permanent "running" reservation after its observer
+                        # disconnects.
+                        _abandon_idempotency(key, request_hash)
+
+                asyncio.create_task(finish_idempotency_at_boundary())
+
+            async def event_stream():
+                nonlocal idempotency_finished
+                terminal_response: dict[str, Any] | None = None
+                try:
+                    async for item in _stream_headless_execution(execution):
+                        if item.get("event") == "result" and isinstance(item.get("data"), dict):
+                            result = dict(item["data"])
+                            _attach_session_lifecycle(result, session_id)
+                            item = {"event": "result", "data": result}
+                            terminal_response = result
+                        yield f"{json.dumps(item, ensure_ascii=False)}\n"
+                    if key:
+                        _finish_idempotency(key, terminal_response or execution.response())
+                        idempotency_finished = True
+                finally:
+                    # This lock guards concurrent HTTP mutations, not the
+                    # lifetime of the Harness Run. Active/pending Run state is
+                    # checked separately, so release it at every stream
+                    # boundary (terminal, HITL, disconnect or cancellation).
+                    _release_headless_session(session_id)
+
+            return StreamingResponse(
+                event_stream(),
+                media_type="application/x-ndjson",
+                headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+            )
         try:
             response = await _consume_run(
                 request=request,
@@ -1175,7 +1410,6 @@ async def create_headless_run(
                 request_received_at=request_received_at,
                 analytics_model_id=selected,
                 analytics_model_match=model_route.to_dict(),
-                worker_key_id=str(principal.get("key_id") or ""),
             )
         except asyncio.TimeoutError:
             response = {
@@ -1188,35 +1422,6 @@ async def create_headless_run(
                 "needs_input": None,
             }
         _attach_session_lifecycle(response, session_id)
-        if stream is True and response.get("run_id"):
-            with _headless_executions_lock:
-                execution = next(
-                    (
-                        item
-                        for item in _headless_executions.values()
-                        if item.run_id == str(response.get("run_id"))
-                    ),
-                    None,
-                )
-            if execution is not None:
-                streaming_lifecycle = True
-
-                async def event_stream():
-                    nonlocal idempotency_finished
-                    terminal_response = response
-                    try:
-                        async for item in _stream_headless_execution(execution, response):
-                            if item.get("event") == "result" and isinstance(item.get("data"), dict):
-                                terminal_response = item["data"]
-                            yield f"{json.dumps(item, ensure_ascii=False)}\n"
-                        if key:
-                            _finish_idempotency(key, terminal_response)
-                            idempotency_finished = True
-                    finally:
-                        if execution.done:
-                            _release_headless_session(session_id)
-
-                return StreamingResponse(event_stream(), media_type="application/x-ndjson")
         if key:
             _finish_idempotency(key, response)
             idempotency_finished = True
@@ -1234,11 +1439,12 @@ async def create_headless_run(
 async def resume_headless_run(
     run_id: str,
     request: HeadlessResumeRequest,
-    authorization: str | None = Header(default=None),
+    http_request: Request,
+    stream: bool = Query(default=False),
 ):
     """Resolve external approval and continue the exact suspended Run."""
 
-    principal = _principal_for_scope(authorization, "worker:runs:create")
+    _require_loopback_request(http_request)
     with _headless_executions_lock:
         execution = next(
             (
@@ -1253,8 +1459,6 @@ async def resume_headless_run(
             status_code=status.HTTP_410_GONE,
             detail="Headless continuation is no longer active; start a new Run",
         )
-    if execution.worker_key_id != str(principal.get("key_id") or ""):
-        raise HTTPException(status_code=403, detail="Run is not authorized for this Worker")
     if not hmac.compare_digest(execution.token, request.continuation_token):
         raise HTTPException(status_code=403, detail="Headless continuation token is invalid")
     if request.workspace_path:
@@ -1302,12 +1506,54 @@ async def resume_headless_run(
 
     if not _claim_headless_session(execution.session_id):
         raise HTTPException(status_code=409, detail="Headless Session already has an active resume request")
+    streaming_lifecycle = False
     try:
         previous_revision = execution.revision
+        previous_sequence = execution.event_sequence
         for decision in request.decisions:
             await _resolve_external_permission(
                 session_id=execution.session_id,
                 decision=decision,
+            )
+        if stream is True:
+            streaming_lifecycle = True
+
+            if request_id:
+                async def cache_resume_at_boundary() -> None:
+                    try:
+                        await execution.wait_for_boundary(after_revision=previous_revision)
+                        result = execution.response()
+                        _attach_session_lifecycle(result, execution.session_id)
+                        execution.resume_results[request_id] = (request_hash, result)
+                    except BaseException:
+                        # The next retry will receive the execution's real
+                        # terminal/pending state instead of a false cached one.
+                        return
+
+                asyncio.create_task(cache_resume_at_boundary())
+
+            async def event_stream():
+                terminal_response: dict[str, Any] | None = None
+                try:
+                    async for item in _stream_headless_execution(
+                        execution,
+                        after_seq=previous_sequence,
+                    ):
+                        if item.get("event") == "result" and isinstance(item.get("data"), dict):
+                            result = dict(item["data"])
+                            _attach_session_lifecycle(result, execution.session_id)
+                            item = {"event": "result", "data": result}
+                            terminal_response = result
+                        yield f"{json.dumps(item, ensure_ascii=False)}\n"
+                    if request_id and terminal_response is not None:
+                        execution.resume_results[request_id] = (request_hash, terminal_response)
+                finally:
+                    _release_headless_session(execution.session_id)
+
+            return StreamingResponse(
+                event_stream(),
+                media_type="application/x-ndjson",
+                headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
             )
         await execution.wait_for_boundary(after_revision=previous_revision)
         response = execution.response()
@@ -1329,20 +1575,25 @@ async def resume_headless_run(
             execution.resume_results[request_id] = (request_hash, response)
         return JSONResponse(status_code=status.HTTP_504_GATEWAY_TIMEOUT, content=response)
     finally:
-        _release_headless_session(execution.session_id)
+        if not streaming_lifecycle:
+            _release_headless_session(execution.session_id)
 
 
 @router.post("/runs/{run_id}/cancel")
 async def cancel_headless_run(
     run_id: str,
-    authorization: str | None = Header(default=None),
+    request: Request,
 ):
     """Cancel a live Headless Run while retaining its Session."""
 
-    principal = _principal_for_scope(authorization, "worker:runs:cancel")
+    _require_loopback_request(request)
     with _headless_executions_lock:
         execution = next(
-            (item for item in _headless_executions.values() if item.run_id == run_id),
+            (
+                item
+                for item in _headless_executions.values()
+                if item.run_id == run_id or item.session_id == run_id
+            ),
             None,
         )
     if execution is None:
@@ -1350,58 +1601,42 @@ async def cancel_headless_run(
             status_code=status.HTTP_410_GONE,
             detail="Headless Run is no longer active",
         )
-    if execution.worker_key_id != str(principal.get("key_id") or ""):
-        raise HTTPException(status_code=403, detail="Run is not authorized for this Worker")
-    if not _claim_headless_session(execution.session_id):
-        raise HTTPException(status_code=409, detail="Headless Session already has an active request")
-    try:
-        await execution.cancel()
-        response = execution.response()
-        _attach_session_lifecycle(response, execution.session_id)
-        return response
-    finally:
-        _release_headless_session(execution.session_id)
+    # Cancellation is an out-of-band control operation. It must be able to
+    # interrupt an active streaming create/resume request instead of waiting
+    # for that request's mutation lock to be released.
+    await execution.cancel()
+    response = execution.response()
+    _attach_session_lifecycle(response, execution.session_id)
+    return response
 
 
-@router.post("/access-keys")
-async def create_worker_access_key(request: Request, payload: WorkerAccessKeyCreateRequest):
-    _admin(request)
-    try:
-        public, token = worker_access_store.create(**payload.model_dump())
-    except WorkerAccessError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-    return {**public, "token": token}
-
-
-@router.get("/access-keys")
-async def list_worker_access_keys(request: Request):
-    _admin(request)
-    return {"keys": worker_access_store.list_public()}
-
-
-@worker_access_router.get("/worker-access-logs")
-async def list_worker_access_logs(
+@headless_activity_router.get("/headless-activity-logs")
+async def list_headless_activity_logs(
     request: Request,
     page: int = Query(default=1, ge=1),
-    key_name: str | None = Query(default=None, max_length=120),
+    source_name: str | None = Query(default=None, max_length=120),
     query_keyword: str | None = Query(default=None, alias="query", max_length=200),
     start_at: float | None = Query(default=None, ge=0),
     end_at: float | None = Query(default=None, ge=0),
 ):
-    _admin(request)
+    _require_loopback_request(request)
     if start_at is not None and end_at is not None and start_at > end_at:
         raise HTTPException(status_code=422, detail="start_at must not be later than end_at")
-    result = await worker_access_log_store.list(
+    result = await headless_activity_log_store.list(
         page=page,
         page_size=10,
-        key_name=key_name,
+        source_name=source_name,
         query=query_keyword,
         start_at=start_at,
         end_at=end_at,
     )
     result["items"] = [
         {
-            **item,
+            "id": item["id"],
+            "source_id": item["source_id"],
+            "source_name": item["source_name"],
+            "query": item["query"],
+            "created_at": item["created_at"],
             "created_at_beijing": datetime.fromtimestamp(
                 float(item["created_at"]),
                 tz=_BEIJING_TIMEZONE,
@@ -1411,46 +1646,3 @@ async def list_worker_access_logs(
     ]
     result["timezone"] = "Asia/Shanghai"
     return result
-
-
-@router.post("/access-keys/{key_id}/rotate")
-async def rotate_worker_access_key(key_id: str, request: Request):
-    _admin(request)
-    try:
-        public, token = worker_access_store.rotate(key_id)
-    except WorkerAccessError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    return {**public, "token": token}
-
-
-@router.delete("/access-keys/{key_id}")
-async def revoke_worker_access_key(key_id: str, request: Request):
-    _admin(request)
-    try:
-        worker_access_store.revoke(key_id)
-    except WorkerAccessError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    return {"status": "revoked", "key_id": key_id}
-
-
-# Stable management paths from the Worker contract. The /headless/access-keys
-# aliases above remain useful for local discovery, while these paths avoid
-# making callers know the implementation grouping of the runtime router.
-@worker_access_router.post("/worker-access-keys")
-async def create_worker_access_key_contract(request: Request, payload: WorkerAccessKeyCreateRequest):
-    return await create_worker_access_key(request, payload)
-
-
-@worker_access_router.get("/worker-access-keys")
-async def list_worker_access_keys_contract(request: Request):
-    return await list_worker_access_keys(request)
-
-
-@worker_access_router.post("/worker-access-keys/{key_id}/rotate")
-async def rotate_worker_access_key_contract(key_id: str, request: Request):
-    return await rotate_worker_access_key(key_id, request)
-
-
-@worker_access_router.delete("/worker-access-keys/{key_id}")
-async def revoke_worker_access_key_contract(key_id: str, request: Request):
-    return await revoke_worker_access_key(key_id, request)

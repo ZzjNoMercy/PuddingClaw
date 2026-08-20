@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { spawn } from "node:child_process";
+import { rmSync } from "node:fs";
 import process from "node:process";
 
 const forwarded = process.argv.slice(2);
@@ -15,6 +16,8 @@ function requestedPort(args) {
 }
 
 const port = requestedPort(forwarded);
+const configuredDistDir = (process.env.NEXT_DIST_DIR || "").trim();
+const distDir = configuredDistDir || `.next-dev-${port}`;
 const hasHost = forwarded.some((value) => value === "-H" || value === "--hostname" || value.startsWith("--hostname="));
 const hasPort = forwarded.some((value) => value === "-p" || value === "--port" || value.startsWith("--port="));
 const args = ["next", "dev"];
@@ -35,12 +38,23 @@ const commandArgs = process.platform === "win32"
       "npx",
       ...args,
     ];
+
+// A dev cache is disposable.  Reusing a graph left behind by an interrupted
+// compiler can serve the server route while its client chunk is missing,
+// producing a stable route-200/chunk-404 loop.  Only remove the default
+// per-port cache owned by this wrapper; an explicitly configured distDir is
+// caller-owned and must not be deleted here.
+if (!configuredDistDir && process.env.PUDDINGCLAW_REUSE_NEXT_DEV_CACHE !== "1") {
+  rmSync(distDir, { recursive: true, force: true });
+  process.stdout.write(`[next-dev] cleared generated cache ${distDir}\n`);
+}
+
 const child = spawn(command, commandArgs, {
   stdio: "inherit",
   env: {
     ...process.env,
     // Never let two dev servers (or next build) mutate the same chunk graph.
-    NEXT_DIST_DIR: process.env.NEXT_DIST_DIR || `.next-dev-${port}`,
+    NEXT_DIST_DIR: distDir,
   },
 });
 

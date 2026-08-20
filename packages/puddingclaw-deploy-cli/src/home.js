@@ -22,7 +22,6 @@ export function homePaths(home) {
     productConfig: path.join(home, "config.json"),
     runtimeState: path.join(home, "runtime.json"),
     initState: path.join(home, "init-state.json"),
-    workerToken: path.join(home, "secrets", "headless-token"),
     providerApiKey: path.join(home, "secrets", "initial-provider-api-key"),
     multimodalProviderApiKey: path.join(home, "secrets", "initial-multimodal-provider-api-key"),
     embeddingApiKey: path.join(home, "secrets", "embedding-provider-api-key"),

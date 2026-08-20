@@ -131,8 +131,8 @@ export function formatDoctor(result) {
   }
   if (result.deployment) {
     lines.push("", "Worker API");
-    const ready = result.configured === true && result.authenticated === true && result.reachable === true;
-    const detail = ready ? "authenticated · reachable" : (result.error || "not ready");
+    const ready = result.configured === true && result.reachable === true;
+    const detail = ready ? "local · reachable" : (result.error || "not ready");
     lines.push(`${ready ? "✓" : "!"} ${"connection".padEnd(24)} ${detail}`);
     if (result.server_version) lines.push(`  ${"server version".padEnd(24)} ${result.server_version}`);
     if (result.project_id) lines.push(`  ${"project".padEnd(24)} ${result.project_id}`);

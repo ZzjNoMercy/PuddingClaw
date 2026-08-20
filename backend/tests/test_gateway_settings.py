@@ -1535,3 +1535,36 @@ def test_single_line_markdown_path_example_does_not_consume_later_prompt_text(tm
         session_id="session-single-line-path-prompt",
         workspace_path=tmp_path,
     ) == message
+
+
+def test_approximate_percentage_is_not_extracted_as_a_home_path(tmp_path):
+    from harness.artifact_paths import (
+        artifact_path_matches,
+        extract_local_directory_paths,
+        extract_local_resource_paths,
+    )
+
+    message = (
+        "| 年份 | 标配渗透率 | 备注 |\n"
+        "|---|---|---|\n"
+        "| 2021 | ~2.5% | 早期估计值 |"
+    )
+
+    assert extract_local_resource_paths(message) == []
+    assert extract_local_directory_paths(message) == []
+    assert artifact_path_matches("~puddingclaw-user-that-does-not-exist/report.md", str(tmp_path)) is False
+    assert DeepAgentsAgentManager._build_user_content(
+        message,
+        session_id="session-approximate-percentage",
+        workspace_path=tmp_path,
+    ) == message
+
+
+def test_current_user_tilde_directory_remains_supported(tmp_path, monkeypatch):
+    from harness.artifact_paths import extract_local_directory_paths
+
+    target = tmp_path / "reports"
+    target.mkdir()
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    assert extract_local_directory_paths("请读取 ~/reports 目录") == [str(target.resolve())]

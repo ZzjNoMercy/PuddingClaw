@@ -11,13 +11,14 @@ import hashlib
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from knowledge.models import (
     KnowledgeBase,
     KnowledgeSourceConnection,
     KnowledgeSourceItem,
+    KnowledgeImportJob,
     KnowledgeSyncRun,
     iso_utc,
     new_id,
@@ -213,7 +214,15 @@ async def list_source_connections(
         (
             await session.execute(
                 select(KnowledgeSourceItem.source_connection_id, func.count(KnowledgeSourceItem.id))
+                .outerjoin(KnowledgeImportJob, KnowledgeImportJob.source_item_id == KnowledgeSourceItem.id)
                 .where(KnowledgeSourceItem.knowledge_base_id == knowledge_base_id)
+                .where(
+                    or_(
+                        KnowledgeSourceItem.status != "staged",
+                        ~KnowledgeSourceItem.external_id.like("import-job:%"),
+                        KnowledgeImportJob.id.is_not(None),
+                    )
+                )
                 .group_by(KnowledgeSourceItem.source_connection_id)
             )
         ).all()
@@ -237,7 +246,18 @@ async def list_source_items(
     limit: int = 200,
 ) -> list[KnowledgeSourceItem]:
     await get_source_connection(session, source_id)
-    stmt = select(KnowledgeSourceItem).where(KnowledgeSourceItem.source_connection_id == source_id)
+    stmt = (
+        select(KnowledgeSourceItem)
+        .outerjoin(KnowledgeImportJob, KnowledgeImportJob.source_item_id == KnowledgeSourceItem.id)
+        .where(KnowledgeSourceItem.source_connection_id == source_id)
+        .where(
+            or_(
+                KnowledgeSourceItem.status != "staged",
+                ~KnowledgeSourceItem.external_id.like("import-job:%"),
+                KnowledgeImportJob.id.is_not(None),
+            )
+        )
+    )
     if status and status != "all":
         if status == "ready":
             stmt = stmt.where(KnowledgeSourceItem.status.in_(["ready", "completed", "succeeded", "success"]))

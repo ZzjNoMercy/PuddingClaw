@@ -18,8 +18,6 @@ def test_home_layout_migration_copies_early_layout_without_runtime_fallback(
     legacy_results.mkdir(parents=True)
     (legacy_usage / "token_usage.db").write_bytes(b"usage")
     (legacy_results / "qr-1.jsonl").write_text('{"id":1}\n', encoding="utf-8")
-    access = paths.data() / "worker-access-keys.json"
-    access.write_text(json.dumps({"key": {"secret_hash": "sha256:test"}}), encoding="utf-8")
     (paths.data() / "evaluation-settings.json").write_text(
         json.dumps({"enabled": True}), encoding="utf-8"
     )
@@ -51,6 +49,3 @@ def test_home_layout_migration_copies_early_layout_without_runtime_fallback(
     assert (paths.databases() / "catalog.sqlite3").read_bytes() == b"catalog"
     assert json.loads(paths.project_registry().read_text(encoding="utf-8"))["project"]["path"] == "/tmp/project"
     assert generated_memory.read_text(encoding="utf-8") == legacy_memory.read_text(encoding="utf-8")
-    owner_access = paths.owner_access("owner") / "worker-access-keys.json"
-    assert owner_access.is_file()
-    assert owner_access.stat().st_mode & 0o777 == 0o600

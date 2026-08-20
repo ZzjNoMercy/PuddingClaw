@@ -6,7 +6,7 @@ import asyncio
 import hashlib
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -76,7 +76,9 @@ def _database_source_snapshot(source: KnowledgeDatabaseSource | dict[str, Any]) 
     payload = dict(source)
     payload["source_type"] = payload.get("source_type") or payload.get("type") or "postgresql"
     payload["type"] = payload.get("type") or payload["source_type"]
-    payload["selected_tables"] = payload.get("selected_tables") if isinstance(payload.get("selected_tables"), list) else []
+    payload["selected_tables"] = (
+        payload.get("selected_tables") if isinstance(payload.get("selected_tables"), list) else []
+    )
     payload.pop("password", None)
     return payload
 
@@ -272,6 +274,54 @@ def task_source_path(base_dir: Path, *, job_id: str, filename: str) -> Path:
     return knowledge_root / ".tasks" / job_id / "source" / safe_name
 
 
+def cleanup_succeeded_task_source(base_dir: Path, job: KnowledgeImportJob) -> bool:
+    """Remove only the disposable upload owned by a completed import job.
+
+    The durable source/artifact has already been written to ``originals`` or
+    ``imported`` before the job becomes successful.  Resolve the exact expected
+    task path instead of trusting ``job.source_path`` so connector files,
+    database URIs and user-mounted files can never be deleted here.
+    """
+
+    if job.status != "succeeded" or job_kind(job) != "import":
+        return False
+    source_path = Path(job.source_path)
+    expected_path = task_source_path(base_dir, job_id=job.id, filename=job.file_name)
+    try:
+        if source_path.expanduser().resolve(strict=False) != expected_path.expanduser().resolve(strict=False):
+            return False
+    except OSError:
+        return False
+    if not source_path.exists() or not source_path.is_file():
+        return False
+    try:
+        source_path.unlink()
+        # Only remove the two now-empty directories owned by this job.  Never
+        # recurse and never touch the shared ``.tasks`` directory.
+        source_path.parent.rmdir()
+        source_path.parent.parent.rmdir()
+    except OSError:
+        logger.warning(
+            "[knowledge-import] completed task source cleanup failed job_id=%s path=%s",
+            job.id,
+            source_path,
+            exc_info=True,
+        )
+        return not source_path.exists()
+    return True
+
+
+async def cleanup_succeeded_task_sources(session: AsyncSession, *, base_dir: Path) -> int:
+    """Recover cleanup if the worker stopped after committing success."""
+
+    result = await session.execute(select(KnowledgeImportJob).where(KnowledgeImportJob.status == "succeeded"))
+    cleaned = 0
+    for job in result.scalars().all():
+        if cleanup_succeeded_task_source(base_dir, job):
+            cleaned += 1
+    return cleaned
+
+
 async def create_import_job(
     session: AsyncSession,
     *,
@@ -283,6 +333,9 @@ async def create_import_job(
     title: str | None = None,
     knowledge_base_id: str = DEFAULT_KNOWLEDGE_BASE_ID,
     publish_targets: list[str] | None = None,
+    status: str = "queued",
+    parser_id: str | None = None,
+    parser_options: dict[str, Any] | None = None,
 ) -> KnowledgeImportJob:
     await assert_writes_allowed(session)
     service = KnowledgeService(base_dir)
@@ -299,14 +352,14 @@ async def create_import_job(
         external_id=f"import-job:{job_id}",
         external_type="file",
         title=(title or "").strip() or filename,
-        status="queued",
+        status=status,
         content_sha256=source_sha256 or None,
         metadata={"original_filename": filename},
     )
     job = KnowledgeImportJob(
         id=job_id,
         knowledge_base_id=knowledge_base_id,
-        status="queued",
+        status=status,
         file_name=filename,
         file_type=detect_file_type(filename),
         file_size=file_size,
@@ -314,17 +367,140 @@ async def create_import_job(
         source_sha256=source_sha256,
         title=(title or "").strip() or None,
         publish_targets=publish_targets or ["local_markdown"],
-        current_step="queued",
+        current_step=status,
         progress=0,
         source_connection_id=source.id,
         source_item_id=source_item.id,
-        job_metadata={"deepagents_backend": "/knowledge/"},
+        job_metadata={
+            "deepagents_backend": "/knowledge/",
+            "source": {
+                "upload_id": job_id,
+                "sha256": source_sha256,
+                "expires_at": (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat()
+                if status == "staged"
+                else None,
+            },
+            "parser": {
+                "requested_id": parser_id or ("mineru_local" if detect_file_type(filename) == "pdf" else "native"),
+                "resolved_id": parser_id or ("mineru_local" if detect_file_type(filename) == "pdf" else "native"),
+                "options": dict(parser_options or {}),
+            },
+        },
     )
     session.add(job)
-    session.add(KnowledgeImportEvent(job_id=job.id, level="info", message="任务已加入导入队列"))
+    session.add(
+        KnowledgeImportEvent(
+            job_id=job.id,
+            level="info",
+            message="文件已暂存，等待选择解析器" if status == "staged" else "任务已加入导入队列",
+        )
+    )
     await session.commit()
     await session.refresh(job)
     return job
+
+
+async def commit_staged_import_job(
+    session: AsyncSession,
+    *,
+    job_id: str,
+    parser_id: str,
+    parser_options: dict[str, Any] | None = None,
+    publish_targets: list[str] | None = None,
+    title: str | None = None,
+    allow_cloud: bool = False,
+) -> KnowledgeImportJob:
+    """Atomically turn one uploaded source into one queued import task."""
+
+    await assert_writes_allowed(session)
+    job = await session.get(KnowledgeImportJob, job_id)
+    if job is None:
+        raise KnowledgeServiceError(f"暂存文件不存在：{job_id}")
+    if job.status != "staged":
+        current_parser = str((job.job_metadata or {}).get("parser", {}).get("resolved_id") or "")
+        if job.status in {"queued", "running", "succeeded"} and current_parser == parser_id:
+            return job
+        raise KnowledgeServiceError("这个暂存文件已经创建过导入任务，不能重复提交。")
+    source = (job.job_metadata or {}).get("source") or {}
+    expires_at = str(source.get("expires_at") or "")
+    if expires_at:
+        try:
+            expired = datetime.fromisoformat(expires_at.replace("Z", "+00:00")) < datetime.now(timezone.utc)
+        except ValueError:
+            expired = True
+        if expired:
+            raise KnowledgeServiceError("暂存文件已过期，请重新选择文件。")
+
+    from knowledge.parsers import get_document_parser_registry
+
+    catalog = await get_document_parser_registry().catalog(
+        filename=job.file_name,
+        file_size=job.file_size,
+        page_count=int(source["page_count"]) if source.get("page_count") is not None else None,
+    )
+    selected = next((item for item in catalog if item["id"] == parser_id), None)
+    if selected is None:
+        raise KnowledgeServiceError(f"未知解析器：{parser_id}")
+    if not selected.get("selectable"):
+        raise KnowledgeServiceError(str(selected.get("reason") or selected.get("health_message") or "解析器不可用"))
+    if selected.get("location") == "cloud" and not allow_cloud:
+        raise KnowledgeServiceError("选择云端解析器前必须明确允许上传到第三方服务。")
+
+    parser_metadata = {
+        "requested_id": parser_id,
+        "resolved_id": parser_id,
+        "version": str(selected.get("version") or "unknown"),
+        "options": dict(parser_options or {}),
+        "location": str(selected.get("location") or "local"),
+    }
+    job.status = "queued"
+    job.current_step = "queued"
+    job.progress = 0
+    job.title = (title or "").strip() or job.title
+    job.publish_targets = publish_targets or ["local_markdown"]
+    job.job_metadata = {**(job.job_metadata or {}), "parser": parser_metadata}
+    if job.source_item_id:
+        source_item = await session.get(KnowledgeSourceItem, job.source_item_id)
+        if source_item is not None:
+            source_item.status = "queued"
+    session.add(KnowledgeImportEvent(job_id=job.id, level="info", message=f"已选择 {selected['name']}，任务加入队列"))
+    await session.commit()
+    await session.refresh(job)
+    return job
+
+
+async def cleanup_expired_staged_import_jobs(session: AsyncSession) -> int:
+    """Expire abandoned staged uploads before they are shown as pending import work."""
+
+    result = await session.execute(select(KnowledgeImportJob).where(KnowledgeImportJob.status == "staged"))
+    now = datetime.now(timezone.utc)
+    expired_jobs: list[KnowledgeImportJob] = []
+    for job in result.scalars().all():
+        source = (job.job_metadata or {}).get("source") or {}
+        expires_at = str(source.get("expires_at") or "")
+        try:
+            expired = not expires_at or datetime.fromisoformat(expires_at.replace("Z", "+00:00")) < now
+        except ValueError:
+            expired = True
+        if expired:
+            expired_jobs.append(job)
+
+    for job in expired_jobs:
+        source_path = Path(job.source_path)
+        try:
+            source_path.unlink(missing_ok=True)
+            source_path.parent.rmdir()
+            source_path.parent.parent.rmdir()
+        except OSError:
+            pass
+        source_item = await session.get(KnowledgeSourceItem, job.source_item_id) if job.source_item_id else None
+        await session.delete(job)
+        await session.flush()
+        if source_item is not None and source_item.document_id is None:
+            await session.delete(source_item)
+    if expired_jobs:
+        await session.commit()
+    return len(expired_jobs)
 
 
 async def create_llm_wiki_ingest_job(
@@ -598,11 +774,7 @@ async def create_vanna_entity_import_job(
         filter_column = str(raw_filter.get("column") or "").strip()
         operator = str(raw_filter.get("operator") or "").strip()
         values = list(
-            dict.fromkeys(
-                str(item).strip()
-                for item in raw_filter.get("values") or []
-                if str(item or "").strip()
-            )
+            dict.fromkeys(str(item).strip() for item in raw_filter.get("values") or [] if str(item or "").strip())
         )
         if not filter_column or operator not in {"in", "not_in"} or not values:
             raise KnowledgeServiceError("实体过滤条件必须选择字段、操作符和已有值。")
@@ -680,7 +852,15 @@ async def delete_import_job(session: AsyncSession, job_id: str) -> None:
         raise KnowledgeServiceError(f"Import job not found: {job_id}")
     if job.status == "running":
         raise KnowledgeServiceError("任务正在处理中，完成后再删除。")
+    source_item = (
+        await session.get(KnowledgeSourceItem, job.source_item_id)
+        if job.status == "staged" and job.source_item_id
+        else None
+    )
     await session.delete(job)
+    await session.flush()
+    if source_item is not None and source_item.document_id is None:
+        await session.delete(source_item)
     await session.commit()
 
 
@@ -695,8 +875,14 @@ async def clear_import_jobs(
     )
     result = await session.execute(stmt)
     jobs = list(result.scalars())
+    staged_source_item_ids = {job.source_item_id for job in jobs if job.status == "staged" and job.source_item_id}
     for job in jobs:
         await session.delete(job)
+    await session.flush()
+    for source_item_id in staged_source_item_ids:
+        source_item = await session.get(KnowledgeSourceItem, source_item_id)
+        if source_item is not None and source_item.document_id is None:
+            await session.delete(source_item)
     await session.commit()
     return len(jobs)
 
@@ -840,7 +1026,9 @@ async def update_job_progress(
     if metadata_patch:
         job.job_metadata = {**(job.job_metadata or {}), **metadata_patch}
     if message and record_event:
-        session.add(KnowledgeImportEvent(job_id=job.id, level="info", message=message, event_metadata=event_metadata or {}))
+        session.add(
+            KnowledgeImportEvent(job_id=job.id, level="info", message=message, event_metadata=event_metadata or {})
+        )
     await session.commit()
 
 
@@ -1041,7 +1229,97 @@ async def process_import_job(session: AsyncSession, *, base_dir: Path, job: Know
         raise KnowledgeServiceError("上传文件校验失败，请重新导入。")
 
     suffix = Path(job.file_name).suffix.lower()
+    parser_metadata = (job.job_metadata or {}).get("parser")
+    if not isinstance(parser_metadata, dict):
+        parser_metadata = {}
+    current_parser_metadata = dict(parser_metadata)
+    parser_id = str(parser_metadata.get("resolved_id") or ("mineru_local" if suffix in PDF_SUFFIXES else "native"))
+    parser_options = parser_metadata.get("options") if isinstance(parser_metadata.get("options"), dict) else {}
+    parser_remote_state = parser_metadata.get("remote") if isinstance(parser_metadata.get("remote"), dict) else {}
     await update_job_progress(session, job, step="parsing", progress=25, message="开始解析文件")
+
+    async def _parser_progress(step: str, progress: int, message: str) -> None:
+        nonlocal current_parser_metadata
+        current_parser_metadata = {
+            **current_parser_metadata,
+            "resolved_id": parser_id,
+            "last_step": step,
+        }
+        await update_job_progress(
+            session,
+            job,
+            step=step,
+            progress=progress,
+            message=message,
+            metadata_patch={
+                "parser": {
+                    **current_parser_metadata,
+                }
+            },
+        )
+
+    async def _parser_checkpoint(patch: dict[str, Any]) -> None:
+        """Persist provider IDs before the worker begins a long remote wait."""
+
+        nonlocal current_parser_metadata, parser_remote_state
+        parser_remote_state = {**parser_remote_state, **patch}
+        remote_task_id = (
+            parser_remote_state.get("job_id")
+            or parser_remote_state.get("batch_id")
+            or parser_remote_state.get("task_id")
+        )
+        current_parser_metadata = {
+            **current_parser_metadata,
+            "resolved_id": parser_id,
+            "remote": parser_remote_state,
+            "remote_task_id": remote_task_id,
+        }
+        await update_job_progress(
+            session,
+            job,
+            step=job.current_step or "parsing",
+            progress=job.progress,
+            metadata_patch={"parser": current_parser_metadata},
+            record_event=False,
+        )
+
+    async def _snapshot_markdown_to_wiki_raw(document: KnowledgeDocument, ingest: dict[str, Any]) -> dict[str, Any]:
+        from knowledge.llm_wiki import LlmWikiError, get_llm_wiki_service
+
+        await update_job_progress(
+            session,
+            job,
+            step="snapshotting_raw",
+            progress=75,
+            message="复制最终 Markdown 到 LLM Wiki Raw",
+        )
+        try:
+            raw_snapshot = await asyncio.to_thread(
+                get_llm_wiki_service(base_dir).snapshot_raw_file,
+                source_id="knowledge-upload",
+                asset_id=document.id,
+                title=document.title,
+                path=Path(document.storage_path),
+                source_path=document.virtual_path,
+            )
+        except (LlmWikiError, OSError) as exc:
+            raw_error = f"创建 LLM Wiki Raw 失败：{exc}"
+            job.publish_targets = [target for target in (job.publish_targets or []) if target != "llm_wiki_raw"]
+            document.publish_targets = [
+                target for target in (document.publish_targets or []) if target != "llm_wiki_raw"
+            ]
+            session.add(
+                KnowledgeImportEvent(
+                    job_id=job.id,
+                    level="warning",
+                    message=f"{raw_error}；知识库原文件已正常导入。",
+                )
+            )
+            return {**(ingest or {}), "llm_wiki_raw": {"ok": False, "error": raw_error}}
+        if "llm_wiki_raw" not in (document.publish_targets or []):
+            document.publish_targets = [*(document.publish_targets or []), "llm_wiki_raw"]
+        return {**(ingest or {}), "llm_wiki_raw": {"ok": True, **raw_snapshot}}
+
     if suffix in PDF_SUFFIXES:
         document, ingest = await service.ingest_pdf_upload(
             session,
@@ -1052,7 +1330,54 @@ async def process_import_job(session: AsyncSession, *, base_dir: Path, job: Know
             publish_targets=job.publish_targets,
             source_connection_id=job.source_connection_id,
             source_item_id=job.source_item_id,
+            parser_id=parser_id,
+            parser_options=parser_options,
+            parser_progress_callback=_parser_progress,
+            parser_remote_state=parser_remote_state,
+            parser_checkpoint_callback=_parser_checkpoint,
         )
+    elif parser_id in {"llamaindex_reader", "unstructured_local"}:
+        from knowledge.parsers import ParseRequest, ParserError, get_document_parser_registry
+
+        try:
+            parse_result = await get_document_parser_registry().parse(
+                parser_id,
+                ParseRequest(
+                    filename=job.file_name,
+                    content=content,
+                    assets_dir=service.knowledge_dir / "assets" / datetime.now().strftime("%Y%m%d") / job.id,
+                    options=parser_options,
+                ),
+                on_progress=_parser_progress,
+            )
+        except ParserError as exc:
+            raise KnowledgeServiceError(str(exc)) from exc
+        document, ingest = await service.ingest_markdown_upload(
+            session,
+            filename=f"{Path(job.file_name).stem}.md",
+            content=(parse_result.markdown.rstrip() + "\n").encode("utf-8"),
+            title=job.title,
+            knowledge_base_id=job.knowledge_base_id,
+            publish_targets=job.publish_targets,
+            source_connection_id=job.source_connection_id,
+            source_item_id=job.source_item_id,
+        )
+        document.source_type = f"file_{parser_id}"
+        document.doc_metadata = {
+            **(document.doc_metadata or {}),
+            "structured_blocks": [dict(block) for block in parse_result.structured_blocks],
+            "parser_trace": {
+                "id": parser_id,
+                "version": parse_result.parser_version,
+                "options_hash": hashlib.sha256(
+                    json.dumps(parser_options, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode(
+                        "utf-8"
+                    )
+                ).hexdigest(),
+                "warnings": list(parse_result.warnings),
+                "metadata": parse_result.parser_metadata,
+            },
+        }
     elif suffix in MARKDOWN_SUFFIXES:
         document, ingest = await service.ingest_markdown_upload(
             session,
@@ -1064,43 +1389,6 @@ async def process_import_job(session: AsyncSession, *, base_dir: Path, job: Know
             source_connection_id=job.source_connection_id,
             source_item_id=job.source_item_id,
         )
-        if "llm_wiki_raw" in (job.publish_targets or []):
-            from knowledge.llm_wiki import LlmWikiError, get_llm_wiki_service
-
-            await update_job_progress(
-                session,
-                job,
-                step="snapshotting_raw",
-                progress=75,
-                message="复制最终 Markdown 到 LLM Wiki Raw",
-            )
-            try:
-                raw_snapshot = await asyncio.to_thread(
-                    get_llm_wiki_service(base_dir).snapshot_raw_file,
-                    source_id="knowledge-upload",
-                    asset_id=document.id,
-                    title=document.title,
-                    path=Path(document.storage_path),
-                    source_path=document.virtual_path,
-                )
-            except (LlmWikiError, OSError) as exc:
-                raw_error = f"创建 LLM Wiki Raw 失败：{exc}"
-                job.publish_targets = [target for target in (job.publish_targets or []) if target != "llm_wiki_raw"]
-                document.publish_targets = [
-                    target for target in (document.publish_targets or []) if target != "llm_wiki_raw"
-                ]
-                ingest = {**(ingest or {}), "llm_wiki_raw": {"ok": False, "error": raw_error}}
-                session.add(
-                    KnowledgeImportEvent(
-                        job_id=job.id,
-                        level="warning",
-                        message=f"{raw_error}；知识库原文件已正常导入。",
-                    )
-                )
-            else:
-                if "llm_wiki_raw" not in (document.publish_targets or []):
-                    document.publish_targets = [*(document.publish_targets or []), "llm_wiki_raw"]
-                ingest = {**(ingest or {}), "llm_wiki_raw": {"ok": True, **raw_snapshot}}
     elif suffix in GENERIC_UPLOAD_SUFFIXES:
         document, ingest = await service.ingest_generic_upload(
             session,
@@ -1114,6 +1402,9 @@ async def process_import_job(session: AsyncSession, *, base_dir: Path, job: Know
         )
     else:
         raise KnowledgeServiceError(f"Unsupported knowledge file type: {suffix or 'unknown'}")
+
+    if "llm_wiki_raw" in (job.publish_targets or []) and document.mime_type == "text/markdown":
+        ingest = await _snapshot_markdown_to_wiki_raw(document, ingest)
 
     await update_job_progress(session, job, step="finalizing", progress=90, message="写入知识库记录")
     if suffix in {".xlsx", ".xls", ".csv", ".tsv"}:
@@ -1157,13 +1448,20 @@ async def process_import_job(session: AsyncSession, *, base_dir: Path, job: Know
     job.lease_expires_at = None
     job.heartbeat_at = None
     job.job_metadata = {**(job.job_metadata or {}), "ingestion": ingest, "document_virtual_path": document.virtual_path}
-    session.add(KnowledgeImportEvent(job_id=job.id, level="info", message="导入完成", event_metadata={"document_id": document.id}))
+    session.add(
+        KnowledgeImportEvent(
+            job_id=job.id, level="info", message="导入完成", event_metadata={"document_id": document.id}
+        )
+    )
     await session.commit()
     await session.refresh(job)
+    cleanup_succeeded_task_source(base_dir, job)
     return job
 
 
-async def process_vector_publish_job(session: AsyncSession, *, base_dir: Path, job: KnowledgeImportJob) -> KnowledgeImportJob:
+async def process_vector_publish_job(
+    session: AsyncSession, *, base_dir: Path, job: KnowledgeImportJob
+) -> KnowledgeImportJob:
     if not job.document_id:
         raise KnowledgeServiceError("任务还没有生成知识库文档，暂时不能导入向量。")
 

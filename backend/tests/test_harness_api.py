@@ -1,5 +1,7 @@
 """API tests for persisted Run/Goal state and explicit Goal controls."""
 
+import time
+
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -256,6 +258,44 @@ def test_session_harness_endpoint_returns_persisted_state(tmp_path):
     payload = response.json()
     assert payload["active_goal_id"] == "goal-1"
     assert payload["goals"]["goal-1"]["objective"] == "完成分析"
+
+
+def test_session_event_endpoint_returns_no_content_without_retained_headless_run(tmp_path):
+    client = _client(tmp_path)
+
+    response = client.get("/api/sessions/session-1/events")
+
+    assert response.status_code == 204
+
+
+def test_session_event_endpoint_replays_retained_headless_events(tmp_path):
+    from api import headless as headless_api
+
+    client = _client(tmp_path)
+    execution = headless_api._HeadlessExecution(
+        stream=None,
+        session_id="session-1",
+        project_id="project-test",
+        approval_mode="smart",
+        analytics_model_id="",
+        analytics_model_match={"status": "general"},
+    )
+    execution._publish({"event": "token", "data": {"content": "可见内容"}})
+    execution._publish({"event": "done", "data": {"content": "可见内容"}})
+    execution.done = True
+    execution.done_at = time.time()
+    with headless_api._headless_executions_lock:
+        headless_api._headless_executions["session-1"] = execution
+    try:
+        response = client.get("/api/sessions/session-1/events?after=1")
+    finally:
+        with headless_api._headless_executions_lock:
+            headless_api._headless_executions.pop("session-1", None)
+
+    assert response.status_code == 200
+    assert "id: 2" in response.text
+    assert "event: done" in response.text
+    assert "可见内容" in response.text
 
 
 def test_goal_pause_resume_cancel_api(tmp_path):

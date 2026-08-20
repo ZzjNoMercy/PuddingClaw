@@ -6,6 +6,7 @@ import { useRouter } from "next/navigation";
 import {
   AlertCircle,
   CheckCircle2,
+  ChevronRight,
   Clock3,
   Database,
   FileText,
@@ -57,6 +58,7 @@ function errorMessage(error: unknown): string {
 }
 
 function jobStatusLabel(status: string): string {
+  if (status === "staged") return "待选择解析器";
   if (status === "queued") return "排队中";
   if (status === "running") return "处理中";
   if (status === "succeeded") return "已完成";
@@ -66,6 +68,7 @@ function jobStatusLabel(status: string): string {
 }
 
 function jobStatusClass(status: string): string {
+  if (status === "staged") return "bg-amber-50 text-amber-700 ring-amber-500/10";
   if (status === "succeeded") return "bg-emerald-50 text-emerald-700 ring-emerald-500/10";
   if (status === "failed") return "bg-red-50 text-red-600 ring-red-500/10";
   if (status === "running") return "bg-[#002fa7]/10 text-[#002fa7] ring-[#002fa7]/10";
@@ -73,6 +76,7 @@ function jobStatusClass(status: string): string {
 }
 
 function JobIcon({ status }: { status: string }) {
+  if (status === "staged") return <FileText className="h-5 w-5 text-amber-600" />;
   if (status === "succeeded") return <CheckCircle2 className="h-5 w-5 text-emerald-600" />;
   if (status === "failed") return <AlertCircle className="h-5 w-5 text-red-500" />;
   if (status === "running") return <Loader2 className="h-5 w-5 animate-spin text-[#002fa7]" />;
@@ -392,23 +396,32 @@ export default function KnowledgeImportJobsPage() {
                                 {job.file_name} · {formatBytes(job.file_size)} · {formatTime(job.created_at)}
                               </p>
                               <p className="mt-1 text-xs text-gray-400">
-                                当前步骤：{job.current_step || job.status}
+                                当前步骤：{job.status === "staged" ? "等待选择解析器" : job.current_step || job.status}
                               </p>
                             </div>
                           </Link>
 
                           <div className="flex shrink-0 items-center gap-3">
-                            <div className="w-40">
-                              <div className="h-2 overflow-hidden rounded-full bg-gray-100">
-                                <div
-                                  className={`h-full rounded-full ${
-                                    job.status === "failed" ? "bg-red-500" : "bg-[#002fa7]"
-                                  }`}
-                                  style={{ width: `${Math.max(0, Math.min(100, job.progress || 0))}%` }}
-                                />
+                            {job.status === "staged" ? (
+                              <Link
+                                href={`/knowledge/imports/${job.id}`}
+                                className="inline-flex h-9 items-center gap-1.5 rounded-full bg-[#002fa7] px-3.5 text-xs font-semibold text-white transition hover:bg-[#001f7a]"
+                              >
+                                继续解析<ChevronRight className="h-3.5 w-3.5" />
+                              </Link>
+                            ) : (
+                              <div className="w-40">
+                                <div className="h-2 overflow-hidden rounded-full bg-gray-100">
+                                  <div
+                                    className={`h-full rounded-full ${
+                                      job.status === "failed" ? "bg-red-500" : "bg-[#002fa7]"
+                                    }`}
+                                    style={{ width: `${Math.max(0, Math.min(100, job.progress || 0))}%` }}
+                                  />
+                                </div>
+                                <p className="mt-1 text-right text-[11px] text-gray-400">{job.progress || 0}%</p>
                               </div>
-                              <p className="mt-1 text-right text-[11px] text-gray-400">{job.progress || 0}%</p>
-                            </div>
+                            )}
                             {job.status === "failed" ? (
                               <button
                                 type="button"

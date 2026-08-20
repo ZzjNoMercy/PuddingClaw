@@ -1431,6 +1431,17 @@ def get_settings_for_display() -> dict[str, Any]:
     display_database = dict(effective_database)
     display_database["password"] = ""
     display_database["url"] = _redact_database_url(str(display_database.get("url") or ""))
+    raw_parser_settings = config.get("knowledge", {}).get("parsers", {})
+    raw_parser_items = raw_parser_settings.get("items", {}) if isinstance(raw_parser_settings, dict) else {}
+    display_parser_items = {
+        str(parser_id): {
+            key: value
+            for key, value in item.items()
+            if key not in {"credential_ref", "api_key", "token"}
+        }
+        for parser_id, item in raw_parser_items.items()
+        if isinstance(item, dict)
+    }
     result = {
         "provider_registry": provider_registry,
         "rag": config.get("rag", {}),
@@ -1456,6 +1467,7 @@ def get_settings_for_display() -> dict[str, Any]:
                 **effective_knowledge_index,
             },
             "search": config.get("knowledge", {}).get("search", {}),
+            "parsers": {"items": display_parser_items},
         },
         "database": {
             **config.get("database", {}),

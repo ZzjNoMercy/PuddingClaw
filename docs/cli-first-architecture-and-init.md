@@ -1,7 +1,10 @@
 # PuddingClaw CLI-first 部署工具与初始化方案
 
-> 状态：0.1.17 实现基线；无参数交互 init、核心数据库独立配置与重配、Agent/图片分析 SubAgent Provider bootstrap、条件依赖探测与 Runtime 裁剪已落地
+> 状态：0.1.19 实现基线；本机 Headless CLI 已移除 Worker Token
 > 日期：2026-08-13
+
+> 2026-08-20 决策：当前只支持本机回环 CLI/Backend，取消 Worker Access Key 和内部
+> `headless-token`。CLI 不携带 PuddingClaw 鉴权参数；Backend 继续负责模型、数据和工具权限。
 
 当前实现位于 `packages/puddingclaw-deploy-cli`，唯一命令为 `puddingclaw`，默认 Home 为
 `~/.puddingclaw`。已完成独立配置、交互式 Profile/Provider 初始化、图片分析 SubAgent 多模态模型绑定、Python/uv/端口探测、Knowledge
@@ -128,7 +131,7 @@ npm install -g @puddingai/puddingclaw
 
 | 层 | 内容 | 默认 |
 | --- | --- | --- |
-| Harness Core | Agent 对话、模型调用、Session、工具编排、文件与终端、Skill、SubAgent、权限、上下文、Goal/Rubric、Trace、Worker/Headless API、Worker Access Key 与运行审计 | 必选 |
+| Harness Core | Agent 对话、模型调用、Session、工具编排、文件与终端、Skill、SubAgent、权限、上下文、Goal/Rubric、Trace、本机 Headless API 与运行审计 | 必选 |
 | Knowledge 扩展 | 知识目录、导入任务、RAG、MinerU、Milvus、LLM Wiki、gbrain | 可选，默认关闭 |
 | Analytics 扩展 | 数据源、Profile、语义资产、智能问数、NL2SQL/Vanna、结果存储 | 可选，默认关闭 |
 
@@ -170,7 +173,6 @@ npm install -g @puddingai/puddingclaw
 ├── providers.json              # Provider、Endpoint、模型与 Binding
 ├── credentials.json            # 首期本地凭证存储，0600；后续可换 OS Keyring
 ├── secrets/
-│   ├── headless-token          # CLI 与本地 Backend 的随机认证凭证，0600
 │   ├── initial-provider-api-key# 首次 Provider Key，仅注入 Backend
 │   ├── initial-multimodal-provider-api-key # 图片分析 SubAgent Key；同 Provider 时不重复保存
 │   ├── embedding-provider-api-key
@@ -216,9 +218,8 @@ npm install -g @puddingai/puddingclaw
 - 环境变量覆盖必须在 `config show` 和 GUI 中明确标记，不能显示为已经写入配置。
 - Provider、Endpoint、模型、模型分类和 Binding 以 Provider Registry 为事实源。
 - `fallback_llm`、`fallback_embedding` 中的旧凭证只用于迁移，不继续作为新安装的主配置入口。
-- 明文密钥不写入 `config.json`、`runtime.json`、命令历史或日志。CLI 与本地 Backend
-  之间的随机认证凭证单独存入 `secrets/headless-token`，仅在启动 Backend 时注入；外部 Worker Key
-  仍由 Backend 的 Worker Access Key Store 管理。
+- 明文 Provider/数据库凭据不写入 `config.json`、`runtime.json`、命令历史或日志。
+- CLI 与本机 Backend 之间不使用 Token；CLI 仅允许回环 URL，Headless API 仅接受回环来源。
 
 ### 3.3 CLI 拥有生命周期
 
@@ -473,7 +474,7 @@ Web 启动时注入实际 `BACKEND_INTERNAL_URL`；`open/status/logs/stop` 读�
 - 拉取 Docker 镜像；
 - 创建或删除 Milvus collection；
 - 初始化 gbrain Schema Pack；
-- 创建 Worker Access Key；
+- 修改本机 Headless 调用边界或授权策略；
 - 终止端口占用进程；
 - 修改 Shell profile、PATH、系统服务或开机启动项。
 
@@ -802,7 +803,7 @@ database 不存在时只能询问是否创建；pgvector 缺失时显示精确�
 
 探测和校验：模型存在、Skill 路径存在、名称唯一、route trigger 合法。图片分析 SubAgent 应与 `image_analyzer` Binding 保持一致。
 
-### 8.15 阶段 14：记忆、项目上下文、MCP 与 Worker Access
+### 8.15 阶段 14：记忆、项目上下文、MCP 与本机 Headless
 
 配置：
 
@@ -810,8 +811,8 @@ database 不存在时只能询问是否创建；pgvector 缺失时显示精确�
 - 默认项目目录和项目上下文文档；
 - MCP server enabled list、超时、allowlist；
 - Web Search / Connector 的显式启用状态；
-- Worker/Headless Access 作为 Harness Core 固定启用；
-- Worker Key 名称、允许的能力和项目根目录。
+- Worker/Headless 作为 Harness Core 固定启用；
+- 本机 CLI 状态、默认项目根目录和调用日志。
 
 探测：
 
@@ -820,9 +821,7 @@ database 不存在时只能询问是否创建；pgvector 缺失时显示精确�
 - 项目路径存在且可访问；
 - MCP server handshake 和工具 allowlist；
 - Connector CLI/凭证状态；
-- Worker Access Key 管理存储可写。
-
-创建或轮换 Worker Key 时，Token 只显示一次；默认不在 `init` 中自动创建远程访问凭证。
+- Headless API 拒绝非回环来源；CLI doctor 不依赖额外凭据。
 
 ### 8.16 阶段 15：汇总、提交和启动验收
 
@@ -841,7 +840,7 @@ Extensions
 
 Harness Worker
   ✓ Headless API enabled
-  ✓ Worker Access Key Store ready
+  ✓ Local CLI reachable
 
 Ports
   Backend: 127.0.0.1:8888
@@ -870,7 +869,7 @@ Ports
 | 知识库 | 阶段 3、5、6、7，仅 Knowledge | PostgreSQL/pgvector、目录、MinerU、Milvus、gbrain |
 | 记忆管理 | 阶段 14 | 文件/索引目录、mem0 模型依赖 |
 | Harness 配置 | 阶段 10、11、12、13 | 模型预算、Docker/Kernel Sandbox、SubAgent/Skill |
-| Worker Access | 阶段 14，所有 Profile | Key Store、项目根目录；创建 Key 需单独确认 |
+| Worker 接入 | 阶段 14，所有 Profile | 本机 CLI、项目根目录、调用日志 |
 | 高级设置 | 已选模块各阶段的 advanced 问题 | 范围、依赖和交叉字段校验 |
 | 系统状态 | 阶段 15 与 `doctor` | 聚合 Core 和已启用扩展探测，区分 available/degraded/disabled |
 

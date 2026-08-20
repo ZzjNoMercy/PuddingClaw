@@ -137,7 +137,6 @@ async def lifespan(app: FastAPI):
     )
     from runtime_identity.paths import PuddingClawPaths
     from tools.skills_scanner import scan_skills
-    from worker_access import worker_access_store
 
     user_paths = PuddingClawPaths.from_environment()
     user_paths.ensure_layout()
@@ -215,8 +214,6 @@ async def lifespan(app: FastAPI):
     )
     # SQL Evidence catalog backfill needs the durable Session owner index.
     session_manager.initialize(sessions_dir=user_paths.sessions())
-    if headless_worker_enabled:
-        worker_access_store.initialize(user_paths.root)
     cli_status = detect_cli_runtime(BASE_DIR)
     if not cli_status.get("installed"):
         print(
@@ -304,7 +301,7 @@ async def lifespan(app: FastAPI):
         backend_lease.release()
 
 
-app = FastAPI(title="PuddingClaw", version="0.1.17", lifespan=lifespan)
+app = FastAPI(title="PuddingClaw", version="0.1.19", lifespan=lifespan)
 
 cors_origins = [
     origin.strip()
@@ -437,12 +434,12 @@ if extension_enabled("analytics"):
 
 if extension_enabled("headless_worker"):
     from api.headless import router as headless_router
-    from api.headless import worker_access_router
+    from api.headless import headless_activity_router
 
     app.include_router(headless_router, prefix="/api")
-    app.include_router(worker_access_router, prefix="/api")
+    app.include_router(headless_activity_router, prefix="/api")
 
 
 @app.get("/")
 async def root():
-    return {"name": "PuddingClaw", "version": "0.1.17", "status": "running"}
+    return {"name": "PuddingClaw", "version": "0.1.19", "status": "running"}

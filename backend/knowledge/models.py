@@ -385,7 +385,7 @@ class AnalyticsQueryResult(Base):
 
 
 class WorkerAccessLog(Base):
-    """Audit record for an authenticated Headless Worker Run request."""
+    """Activity record for a local Headless Run (legacy table/column names)."""
 
     __tablename__ = "worker_access_logs"
     __table_args__ = (

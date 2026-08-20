@@ -103,7 +103,7 @@ def disabled_extension_for_api_path(
     prefixes = {
         "knowledge": ("/api/knowledge", "/api/read-later"),
         "analytics": ("/api/analytics",),
-        "headless_worker": ("/api/headless", "/api/worker-access-"),
+        "headless_worker": ("/api/headless", "/api/headless-activity-"),
     }
     for name, candidates in prefixes.items():
         if not states[name] and any(

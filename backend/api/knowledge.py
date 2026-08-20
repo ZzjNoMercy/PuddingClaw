@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import mimetypes
+import re
 from pathlib import Path
 from typing import Literal
 
@@ -41,7 +42,9 @@ from knowledge.database_sources import (
     upsert_database_source,
 )
 from knowledge.import_jobs import (
+    cleanup_expired_staged_import_jobs,
     clear_import_jobs,
+    commit_staged_import_job,
     create_document_vector_publish_job,
     create_import_job,
     create_vanna_entity_import_job,
@@ -59,6 +62,8 @@ from knowledge.import_jobs import (
 from knowledge.indexer import reset_multimodal_collections
 from knowledge.llm_wiki import LlmWikiError, get_llm_wiki_service
 from knowledge.models import KnowledgeDocument, new_id
+from knowledge.parsers import ParserError, get_document_parser_registry
+from knowledge.parsers.dependency_installer import start_optional_dependency_install
 from knowledge.paths import get_knowledge_originals_dir, get_knowledge_root
 from knowledge.portal_search import (
     KnowledgePortalSearchService,
@@ -79,6 +84,7 @@ from tools.pandas_knowledge_tool import PandasKnowledgeQueryTool
 router = APIRouter(prefix="/knowledge", tags=["knowledge"])
 BASE_DIR = Path(__file__).resolve().parent.parent
 logger = logging.getLogger(__name__)
+MAX_KNOWLEDGE_UPLOAD_BYTES = 512 * 1024 * 1024
 
 
 def _sha256_path(path: Path) -> str:
@@ -87,6 +93,21 @@ def _sha256_path(path: Path) -> str:
         while chunk := handle.read(1024 * 1024):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _estimate_pdf_page_count(path: Path) -> int | None:
+    """Count page markers without loading a potentially large PDF into memory."""
+
+    pattern = re.compile(rb"/Type\s*/Page\b")
+    count = 0
+    tail = b""
+    with path.open("rb") as handle:
+        while chunk := handle.read(1024 * 1024):
+            window = tail + chunk
+            boundary = len(tail)
+            count += sum(1 for match in pattern.finditer(window) if match.end() > boundary)
+            tail = window[-32:]
+    return count or None
 
 
 class ImportLocalMarkdownRequest(BaseModel):
@@ -126,6 +147,28 @@ class KnowledgeSearchConfigRequest(BaseModel):
 
 class KnowledgeFileRawRequest(BaseModel):
     virtual_path: str = Field(description="A Markdown file under /knowledge/ to copy into immutable LLM Wiki Raw.")
+
+
+class CommitStagedImportRequest(BaseModel):
+    parser_id: str = Field(min_length=1, max_length=100)
+    parser_options: dict[str, object] = Field(default_factory=dict)
+    publish_targets: list[str] = Field(default_factory=lambda: ["local_markdown"])
+    title: str | None = Field(default=None, max_length=300)
+    allow_cloud: bool = False
+
+
+class ParserUpdateRequest(BaseModel):
+    enabled: bool | None = None
+    priority: int | None = Field(default=None, ge=1, le=1000)
+    base_url: str | None = Field(default=None, max_length=500)
+    credential_ref: str | None = Field(default=None, max_length=300)
+    default_options: dict[str, object] | None = None
+    api_key: str = Field(default="", max_length=10000)
+
+
+class ParserTestRequest(BaseModel):
+    base_url: str | None = Field(default=None, max_length=500)
+    api_key: str | None = Field(default=None, max_length=10000)
 
 
 class KnowledgeTableQueryRequest(BaseModel):
@@ -212,6 +255,10 @@ async def _save_upload_to_task_source(file: UploadFile, *, job_id: str, filename
             if not chunk:
                 break
             size += len(chunk)
+            if size > MAX_KNOWLEDGE_UPLOAD_BYTES:
+                handle.close()
+                target.unlink(missing_ok=True)
+                raise KnowledgeServiceError("文件超过 512 MB，请拆分后再导入。")
             digest.update(chunk)
             handle.write(chunk)
     if size <= 0:
@@ -605,6 +652,7 @@ async def list_knowledge_import_jobs(
     session: AsyncSession = Depends(get_db_session),
 ):
     try:
+        await cleanup_expired_staged_import_jobs(session)
         jobs = await list_import_jobs(session, knowledge_base_id=knowledge_base_id, limit=limit)
         return {"jobs": [job_to_list_dict(job) for job in jobs]}
     except Exception as exc:
@@ -723,6 +771,151 @@ async def publish_document_vector(
         raise HTTPException(status_code=503, detail=f"Failed to create vector import job: {exc}") from exc
 
 
+@router.get("/parsers")
+async def list_document_parsers(filename: str = ""):
+    """Return capability, configuration and live health without exposing secrets."""
+
+    try:
+        return {"parsers": await get_document_parser_registry().catalog(filename=filename)}
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"解析器状态不可用：{exc}") from exc
+
+
+@router.patch("/parsers/{parser_id}")
+async def update_document_parser(parser_id: str, request: ParserUpdateRequest):
+    patch = request.model_dump(exclude={"api_key"}, exclude_none=True)
+    credential_ref = str(patch.get("credential_ref") or "")
+    if credential_ref.startswith("env://") and credential_ref not in {
+        "env://LLAMA_CLOUD_API_KEY",
+        "env://MINERU_API_TOKEN",
+    }:
+        raise HTTPException(status_code=400, detail="不允许使用未登记的环境变量密钥引用。")
+    try:
+        registry = get_document_parser_registry()
+        registry.update(parser_id, patch, api_key=request.api_key)
+        parser = next(item for item in await registry.catalog() if item["id"] == parser_id)
+        return {"parser": parser}
+    except (ParserError, StopIteration) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/parsers/{parser_id}/test")
+async def test_document_parser(parser_id: str, request: ParserTestRequest | None = None):
+    request = request or ParserTestRequest()
+    registry = get_document_parser_registry()
+    try:
+        ok, message = await registry.probe(
+            parser_id,
+            base_url=request.base_url.strip() if request.base_url is not None else None,
+            api_key=request.api_key.strip() if request.api_key is not None else None,
+        )
+        parser = next(item for item in await registry.catalog() if item["id"] == parser_id)
+    except (ParserError, StopIteration) as exc:
+        raise HTTPException(status_code=404, detail=f"未知解析器：{parser_id}") from exc
+    return {
+        "ok": bool(ok),
+        "message": str(message or "未知状态"),
+        "parser": parser,
+    }
+
+
+@router.post("/parsers/{parser_id}/install")
+async def install_document_parser_dependency(parser_id: str):
+    """Start an explicit locked uv-extra install; catalog polling reports completion."""
+
+    try:
+        return {"install": await start_optional_dependency_install(parser_id)}
+    except ParserError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/import-sources")
+async def stage_knowledge_import_source(
+    file: UploadFile = File(...),
+    title: str | None = Form(default=None),
+    knowledge_base_id: str = Form(default=DEFAULT_KNOWLEDGE_BASE_ID),
+    session: AsyncSession = Depends(get_db_session),
+):
+    """Upload once, persist a staged source, and probe only non-content metadata."""
+
+    filename = _slugify(file.filename or "document")
+    job_id = new_id("job")
+    try:
+        await cleanup_expired_staged_import_jobs(session)
+        source_path, file_size, source_sha256 = await _save_upload_to_task_source(
+            file, job_id=job_id, filename=filename
+        )
+        job = await create_import_job(
+            session,
+            base_dir=BASE_DIR,
+            filename=filename,
+            source_path=source_path,
+            file_size=file_size,
+            source_sha256=source_sha256,
+            title=title,
+            knowledge_base_id=knowledge_base_id,
+            publish_targets=["local_markdown"],
+            status="staged",
+        )
+        page_count = None
+        if Path(filename).suffix.lower() == ".pdf":
+            try:
+                # Metadata-only fallback that does not parse or send the PDF.
+                page_count = _estimate_pdf_page_count(source_path)
+            except OSError:
+                page_count = None
+        source_metadata = {
+            **((job.job_metadata or {}).get("source") or {}),
+            "page_count": page_count,
+        }
+        job.job_metadata = {**(job.job_metadata or {}), "source": source_metadata}
+        await session.commit()
+        return {
+            "source": {
+                "id": job.id,
+                "file_name": filename,
+                "size_bytes": file_size,
+                "sha256": source_sha256,
+                "mime_type": file.content_type or mimetypes.guess_type(filename)[0] or "application/octet-stream",
+                "page_count": page_count,
+                "expires_at": source_metadata.get("expires_at"),
+                "status": "staged",
+            },
+            "parsers": await get_document_parser_registry().catalog(
+                filename=filename,
+                file_size=file_size,
+                page_count=page_count,
+            ),
+        }
+    except KnowledgeServiceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("[knowledge-import-source] failed filename=%s", filename)
+        raise HTTPException(status_code=503, detail=f"暂存文件失败：{exc}") from exc
+
+
+@router.post("/import-jobs/{job_id}/commit")
+async def commit_knowledge_import_job(
+    job_id: str,
+    request: CommitStagedImportRequest,
+    session: AsyncSession = Depends(get_db_session),
+):
+    try:
+        job = await commit_staged_import_job(
+            session,
+            job_id=job_id,
+            parser_id=request.parser_id,
+            parser_options=request.parser_options,
+            publish_targets=request.publish_targets,
+            title=request.title,
+            allow_cloud=request.allow_cloud,
+        )
+        return {"job": job_to_dict(job)}
+    except KnowledgeServiceError as exc:
+        await session.rollback()
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @router.post("/import-jobs")
 async def create_knowledge_import_job(
     file: UploadFile = File(...),
@@ -736,7 +929,9 @@ async def create_knowledge_import_job(
     job_id = new_id("job")
     try:
         logger.info("[knowledge-import-job] receiving filename=%s job_id=%s", filename, job_id)
-        source_path, file_size, source_sha256 = await _save_upload_to_task_source(file, job_id=job_id, filename=filename)
+        source_path, file_size, source_sha256 = await _save_upload_to_task_source(
+            file, job_id=job_id, filename=filename
+        )
         job = await create_import_job(
             session,
             base_dir=BASE_DIR,
@@ -747,6 +942,7 @@ async def create_knowledge_import_job(
             title=title,
             knowledge_base_id=knowledge_base_id,
             publish_targets=targets,
+            parser_id="mineru_local" if Path(filename).suffix.lower() == ".pdf" else "native",
         )
         return {"job": job_to_dict(job)}
     except KnowledgeServiceError as exc:

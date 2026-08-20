@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from pathlib import Path
@@ -16,14 +17,16 @@ from api.headless import (
     HeadlessResumeDecision,
     HeadlessResumeRequest,
     HeadlessRunRequest,
-    _admin,
+    _require_loopback_request,
     _consume_run,
     _ensure_worker_project,
+    _HeadlessExecution,
     _resolve_external_permission,
     _resolve_worker_project,
+    _stream_headless_execution,
     cancel_headless_run,
     create_headless_run,
-    list_worker_access_logs,
+    list_headless_activity_logs,
     resume_headless_run,
 )
 from graph.headless_resolver import HeadlessInterruptResolver, headless_authority_from_environment
@@ -32,14 +35,14 @@ from graph.session_manager import session_manager
 from headless_session_lifecycle import cleanup_stale_headless_sessions
 from knowledge.models import WorkerAccessLog
 from projects.registry import project_registry
-from worker_access import WorkerAccessLogStore, WorkerAccessStore
+from headless_activity import HeadlessActivityLogStore
 
 
 def _request_from(host: str) -> Request:
     return Request({
         "type": "http",
         "method": "GET",
-        "path": "/api/worker-access-keys",
+        "path": "/api/headless/health",
         "headers": [],
         "client": (host, 1234),
         "server": ("127.0.0.1", 8888),
@@ -97,7 +100,7 @@ def test_headless_permission_projection_preserves_shell_access_intent() -> None:
     assert projected["grant_bindings"] == payload["grant_bindings"]
 
 
-def test_model_routing_candidates_are_limited_by_worker_key(monkeypatch):
+def test_model_routing_candidates_include_configured_models(monkeypatch):
     class FakeRegistry:
         def list_models(self):
             return {
@@ -111,16 +114,14 @@ def test_model_routing_candidates_are_limited_by_worker_key(monkeypatch):
             return {"id": model_id, "body": f"{model_id} applicability"}
 
     monkeypatch.setattr(headless_api, "get_analytics_model_registry", lambda _base_dir: FakeRegistry())
-    candidates = headless_api._model_routing_candidates(
-        {"allowed_analytics_models": ["allowed"]}
-    )
+    candidates = headless_api._model_routing_candidates()
 
-    assert [item["id"] for item in candidates] == ["allowed"]
+    assert [item["id"] for item in candidates] == ["allowed", "forbidden"]
     assert candidates[0]["applicability"] == "allowed applicability"
 
 
 @pytest.mark.asyncio
-async def test_worker_access_log_api_uses_beijing_time_and_fixed_page_size(monkeypatch):
+async def test_headless_activity_log_api_uses_beijing_time_and_fixed_page_size(monkeypatch):
     captured: dict[str, object] = {}
 
     async def fake_list(**kwargs):
@@ -130,8 +131,8 @@ async def test_worker_access_log_api_uses_beijing_time_and_fixed_page_size(monke
                 {
                     "id": "wal-test",
                     "created_at": 0.0,
-                    "key_id": "key-test",
-                    "key_name": "puddingteams",
+                    "source_id": "puddingteams",
+                    "source_name": "PuddingTeams",
                     "query": "测试 query",
                 }
             ],
@@ -139,15 +140,14 @@ async def test_worker_access_log_api_uses_beijing_time_and_fixed_page_size(monke
             "page_size": 10,
             "total": 1,
             "total_pages": 1,
-            "key_names": ["puddingteams"],
+            "source_names": ["PuddingTeams"],
         }
 
-    monkeypatch.delenv("PUDDINGCLAW_ADMIN_TOKEN", raising=False)
-    monkeypatch.setattr(headless_api.worker_access_log_store, "list", fake_list)
-    result = await list_worker_access_logs(
+    monkeypatch.setattr(headless_api.headless_activity_log_store, "list", fake_list)
+    result = await list_headless_activity_logs(
         _request_from("127.0.0.1"),
         page=1,
-        key_name=None,
+        source_name=None,
         query_keyword=None,
         start_at=None,
         end_at=None,
@@ -158,16 +158,14 @@ async def test_worker_access_log_api_uses_beijing_time_and_fixed_page_size(monke
     assert result["items"][0]["created_at_beijing"] == "1970-01-01 08:00:00"
 
 
-def test_local_worker_key_management_does_not_require_admin_token(monkeypatch):
-    monkeypatch.delenv("PUDDINGCLAW_ADMIN_TOKEN", raising=False)
-    _admin(_request_from("127.0.0.1"))
+def test_local_headless_api_accepts_loopback():
+    _require_loopback_request(_request_from("127.0.0.1"))
 
 
-def test_remote_worker_key_management_requires_admin_token(monkeypatch):
-    monkeypatch.delenv("PUDDINGCLAW_ADMIN_TOKEN", raising=False)
+def test_headless_api_rejects_non_loopback():
     with pytest.raises(HTTPException) as error:
-        _admin(_request_from("192.0.2.10"))
-    assert error.value.status_code == 503
+        _require_loopback_request(_request_from("192.0.2.10"))
+    assert error.value.status_code == 403
 
 
 def test_worker_project_has_internal_identity(tmp_path, monkeypatch):
@@ -196,14 +194,9 @@ async def test_headless_run_binds_platform_workspace_path(tmp_path, monkeypatch)
     project_registry.initialize(tmp_path)
     workspace = tmp_path / "teams-room"
     workspace.mkdir()
-    monkeypatch.setattr(
-        headless_api,
-        "_principal_for_scope",
-        lambda _authorization, _scope: {"key_id": "key-owner", "authority_profile": "smart"},
-    )
-    monkeypatch.setattr(headless_api, "_model_options", lambda _principal: [{"id": "analysis"}])
+    monkeypatch.setattr(headless_api, "_model_options", lambda: [{"id": "analysis"}])
 
-    async def fake_route(_message, _principal):
+    async def fake_route(_message):
         return AnalyticsModelRoute("matched", "analysis", 0.96, "semantic", "matched")
 
     consumed: dict[str, object] = {}
@@ -223,7 +216,7 @@ async def test_headless_run_binds_platform_workspace_path(tmp_path, monkeypatch)
 
     response = await create_headless_run(
         HeadlessRunRequest(message="使用房间目录", workspace_path=str(workspace)),
-        authorization="Bearer test",
+        http_request=_request_from("127.0.0.1"),
     )
 
     assert response["project_id"] == consumed["project_id"]
@@ -349,12 +342,7 @@ async def test_headless_ttl_cleanup_skips_pending_resume_future(tmp_path: Path):
 async def test_expired_headless_session_cannot_be_reused(tmp_path: Path, monkeypatch):
     session_manager.initialize(tmp_path)
     monkeypatch.setenv("PUDDINGCLAW_HEADLESS_SESSION_TTL_HOURS", "24")
-    monkeypatch.setattr(headless_api, "_model_options", lambda _principal: [{"id": "analysis"}])
-    monkeypatch.setattr(
-        headless_api,
-        "_principal_for_scope",
-        lambda _authorization, _scope: {"key_id": "key-owner", "authority_profile": "smart"},
-    )
+    monkeypatch.setattr(headless_api, "_model_options", lambda: [{"id": "analysis"}])
     session_id = "expired-headless"
     session_manager.create_session(
         session_id,
@@ -375,7 +363,7 @@ async def test_expired_headless_session_cannot_be_reused(tmp_path: Path, monkeyp
                 message="继续任务",
                 session_id=session_id,
             ),
-            authorization="Bearer test",
+            http_request=_request_from("127.0.0.1"),
         )
 
     assert error.value.status_code == 410
@@ -387,16 +375,7 @@ async def test_new_headless_run_returns_session_retention_metadata(tmp_path: Pat
     session_manager.initialize(tmp_path)
     project_id = _register_test_worker_project(tmp_path)
     monkeypatch.setenv("PUDDINGCLAW_HEADLESS_SESSION_TTL_HOURS", "24")
-    monkeypatch.setattr(headless_api, "_model_options", lambda _principal: [{"id": "analysis"}])
-    monkeypatch.setattr(
-        headless_api,
-        "_principal_for_scope",
-        lambda _authorization, _scope: {
-            "key_id": "key-owner",
-            "name": "puddingteams",
-            "authority_profile": "smart",
-        },
-    )
+    monkeypatch.setattr(headless_api, "_model_options", lambda: [{"id": "analysis"}])
     monkeypatch.setattr(headless_api, "_ensure_worker_project", lambda: (project_id, tmp_path))
     logged: dict[str, object] = {}
 
@@ -404,12 +383,12 @@ async def test_new_headless_run_returns_session_retention_metadata(tmp_path: Pat
         logged.update(kwargs)
 
     monkeypatch.setattr(
-        headless_api.worker_access_log_store,
+        headless_api.headless_activity_log_store,
         "record",
         fake_record,
     )
 
-    async def fake_route(_message, _principal):
+    async def fake_route(_message):
         return AnalyticsModelRoute("matched", "analysis", 0.96, "semantic", "matched business scope")
 
     monkeypatch.setattr(headless_api, "_route_analytics_model", fake_route)
@@ -425,8 +404,11 @@ async def test_new_headless_run_returns_session_retention_metadata(tmp_path: Pat
 
     monkeypatch.setattr(headless_api, "_consume_run", fake_consume)
     response = await create_headless_run(
-        HeadlessRunRequest(message="新任务"),
-        authorization="Bearer test",
+        HeadlessRunRequest(
+            message="新任务",
+            metadata={"caller_id": "puddingteams", "caller_name": "PuddingTeams"},
+        ),
+        http_request=_request_from("127.0.0.1"),
     )
 
     assert response["session_id"].startswith("worker-session-")
@@ -434,35 +416,21 @@ async def test_new_headless_run_returns_session_retention_metadata(tmp_path: Pat
     assert response["session_expires_at"] > time.time()
     assert session_manager.get_metadata(response["session_id"])["analytics_model_id"] == "analysis"
     assert session_manager.get_metadata(response["session_id"])["session_source"] == "cli"
-    assert logged["key_name"] == "puddingteams"
+    assert logged["source_name"] == "PuddingTeams"
     assert logged["query"] == "新任务"
 
 
-def test_worker_access_key_is_one_time_and_revocable(tmp_path: Path):
-    store = WorkerAccessStore()
-    store.initialize(tmp_path)
-    key_path = tmp_path / "users" / "local" / "access" / "worker-access-keys.json"
-    assert key_path.stat().st_mode & 0o777 == 0o600
-    public, secret = store.create(name="teams", scopes=["worker:models:read"])
-    assert public["prefix"] == secret[:12]
-    assert "secret_hash" not in public
-    assert store.authenticate(secret, "worker:models:read")["key_id"] == public["key_id"]
-    assert store.authenticate(secret, "worker:runs:create") is None
-    store.revoke(public["key_id"])
-    assert store.authenticate(secret, "worker:models:read") is None
-
-
 @pytest.mark.asyncio
-async def test_worker_access_logs_filter_and_paginate_ten_per_page(tmp_path: Path):
+async def test_headless_activity_logs_filter_and_paginate_ten_per_page(tmp_path: Path):
     engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'worker-logs.db'}")
     sessions = async_sessionmaker(engine, expire_on_commit=False)
     async with engine.begin() as connection:
         await connection.run_sync(WorkerAccessLog.__table__.create)
-    store = WorkerAccessLogStore(sessions)
+    store = HeadlessActivityLogStore(sessions)
     for index in range(23):
         await store.record(
-            key_id="key-teams" if index % 2 == 0 else "key-codex",
-            key_name="puddingteams" if index % 2 == 0 else "codex",
+            source_id="puddingteams" if index % 2 == 0 else "codex",
+            source_name="PuddingTeams" if index % 2 == 0 else "Codex",
             query=f"查询第 {index} 条销量" if index % 3 == 0 else f"查询第 {index} 条配置",
             created_at=1_000.0 + index,
         )
@@ -471,7 +439,7 @@ async def test_worker_access_logs_filter_and_paginate_ten_per_page(tmp_path: Pat
     filtered = await store.list(
         page=1,
         page_size=10,
-        key_name="puddingteams",
+        source_name="PuddingTeams",
         query="销量",
         start_at=1_000.0,
         end_at=1_022.0,
@@ -482,9 +450,9 @@ async def test_worker_access_logs_filter_and_paginate_ten_per_page(tmp_path: Pat
     assert len(second_page["items"]) == 10
     assert second_page["items"][0]["created_at"] == 1_012.0
     assert filtered["total"] == 4
-    assert {item["key_name"] for item in filtered["items"]} == {"puddingteams"}
+    assert {item["source_name"] for item in filtered["items"]} == {"PuddingTeams"}
     assert all("销量" in item["query"] for item in filtered["items"])
-    assert filtered["key_names"] == ["codex", "puddingteams"]
+    assert filtered["source_names"] == ["Codex", "PuddingTeams"]
     await engine.dispose()
 
 
@@ -568,15 +536,6 @@ async def test_headless_never_auto_approves_browser_actions():
     assert permission_resume_registry.get(request["id"])["status"] == "resolved"
 
 
-def test_worker_access_store_does_not_persist_secret(tmp_path: Path):
-    store = WorkerAccessStore()
-    store.initialize(tmp_path)
-    _public, secret = store.create(name="private")
-    contents = (tmp_path / "users" / "local" / "access" / "worker-access-keys.json").read_text()
-    assert secret not in contents
-    assert "secret_hash" in contents
-
-
 @pytest.mark.asyncio
 async def test_headless_response_separates_aggregate_reply_from_final_assistant_content(monkeypatch):
     async def fake_stream(**_kwargs):
@@ -610,6 +569,209 @@ async def test_headless_response_separates_aggregate_reply_from_final_assistant_
     assert response["reply"] == "现在执行查询。\n\n最终答案。"
     assert response["final_response"] == "最终答案。"
     assert response["analytics_model_id"] == "analysis"
+
+
+@pytest.mark.asyncio
+async def test_headless_stream_emits_starting_before_agent_reaches_boundary():
+    gate = asyncio.Event()
+
+    async def stalled_stream(**_kwargs):
+        await gate.wait()
+        if False:
+            yield {}
+
+    execution = _HeadlessExecution(
+        stream=stalled_stream(),
+        session_id="headless-stream-session",
+        project_id="project-test",
+        approval_mode="smart",
+        analytics_model_id="",
+        analytics_model_match={"status": "general"},
+    )
+    execution.start()
+    first = await asyncio.wait_for(
+        anext(_stream_headless_execution(execution)),
+        timeout=0.2,
+    )
+    assert first["event"] == "run_starting"
+    assert first["data"]["session_id"] == execution.session_id
+    gate.set()
+    await execution.cancel()
+
+
+@pytest.mark.asyncio
+async def test_streaming_run_endpoint_returns_before_agent_generator_advances(tmp_path, monkeypatch):
+    session_manager.initialize(tmp_path)
+    project_registry.initialize(tmp_path)
+    workspace = tmp_path / "stream-workspace"
+    workspace.mkdir()
+    gate = asyncio.Event()
+
+    monkeypatch.setattr(headless_api, "_model_options", lambda: [])
+
+    async def fake_route(_message):
+        return AnalyticsModelRoute("general", None, 1.0, "deterministic", "general")
+
+    async def gated_stream(**_kwargs):
+        await gate.wait()
+        yield {"event": "token", "data": json.dumps({"content": "完成"})}
+        yield {"event": "done", "data": json.dumps({"content": "完成", "final_response": "完成"})}
+
+    monkeypatch.setattr(headless_api, "_route_analytics_model", fake_route)
+    monkeypatch.setattr(headless_api.deepagents_agent_manager, "astream", gated_stream)
+
+    response = await create_headless_run(
+        HeadlessRunRequest(message="流式执行", workspace_path=str(workspace)),
+        http_request=_request_from("127.0.0.1"),
+        stream=True,
+    )
+    first = await asyncio.wait_for(anext(response.body_iterator), timeout=0.2)
+    first_event = json.loads(first)
+    assert first_event["event"] == "run_starting"
+    session_id = first_event["data"]["session_id"]
+    assert session_id in headless_api._active_headless_sessions
+
+    gate.set()
+    remaining = [json.loads(chunk) async for chunk in response.body_iterator]
+    assert [item["event"] for item in remaining] == ["token", "done", "result"]
+    assert session_id not in headless_api._active_headless_sessions
+    with headless_api._headless_executions_lock:
+        headless_api._headless_executions.pop(session_id, None)
+
+
+@pytest.mark.asyncio
+async def test_headless_stream_hides_reasoning_but_keeps_user_content():
+    async def fake_stream():
+        yield {
+            "event": "reasoning",
+            "data": json.dumps({"content": "内部思考不应外送"}),
+        }
+        yield {
+            "event": "model_stream_preview",
+            "data": json.dumps({"content": "内部传输预览也不应外送"}),
+        }
+        yield {
+            "event": "token",
+            "data": json.dumps({"content": "用户可见内容"}),
+        }
+        yield {
+            "event": "done",
+            "data": json.dumps({"content": "用户可见内容", "final_response": "最终回答"}),
+        }
+
+    execution = _HeadlessExecution(
+        stream=fake_stream(),
+        session_id="headless-public-events",
+        project_id="project-test",
+        approval_mode="smart",
+        analytics_model_id="",
+        analytics_model_match={"status": "general"},
+    )
+    execution.start()
+    events = [item async for item in _stream_headless_execution(execution)]
+    assert [item["event"] for item in events] == ["run_starting", "token", "done", "result"]
+    assert all(item["event"] != "reasoning" for item in events)
+
+
+@pytest.mark.asyncio
+async def test_headless_execution_broadcasts_same_ordered_events_to_multiple_observers():
+    async def fake_stream():
+        yield {"event": "token", "data": json.dumps({"content": "增量"})}
+        yield {"event": "tool_start", "data": json.dumps({"id": "tool-1", "tool": "search"})}
+        yield {"event": "done", "data": json.dumps({"content": "增量"})}
+
+    execution = _HeadlessExecution(
+        stream=fake_stream(),
+        session_id="headless-broadcast-session",
+        project_id="project-test",
+        approval_mode="smart",
+        analytics_model_id="",
+        analytics_model_match={"status": "general"},
+    )
+    execution.start()
+    first = execution.subscribe()
+    second = execution.subscribe()
+    assert execution.task is not None
+    await execution.task
+
+    async def drain(queue):
+        items = []
+        while True:
+            item = await queue.get()
+            if item is None:
+                return items
+            items.append(item)
+
+    first_events, second_events = await asyncio.gather(drain(first), drain(second))
+    assert first_events == second_events
+    assert [item["event"] for item in first_events] == [
+        "run_starting",
+        "token",
+        "tool_start",
+        "done",
+    ]
+    assert [item["seq"] for item in first_events] == [1, 2, 3, 4]
+
+
+@pytest.mark.asyncio
+async def test_headless_late_observer_replays_only_events_after_sequence():
+    async def fake_stream():
+        yield {"event": "token", "data": json.dumps({"content": "A"})}
+        yield {"event": "token", "data": json.dumps({"content": "B"})}
+        yield {"event": "done", "data": json.dumps({"content": "AB"})}
+
+    execution = _HeadlessExecution(
+        stream=fake_stream(),
+        session_id="headless-replay-session",
+        project_id="project-test",
+        approval_mode="smart",
+        analytics_model_id="",
+        analytics_model_match={"status": "general"},
+    )
+    execution.start()
+    assert execution.task is not None
+    await execution.task
+    subscriber = execution.subscribe(after_seq=2)
+    replayed = []
+    while True:
+        item = await subscriber.get()
+        if item is None:
+            break
+        replayed.append(item)
+    assert [(item["seq"], item["event"]) for item in replayed] == [
+        (3, "token"),
+        (4, "done"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_headless_replay_marks_reset_when_initial_backlog_exceeds_queue(monkeypatch):
+    monkeypatch.setattr(headless_api, "_HEADLESS_SUBSCRIBER_QUEUE_LIMIT", 4)
+    execution = _HeadlessExecution(
+        stream=None,
+        session_id="headless-reset-session",
+        project_id="project-test",
+        approval_mode="smart",
+        analytics_model_id="",
+        analytics_model_match={"status": "general"},
+    )
+    for index in range(5):
+        execution._publish({"event": "token", "data": {"content": str(index)}})
+    execution.done = True
+    subscriber = execution.subscribe()
+    replayed = []
+    while True:
+        item = await subscriber.get()
+        if item is None:
+            break
+        replayed.append(item)
+
+    assert replayed[0]["event"] == "stream_reset_required"
+    assert replayed[0]["data"]["replay_start_seq"] == 4
+    assert [(item["seq"], item["event"]) for item in replayed[1:]] == [
+        (4, "token"),
+        (5, "token"),
+    ]
 
 
 @pytest.mark.asyncio
@@ -674,11 +836,6 @@ async def test_headless_permission_pauses_and_resume_continues_same_run(tmp_path
 
     monkeypatch.setattr(headless_api.deepagents_agent_manager, "astream", fake_stream)
     monkeypatch.setattr(headless_api, "_model_binding", lambda model_id: {"id": model_id})
-    monkeypatch.setattr(
-        headless_api,
-        "_principal_for_scope",
-        lambda _authorization, _scope: {"key_id": "key-owner"},
-    )
 
     paused = await _consume_run(
         request=HeadlessRunRequest(message="运行 Skill"),
@@ -689,7 +846,6 @@ async def test_headless_permission_pauses_and_resume_continues_same_run(tmp_path
         request_received_at=1234.5,
         analytics_model_id="analysis",
         analytics_model_match={"status": "matched", "selected_id": "analysis"},
-        worker_key_id="key-owner",
     )
 
     assert paused["status"] == "needs_input"
@@ -714,7 +870,7 @@ async def test_headless_permission_pauses_and_resume_continues_same_run(tmp_path
                 )
             ],
         ),
-        authorization="Bearer test",
+        http_request=_request_from("127.0.0.1"),
     )
 
     assert completed["status"] == "completed"
@@ -737,7 +893,7 @@ async def test_headless_permission_pauses_and_resume_continues_same_run(tmp_path
                 )
             ],
         ),
-        authorization="Bearer test",
+        http_request=_request_from("127.0.0.1"),
     )
     assert retried["status"] == "completed"
     assert retried["run_id"] == "run-same"
@@ -756,7 +912,7 @@ async def test_headless_permission_pauses_and_resume_continues_same_run(tmp_path
                     )
                 ],
             ),
-            authorization="Bearer test",
+            http_request=_request_from("127.0.0.1"),
         )
     assert conflict.value.status_code == 409
 
@@ -766,7 +922,6 @@ async def test_headless_cancel_ends_run_but_keeps_session_handle(monkeypatch):
     class FakeExecution:
         run_id = "run-cancel"
         session_id = "worker-session-cancel"
-        worker_key_id = "key-cancel"
         done = False
 
         async def cancel(self):
@@ -784,14 +939,16 @@ async def test_headless_cancel_ends_run_but_keeps_session_handle(monkeypatch):
     monkeypatch.setattr(headless_api, "_headless_executions", {execution.session_id: execution})
     monkeypatch.setattr(
         headless_api,
-        "_principal_for_scope",
-        lambda _authorization, _scope: {"key_id": execution.worker_key_id},
+        "_claim_headless_session",
+        lambda _session_id: (_ for _ in ()).throw(
+            AssertionError("out-of-band cancellation must not wait for the stream request lock")
+        ),
     )
-    monkeypatch.setattr(headless_api, "_claim_headless_session", lambda _session_id: True)
-    monkeypatch.setattr(headless_api, "_release_headless_session", lambda _session_id: None)
     monkeypatch.setattr(headless_api, "_attach_session_lifecycle", lambda response, _session_id: response)
 
-    response = await cancel_headless_run("run-cancel", authorization="Bearer test")
+    # Before run_started provides a Run id, CLI/PuddingTeams can already cancel
+    # with the session handle emitted by run_starting.
+    response = await cancel_headless_run("worker-session-cancel", request=_request_from("127.0.0.1"))
     assert response["status"] == "cancelled"
     assert execution.done is True
 
@@ -842,16 +999,11 @@ async def test_ambiguous_model_route_does_not_create_or_run_session(tmp_path: Pa
     session_manager.initialize(tmp_path)
     monkeypatch.setattr(
         headless_api,
-        "_principal_for_scope",
-        lambda _authorization, _scope: {"key_id": "key-owner", "authority_profile": "smart"},
-    )
-    monkeypatch.setattr(
-        headless_api,
         "_model_options",
-        lambda _principal: [{"id": "sales"}, {"id": "product"}],
+        lambda: [{"id": "sales"}, {"id": "product"}],
     )
 
-    async def fake_route(_message, _principal):
+    async def fake_route(_message):
         return AnalyticsModelRoute("ambiguous", None, 0.51, "semantic", "two plausible models")
 
     async def fail_consume(**_kwargs):
@@ -862,7 +1014,7 @@ async def test_ambiguous_model_route_does_not_create_or_run_session(tmp_path: Pa
 
     response = await create_headless_run(
         HeadlessRunRequest(message="帮我分析一下"),
-        authorization="Bearer test",
+        http_request=_request_from("127.0.0.1"),
     )
 
     assert response["status"] == "needs_input"
@@ -886,12 +1038,7 @@ async def test_continuous_session_reuses_bound_model_without_rerouting(tmp_path:
             "analytics_model_id": "product",
         },
     )
-    monkeypatch.setattr(
-        headless_api,
-        "_principal_for_scope",
-        lambda _authorization, _scope: {"key_id": "key-owner", "authority_profile": "smart"},
-    )
-    monkeypatch.setattr(headless_api, "_model_options", lambda _principal: [{"id": "product"}])
+    monkeypatch.setattr(headless_api, "_model_options", lambda: [{"id": "product"}])
     monkeypatch.setattr(headless_api, "_ensure_worker_project", lambda: (project_id, tmp_path))
 
     async def fail_route(_message, _principal):
@@ -912,7 +1059,7 @@ async def test_continuous_session_reuses_bound_model_without_rerouting(tmp_path:
 
     response = await create_headless_run(
         HeadlessRunRequest(message="继续", session_id=session_id),
-        authorization="Bearer test",
+        http_request=_request_from("127.0.0.1"),
     )
 
     assert response["analytics_model_id"] == "product"
@@ -925,17 +1072,12 @@ async def test_general_route_runs_session_without_model(tmp_path: Path, monkeypa
     project_id = _register_test_worker_project(tmp_path)
     monkeypatch.setattr(
         headless_api,
-        "_principal_for_scope",
-        lambda _authorization, _scope: {"key_id": "key-owner", "authority_profile": "smart"},
-    )
-    monkeypatch.setattr(
-        headless_api,
         "_model_options",
-        lambda _principal: [{"id": "sales"}, {"id": "product"}],
+        lambda: [{"id": "sales"}, {"id": "product"}],
     )
     monkeypatch.setattr(headless_api, "_ensure_worker_project", lambda: (project_id, tmp_path))
 
-    async def fake_route(_message, _principal):
+    async def fake_route(_message):
         return AnalyticsModelRoute("general", None, 0.9, "semantic", "weather_question")
 
     consumed: dict[str, object] = {}
@@ -956,7 +1098,7 @@ async def test_general_route_runs_session_without_model(tmp_path: Path, monkeypa
 
     response = await create_headless_run(
         HeadlessRunRequest(message="今天宁波慈溪天气如何"),
-        authorization="Bearer test",
+        http_request=_request_from("127.0.0.1"),
     )
 
     assert response["status"] == "completed"
@@ -980,13 +1122,8 @@ async def test_continuous_general_session_reroutes_and_can_bind_later(tmp_path: 
     )
     monkeypatch.setattr(
         headless_api,
-        "_principal_for_scope",
-        lambda _authorization, _scope: {"key_id": "key-owner", "authority_profile": "smart"},
-    )
-    monkeypatch.setattr(
-        headless_api,
         "_model_options",
-        lambda _principal: [{"id": "sales"}, {"id": "product"}],
+        lambda: [{"id": "sales"}, {"id": "product"}],
     )
     monkeypatch.setattr(headless_api, "_ensure_worker_project", lambda: (project_id, tmp_path))
 
@@ -995,7 +1132,7 @@ async def test_continuous_general_session_reroutes_and_can_bind_later(tmp_path: 
         AnalyticsModelRoute("matched", "product", 0.96, "semantic", "matched business scope"),
     ]
 
-    async def fake_route(_message, _principal):
+    async def fake_route(_message):
         return routes.pop(0)
 
     consumed: list[dict[str, object]] = []
@@ -1015,7 +1152,7 @@ async def test_continuous_general_session_reroutes_and_can_bind_later(tmp_path: 
 
     general = await create_headless_run(
         HeadlessRunRequest(message="今天天气如何", session_id=session_id),
-        authorization="Bearer test",
+        http_request=_request_from("127.0.0.1"),
     )
     assert general["status"] == "completed"
     assert consumed[0]["analytics_model_id"] == ""
@@ -1023,7 +1160,7 @@ async def test_continuous_general_session_reroutes_and_can_bind_later(tmp_path: 
 
     bound = await create_headless_run(
         HeadlessRunRequest(message="看看空气悬架配置率", session_id=session_id),
-        authorization="Bearer test",
+        http_request=_request_from("127.0.0.1"),
     )
     assert bound["status"] == "completed"
     assert consumed[1]["analytics_model_id"] == "product"

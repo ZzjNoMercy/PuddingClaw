@@ -17,7 +17,6 @@ import { embeddedRuntimeStatus } from "./runtime-commands.js";
 import { installRuntimeBundle } from "./runtime-bundle.js";
 import { prepareRuntimePython } from "./runtime-python.js";
 import { bootstrapUv } from "./uv-runtime.js";
-import { ensureLocalWorkerToken } from "./local-worker-token.js";
 import {
   discoverExtensionInfrastructure,
   discoverInitialMultimodalProvider,
@@ -322,7 +321,6 @@ export async function runInit({ flags, paths, interactive = process.stdin.isTTY 
       exitCode: 1,
     });
   }
-  await ensureLocalWorkerToken(paths);
   if (providerDiscovery.apiKey) await writeSecret(paths.providerApiKey, providerDiscovery.apiKey);
   if (multimodalProviderDiscovery.apiKey) {
     await writeSecret(paths.multimodalProviderApiKey, multimodalProviderDiscovery.apiKey);

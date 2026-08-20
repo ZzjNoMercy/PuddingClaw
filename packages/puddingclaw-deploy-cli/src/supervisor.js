@@ -10,7 +10,6 @@ import { readJson, writeJsonAtomic } from "./store.js";
 import { probeRuntimeState } from "./probes.js";
 import { selectPorts } from "./init.js";
 import { loadActiveRuntime, resolveRuntimeProcess } from "./runtime-bundle.js";
-import { ensureLocalWorkerToken } from "./local-worker-token.js";
 import { readSecret } from "./secrets.js";
 
 const launcherPath = fileURLToPath(new URL("./runtime-launcher.js", import.meta.url));
@@ -214,7 +213,6 @@ export async function startRuntime(paths, { automaticPorts = false, timeoutMs = 
       exitCode: 1,
     });
   }
-  const localWorkerToken = await ensureLocalWorkerToken(paths);
   const initialProviderApiKey = config.provider?.status === "unconfigured"
     ? ""
     : await readSecret(paths.providerApiKey);
@@ -286,7 +284,6 @@ export async function startRuntime(paths, { automaticPorts = false, timeoutMs = 
           PUDDINGCLAW_EXTENSION_ANALYTICS: variables.EXTENSION_ANALYTICS,
           PUDDINGCLAW_EXTENSION_HEADLESS_WORKER: variables.EXTENSION_HEADLESS_WORKER,
           ...(name === "backend" ? {
-            PUDDINGCLAW_HEADLESS_TOKEN: localWorkerToken,
             PUDDINGCLAW_INITIAL_PROVIDER: JSON.stringify(config.provider || {}),
             PUDDINGCLAW_INITIAL_PROVIDER_BOOTSTRAP_ID: config.initialized_at || "legacy",
             ...(initialProviderApiKey ? { PUDDINGCLAW_INITIAL_PROVIDER_API_KEY: initialProviderApiKey } : {}),

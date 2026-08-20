@@ -62,7 +62,8 @@ import {
 } from "@/lib/api";
 import MemoryEditor from "@/components/settings/MemoryEditor";
 import CapabilitiesStatus from "@/components/settings/CapabilitiesStatus";
-import WorkerAccessKeysPanel from "@/components/settings/WorkerAccessKeysPanel";
+import HeadlessActivityPanel from "@/components/settings/HeadlessActivityPanel";
+import DocumentParserSettings from "@/components/settings/DocumentParserSettings";
 import SettingsAnchorLayout, { type SettingsAnchorSection } from "@/components/settings/SettingsAnchorLayout";
 import SettingsNavigation, { SETTINGS_CATEGORIES, settingsCategoryEnabled, type SettingsCategory } from "@/components/settings/SettingsNavigation";
 import { useRuntimeProfile } from "@/lib/useRuntimeProfile";
@@ -111,6 +112,7 @@ const RAG_SECTIONS: SettingsAnchorSection[] = [
 
 const KNOWLEDGE_SECTIONS: SettingsAnchorSection[] = [
   { id: "directory", label: "本地目录", description: "知识库资产根目录", icon: FolderOpen },
+  { id: "parsers", label: "文档解析器", description: "导入转换与云端授权", icon: FileText },
   { id: "wiki", label: "LLM Wiki", description: "编译与混合检索", icon: Bot },
   { id: "gbrain", label: "GBrain", description: "模型与独立数据库", icon: Brain },
   { id: "embedding", label: "多模态 Embedding", description: "模型绑定与批量数", icon: Network },
@@ -126,7 +128,7 @@ const SETTINGS_CATEGORY_DESCRIPTIONS: Record<SettingsCategory, string> = {
   knowledge: "管理本地知识库目录、Wiki 编译与向量索引。",
   memory: "维护全局与项目级 Agent 记忆。",
   harness: "管理 Agent 编排、上下文、执行预算与运行保护。",
-  worker: "管理 Worker Access Key 与 Headless API 调用记录。",
+  worker: "查看本机 CLI 状态与 Headless 调用记录。",
   system: "查看核心服务、扩展能力与运行依赖状态。",
 };
 const DEFAULT_IMAGE_ANALYZER_PROMPT =
@@ -2486,6 +2488,12 @@ export default function SettingsPage() {
                 </SettingsCard>
                 </section>
 
+                <section id="knowledge-section-parsers" className="scroll-mt-6">
+                  <SettingsCard title="文档解析器" icon={FileText} color="#002fa7">
+                    <DocumentParserSettings />
+                  </SettingsCard>
+                </section>
+
                 <section id="knowledge-section-wiki" className="scroll-mt-6">
                 <SettingsCard title="LLM Wiki" icon={Bot} color="#7c3aed">
                   <div className="flex items-center gap-2">
@@ -3586,8 +3594,8 @@ export default function SettingsPage() {
                 </div>
               </div>
             )}
-            {/* Worker Access */}
-            {activeCategory === "worker" && <WorkerAccessKeysPanel extensions={runtimeExtensions} />}
+            {/* Local Headless CLI */}
+            {activeCategory === "worker" && <HeadlessActivityPanel extensions={runtimeExtensions} />}
 
             {/* Memory Editor */}
             {activeCategory === "memory" && (

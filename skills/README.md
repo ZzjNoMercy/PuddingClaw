@@ -15,8 +15,8 @@
 
 - 每个子目录是一个可独立分发的 Skill，以 `SKILL.md` 为入口。
 - 外部 Skill 只能依赖公开 CLI / Worker 契约，不导入 Backend 私有模块或宿主绝对路径。
-- 可以提供 `.env.example`，但不得提交真实 `.env`、Worker Access Key 或其他凭据。
-- 凭据由外部宿主的 Secret Store 管理；无凭据管理能力时，按具体 Skill 的说明创建本地 `.env`。
+- 本机 CLI 接入不携带 PuddingClaw Token；模型、数据源和工具权限由 PuddingClaw Backend 自己管理。
+- 外部 Agent 不得把模型 Provider 凭据或其他 PuddingClaw 内部秘密复制到 Skill 目录。
 - 单个 Skill 内不再增加 README；安装、调用和安全规则写在其 `SKILL.md` 中。
 
 ## 当前 Skills

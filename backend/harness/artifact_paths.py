@@ -147,12 +147,16 @@ def extract_local_directory_paths(message: str) -> list[str]:
             raw = message[start:end].replace("\\ ", " ").strip().strip("`'\"()（）[]【】{},，。；;:：")
             if not raw:
                 continue
-            candidate = Path(raw).expanduser()
             try:
+                candidate = Path(raw).expanduser()
                 if not candidate.is_absolute() or not candidate.is_dir():
                     continue
                 resolved = str(candidate.resolve())
-            except OSError:
+            except (OSError, RuntimeError):
+                # ``Path.expanduser()`` raises RuntimeError for unresolved
+                # forms such as ``~unknown/path``. Path discovery is a
+                # best-effort parser over arbitrary prose and must never abort
+                # an Agent run because a non-path token resembles ``~user``.
                 continue
             # A slash discovered inside pasted markup is not an explicit
             # request to expose the host filesystem root.
@@ -337,7 +341,7 @@ def artifact_path_matches(candidate: str, declared: str) -> bool:
     try:
         if Path(candidate).expanduser().is_absolute() and Path(declared).expanduser().is_absolute():
             return Path(candidate).expanduser().resolve() == Path(declared).expanduser().resolve()
-    except OSError:
+    except (OSError, RuntimeError):
         return False
     return False
 
@@ -390,6 +394,12 @@ def _path_starts(message: str) -> list[int]:
     for index, char in enumerate(message):
         if char == "/" or char == "~":
             suffix = message[index:]
+            # In free-form text, ``~`` commonly means "approximately" (for
+            # example ``~2.5%``). Only the unambiguous current-user path form
+            # ``~/...`` is treated as a local path. Cross-user ``~name/...``
+            # paths are deliberately excluded from implicit host discovery.
+            if char == "~" and not suffix.startswith(("~/", "~\\")):
+                continue
             is_known_root = any(suffix.startswith(prefix) for prefix in _POSIX_ROOT_PREFIXES)
             if char == "/" and (
                 (index > 0 and message[index - 1] == ":" and message[index : index + 2] == "//")

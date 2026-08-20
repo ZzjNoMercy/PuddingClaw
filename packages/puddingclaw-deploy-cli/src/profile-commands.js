@@ -18,7 +18,6 @@ import {
 import { probeDocker } from "./postgres-runtime.js";
 import { embeddedRuntimeStatus } from "./runtime-commands.js";
 import { loadActiveRuntime } from "./runtime-bundle.js";
-import { ensureLocalWorkerToken } from "./local-worker-token.js";
 import { readJson } from "./store.js";
 
 const PROFILE_LABELS = Object.freeze({
@@ -317,7 +316,6 @@ export async function applyProfile(profile, paths) {
     ...(python.selected ? { python: { ...config.runtime?.python, ...python.selected } } : {}),
     ...(uv.selected ? { uv: { ...config.runtime?.uv, ...uv.selected } } : {}),
   };
-  await ensureLocalWorkerToken(paths);
   await saveConfig(paths.config, config);
   return {
     status: "applied",

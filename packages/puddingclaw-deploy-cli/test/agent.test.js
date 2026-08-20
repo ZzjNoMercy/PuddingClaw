@@ -20,7 +20,6 @@ async function runAgent(args, { input, env = {}, prepareHome } = {}) {
       ...process.env,
       PUDDINGCLAW_HOME: home,
       PUDDINGCLAW_URL: "http://127.0.0.1:8888",
-      PUDDINGCLAW_TOKEN: "test-token",
       ...env,
     },
     stdio: [input === undefined ? "ignore" : "pipe", "pipe", "pipe"],
@@ -50,7 +49,6 @@ test("unified doctor preserves Worker probe fields and adds deployment diagnosti
   const diagnostic = JSON.parse(result.stdout);
   assert.equal(diagnostic.status, "ok");
   assert.equal(diagnostic.configured, true);
-  assert.equal(diagnostic.authenticated, true);
   assert.equal(diagnostic.reachable, true);
   assert.equal(diagnostic.agent_id, "puddingclaw");
   assert.equal(diagnostic.deployment.initialized, false);
@@ -80,20 +78,15 @@ test("merged run discovers the managed runtime's dynamic Backend URL", async () 
     },
   });
   assert.equal(result.code, 0, result.stderr);
-  assert.equal(JSON.parse(result.stdout).request_url, "http://127.0.0.1:45678/api/headless/runs");
+  assert.equal(JSON.parse(result.stdout).request_url, "http://127.0.0.1:45678/api/headless/runs?stream=true");
 });
 
-test("merged run uses the private init-managed local token when env credentials are absent", async () => {
-  const result = await runAgent(["run", "local auth", "--json"], {
-    env: { PUDDINGCLAW_TOKEN: "", PUDDINGCLAW_HEADLESS_TOKEN: "" },
-    prepareHome: async (home) => {
-      const secrets = path.join(home, "secrets");
-      await mkdir(secrets, { recursive: true, mode: 0o700 });
-      await writeFile(path.join(secrets, "headless-token"), `pck_${"A".repeat(43)}\n`, { mode: 0o600 });
-    },
-  });
+test("merged run uses the local Backend without a CLI credential", async () => {
+  const result = await runAgent(["run", "local auth", "--json"]);
   assert.equal(result.code, 0, result.stderr);
-  assert.equal(JSON.parse(result.stdout).final_response, "final ok");
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.final_response, "final ok");
+  assert.equal(payload.authorization_header, null);
 });
 
 test("merged run returns external approval without deciding in JSON mode", async () => {
@@ -112,6 +105,14 @@ test("merged run streams JSONL and emits exactly one result event", async () => 
   assert.equal(events.at(-1).data.final_response, "stream done");
 });
 
+test("merged run remains compatible with a legacy Backend single JSON boundary", async () => {
+  const result = await runAgent(["run", "legacy", "--json"], {
+    env: { MOCK_LEGACY_STREAM: "1" },
+  });
+  assert.equal(result.code, 0, result.stderr);
+  assert.equal(JSON.parse(result.stdout).final_response, "legacy done");
+});
+
 test("merged respond and cancel preserve lifecycle protocol", async () => {
   const responded = await runAgent(["respond", "run-respond", "--input-json", "-", "--json"], {
     input: {
@@ -124,6 +125,24 @@ test("merged respond and cancel preserve lifecycle protocol", async () => {
   const cancelled = await runAgent(["cancel", "run-cancel", "--json"]);
   assert.equal(cancelled.code, 0, cancelled.stderr);
   assert.equal(JSON.parse(cancelled.stdout).outcome, "cancelled");
+});
+
+test("merged respond forwards resumed Run progress as JSONL", async () => {
+  const responded = await runAgent(["respond", "run-respond", "--input-json", "-", "--jsonl"], {
+    input: {
+      continuation_token: "continuation-token-long-enough",
+      decisions: [{ request_id: "permission-1", decision: "approve", scope: "once" }],
+    },
+  });
+  assert.equal(responded.code, 0, responded.stderr);
+  const events = responded.stdout.trim().split("\n").map((line) => JSON.parse(line));
+  assert.deepEqual(events.map((event) => event.event), [
+    "permission_resolved",
+    "tool_start",
+    "tool_end",
+    "result",
+  ]);
+  assert.equal(events.at(-1).data.final_response, "responded");
 });
 
 test("merged run exports only Backend-declared workspace artifacts", async () => {

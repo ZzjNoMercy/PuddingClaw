@@ -139,6 +139,7 @@ export async function cancelSkillPlan(
 export interface SSEEvent {
   event: string;
   data: Record<string, unknown>;
+  id?: string;
 }
 
 export type GoalStatus =
@@ -1724,6 +1725,148 @@ export async function createKnowledgeImportJob(
   }
   const payload = await response.json();
   return payload.job;
+}
+
+export interface DocumentParserStatus {
+  id: string;
+  name: string;
+  description: string;
+  location: "local" | "cloud";
+  supported_extensions: string[];
+  supports_assets?: boolean;
+  supports_tables?: boolean;
+  requires_credential: boolean;
+  credential_env?: string;
+  credential_configured: boolean;
+  credential_source?: "environment" | "vault" | "none";
+  cloud_data_notice?: string;
+  version?: string;
+  implementation_available: boolean;
+  enabled: boolean;
+  priority: number;
+  available: boolean;
+  healthy?: boolean;
+  health_message: string;
+  compatible: boolean;
+  selectable: boolean;
+  recommended: boolean;
+  reason: string;
+  base_url?: string;
+  dependency_extra?: string;
+  dependency_install?: {
+    status: "idle" | "installing" | "succeeded" | "failed";
+    message: string;
+    started_at?: string;
+    finished_at?: string;
+  };
+}
+
+export interface StagedKnowledgeSource {
+  id: string;
+  file_name: string;
+  size_bytes: number;
+  sha256: string;
+  mime_type: string;
+  page_count?: number | null;
+  expires_at?: string | null;
+  status: "staged";
+}
+
+export async function listDocumentParsers(filename = ""): Promise<DocumentParserStatus[]> {
+  const query = filename ? `?filename=${encodeURIComponent(filename)}` : "";
+  const response = await fetch(`${DIRECT_BACKEND_API_BASE}/knowledge/parsers${query}`, { cache: "no-store" });
+  const text = await response.text();
+  if (!response.ok) throw new Error(apiErrorMessage(text, `加载解析器失败：${response.status}`));
+  return (JSON.parse(text) as { parsers: DocumentParserStatus[] }).parsers;
+}
+
+export async function stageKnowledgeImportSource(
+  file: File,
+  title?: string,
+): Promise<{ source: StagedKnowledgeSource; parsers: DocumentParserStatus[] }> {
+  const form = new FormData();
+  form.append("file", file, file.name);
+  if (title?.trim()) form.append("title", title.trim());
+  const response = await fetch(`${DIRECT_BACKEND_API_BASE}/knowledge/import-sources`, {
+    method: "POST",
+    body: form,
+  });
+  const text = await response.text();
+  if (!response.ok) throw new Error(apiErrorMessage(text, `暂存文件失败：${response.status}`));
+  return JSON.parse(text);
+}
+
+export async function commitKnowledgeImportSource(
+  sourceId: string,
+  input: {
+    parser_id: string;
+    parser_options?: Record<string, unknown>;
+    publish_targets?: string[];
+    title?: string;
+    allow_cloud?: boolean;
+  },
+): Promise<KnowledgeImportJob> {
+  const response = await fetch(
+    `${DIRECT_BACKEND_API_BASE}/knowledge/import-jobs/${encodeURIComponent(sourceId)}/commit`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(input),
+    },
+  );
+  const text = await response.text();
+  if (!response.ok) throw new Error(apiErrorMessage(text, `创建导入任务失败：${response.status}`));
+  return (JSON.parse(text) as { job: KnowledgeImportJob }).job;
+}
+
+export async function updateDocumentParser(
+  parserId: string,
+  input: {
+    enabled?: boolean;
+    priority?: number;
+    base_url?: string;
+    credential_ref?: string;
+    default_options?: Record<string, unknown>;
+    api_key?: string;
+  },
+): Promise<DocumentParserStatus> {
+  const response = await fetch(`${DIRECT_BACKEND_API_BASE}/knowledge/parsers/${encodeURIComponent(parserId)}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(input),
+  });
+  const text = await response.text();
+  if (!response.ok) throw new Error(apiErrorMessage(text, `保存解析器失败：${response.status}`));
+  return (JSON.parse(text) as { parser: DocumentParserStatus }).parser;
+}
+
+export async function testDocumentParser(
+  parserId: string,
+  input: { base_url?: string; api_key?: string } = {},
+): Promise<{ ok: boolean; message: string; parser: DocumentParserStatus }> {
+  const response = await fetch(
+    `${DIRECT_BACKEND_API_BASE}/knowledge/parsers/${encodeURIComponent(parserId)}/test`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(input),
+    },
+  );
+  const text = await response.text();
+  if (!response.ok) throw new Error(apiErrorMessage(text, `测试解析器失败：${response.status}`));
+  return JSON.parse(text);
+}
+
+export async function installDocumentParserDependency(
+  parserId: string,
+): Promise<NonNullable<DocumentParserStatus["dependency_install"]>> {
+  const response = await fetch(
+    `${DIRECT_BACKEND_API_BASE}/knowledge/parsers/${encodeURIComponent(parserId)}/install`,
+    { method: "POST" },
+  );
+  const text = await response.text();
+  if (!response.ok) throw new Error(apiErrorMessage(text, `安装解析器依赖失败：${response.status}`));
+  return (JSON.parse(text) as { install: NonNullable<DocumentParserStatus["dependency_install"]> }).install;
 }
 
 export async function createLlmWikiIngestJob(
@@ -3787,6 +3930,40 @@ export async function* streamAgent(
   }
 }
 
+/** Observe a Headless Run already owned by CLI/PuddingTeams. */
+export async function* streamSessionEvents(
+  sessionId: string,
+  signal?: AbortSignal,
+  after = 0,
+): AsyncGenerator<SSEEvent> {
+  const response = await fetch(
+    `${API_BASE}/sessions/${encodeURIComponent(sessionId)}/events?after=${Math.max(0, after)}`,
+    { cache: "no-store", signal },
+  );
+  if (response.status === 204) return;
+  if (!response.ok) throw new Error(`Session event API error: ${response.status}`);
+  const reader = response.body?.getReader();
+  if (!reader) throw new Error("No response body");
+
+  const decoder = new TextDecoder();
+  let buffer = "";
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    buffer = buffer.replace(/\r\n/g, "\n");
+    const frames = buffer.split("\n\n");
+    buffer = frames.pop() || "";
+    for (const frame of frames) {
+      const parsed = parseSSEFrame(frame);
+      if (parsed) yield parsed;
+    }
+  }
+  buffer += decoder.decode();
+  const tail = parseSSEFrame(buffer.trim());
+  if (tail) yield tail;
+}
+
 export async function getSessionHarnessState(
   sessionId: string,
 ): Promise<SessionHarnessState> {
@@ -3871,11 +4048,14 @@ export async function updateGoalObjective(
 
 function parseSSEFrame(frame: string): SSEEvent | null {
   let event = "message";
+  let id: string | undefined;
   const dataLines: string[] = [];
   for (const line of frame.split("\n")) {
     if (!line || line.startsWith(":")) continue;
     if (line.startsWith("event:")) {
       event = line.slice(6).trim() || "message";
+    } else if (line.startsWith("id:")) {
+      id = line.slice(3).trim() || undefined;
     } else if (line.startsWith("data:")) {
       dataLines.push(line.slice(5).trimStart());
     }
@@ -3883,7 +4063,7 @@ function parseSSEFrame(frame: string): SSEEvent | null {
   if (dataLines.length === 0) return null;
   try {
     const data = JSON.parse(dataLines.join("\n"));
-    return { event, data };
+    return { event, data, ...(id ? { id } : {}) };
   } catch {
     return null;
   }

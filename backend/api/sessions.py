@@ -1,12 +1,15 @@
 """Session CRUD API — list / create / rename / delete / raw messages / generate title."""
 
+import json
 import uuid
 from pathlib import Path
 from typing import Any, Literal
 
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
+from sse_starlette.sse import EventSourceResponse
 from starlette.concurrency import run_in_threadpool
+from starlette.responses import Response
 
 from config import get_fallback_llm_config
 from graph.deepagents_manager import deepagents_agent_manager
@@ -228,6 +231,42 @@ async def get_session_harness_state(session_id: str):
         **harness,
         "legacy_external_lease_audit": legacy_audit,
     }
+
+
+@router.get("/sessions/{session_id}/events")
+async def observe_session_events(
+    session_id: str,
+    after: int = Query(default=0, ge=0),
+):
+    """Observe an existing Headless Harness Run from another local client.
+
+    Starting/resuming the Run and observing it are separate concerns. The CLI,
+    PuddingTeams and Web UI can therefore render the same execution without
+    racing for a single queue or launching a duplicate Agent turn.
+    """
+
+    if not await run_in_threadpool(session_manager.session_exists, session_id):
+        raise HTTPException(status_code=404, detail="Session not found")
+    # Import lazily: Headless is an optional runtime profile while Session CRUD
+    # remains part of the core API.
+    from api.headless import get_headless_execution, observe_headless_execution
+
+    if get_headless_execution(session_id) is None:
+        return Response(status_code=204)
+
+    async def event_stream():
+        async for item in observe_headless_execution(session_id, after_seq=after):
+            yield {
+                "id": str(item.get("seq") or ""),
+                "event": str(item.get("event") or "message"),
+                "data": json.dumps(item.get("data") or {}, ensure_ascii=False),
+            }
+
+    return EventSourceResponse(
+        event_stream(),
+        ping=15,
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @router.get("/sessions/{session_id}/todos/current")
