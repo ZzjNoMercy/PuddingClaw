@@ -5,15 +5,13 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import {
   AlertCircle,
-  ArrowRight,
   BookOpenCheck,
   CheckCircle2,
+  ChevronRight,
   Clock3,
   Database,
-  Files,
   FileUp,
   Link2,
-  ListChecks,
   Loader2,
   RefreshCw,
   Search,
@@ -24,20 +22,28 @@ import {
 
 import KnowledgeWorkspaceNav from "@/components/knowledge/KnowledgeWorkspaceNav";
 import KnowledgeWorkspaceHeader from "@/components/knowledge/KnowledgeWorkspaceHeader";
+import DocumentDetailModal, {
+  docType,
+  formatSize,
+  KindLogo,
+  statusView,
+  type SourceKind,
+} from "@/components/knowledge/DocumentDetailModal";
 import {
   createKnowledgeImportJob,
   createLlmWikiIngestJob,
   getLlmWikiWorkspaceStatus,
   listReadLaterItems,
   saveReadLaterUrl,
+  type KnowledgeDocument,
   type KnowledgeImportJob,
   type LlmWikiWorkspaceStatus,
   type ReadLaterItem,
 } from "@/lib/api";
+import { listKnowledgeSources, type KnowledgeSource } from "@/lib/knowledgeSourcesApi";
 
 type Props = {
-  documentCount: number;
-  fileCount: number;
+  documents: KnowledgeDocument[];
   jobs: KnowledgeImportJob[];
   loading: boolean;
   onRefresh: () => void;
@@ -47,12 +53,33 @@ function isActive(job: KnowledgeImportJob) {
   return job.status === "queued" || job.status === "running";
 }
 
-export default function KnowledgeOverview({ documentCount, fileCount, jobs, loading, onRefresh }: Props) {
+function relativeTime(value: string | null | undefined): string {
+  if (!value) return "—";
+  const time = new Date(value).getTime();
+  if (!Number.isFinite(time)) return "—";
+  const minutes = Math.max(1, Math.floor((Date.now() - time) / 60000));
+  if (minutes < 60) return `${minutes} 分钟前`;
+  const date = new Date(value);
+  const clock = `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
+  if (minutes < 1440 && date.toDateString() === new Date().toDateString()) return `今天 ${clock}`;
+  if (minutes < 2880) return `昨天 ${clock}`;
+  return date.toLocaleDateString("zh-CN");
+}
+
+function kindOf(doc: KnowledgeDocument, sources: KnowledgeSource[]): SourceKind {
+  const source = doc.source_connection_id ? sources.find((item) => item.id === doc.source_connection_id) : undefined;
+  if (source?.connector_key === "feishu_wiki" || doc.source_type.startsWith("feishu")) return "feishu";
+  if (source?.connector_key === "web_capture" || doc.source_type === "read_later" || doc.source_type === "web") return "web";
+  return "local";
+}
+
+export default function KnowledgeOverview({ documents, jobs, loading, onRefresh }: Props) {
   const router = useRouter();
   const uploadInputRef = useRef<HTMLInputElement>(null);
   const searchInputRef = useRef<HTMLInputElement>(null);
   const [searchQuery, setSearchQuery] = useState("");
   const [readLater, setReadLater] = useState<ReadLaterItem[]>([]);
+  const [sources, setSources] = useState<KnowledgeSource[]>([]);
   const [dialog, setDialog] = useState<"read-later" | "compile" | null>(null);
   const [url, setUrl] = useState("");
   const [workspace, setWorkspace] = useState<LlmWikiWorkspaceStatus | null>(null);
@@ -61,9 +88,11 @@ export default function KnowledgeOverview({ documentCount, fileCount, jobs, load
   const [busy, setBusy] = useState<"upload" | "read-later" | "compile" | null>(null);
   const [actionError, setActionError] = useState("");
   const [notice, setNotice] = useState("");
+  const [detail, setDetail] = useState<{ doc: KnowledgeDocument; kind: SourceKind } | null>(null);
 
   useEffect(() => {
     void listReadLaterItems().then(setReadLater).catch(() => setReadLater([]));
+    void listKnowledgeSources().then(setSources).catch(() => setSources([]));
   }, []);
 
   useEffect(() => {
@@ -98,10 +127,34 @@ export default function KnowledgeOverview({ documentCount, fileCount, jobs, load
   }, [busy, dialog]);
 
   const unreadCount = readLater.filter((item) => item.reading_status === "unread").length;
-  const readyCount = readLater.filter((item) => item.parse_status === "ready").length;
   const activeJobs = jobs.filter(isActive);
   const latestJobs = useMemo(() => jobs.slice(0, 3), [jobs]);
   const pendingRaw = useMemo(() => workspace?.raw.filter((item) => !item.compiled) ?? [], [workspace]);
+
+  const feishuSourceName = sources.find((item) => item.connector_key === "feishu_wiki")?.name || "飞书";
+  const sourceColumns = useMemo(() => ([
+    { kind: "local" as SourceKind, title: "本地上传", hint: "PDF、Markdown 与 Office 文件" },
+    { kind: "web" as SourceKind, title: "稍后读", hint: `${unreadCount} 篇未读` },
+    { kind: "feishu" as SourceKind, title: feishuSourceName, hint: "飞书 Wiki 同步" },
+  ]), [feishuSourceName, unreadCount]);
+
+  const sourceGroups = useMemo(() => {
+    const groups: Record<SourceKind, KnowledgeDocument[]> = { local: [], web: [], feishu: [] };
+    for (const doc of documents) {
+      if (doc.status === "deleted") continue;
+      groups[kindOf(doc, sources)].push(doc);
+    }
+    for (const kind of Object.keys(groups) as SourceKind[]) {
+      groups[kind].sort((a, b) => Date.parse(b.updated_at || "") - Date.parse(a.updated_at || ""));
+    }
+    return groups;
+  }, [documents, sources]);
+
+  function sourceNameOf(kind: SourceKind): string {
+    if (kind === "feishu") return feishuSourceName;
+    if (kind === "web") return "稍后读";
+    return "本地上传";
+  }
 
   async function uploadFile(file: File | undefined) {
     if (!file) return;
@@ -176,40 +229,25 @@ export default function KnowledgeOverview({ documentCount, fileCount, jobs, load
     }
   }
 
-  const workspaces = [
-    {
-      href: "/knowledge/library",
-      title: "资料库",
-      description: "上传、预览和管理原始资料；需要时复制 Markdown 到 Wiki Raw。",
-      meta: `${fileCount} 个文件 · ${documentCount} 个已登记文档`,
-      icon: Files,
-      tone: "bg-[#002fa7]/[0.08] text-[#002fa7]",
-    },
-    {
-      href: "/knowledge/read-later",
-      title: "稍后读",
-      description: "先收藏链接并自动整理正文，阅读后再决定是否进入 Wiki。",
-      meta: `${unreadCount} 篇未读 · ${readyCount} 篇正文就绪`,
-      icon: BookOpenCheck,
-      tone: "bg-cyan-50 text-cyan-700",
-    },
-    {
-      href: "/knowledge/schema",
-      title: "LLM Wiki Studio",
-      description: "维护 Schema，将 Raw 编译成互联 Wiki，并按需导入 GBrain。",
-      meta: "Raw → Wiki → 检查 → GBrain",
-      icon: Sparkles,
-      tone: "bg-violet-50 text-violet-700",
-    },
-    {
-      href: "/knowledge/imports",
-      title: "任务中心",
-      description: "统一查看文件解析、稍后读抓取、Wiki 编译和数据库导入。",
-      meta: `${activeJobs.length} 个处理中 · ${jobs.length} 条记录`,
-      icon: ListChecks,
-      tone: "bg-amber-50 text-amber-700",
-    },
-  ];
+  function renderDocRow(doc: KnowledgeDocument, kind: SourceKind) {
+    const type = docType(doc);
+    const status = statusView(doc);
+    return (
+      <button
+        key={doc.id}
+        type="button"
+        onClick={() => setDetail({ doc, kind })}
+        className="flex w-full items-center gap-2.5 rounded-2xl px-2.5 py-2.5 text-left transition hover:bg-[#002fa7]/[0.04]"
+      >
+        <span className="grid h-8 w-8 shrink-0 place-items-center rounded-xl bg-[#002fa7]/[0.06] text-[9px] font-bold text-[#002fa7]">{type.glyph}</span>
+        <span className="min-w-0 flex-1">
+          <span className="block truncate text-xs font-medium text-gray-800">{doc.title}</span>
+          <span className="mt-0.5 block text-[10px] text-gray-400">{type.label} · {formatSize(doc.size_bytes)} · {relativeTime(doc.updated_at)}</span>
+        </span>
+        <span className={`shrink-0 rounded-full px-2 py-0.5 text-[10px] font-semibold ${status.className}`}>{status.label}</span>
+      </button>
+    );
+  }
 
   return (
     <>
@@ -263,91 +301,106 @@ export default function KnowledgeOverview({ documentCount, fileCount, jobs, load
         </div>
       </section>
 
-      <section className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
-        {workspaces.map((item) => {
-          const Icon = item.icon;
+      <section className="rounded-[28px] border border-black/[0.06] bg-white p-5 shadow-sm sm:p-6">
+        <div className="flex items-center justify-between gap-3">
+          <div>
+            <h2 className="text-base font-semibold text-gray-950">快速开始</h2>
+            <p className="mt-1 text-xs text-gray-400">从当前意图直接进入下一步。</p>
+          </div>
+        </div>
+        <div className="mt-4 grid gap-3 sm:grid-cols-3">
+          <input
+            ref={uploadInputRef}
+            type="file"
+            accept="application/pdf,.pdf,text/markdown,.md,.markdown,.xlsx,.xls,.csv,.tsv,.txt,.docx"
+            className="hidden"
+            onChange={(event) => void uploadFile(event.target.files?.[0])}
+          />
+          <button
+            type="button"
+            onClick={() => uploadInputRef.current?.click()}
+            disabled={Boolean(busy)}
+            className="group flex min-h-[92px] items-center gap-3 rounded-2xl border border-[#002fa7]/15 bg-[#002fa7]/[0.035] px-4 py-3 text-left transition hover:border-[#002fa7]/30 hover:bg-[#002fa7]/[0.07] disabled:cursor-wait disabled:opacity-60"
+          >
+            <span className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl bg-blue-50 text-[#002fa7]">
+              {busy === "upload" ? <Loader2 className="h-5 w-5 animate-spin" /> : <FileUp className="h-5 w-5" />}
+            </span>
+            <span className="min-w-0 flex-1"><strong className="block text-sm text-gray-900">上传资料</strong><span className="mt-1 block text-[11px] leading-4 text-gray-400">PDF / Markdown / 表格，后台自动解析</span></span>
+          </button>
+          <button type="button" onClick={openReadLater} disabled={Boolean(busy)} className="group flex min-h-[92px] items-center gap-3 rounded-2xl border border-black/[0.06] bg-black/[0.018] px-4 py-3 text-left transition hover:border-cyan-500/20 hover:bg-cyan-50/60 disabled:opacity-60">
+            <span className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl bg-cyan-50 text-cyan-700"><BookOpenCheck className="h-5 w-5" /></span>
+            <span className="min-w-0 flex-1"><strong className="block text-sm text-gray-900">收藏链接</strong><span className="mt-1 block text-[11px] leading-4 text-gray-400">自动抓取并整理正文</span></span>
+          </button>
+          <button type="button" onClick={() => void openCompile()} disabled={Boolean(busy)} className="group flex min-h-[92px] items-center gap-3 rounded-2xl border border-black/[0.06] bg-black/[0.018] px-4 py-3 text-left transition hover:border-violet-500/20 hover:bg-violet-50/60 disabled:opacity-60">
+            <span className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl bg-violet-50 text-violet-700"><Sparkles className="h-5 w-5" /></span>
+            <span className="min-w-0 flex-1"><strong className="block text-sm text-gray-900">编译 Wiki</strong><span className="mt-1 block text-[11px] leading-4 text-gray-400">选择 Raw 并提交后台</span></span>
+          </button>
+        </div>
+        {notice ? <p className="mt-3 text-xs font-medium text-emerald-700">{notice}</p> : null}
+        {actionError && !dialog ? <p className="mt-3 text-xs font-medium text-red-600">{actionError}</p> : null}
+      </section>
+
+      <section className="grid items-start gap-4 lg:grid-cols-3">
+        {sourceColumns.map((column) => {
+          const docs = sourceGroups[column.kind];
           return (
-            <Link
-              key={item.href}
-              href={item.href}
-              className="group flex min-h-[210px] flex-col rounded-[28px] border border-black/[0.06] bg-white p-5 shadow-sm transition hover:-translate-y-0.5 hover:border-[#002fa7]/15 hover:shadow-lg hover:shadow-[#002fa7]/[0.06]"
-            >
-              <div className="flex items-start justify-between gap-3">
-                <span className={`flex h-11 w-11 items-center justify-center rounded-2xl ${item.tone}`}>
-                  <Icon className="h-5 w-5" />
-                </span>
-                <ArrowRight className="h-4 w-4 text-gray-300 transition group-hover:translate-x-0.5 group-hover:text-[#002fa7]" />
+            <div key={column.kind} className="flex flex-col rounded-[28px] border border-black/[0.06] bg-white p-5 shadow-sm">
+              <div className="flex items-center justify-between gap-3">
+                <div className="flex min-w-0 items-center gap-2.5">
+                  <KindLogo kind={column.kind} />
+                  <div className="min-w-0">
+                    <h3 className="truncate text-sm font-semibold text-gray-950">{column.title}</h3>
+                    <p className="mt-0.5 text-[11px] text-gray-400">{column.hint} · {docs.length} 项</p>
+                  </div>
+                </div>
+                <Link
+                  href={`/knowledge/library?source=${column.kind}`}
+                  className="inline-flex shrink-0 items-center gap-0.5 text-xs font-semibold text-[#002fa7] hover:underline"
+                >
+                  查看更多<ChevronRight className="h-3.5 w-3.5" />
+                </Link>
               </div>
-              <h2 className="mt-5 text-base font-semibold text-gray-950">{item.title}</h2>
-              <p className="mt-2 flex-1 text-xs leading-5 text-gray-500">{item.description}</p>
-              <p className="mt-4 border-t border-black/[0.05] pt-3 text-[11px] font-medium text-gray-400">{item.meta}</p>
-            </Link>
+              <div className="mt-3 space-y-1">
+                {docs.slice(0, 5).map((doc) => renderDocRow(doc, column.kind))}
+                {!docs.length ? (
+                  <div className="rounded-2xl border border-dashed border-black/[0.08] px-4 py-8 text-center text-xs text-gray-400">还没有内容。</div>
+                ) : null}
+              </div>
+            </div>
           );
         })}
       </section>
 
-      <section className="grid items-start gap-4 xl:grid-cols-2">
-        <div className="rounded-2xl border border-black/[0.06] bg-white p-5 shadow-sm">
-          <div className="flex items-center justify-between gap-3">
-            <div>
-              <h2 className="text-base font-semibold text-gray-950">快速开始</h2>
-              <p className="mt-1 text-xs text-gray-400">从当前意图直接进入下一步。</p>
-            </div>
+      <section className="rounded-2xl border border-black/[0.06] bg-white p-5 shadow-sm">
+        <div className="flex items-center justify-between gap-3">
+          <div>
+            <h2 className="text-base font-semibold text-gray-950">后台动态</h2>
+            <p className="mt-1 text-xs text-gray-400">最近任务与处理状态。</p>
           </div>
-          <div className="mt-3 grid gap-2.5 sm:grid-cols-3">
-            <input
-              ref={uploadInputRef}
-              type="file"
-              accept="application/pdf,.pdf,text/markdown,.md,.markdown,.xlsx,.xls,.csv,.tsv,.txt,.docx"
-              className="hidden"
-              onChange={(event) => void uploadFile(event.target.files?.[0])}
-            />
-            <button
-              type="button"
-              onClick={() => uploadInputRef.current?.click()}
-              disabled={Boolean(busy)}
-              className="group flex min-h-[68px] items-center gap-2.5 rounded-xl border border-[#002fa7]/15 bg-[#002fa7]/[0.035] px-3 py-2.5 text-left transition hover:border-[#002fa7]/30 hover:bg-[#002fa7]/[0.07] disabled:cursor-wait disabled:opacity-60"
-            >
-              <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-blue-50 text-[#002fa7]">
-                {busy === "upload" ? <Loader2 className="h-4 w-4 animate-spin" /> : <FileUp className="h-4 w-4" />}
-              </span>
-              <span className="min-w-0 flex-1"><strong className="block text-sm text-gray-900">上传资料</strong><span className="mt-0.5 block truncate text-[10px] text-gray-400">PDF / Markdown / 表格</span></span>
-            </button>
-            <button type="button" onClick={openReadLater} disabled={Boolean(busy)} className="group flex min-h-[68px] items-center gap-2.5 rounded-xl border border-black/[0.06] bg-black/[0.018] px-3 py-2.5 text-left transition hover:border-cyan-500/20 hover:bg-cyan-50/60 disabled:opacity-60">
-              <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-cyan-50 text-cyan-700"><BookOpenCheck className="h-4 w-4" /></span>
-              <span className="min-w-0 flex-1"><strong className="block text-sm text-gray-900">收藏链接</strong><span className="mt-0.5 block truncate text-[10px] text-gray-400">自动抓取并整理正文</span></span>
-            </button>
-            <button type="button" onClick={() => void openCompile()} disabled={Boolean(busy)} className="group flex min-h-[68px] items-center gap-2.5 rounded-xl border border-black/[0.06] bg-black/[0.018] px-3 py-2.5 text-left transition hover:border-violet-500/20 hover:bg-violet-50/60 disabled:opacity-60">
-              <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-violet-50 text-violet-700"><Sparkles className="h-4 w-4" /></span>
-              <span className="min-w-0 flex-1"><strong className="block text-sm text-gray-900">编译 Wiki</strong><span className="mt-0.5 block truncate text-[10px] text-gray-400">选择 Raw 并提交后台</span></span>
-            </button>
-          </div>
-          {notice ? <p className="mt-3 text-xs font-medium text-emerald-700">{notice}</p> : null}
-          {actionError && !dialog ? <p className="mt-3 text-xs font-medium text-red-600">{actionError}</p> : null}
+          <Link href="/knowledge/imports" className="text-xs font-semibold text-[#002fa7]">查看全部</Link>
         </div>
-
-        <div className="rounded-2xl border border-black/[0.06] bg-white p-5 shadow-sm">
-          <div className="flex items-center justify-between gap-3">
-            <div>
-              <h2 className="text-base font-semibold text-gray-950">后台动态</h2>
-              <p className="mt-1 text-xs text-gray-400">最近任务与处理状态。</p>
-            </div>
-            <Link href="/knowledge/imports" className="text-xs font-semibold text-[#002fa7]">查看全部</Link>
-          </div>
-          <div className="mt-4 space-y-2">
-            {latestJobs.length ? latestJobs.map((job) => (
-              <Link key={job.id} href={`/knowledge/imports/${job.id}`} className="flex items-center gap-3 rounded-2xl bg-black/[0.022] px-3 py-3 transition hover:bg-black/[0.04]">
-                <span className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-xl ${isActive(job) ? "bg-[#002fa7]/10 text-[#002fa7]" : "bg-emerald-50 text-emerald-700"}`}>
-                  {isActive(job) ? <Clock3 className="h-4 w-4" /> : <CheckCircle2 className="h-4 w-4" />}
-                </span>
-                <span className="min-w-0 flex-1"><strong className="block truncate text-xs text-gray-800">{job.title || job.file_name}</strong><span className="mt-0.5 block text-[10px] text-gray-400">{job.current_step || job.status}</span></span>
-              </Link>
-            )) : (
-              <div className="rounded-2xl border border-dashed border-black/[0.08] px-4 py-7 text-center text-xs text-gray-400">还没有后台任务</div>
-            )}
-          </div>
+        <div className="mt-4 grid gap-2 sm:grid-cols-3">
+          {latestJobs.length ? latestJobs.map((job) => (
+            <Link key={job.id} href={`/knowledge/imports/${job.id}`} className="flex items-center gap-3 rounded-2xl bg-black/[0.022] px-3 py-3 transition hover:bg-black/[0.04]">
+              <span className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-xl ${isActive(job) ? "bg-[#002fa7]/10 text-[#002fa7]" : "bg-emerald-50 text-emerald-700"}`}>
+                {isActive(job) ? <Clock3 className="h-4 w-4" /> : <CheckCircle2 className="h-4 w-4" />}
+              </span>
+              <span className="min-w-0 flex-1"><strong className="block truncate text-xs text-gray-800">{job.title || job.file_name}</strong><span className="mt-0.5 block text-[10px] text-gray-400">{job.current_step || job.status}</span></span>
+            </Link>
+          )) : (
+            <div className="rounded-2xl border border-dashed border-black/[0.08] px-4 py-7 text-center text-xs text-gray-400 sm:col-span-3">还没有后台任务</div>
+          )}
         </div>
       </section>
+
+      {detail ? (
+        <DocumentDetailModal
+          doc={detail.doc}
+          kind={detail.kind}
+          sourceName={sourceNameOf(detail.kind)}
+          onClose={() => setDetail(null)}
+        />
+      ) : null}
 
       {dialog ? (
         <div

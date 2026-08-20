@@ -538,8 +538,7 @@ export default function KnowledgePage() {
             <div className="workspace-page-container flex flex-col gap-5">
         {pathname === "/knowledge" ? (
           <KnowledgeOverview
-            documentCount={documents.length}
-            fileCount={directoryFiles.length}
+            documents={documents}
             jobs={importJobs}
             loading={loading}
             onRefresh={refresh}

@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="本地上传">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#F3F7FF"/>
+      <stop offset="1" stop-color="#DCE8FF"/>
+    </linearGradient>
+    <linearGradient id="fg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1B4BD8"/>
+      <stop offset="1" stop-color="#002FA7"/>
+    </linearGradient>
+  </defs>
+  <rect width="64" height="64" rx="16" fill="url(#bg)"/>
+  <path d="M14 24a4 4 0 0 1 4-4h9.5a3 3 0 0 1 2.5 1.3L33 26h13a4 4 0 0 1 4 4v14a4 4 0 0 1-4 4H18a4 4 0 0 1-4-4V24z" fill="url(#fg)"/>
+  <path d="M32 43V33" fill="none" stroke="#FFFFFF" stroke-width="3.4" stroke-linecap="round"/>
+  <path d="M26.2 35.6 32 29.8l5.8 5.8" fill="none" stroke="#FFFFFF" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

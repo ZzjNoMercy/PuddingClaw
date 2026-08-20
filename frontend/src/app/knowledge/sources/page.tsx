@@ -20,6 +20,7 @@ import {
 } from "lucide-react";
 
 import FeishuConnectionWizard from "@/components/knowledge/FeishuConnectionWizard";
+import DocumentDetailModal, { type SourceKind } from "@/components/knowledge/DocumentDetailModal";
 import KnowledgeWorkspaceHeader from "@/components/knowledge/KnowledgeWorkspaceHeader";
 import KnowledgeWorkspaceNav from "@/components/knowledge/KnowledgeWorkspaceNav";
 import Navbar from "@/components/layout/Navbar";
@@ -27,8 +28,10 @@ import ResizeHandle from "@/components/layout/ResizeHandle";
 import Sidebar from "@/components/layout/Sidebar";
 import {
   createKnowledgeImportJob,
+  listKnowledgeDocuments,
   listReadLaterItems,
   saveReadLaterUrl,
+  type KnowledgeDocument,
   type ReadLaterItem,
 } from "@/lib/api";
 import {
@@ -68,9 +71,9 @@ function statusView(status: string): { label: string; className: string } {
 }
 
 function SourceMark({ kind }: { kind: KnowledgeSource["connector_key"] }) {
-  if (kind === "local_upload") return <span className="grid h-11 w-11 place-items-center rounded-2xl border border-black/[0.08] bg-white text-lg font-bold text-[#002fa7] shadow-sm">本</span>;
-  if (kind === "web_capture") return <span className="grid h-11 w-11 place-items-center rounded-2xl border border-black/[0.08] bg-white text-lg font-bold text-[#002fa7] shadow-sm">网</span>;
-  return <img src="/brands/feishu-logo.svg" alt="飞书" className="h-11 w-11 rounded-2xl border border-black/[0.06] bg-white object-cover shadow-sm" />;
+  const src = kind === "local_upload" ? "/brands/local-upload.svg" : kind === "web_capture" ? "/brands/web-capture.svg" : "/brands/feishu-logo.svg";
+  const alt = kind === "local_upload" ? "本地上传" : kind === "web_capture" ? "网页收藏" : "飞书";
+  return <img src={src} alt={alt} className="h-11 w-11 rounded-2xl border border-black/[0.06] bg-white object-cover shadow-sm" />;
 }
 
 function SourceList({ sources, selectedId, onSelect, onAdd }: {
@@ -131,7 +134,7 @@ function Metric({ label, value, hint }: { label: string; value: string | number;
   return <div className="rounded-2xl border border-black/[0.055] bg-gray-50/70 p-4"><div className="text-[11px] font-medium text-gray-400">{label}</div><div className="mt-2 text-lg font-semibold tracking-tight text-gray-900">{value}</div>{hint ? <div className="mt-1 text-[10px] text-gray-400">{hint}</div> : null}</div>;
 }
 
-function LocalUploadPanel({ source, items, onChanged }: { source: KnowledgeSource; items: KnowledgeSourceItem[]; onChanged: () => void | Promise<void> }) {
+function LocalUploadPanel({ source, items, onChanged, onOpenDoc }: { source: KnowledgeSource; items: KnowledgeSourceItem[]; onChanged: () => void | Promise<void>; onOpenDoc: (item: KnowledgeSourceItem) => void }) {
   const inputRef = useRef<HTMLInputElement>(null);
   const [uploading, setUploading] = useState(false);
   const [notice, setNotice] = useState("");
@@ -161,12 +164,12 @@ function LocalUploadPanel({ source, items, onChanged }: { source: KnowledgeSourc
       </div>
       {notice ? <div className={`rounded-xl px-4 py-3 text-xs ${notice.includes("已提交") ? "bg-emerald-50 text-emerald-700" : "bg-red-50 text-red-700"}`}>{notice}</div> : null}
       <div className="grid grid-cols-2 gap-3 lg:grid-cols-4"><Metric label="文件数量" value={source.item_count || items.length} /><Metric label="已索引" value={items.filter((item) => item.status === "indexed").length} /><Metric label="处理中" value={items.filter((item) => ["queued", "processing"].includes(item.status)).length} /><Metric label="最近导入" value={relativeTime(items[0]?.updated_at)} /></div>
-      <RecentItems items={items} empty="还没有上传文件。" />
+      <RecentItems items={items} empty="还没有上传文件。" onOpen={onOpenDoc} />
     </div>
   );
 }
 
-function WebCapturePanel({ source, onChanged }: { source: KnowledgeSource; onChanged: () => void | Promise<void> }) {
+function WebCapturePanel({ source, onChanged, onOpenDoc }: { source: KnowledgeSource; onChanged: () => void | Promise<void>; onOpenDoc: (item: ReadLaterItem) => void }) {
   const [url, setUrl] = useState("");
   const [saving, setSaving] = useState(false);
   const [items, setItems] = useState<ReadLaterItem[]>([]);
@@ -201,22 +204,30 @@ function WebCapturePanel({ source, onChanged }: { source: KnowledgeSource; onCha
       {notice ? <div className={`rounded-xl px-4 py-3 text-xs ${notice.includes("失败") || notice.includes("错误") ? "bg-red-50 text-red-700" : "bg-emerald-50 text-emerald-700"}`}>{notice}</div> : null}
       <div className="flex flex-wrap items-center justify-between gap-3"><div><h3 className="text-sm font-semibold text-gray-900">网页收藏</h3><p className="mt-1 text-xs text-gray-400">正文进入统一资料库，阅读状态仍保留。</p></div><div className="flex items-center gap-2"><label className="flex h-9 items-center gap-2 rounded-xl border border-black/[0.07] px-3"><Search className="h-3.5 w-3.5 text-gray-400" /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索收藏" className="w-28 bg-transparent text-xs outline-none" /></label><Link href="/knowledge/read-later" className="inline-flex h-9 items-center gap-1.5 rounded-xl bg-gray-100 px-3 text-xs font-semibold text-gray-600 hover:bg-gray-200">进入阅读器 <ExternalLink className="h-3.5 w-3.5" /></Link></div></div>
       <div className="overflow-hidden rounded-2xl border border-black/[0.06]">
-        {items.length ? items.slice(0, 8).map((item) => (
-          <div key={item.id} className="flex items-center gap-3 border-b border-black/[0.05] px-4 py-3 last:border-0"><span className="grid h-9 w-9 shrink-0 place-items-center rounded-xl bg-[#002fa7]/[0.055] text-[#002fa7]"><Globe2 className="h-4 w-4" /></span><span className="min-w-0 flex-1"><span className="block truncate text-sm font-medium text-gray-800">{item.title || item.original_url}</span><span className="mt-0.5 block truncate text-[10px] text-gray-400">{item.site_name || item.canonical_url} · {relativeTime(item.updated_at)}</span></span><span className={`rounded-full px-2 py-1 text-[10px] font-semibold ${item.parse_status === "ready" ? "bg-emerald-50 text-emerald-700" : item.parse_status === "failed" ? "bg-red-50 text-red-600" : "bg-amber-50 text-amber-700"}`}>{item.parse_status === "ready" ? "正文就绪" : item.parse_status === "failed" ? "解析失败" : "解析中"}</span></div>
-        )) : <div className="px-5 py-12 text-center text-xs text-gray-400">还没有网页收藏。</div>}
+        {items.length ? items.slice(0, 8).map((item) => {
+          const clickable = Boolean(item.document_id);
+          return (
+            <button type="button" key={item.id} disabled={!clickable} onClick={() => clickable && onOpenDoc(item)} className={`flex w-full items-center gap-3 border-b border-black/[0.05] px-4 py-3 text-left last:border-0 ${clickable ? "cursor-pointer transition hover:bg-[#002fa7]/[0.03]" : "cursor-default"}`}><span className="grid h-9 w-9 shrink-0 place-items-center rounded-xl bg-[#002fa7]/[0.055] text-[#002fa7]"><Globe2 className="h-4 w-4" /></span><span className="min-w-0 flex-1"><span className="block truncate text-sm font-medium text-gray-800">{item.title || item.original_url}</span><span className="mt-0.5 block truncate text-[10px] text-gray-400">{item.site_name || item.canonical_url} · {relativeTime(item.updated_at)}</span></span><span className={`rounded-full px-2 py-1 text-[10px] font-semibold ${item.parse_status === "ready" ? "bg-emerald-50 text-emerald-700" : item.parse_status === "failed" ? "bg-red-50 text-red-600" : "bg-amber-50 text-amber-700"}`}>{item.parse_status === "ready" ? "正文就绪" : item.parse_status === "failed" ? "解析失败" : "解析中"}</span></button>
+          );
+        }) : <div className="px-5 py-12 text-center text-xs text-gray-400">还没有网页收藏。</div>}
       </div>
       <div className="hidden">{source.item_count}</div>
     </div>
   );
 }
 
-function RecentItems({ items, empty }: { items: KnowledgeSourceItem[]; empty: string }) {
+function RecentItems({ items, empty, onOpen }: { items: KnowledgeSourceItem[]; empty: string; onOpen?: (item: KnowledgeSourceItem) => void }) {
   return (
-    <div><div className="mb-3 flex items-center justify-between"><h3 className="text-sm font-semibold text-gray-900">最近内容</h3><span className="text-[11px] text-gray-400">最近更新优先</span></div><div className="overflow-hidden rounded-2xl border border-black/[0.06]">{items.length ? items.slice(0, 8).map((item) => <div key={item.id} className="flex items-center gap-3 border-b border-black/[0.05] px-4 py-3 last:border-0"><span className="grid h-9 w-9 shrink-0 place-items-center rounded-xl bg-[#002fa7]/[0.05] text-[#002fa7]"><FileText className="h-4 w-4" /></span><span className="min-w-0 flex-1"><span className="block truncate text-sm font-medium text-gray-800">{item.title || item.external_id}</span><span className="mt-0.5 block truncate text-[10px] text-gray-400">{item.path?.join(" / ") || item.external_type} · {relativeTime(item.updated_at)}</span></span><span className="rounded-full bg-gray-100 px-2 py-1 text-[10px] font-semibold text-gray-600">{item.status}</span></div>) : <div className="px-5 py-12 text-center text-xs text-gray-400">{empty}</div>}</div></div>
+    <div><div className="mb-3 flex items-center justify-between"><h3 className="text-sm font-semibold text-gray-900">最近内容</h3><span className="text-[11px] text-gray-400">最近更新优先</span></div><div className="overflow-hidden rounded-2xl border border-black/[0.06]">{items.length ? items.slice(0, 8).map((item) => {
+      const clickable = Boolean(onOpen && item.document_id);
+      return (
+        <button type="button" key={item.id} disabled={!clickable} onClick={() => clickable && onOpen?.(item)} className={`flex w-full items-center gap-3 border-b border-black/[0.05] px-4 py-3 text-left last:border-0 ${clickable ? "cursor-pointer transition hover:bg-[#002fa7]/[0.03]" : "cursor-default"}`}><span className="grid h-9 w-9 shrink-0 place-items-center rounded-xl bg-[#002fa7]/[0.05] text-[#002fa7]"><FileText className="h-4 w-4" /></span><span className="min-w-0 flex-1"><span className="block truncate text-sm font-medium text-gray-800">{item.title || item.external_id}</span><span className="mt-0.5 block truncate text-[10px] text-gray-400">{item.path?.join(" / ") || item.external_type} · {relativeTime(item.updated_at)}</span></span><span className="rounded-full bg-gray-100 px-2 py-1 text-[10px] font-semibold text-gray-600">{item.status}</span></button>
+      );
+    }) : <div className="px-5 py-12 text-center text-xs text-gray-400">{empty}</div>}</div></div>
   );
 }
 
-function FeishuPanel({ source, items, runs, onChanged, onReconnect }: { source: KnowledgeSource; items: KnowledgeSourceItem[]; runs: KnowledgeSyncRun[]; onChanged: () => void | Promise<void>; onReconnect: () => void }) {
+function FeishuPanel({ source, items, runs, onChanged, onReconnect, onOpenDoc }: { source: KnowledgeSource; items: KnowledgeSourceItem[]; runs: KnowledgeSyncRun[]; onChanged: () => void | Promise<void>; onReconnect: () => void; onOpenDoc: (item: KnowledgeSourceItem) => void }) {
   const [busyMode, setBusyMode] = useState("");
   const [notice, setNotice] = useState("");
   const status = statusView(source.status);
@@ -259,7 +270,7 @@ function FeishuPanel({ source, items, runs, onChanged, onReconnect }: { source: 
       <div className="grid grid-cols-2 gap-3 lg:grid-cols-4"><Metric label="内容条目" value={source.item_count || items.length} /><Metric label="同步状态" value={lastRun ? statusView(lastRun.status).label : "尚未运行"} hint={lastRun?.current_step} /><Metric label="上次同步" value={relativeTime(source.last_synced_at)} /><Metric label="失败条目" value={lastRun?.stats.failed || 0} /></div>
       {lastRun ? <div className="grid grid-cols-2 gap-px overflow-hidden rounded-2xl border border-black/[0.06] bg-black/[0.06] sm:grid-cols-5">{[["发现", lastRun.stats.discovered || 0], ["更新", lastRun.stats.changed || 0], ["跳过", lastRun.stats.unchanged || 0], ["删除", lastRun.stats.deleted || 0], ["失败", lastRun.stats.failed || 0]].map(([label, value]) => <div key={String(label)} className="bg-white px-4 py-3"><div className="text-[10px] text-gray-400">{label}</div><div className="mt-1 text-base font-semibold text-gray-900">{value}</div></div>)}</div> : null}
       {source.last_error && Object.keys(source.last_error).length ? <div className="flex gap-3 rounded-2xl bg-red-50 p-4 text-xs leading-5 text-red-700"><AlertCircle className="mt-0.5 h-4 w-4 shrink-0" /><span>{String(source.last_error.message || source.last_error.detail || "最近一次同步出现错误。")}</span></div> : null}
-      <RecentItems items={items} empty="完成首次同步后，飞书文档会出现在这里。" />
+      <RecentItems items={items} empty="完成首次同步后，飞书文档会出现在这里。" onOpen={onOpenDoc} />
     </div>
   );
 }
@@ -268,6 +279,7 @@ export default function KnowledgeSourcesPage() {
   const { sidebarOpen, toggleSidebar, sidebarWidth, setSidebarWidth } = useApp();
   const [mounted, setMounted] = useState(false);
   const [sources, setSources] = useState<KnowledgeSource[]>([]);
+  const [documents, setDocuments] = useState<KnowledgeDocument[]>([]);
   const [selectedId, setSelectedId] = useState("");
   const [items, setItems] = useState<KnowledgeSourceItem[]>([]);
   const [runs, setRuns] = useState<KnowledgeSyncRun[]>([]);
@@ -276,14 +288,25 @@ export default function KnowledgeSourcesPage() {
   const [pickerOpen, setPickerOpen] = useState(false);
   const [reconnectSource, setReconnectSource] = useState<KnowledgeSource | null>(null);
   const [notice, setNotice] = useState("");
+  const [detail, setDetail] = useState<{ doc: KnowledgeDocument; kind: SourceKind; sourceName: string } | null>(null);
 
   useEffect(() => setMounted(true), []);
   const selected = useMemo(() => sources.find((source) => source.id === selectedId) || sources[0] || null, [selectedId, sources]);
+  const docById = useMemo(() => new Map(documents.map((doc) => [doc.id, doc])), [documents]);
+
+  const openDocument = useCallback((source: KnowledgeSource, documentId: string | null) => {
+    if (!documentId) return;
+    const doc = docById.get(documentId);
+    if (!doc) return;
+    const kind: SourceKind = source.connector_key === "feishu_wiki" ? "feishu" : source.connector_key === "web_capture" ? "web" : "local";
+    setDetail({ doc, kind, sourceName: source.name });
+  }, [docById]);
 
   const refreshSources = useCallback(async () => {
     try {
-      const next = await listKnowledgeSources();
+      const [next, nextDocuments] = await Promise.all([listKnowledgeSources(), listKnowledgeDocuments()]);
       setSources(next);
+      setDocuments(nextDocuments);
       setSelectedId((current) => next.some((source) => source.id === current) ? current : next[0]?.id || "");
       setNotice("");
     } catch (error) {
@@ -339,7 +362,7 @@ export default function KnowledgeSourcesPage() {
                 <SourceList sources={sources} selectedId={selected?.id || ""} onSelect={setSelectedId} onAdd={() => setPickerOpen(true)} />
                 <div className="min-w-0 rounded-3xl border border-black/[0.06] bg-white p-5 shadow-sm sm:p-6">
                   {selected && !selected.builtin ? <div className="mb-6 flex items-center gap-3 border-b border-black/[0.055] pb-5"><SourceMark kind={selected.connector_key} /><div className="min-w-0"><h2 className="truncate text-lg font-semibold tracking-tight text-gray-950">{selected.name}</h2><div className="mt-1 flex items-center gap-2 text-[11px] text-gray-400"><span>可同步 Connector</span><span>·</span><span>{selected.item_count || 0} 项</span></div></div></div> : null}
-                  {!selected ? <div className="grid min-h-[300px] place-items-center text-sm text-gray-400"><div className="text-center"><Unplug className="mx-auto mb-3 h-7 w-7" />还没有资料来源</div></div> : selected.connector_key === "local_upload" ? <LocalUploadPanel source={selected} items={items} onChanged={changed} /> : selected.connector_key === "web_capture" ? <WebCapturePanel source={selected} onChanged={changed} /> : <FeishuPanel source={selected} items={items} runs={runs} onChanged={changed} onReconnect={() => { setReconnectSource(selected); setWizardOpen(true); }} />}
+                  {!selected ? <div className="grid min-h-[300px] place-items-center text-sm text-gray-400"><div className="text-center"><Unplug className="mx-auto mb-3 h-7 w-7" />还没有资料来源</div></div> : selected.connector_key === "local_upload" ? <LocalUploadPanel source={selected} items={items} onChanged={changed} onOpenDoc={(item) => openDocument(selected, item.document_id)} /> : selected.connector_key === "web_capture" ? <WebCapturePanel source={selected} onChanged={changed} onOpenDoc={(item) => openDocument(selected, item.document_id)} /> : <FeishuPanel source={selected} items={items} runs={runs} onChanged={changed} onReconnect={() => { setReconnectSource(selected); setWizardOpen(true); }} onOpenDoc={(item) => openDocument(selected, item.document_id)} />}
                 </div>
               </section>
             )}
@@ -348,6 +371,7 @@ export default function KnowledgeSourcesPage() {
       </div>
       <ConnectorPicker open={pickerOpen} onClose={() => setPickerOpen(false)} onPickFeishu={() => { setPickerOpen(false); setReconnectSource(null); setWizardOpen(true); }} />
       <FeishuConnectionWizard open={wizardOpen} existingSource={reconnectSource} onClose={() => setWizardOpen(false)} onConnected={async (next) => { await refreshSources(); setSelectedId(next.id); }} />
+      {detail ? <DocumentDetailModal doc={detail.doc} kind={detail.kind} sourceName={detail.sourceName} onClose={() => setDetail(null)} /> : null}
     </div>
   );
 }
