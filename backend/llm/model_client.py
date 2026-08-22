@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 import time
 import uuid
 from typing import Any
@@ -18,7 +19,7 @@ from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResu
 from langchain_core.runnables.config import var_child_runnable_config
 from langgraph.config import get_stream_writer
 
-from config import get_fallback_llm_config
+from config import get_fallback_llm_config, load_config
 from llm.thinking_mapping import normalize_model_temperature
 
 logger = logging.getLogger(__name__)
@@ -53,12 +54,24 @@ def _retryable_stream_error(exc: Exception) -> bool:
 
     if isinstance(exc, (ConnectionResetError, ConnectionAbortedError, TimeoutError)):
         return True
+    status_code = getattr(exc, "status_code", None)
+    if status_code is None:
+        response = getattr(exc, "response", None)
+        status_code = getattr(response, "status_code", None)
+    if isinstance(status_code, int) and (
+        status_code in {408, 409, 429} or 500 <= status_code <= 599
+    ):
+        return True
     class_names = {cls.__name__ for cls in type(exc).__mro__}
     if class_names.intersection(
         {
+            "APIConnectionError",
+            "APITimeoutError",
             "ConnectError",
             "ConnectionError",
+            "InternalServerError",
             "NetworkError",
+            "RateLimitError",
             "ReadError",
             "ReadTimeout",
             "RemoteProtocolError",
@@ -70,8 +83,10 @@ def _retryable_stream_error(exc: Exception) -> bool:
         marker in text
         for marker in (
             "connection reset",
+            "connection error",
             "incomplete chunked read",
             "peer closed connection",
+            "request timed out",
             "server disconnected",
         )
     )
@@ -82,6 +97,43 @@ def _emit_model_stream_event(payload: dict[str, Any]) -> None:
         get_stream_writer()(payload)
     except (KeyError, RuntimeError):
         return
+
+
+def _model_transport_retry_policy() -> tuple[int, float, float]:
+    """Return the PuddingClaw-owned pre-first-chunk retry policy."""
+
+    try:
+        retry = (
+            load_config()
+            .get("harness", {})
+            .get("model_resilience", {})
+            .get("transport_retry", {})
+        )
+    except Exception:
+        retry = {}
+    if not isinstance(retry, dict) or retry.get("enabled", True) is False:
+        return 1, 0.0, 0.0
+    max_attempts = retry.get("max_attempts", 2)
+    initial_delay = retry.get("initial_delay_seconds", 0.25)
+    max_delay = retry.get("max_delay_seconds", 2.0)
+    if not isinstance(max_attempts, int) or isinstance(max_attempts, bool):
+        max_attempts = 2
+    if not isinstance(initial_delay, (int, float)) or isinstance(initial_delay, bool):
+        initial_delay = 0.25
+    if not isinstance(max_delay, (int, float)) or isinstance(max_delay, bool):
+        max_delay = 2.0
+    return (
+        max(1, min(5, max_attempts)),
+        max(0.0, min(10.0, float(initial_delay))),
+        max(0.0, min(60.0, float(max_delay))),
+    )
+
+
+def _model_transport_retry_delay(attempt: int, initial_delay: float, max_delay: float) -> float:
+    """Exponential backoff with bounded jitter to avoid synchronized retries."""
+
+    base = min(max_delay, initial_delay * (2 ** max(0, attempt - 1)))
+    return base * random.uniform(0.75, 1.0) if base > 0 else 0.0
 
 
 def _usage_value(usage: dict[str, Any], *path: str) -> int:
@@ -387,6 +439,9 @@ class ModelClient:
             temperature=self.temperature,
             streaming=self.streaming,
             stream_usage=True,
+            # PuddingClaw owns the observable retry boundary.  Disabling the
+            # SDK retry prevents max_attempts from multiplying hidden requests.
+            max_retries=0,
             **thinking_kwargs,
         )
 
@@ -410,6 +465,8 @@ class ModelClient:
             temperature=self.temperature,
             streaming=self.streaming,
             stream_usage=True,
+            # Keep one retry authority so UI limits map to actual requests.
+            max_retries=0,
             **thinking_kwargs,
         )
 
@@ -510,7 +567,7 @@ class ModelClient:
         start = time.perf_counter()
         generation_started_at: float | None = None
         route = "direct"
-        max_attempts = 2
+        max_attempts, initial_retry_delay, max_retry_delay = _model_transport_retry_policy()
         for attempt in range(1, max_attempts + 1):
             emitted_chunks = 0
             attempt_usage: dict[str, Any] = {}
@@ -553,6 +610,11 @@ class ModelClient:
                     and attempt < max_attempts
                     and retryable
                 )
+                retry_delay = (
+                    _model_transport_retry_delay(attempt, initial_retry_delay, max_retry_delay)
+                    if can_retry
+                    else None
+                )
                 _emit_model_stream_event(
                     {
                         "type": "model_transport_interrupted",
@@ -565,6 +627,7 @@ class ModelClient:
                         "chunks_emitted": emitted_chunks,
                         "error_class": exc.__class__.__name__,
                         "retryable": retryable,
+                        "retry_delay_seconds": retry_delay,
                         "next_action": (
                             "retry_same_model_node"
                             if can_retry
@@ -582,7 +645,7 @@ class ModelClient:
                         emitted_chunks,
                         exc_info=True,
                     )
-                    await asyncio.sleep(0.25 * (2 ** (attempt - 1)))
+                    await asyncio.sleep(float(retry_delay or 0.0))
                     continue
                 if retryable:
                     raise ModelTransportInterruptedError(
@@ -652,7 +715,7 @@ class ModelClient:
         start = time.perf_counter()
         generation_started_at: float | None = None
         route = "direct"
-        max_attempts = 2
+        max_attempts, initial_retry_delay, max_retry_delay = _model_transport_retry_policy()
         for attempt in range(1, max_attempts + 1):
             emitted_chunks = 0
             attempt_usage: dict[str, Any] = {}
@@ -691,6 +754,11 @@ class ModelClient:
                     and attempt < max_attempts
                     and retryable
                 )
+                retry_delay = (
+                    _model_transport_retry_delay(attempt, initial_retry_delay, max_retry_delay)
+                    if can_retry
+                    else None
+                )
                 _emit_model_stream_event(
                     {
                         "type": "model_transport_interrupted",
@@ -703,6 +771,7 @@ class ModelClient:
                         "chunks_emitted": emitted_chunks,
                         "error_class": exc.__class__.__name__,
                         "retryable": retryable,
+                        "retry_delay_seconds": retry_delay,
                         "next_action": (
                             "retry_same_model_node"
                             if can_retry
@@ -720,7 +789,7 @@ class ModelClient:
                         emitted_chunks,
                         exc_info=True,
                     )
-                    time.sleep(0.25 * (2 ** (attempt - 1)))
+                    time.sleep(float(retry_delay or 0.0))
                     continue
                 if retryable:
                     raise ModelTransportInterruptedError(

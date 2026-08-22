@@ -2048,7 +2048,7 @@ def test_product_execution_modes_do_not_implicitly_construct_managed_cli_service
     assert pipeline.managed_cli_service is None
 
 
-def test_managed_cli_credentials_and_network_require_bound_approval(tmp_path):
+def test_managed_cli_provider_network_does_not_repeat_harness_approval(tmp_path):
     pipeline = ToolExecutionPipeline(
         known_tools={"execute"},
         backend_mode="spawn",
@@ -2069,10 +2069,30 @@ def test_managed_cli_credentials_and_network_require_bound_approval(tmp_path):
         managed_cli=match,
     )
 
-    assert result.decision == PolicyDecision.ASK
-    assert result.reason == "managed_cli_credential_network_authorization"
+    assert result.decision == PolicyDecision.ALLOW
+    assert result.reason == "managed_cli_personal_autonomy"
     assert "network_access" in capabilities
     assert "credential_profile:sha256:credential-profile" in capabilities
+
+
+def test_host_lark_install_uses_a_host_global_approval_contract():
+    plan = SimpleNamespace(
+        match=SimpleNamespace(
+            adapter_id="lark-cli",
+            route=SimpleNamespace(value="installer"),
+            requires_profile=False,
+            requires_network=True,
+            credential_state=None,
+            workspace_writable=False,
+            destructive=False,
+        )
+    )
+
+    result = ToolExecutionPipeline._managed_cli_preflight(plan)
+
+    assert result.decision == PolicyDecision.ASK
+    assert result.reason == "managed_cli_host_install"
+    assert result.explanation == "安装或更新用户级全局飞书 CLI 需要确认。"
 
 
 def test_kernel_mode_selects_kernel_backend_without_docker_probe(tmp_path, monkeypatch):

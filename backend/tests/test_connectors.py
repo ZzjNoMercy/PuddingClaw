@@ -175,6 +175,15 @@ def _install_fake_lark(paths: PuddingClawPaths, runtime_contract: str = "test") 
     _install_adapter(paths, ManagedCliRegistry(), "lark-cli", "1.0.78", runtime_contract)
 
 
+def _global_lark(tmp_path, monkeypatch, version: str = "1.0.78"):
+    executable = tmp_path / "global-bin" / "lark-cli"
+    executable.parent.mkdir(parents=True, exist_ok=True)
+    executable.write_text(f"#!/bin/sh\necho 'lark-cli version {version}'\n", encoding="utf-8")
+    executable.chmod(0o755)
+    monkeypatch.setenv("PUDDINGCLAW_LARK_CLI_PATH", str(executable))
+    return executable
+
+
 def test_application_registers_connector_routes():
     from app import app
 
@@ -189,9 +198,9 @@ def test_application_registers_connector_routes():
     assert "/api/toolchains/{adapter_id}/rollback/commit" in paths
 
 
-def test_connector_catalog_does_not_create_profile_when_only_viewed(tmp_path):
+def test_connector_catalog_does_not_create_profile_when_only_viewed(tmp_path, monkeypatch):
     paths = PuddingClawPaths(tmp_path / ".puddingclaw")
-    _install_fake_lark(paths)
+    executable = _global_lark(tmp_path, monkeypatch)
 
     connector = ConnectorRegistry(
         paths,
@@ -204,6 +213,8 @@ def test_connector_catalog_does_not_create_profile_when_only_viewed(tmp_path):
     assert connector["environment"]["health"] == "available"
     assert connector["environment"]["version"] == "1.0.78"
     assert connector["environment"]["availability_scope"] == "all_projects"
+    assert connector["environment"]["executable"] == str(executable.resolve())
+    assert connector["environment"]["state_model"] == "provider_native_profile_dirs"
     assert connector["driver_kind"] == "managed_cli"
     assert connector["profile"] is None
     assert CredentialProfileStore(paths, "local").resolve("lark", create_default=False) is None
@@ -294,8 +305,9 @@ def test_connector_counts_effective_home_skills(tmp_path):
     assert connector._installed_skill_count(connector.definitions["fixture"]) == 1
 
 
-def test_connector_catalog_ignores_obsolete_per_adapter_release(tmp_path):
+def test_connector_catalog_ignores_obsolete_per_adapter_release(tmp_path, monkeypatch):
     paths = PuddingClawPaths(tmp_path / ".puddingclaw")
+    _global_lark(tmp_path, monkeypatch)
     root = paths.root / "runtime" / "toolchains" / "node" / "obsolete" / "adapters" / "lark-cli"
     release = root / "releases" / "release-forged"
     executable = release / "bin" / "lark-cli"
@@ -311,13 +323,15 @@ def test_connector_catalog_ignores_obsolete_per_adapter_release(tmp_path):
 
     connector = ConnectorRegistry(paths, "test", owner_user_id="local").get("lark")
 
-    assert connector["status"] == "repair_required"
-    assert connector["environment"]["health"] == "repair_required"
-    assert connector["environment"]["version"] is None
+    assert connector["status"] == "unconfigured"
+    assert connector["environment"]["health"] == "available"
+    assert connector["environment"]["version"] == "1.0.78"
 
 
-def test_connector_catalog_treats_empty_toolchain_as_not_installed(tmp_path):
+def test_connector_catalog_treats_empty_toolchain_as_not_installed(tmp_path, monkeypatch):
     paths = PuddingClawPaths(tmp_path / ".puddingclaw")
+    missing = tmp_path / "missing" / "lark-cli"
+    monkeypatch.setenv("PUDDINGCLAW_LARK_CLI_PATH", str(missing))
     ToolchainManager(paths, "test").resolve_node("lark-cli")
 
     connector = ConnectorRegistry(
@@ -331,9 +345,9 @@ def test_connector_catalog_treats_empty_toolchain_as_not_installed(tmp_path):
     assert connector["environment"]["health"] == "unavailable"
 
 
-def test_connector_catalog_marks_runtime_image_drift_for_repair(tmp_path):
+def test_connector_catalog_ignores_managed_runtime_image_for_host_cli(tmp_path, monkeypatch):
     paths = PuddingClawPaths(tmp_path / ".puddingclaw")
-    _install_fake_lark(paths)
+    _global_lark(tmp_path, monkeypatch)
 
     connector = ConnectorRegistry(
         paths,
@@ -342,8 +356,8 @@ def test_connector_catalog_marks_runtime_image_drift_for_repair(tmp_path):
         runtime_image_digest="sha256:" + "2" * 64,
     ).get("lark")
 
-    assert connector["status"] == "repair_required"
-    assert connector["environment"]["health"] == "repair_required"
+    assert connector["status"] == "unconfigured"
+    assert connector["environment"]["health"] == "available"
 
 
 def test_connector_catalog_rejects_cross_driver_connector_id_collision(tmp_path):

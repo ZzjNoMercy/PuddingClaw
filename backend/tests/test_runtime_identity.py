@@ -78,6 +78,24 @@ from runtime_identity.service import (
 )
 from runtime_identity.toolchains import ToolchainManager
 
+_OBSOLETE_LARK_ARCHIVE_TEST = pytest.mark.skip(
+    reason="lark-cli now owns tokens in its native keychain; Profile Vault archive staging was removed"
+)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_host_lark_cli(tmp_path, monkeypatch):
+    """Keep host-native CLI plans hermetic and writable in legacy service tests."""
+
+    executable = tmp_path / "bin" / "lark-cli"
+    executable.parent.mkdir(parents=True, exist_ok=True)
+    executable.write_text(
+        "#!/bin/sh\necho 'lark-cli version 1.0.77'\n",
+        encoding="utf-8",
+    )
+    executable.chmod(0o755)
+    monkeypatch.setenv("PUDDINGCLAW_LARK_CLI_PATH", str(executable))
+
 
 def test_managed_cli_control_plane_is_constructed_lazily_once():
     calls: list[str] = []
@@ -748,18 +766,18 @@ def test_profile_resolution_is_explicit_then_project_then_default(tmp_path):
 def test_profile_vault_freezes_credential_state_fingerprint(tmp_path):
     paths = PuddingClawPaths(tmp_path / ".puddingclaw")
     store = CredentialProfileStore(paths, "owner", vault=CredentialVault(b"a" * 32))
-    profile = store.resolve("lark")
+    profile = store.resolve("fixture")
     assert profile is not None
     archive = _credential_archive()
     store.write_state(
-        "lark",
+        "fixture",
         profile["profile_id"],
         archive,
         credential_state=_LARK_STATE,
     )
     assert (
         store.read_state(
-            "lark",
+            "fixture",
             profile["profile_id"],
             credential_state=_LARK_STATE,
         )
@@ -773,7 +791,7 @@ def test_profile_vault_freezes_credential_state_fingerprint(tmp_path):
     )
     with pytest.raises(ValueError, match="state contract"):
         store.read_state(
-            "lark",
+            "fixture",
             profile["profile_id"],
             credential_state=changed,
         )
@@ -782,18 +800,18 @@ def test_profile_vault_freezes_credential_state_fingerprint(tmp_path):
 def test_profile_vault_writeback_uses_state_revision_cas(tmp_path):
     paths = PuddingClawPaths(tmp_path / ".puddingclaw")
     store = CredentialProfileStore(paths, "owner", vault=CredentialVault(b"a" * 32))
-    profile = store.resolve("lark")
+    profile = store.resolve("fixture")
     assert profile is not None
     first = _credential_archive(b'{"token":"first"}')
     competing = _credential_archive(b'{"token":"competing"}')
     rotated = _credential_archive(b'{"token":"rotated"}')
-    store.write_state("lark", profile["profile_id"], first, credential_state=_LARK_STATE)
-    frozen_revision = store.state_revision("lark", profile["profile_id"])
-    store.write_state("lark", profile["profile_id"], competing, credential_state=_LARK_STATE)
+    store.write_state("fixture", profile["profile_id"], first, credential_state=_LARK_STATE)
+    frozen_revision = store.state_revision("fixture", profile["profile_id"])
+    store.write_state("fixture", profile["profile_id"], competing, credential_state=_LARK_STATE)
 
     assert (
         store.write_state_if_revision(
-            "lark",
+            "fixture",
             profile["profile_id"],
             rotated,
             expected_revision=frozen_revision,
@@ -801,29 +819,29 @@ def test_profile_vault_writeback_uses_state_revision_cas(tmp_path):
         )
         is None
     )
-    assert store.read_state("lark", profile["profile_id"], credential_state=_LARK_STATE) == competing
+    assert store.read_state("fixture", profile["profile_id"], credential_state=_LARK_STATE) == competing
 
-    current_revision = store.state_revision("lark", profile["profile_id"])
+    current_revision = store.state_revision("fixture", profile["profile_id"])
     committed = store.write_state_if_revision(
-        "lark",
+        "fixture",
         profile["profile_id"],
         rotated,
         expected_revision=current_revision,
         credential_state=_LARK_STATE,
     )
-    assert committed == store.state_revision("lark", profile["profile_id"])
-    assert store.read_state("lark", profile["profile_id"], credential_state=_LARK_STATE) == rotated
+    assert committed == store.state_revision("fixture", profile["profile_id"])
+    assert store.read_state("fixture", profile["profile_id"], credential_state=_LARK_STATE) == rotated
 
 
 def test_profile_vault_metadata_failure_does_not_cross_token_commit_point(tmp_path, monkeypatch):
     paths = PuddingClawPaths(tmp_path / ".puddingclaw")
     store = CredentialProfileStore(paths, "owner", vault=CredentialVault(b"a" * 32))
-    profile = store.resolve("lark")
+    profile = store.resolve("fixture")
     assert profile is not None
     initial = _credential_archive(b'{"token":"initial"}')
     rotated = _credential_archive(b'{"token":"rotated"}')
-    store.write_state("lark", profile["profile_id"], initial, credential_state=_LARK_STATE)
-    frozen_revision = store.state_revision("lark", profile["profile_id"])
+    store.write_state("fixture", profile["profile_id"], initial, credential_state=_LARK_STATE)
+    frozen_revision = store.state_revision("fixture", profile["profile_id"])
     monkeypatch.setattr(
         store,
         "_write_json",
@@ -832,15 +850,15 @@ def test_profile_vault_metadata_failure_does_not_cross_token_commit_point(tmp_pa
 
     with pytest.raises(OSError, match="metadata volume unavailable"):
         store.write_state_if_revision(
-            "lark",
+            "fixture",
             profile["profile_id"],
             rotated,
             expected_revision=frozen_revision,
             credential_state=_LARK_STATE,
         )
 
-    assert store.state_revision("lark", profile["profile_id"]) == frozen_revision
-    assert store.read_state("lark", profile["profile_id"], credential_state=_LARK_STATE) == initial
+    assert store.state_revision("fixture", profile["profile_id"]) == frozen_revision
+    assert store.read_state("fixture", profile["profile_id"], credential_state=_LARK_STATE) == initial
 
 
 def test_authorization_driver_registry_is_frozen_and_rejects_ambiguity():
@@ -1090,7 +1108,7 @@ def test_authorization_resume_rejects_stale_contract_or_unknown_graph_path(
     result = service.execute(service.plan(resume_match, {}), {})
 
     assert result.payload["error"] == "authorization_flow_missing"
-    assert store.read_state("lark", plan.profile_id, credential_state=_LARK_STATE) == original_state
+    assert store.read_state_metadata("lark", plan.profile_id)["state_model"] == "provider_native_profile_dirs"
     cancelled = next(item for item in flow_store._read_registry()["flows"] if item["flow_id"] == active["flow_id"])
     assert cancelled["status"] == "cancelled"
     assert cancelled["cancel_reason"] == cancel_reason
@@ -1148,6 +1166,7 @@ def test_toolchain_install_switches_atomically_and_failure_keeps_current(tmp_pat
 
 def test_missing_managed_cli_returns_trusted_installer_command(tmp_path, monkeypatch):
     monkeypatch.setenv("PUDDINGCLAW_OWNER_USER_ID", "trusted_owner")
+    monkeypatch.setenv("PUDDINGCLAW_LARK_CLI_PATH", str(tmp_path / "missing" / "lark-cli"))
 
     class Backend(_RuntimeImageBackend):
         manager = SimpleNamespace(runtime_contract="test-runtime")
@@ -1934,6 +1953,7 @@ def test_config_init_can_transactionally_repair_existing_shared_profile(tmp_path
     assert repaired.profile_id == first.profile_id
 
 
+@_OBSOLETE_LARK_ARCHIVE_TEST
 def test_config_init_can_repair_a_legacy_vault_contract(tmp_path, monkeypatch):
     monkeypatch.setenv("PUDDINGCLAW_OWNER_USER_ID", "trusted_owner")
     paths = PuddingClawPaths(tmp_path / ".puddingclaw")
@@ -1991,6 +2011,7 @@ def test_provider_rechecks_profile_revision_inside_profile_lock(tmp_path, monkey
     assert result.payload["error"] == "managed_plan_stale"
 
 
+@_OBSOLETE_LARK_ARCHIVE_TEST
 def test_provider_rotation_writeback_rejects_concurrent_vault_change(tmp_path, monkeypatch):
     monkeypatch.setenv("PUDDINGCLAW_OWNER_USER_ID", "trusted_owner")
     paths = PuddingClawPaths(tmp_path / ".puddingclaw")
@@ -2083,17 +2104,10 @@ def test_successful_user_operation_marks_auto_refreshed_identity_valid(tmp_path,
         "token_status": "valid",
         "updated_at": refreshed["identities"]["user"]["updated_at"],
     }
-    assert store.read_state("lark", profile["profile_id"], credential_state=_LARK_STATE) == rotated
+    assert store.read_state_metadata("lark", profile["profile_id"])["state_model"] == "provider_native_profile_dirs"
 
 
-@pytest.mark.parametrize(
-    "command",
-    (
-        "lark-cli im send --data '{}'",
-        "lark-cli config init --new",
-    ),
-)
-def test_managed_provider_and_browser_reject_runtime_image_drift(tmp_path, monkeypatch, command):
+def test_host_lark_cli_is_not_bound_to_managed_runtime_image(tmp_path, monkeypatch):
     monkeypatch.setenv("PUDDINGCLAW_OWNER_USER_ID", "trusted_owner")
     paths = PuddingClawPaths(tmp_path / ".puddingclaw")
 
@@ -2107,14 +2121,11 @@ def test_managed_provider_and_browser_reject_runtime_image_drift(tmp_path, monke
             return self.image_digest
 
         def run_managed_provider_cli(self, **_kwargs):
-            raise AssertionError("provider runner must not receive credentials after image drift")
-
-        def run_managed_browser_auth_cli(self, **_kwargs):
-            raise AssertionError("browser runner must not start after image drift")
+            return ManagedProviderExecutionResult('{"ok":true}', 0, None)
 
     backend = Backend()
     service = ManagedCliService(backend, paths=paths)
-    match = ManagedCliRegistry().match(command)
+    match = ManagedCliRegistry().match("lark-cli im send --data '{}'")
     plan = service.plan(match, {})
     executable = plan.toolchain_path / "bin" / "lark-cli"
     executable.parent.mkdir(parents=True, exist_ok=True)
@@ -2123,7 +2134,7 @@ def test_managed_provider_and_browser_reject_runtime_image_drift(tmp_path, monke
 
     result = service.execute(plan, {})
 
-    assert result.payload["error"] == "managed_runtime_image_changed"
+    assert result.payload["status"] == "completed"
 
 
 def test_redaction_removes_common_secret_shapes():
@@ -2565,9 +2576,8 @@ async def test_pipeline_keeps_browser_material_in_ui_artifact_not_model_tool_con
         backend_mode="docker",
         managed_cli_service=Service(),
     )
-    # The service contract is the subject here. Bypass the separate
-    # credential+network approval gate so this unit test does not need a
-    # LangGraph interrupt runtime.
+    # The service contract is the subject here. Freeze the preflight result so
+    # this unit test stays independent from policy classification details.
     monkeypatch.setattr(
         pipeline,
         "_managed_cli_preflight",
@@ -2586,16 +2596,17 @@ async def test_pipeline_keeps_browser_material_in_ui_artifact_not_model_tool_con
 @pytest.mark.parametrize(
     ("command", "decision"),
     [
-        ("lark-cli im send --data '{}'", PolicyDecision.ASK),
-        ("lark-cli doc create --data '{}'", PolicyDecision.ASK),
-        ("lark-cli base update --data '{}'", PolicyDecision.ASK),
-        ("lark-cli drive upload --file report.md", PolicyDecision.ASK),
-        ("lark-cli drive permissions update --data '{}'", PolicyDecision.ASK),
+        ("lark-cli auth status --json --verify", PolicyDecision.ALLOW),
+        ("lark-cli im send --data '{}'", PolicyDecision.ALLOW),
+        ("lark-cli doc create --data '{}'", PolicyDecision.ALLOW),
+        ("lark-cli base update --data '{}'", PolicyDecision.ALLOW),
+        ("lark-cli drive upload --file report.md", PolicyDecision.ALLOW),
+        ("lark-cli drive permissions update --data '{}'", PolicyDecision.ALLOW),
         ("lark-cli drive files delete --token abc", PolicyDecision.ASK),
         ("npm install -g @larksuite/cli", PolicyDecision.ASK),
     ],
 )
-def test_managed_lark_policy_requires_smart_approval_for_credentialed_network(command, decision):
+def test_managed_lark_policy_gates_effects_not_credentialed_network(command, decision):
     match = ManagedCliRegistry().match(command)
     result = ToolExecutionPipeline._managed_cli_preflight(SimpleNamespace(match=match))
     assert result.decision == decision
@@ -2849,7 +2860,7 @@ def test_orphaned_app_configuration_flow_expires_before_provider_status(tmp_path
     record = next(item for item in flow_store._read_registry()["flows"] if item["flow_id"] == orphan["flow_id"])
     assert record["status"] == "expired"
     assert record["error"] == "browser_job_missing"
-    assert store.read_state("lark", profile["profile_id"], credential_state=_LARK_STATE) == old_state
+    assert store.read_state_metadata("lark", profile["profile_id"])["state_model"] == "provider_native_profile_dirs"
 
 
 def test_missing_browser_runner_terminalizes_flow_and_continues_provider_status(tmp_path, monkeypatch):
@@ -2920,6 +2931,7 @@ def test_missing_browser_runner_terminalizes_flow_and_continues_provider_status(
     assert current["last_browser_job_status"] == "expired"
 
 
+@_OBSOLETE_LARK_ARCHIVE_TEST
 def test_provider_read_cannot_commit_phase_one_candidate_or_invalidate_flow(tmp_path, monkeypatch):
     """Regression: config show used to overwrite the durable Vault mid-flow."""
 
@@ -3373,6 +3385,7 @@ def test_flow_recovery_resets_user_attempt_when_continuation_is_missing(tmp_path
     assert flow_store.read_staged_state(recovered) == staged
 
 
+@_OBSOLETE_LARK_ARCHIVE_TEST
 def test_lark_two_phase_flow_stages_then_atomically_commits_without_leaking_device_code(
     tmp_path,
     monkeypatch,
@@ -3574,6 +3587,7 @@ def test_resume_without_active_flow_never_uses_old_valid_token_as_success(tmp_pa
     assert backend.calls == []
 
 
+@_OBSOLETE_LARK_ARCHIVE_TEST
 def test_invalid_resume_resets_only_user_attempt_without_damaging_profile_or_step_one(
     tmp_path,
     monkeypatch,
@@ -3667,6 +3681,7 @@ def test_invalid_resume_resets_only_user_attempt_without_damaging_profile_or_ste
     assert flow_store.read_staged_state(active) == staged_state
 
 
+@_OBSOLETE_LARK_ARCHIVE_TEST
 def test_nonzero_resume_with_independently_verified_candidate_commits(tmp_path, monkeypatch):
     monkeypatch.setenv("PUDDINGCLAW_OWNER_USER_ID", "trusted_owner")
     paths = PuddingClawPaths(tmp_path / ".puddingclaw")
@@ -3735,6 +3750,7 @@ def test_nonzero_resume_with_independently_verified_candidate_commits(tmp_path, 
     assert sum(call["argv"] == ["lark-cli", "auth", "login"] for call in backend.calls) == 1
 
 
+@_OBSOLETE_LARK_ARCHIVE_TEST
 def test_unknown_resume_failure_preserves_same_attempt_and_step_one(tmp_path, monkeypatch):
     monkeypatch.setenv("PUDDINGCLAW_OWNER_USER_ID", "trusted_owner")
     paths = PuddingClawPaths(tmp_path / ".puddingclaw")
@@ -3780,6 +3796,7 @@ def test_unknown_resume_failure_preserves_same_attempt_and_step_one(tmp_path, mo
     assert store.read_state("lark", plan.profile_id, credential_state=_LARK_STATE) == old_state
 
 
+@_OBSOLETE_LARK_ARCHIVE_TEST
 def test_pending_resume_with_exported_baseline_does_not_reset_attempt(tmp_path, monkeypatch):
     monkeypatch.setenv("PUDDINGCLAW_OWNER_USER_ID", "trusted_owner")
     paths = PuddingClawPaths(tmp_path / ".puddingclaw")
@@ -3895,6 +3912,7 @@ def test_candidate_state_is_cryptographically_bound_to_one_attempt(tmp_path, mon
     assert flow_store.read_secret(renewed)["device_code"] == "NEW-DEVICE"
 
 
+@_OBSOLETE_LARK_ARCHIVE_TEST
 def test_verifying_recovery_rebinds_digest_after_crash_between_state_and_manifest(
     tmp_path,
     monkeypatch,
@@ -3964,6 +3982,7 @@ def test_verifying_recovery_rebinds_digest_after_crash_between_state_and_manifes
     assert store.read_state("lark", plan.profile_id, credential_state=_LARK_STATE) == refreshed_candidate
 
 
+@_OBSOLETE_LARK_ARCHIVE_TEST
 def test_candidate_verify_transient_failure_is_recoverable_without_reusing_device_code(
     tmp_path,
     monkeypatch,
@@ -4040,6 +4059,7 @@ def test_candidate_verify_transient_failure_is_recoverable_without_reusing_devic
     assert store.read_state("lark", plan.profile_id, credential_state=_LARK_STATE) == candidate_state
 
 
+@_OBSOLETE_LARK_ARCHIVE_TEST
 def test_explicit_user_reauthorization_clears_only_staged_old_login(tmp_path, monkeypatch):
     monkeypatch.setenv("PUDDINGCLAW_OWNER_USER_ID", "trusted_owner")
     paths = PuddingClawPaths(tmp_path / ".puddingclaw")
@@ -4150,6 +4170,7 @@ def test_explicit_user_reauthorization_clears_only_staged_old_login(tmp_path, mo
     assert logout["network_enabled"] is False
 
 
+@_OBSOLETE_LARK_ARCHIVE_TEST
 def test_user_reauthorization_supersedes_incomplete_accidental_full_setup(tmp_path, monkeypatch):
     monkeypatch.setenv("PUDDINGCLAW_OWNER_USER_ID", "trusted_owner")
     paths = PuddingClawPaths(tmp_path / ".puddingclaw")
@@ -4239,6 +4260,7 @@ def test_user_reauthorization_supersedes_incomplete_accidental_full_setup(tmp_pa
     assert store.read_state("lark", plan.profile_id, credential_state=_LARK_STATE) == old_state
 
 
+@_OBSOLETE_LARK_ARCHIVE_TEST
 def test_full_replacement_supersedes_user_flow_without_deleting_old_vault(tmp_path, monkeypatch):
     monkeypatch.setenv("PUDDINGCLAW_OWNER_USER_ID", "trusted_owner")
     paths = PuddingClawPaths(tmp_path / ".puddingclaw")
@@ -4308,6 +4330,7 @@ def test_full_replacement_supersedes_user_flow_without_deleting_old_vault(tmp_pa
     assert current["browser_job_id"] == browser_job_id
 
 
+@_OBSOLETE_LARK_ARCHIVE_TEST
 def test_full_replacement_supersedes_same_purpose_flow_with_stale_base(tmp_path, monkeypatch):
     monkeypatch.setenv("PUDDINGCLAW_OWNER_USER_ID", "trusted_owner")
     paths = PuddingClawPaths(tmp_path / ".puddingclaw")
@@ -4483,6 +4506,7 @@ def test_confirmed_profile_revoke_stops_active_browser_runner_before_remove(tmp_
     assert profile["status"] == "revoked"
 
 
+@_OBSOLETE_LARK_ARCHIVE_TEST
 def test_user_token_expiry_pauses_provider_command_and_starts_user_consent(tmp_path, monkeypatch):
     monkeypatch.setenv("PUDDINGCLAW_OWNER_USER_ID", "trusted_owner")
     paths = PuddingClawPaths(tmp_path / ".puddingclaw")

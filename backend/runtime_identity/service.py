@@ -6,6 +6,7 @@ import hashlib
 import json
 import re
 import shlex
+import subprocess
 import threading
 import time
 import uuid
@@ -534,8 +535,51 @@ class ManagedCliExecutionPlan:
     toolchain_lease_id: str = ""
     toolchain_lease_expires_at: float = 0
     profile_state_revision: str = ""
+    executable_path: Path | None = None
 
     def approval_preview(self) -> str:
+        if self.match.adapter_id == "lark-cli" and self.match.route == ManagedCliRoute.INSTALLER:
+            return json.dumps(
+                {
+                    "adapter_id": self.match.adapter_id,
+                    "action": self.match.action.value,
+                    "route": self.match.route.value,
+                    "installation_scope": "host_user_global",
+                    "requested_distribution": self.match.distribution,
+                    "resolved_distribution": self.resolved_distribution,
+                    "resolved_version": self.resolved_version,
+                    "resolved_integrity": self.resolved_integrity,
+                    "current_executable_path": (
+                        str(self.executable_path) if self.executable_path else None
+                    ),
+                    "current_version": self.toolchain_revision.removeprefix("host-global:"),
+                    "resolution_fingerprint": self.resolution_fingerprint,
+                    "destructive": False,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        if self.match.adapter_id == "lark-cli":
+            return json.dumps(
+                {
+                    "adapter_id": self.match.adapter_id,
+                    "action": self.match.action.value,
+                    "route": self.match.route.value,
+                    "runtime": "host",
+                    "argv": list(self.match.argv),
+                    "owner_user_id": self.owner_user_id,
+                    "profile_id": self.profile_id,
+                    "profile_revision": self.profile_revision,
+                    "profile_state_revision": self.profile_state_revision,
+                    "executable_path": str(self.executable_path) if self.executable_path else None,
+                    "version": self.toolchain_revision.removeprefix("host-global:"),
+                    "adapter_contract_fingerprint": self.adapter_contract_fingerprint,
+                    "package_contract_fingerprint": self.package_contract_fingerprint,
+                    "destructive": self.match.destructive,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
         return json.dumps(
             {
                 "adapter_id": self.match.adapter_id,
@@ -547,6 +591,7 @@ class ManagedCliExecutionPlan:
                 "profile_revision": self.profile_revision,
                 "profile_state_revision": self.profile_state_revision,
                 "toolchain_revision": self.toolchain_revision,
+                "executable_path": str(self.executable_path) if self.executable_path else None,
                 "adapter_contract_fingerprint": self.adapter_contract_fingerprint,
                 "package_contract_fingerprint": self.package_contract_fingerprint,
                 "resolved_distribution": self.resolved_distribution,
@@ -573,6 +618,7 @@ class ManagedCliExecutionPlan:
             "profile_revision": self.profile_revision,
             "profile_state_revision": self.profile_state_revision,
             "toolchain_revision": self.toolchain_revision,
+            "executable_path": str(self.executable_path) if self.executable_path else None,
             "adapter_contract_fingerprint": self.adapter_contract_fingerprint,
             "package_contract_fingerprint": self.package_contract_fingerprint,
             "resolution_fingerprint": self.resolution_fingerprint,
@@ -885,6 +931,8 @@ class ManagedCliService:
         if not isinstance(jobs, list):
             return
         store = CredentialProfileStore(self.paths, owner_user_id)
+        if not jobs and not store.list_profiles():
+            return
         flow_store = self._authorization_flow_store(store, owner_user_id)
         live_jobs: set[tuple[str, str, str]] = set()
         for job in jobs:
@@ -1120,8 +1168,27 @@ class ManagedCliService:
         resolved_version = ""
         resolved_integrity = ""
         resolution_fingerprint = ""
-        if match.route == ManagedCliRoute.INSTALLER:
-            resolver = getattr(self.backend, "resolve_managed_node_cli", None)
+        host_lark_resolution = None
+        if match.adapter_id == "lark-cli" and match.route != ManagedCliRoute.INSTALLER:
+            resolver = getattr(self.backend, "resolve_host_lark_cli", None)
+            if callable(resolver):
+                host_lark_resolution = resolver()
+            else:
+                # Lightweight test/control-plane backends need not re-expose a
+                # pure host probe. Execution still remains backend-owned.
+                from runtime_identity.host_lark_cli import HostLarkCliRuntime
+
+                host_lark_resolution = HostLarkCliRuntime(self.paths).resolve()
+            executable = str(getattr(host_lark_resolution, "executable", "") or "")
+            version = str(getattr(host_lark_resolution, "version", "") or "missing")
+            runtime_image_digest = "sha256:" + hashlib.sha256(
+                f"host-lark-cli-v1\0{executable}\0{version}".encode()
+            ).hexdigest()
+        elif match.route == ManagedCliRoute.INSTALLER:
+            resolver_name = (
+                "resolve_host_lark_package" if match.adapter_id == "lark-cli" else "resolve_managed_node_cli"
+            )
+            resolver = getattr(self.backend, resolver_name, None)
             if not callable(resolver) or not match.distribution:
                 raise ValueError("managed CLI backend cannot resolve package metadata")
             # This is a trusted, credentialless control-plane lookup against
@@ -1135,7 +1202,11 @@ class ManagedCliService:
             resolved_distribution = str(getattr(resolution, "distribution", "") or "")
             resolved_version = str(getattr(resolution, "version", "") or "")
             resolved_integrity = str(getattr(resolution, "integrity", "") or "")
-            runtime_image_digest = str(getattr(resolution, "runtime_image_digest", "") or "")
+            runtime_image_digest = (
+                ""
+                if match.adapter_id == "lark-cli"
+                else str(getattr(resolution, "runtime_image_digest", "") or "")
+            )
             if (
                 getattr(resolution, "package", None) != adapter.toolchain_package.package
                 or resolved_distribution != f"{adapter.toolchain_package.package}@{resolved_version}"
@@ -1144,7 +1215,10 @@ class ManagedCliService:
                     resolved_version,
                 )
                 or not re.fullmatch(r"sha512-[A-Za-z0-9+/]+={0,2}", resolved_integrity)
-                or not re.fullmatch(r"sha256:[0-9a-f]{64}", runtime_image_digest)
+                or (
+                    match.adapter_id != "lark-cli"
+                    and not re.fullmatch(r"sha256:[0-9a-f]{64}", runtime_image_digest)
+                )
                 or (
                     adapter.toolchain_package.compatibility
                     and not version_satisfies(
@@ -1181,7 +1255,13 @@ class ManagedCliService:
             # An install/update is also the repair path for an obsolete or
             # incompatible current revision. Freeze its identity for CAS, but
             # do not require the old contract to validate before replacement.
-            ref = self.toolchains.resolve_node(match.adapter_id)
+            if match.adapter_id == "lark-cli":
+                host_resolver = getattr(self.backend, "resolve_host_lark_cli", None)
+                if not callable(host_resolver):
+                    raise ValueError("managed CLI backend cannot resolve the host lark-cli")
+                host_lark_resolution = host_resolver()
+            else:
+                ref = self.toolchains.resolve_node(match.adapter_id)
         else:
             runtime_image_digest = self._runtime_image_digest()
             ref = self.toolchains.resolve_for_adapter(
@@ -1211,20 +1291,34 @@ class ManagedCliService:
             profile_id = str(profile["profile_id"])
             profile_revision = float(profile.get("updated_at") or 0)
             profile_state_revision = store.state_revision(match.provider or "", profile_id)
-        lease_id, lease_expires_at = self.toolchains.acquire_revision_lease(
-            adapter_id=match.adapter_id,
-            revision=ref.host_path.name,
-            owner_kind="plan",
-            owner_id=str(context.get("run_id") or context.get("query_id") or uuid.uuid4().hex),
-            contract_fingerprint=adapter_contract_fingerprint,
-        )
+        if host_lark_resolution is not None:
+            executable_path = getattr(host_lark_resolution, "executable", None)
+            version = str(getattr(host_lark_resolution, "version", "") or "missing")
+            # Keep the legacy plan field inside PuddingClaw's own data root.
+            # The real host executable has its own explicit field and must not
+            # be mistaken for a writable Toolchain publication directory.
+            toolchain_path = self.paths.root / "runtime" / "host-lark-cli"
+            toolchain_revision = f"host-global:{version}"
+            lease_id = ""
+            lease_expires_at = 0.0
+        else:
+            executable_path = None
+            toolchain_path = ref.host_path
+            toolchain_revision = ref.host_path.name
+            lease_id, lease_expires_at = self.toolchains.acquire_revision_lease(
+                adapter_id=match.adapter_id,
+                revision=ref.host_path.name,
+                owner_kind="plan",
+                owner_id=str(context.get("run_id") or context.get("query_id") or uuid.uuid4().hex),
+                contract_fingerprint=adapter_contract_fingerprint,
+            )
         return ManagedCliExecutionPlan(
             match=match,
             owner_user_id=owner_user_id,
             profile_id=profile_id,
             profile_revision=profile_revision,
-            toolchain_path=ref.host_path,
-            toolchain_revision=ref.host_path.name,
+            toolchain_path=toolchain_path,
+            toolchain_revision=toolchain_revision,
             adapter_contract_fingerprint=adapter_contract_fingerprint,
             package_contract_fingerprint=adapter.toolchain_package.fingerprint,
             resolved_distribution=resolved_distribution,
@@ -1235,6 +1329,7 @@ class ManagedCliService:
             toolchain_lease_id=lease_id,
             toolchain_lease_expires_at=lease_expires_at,
             profile_state_revision=profile_state_revision,
+            executable_path=executable_path,
         )
 
     @staticmethod
@@ -1562,6 +1657,39 @@ class ManagedCliService:
                 "managed_install_plan_stale",
                 "Managed package resolution is missing or changed; prepare a new installation approval.",
             )
+        if match.adapter_id == "lark-cli":
+            installer = getattr(self.backend, "install_host_lark_cli", None)
+            if not callable(installer):
+                return self._error(
+                    "managed_install_failed",
+                    "The host runtime cannot install the official lark-cli.",
+                )
+            try:
+                installed = installer(
+                    plan.resolved_distribution,
+                    expected_version=plan.resolved_version,
+                )
+            except (OSError, ValueError, subprocess.SubprocessError) as exc:
+                return self._error(
+                    "managed_install_failed",
+                    f"Global lark-cli installation failed: {type(exc).__name__}: {exc}",
+                )
+            return ManagedCliServiceResult(
+                payload={
+                    "ok": installed.exit_code == 0,
+                    "managed_by": "managed_cli",
+                    "adapter_id": match.adapter_id,
+                    "route": match.route.value,
+                    "action": match.action.value,
+                    "distribution": match.distribution,
+                    "resolved_distribution": plan.resolved_distribution,
+                    "resolved_version": plan.resolved_version,
+                    "installation_scope": "host_user_global",
+                    "reproducible_request": True,
+                    "output": redact_managed_cli_output(installed.output),
+                },
+                exit_code=installed.exit_code,
+            )
         try:
             result = self.toolchains.install_package(
                 self.backend,
@@ -1777,7 +1905,11 @@ class ManagedCliService:
         store: CredentialProfileStore,
         owner_user_id: str,
     ) -> AuthorizationFlowStore:
-        return AuthorizationFlowStore(self.paths, owner_user_id, vault=store.vault)
+        del store
+        # AuthorizationFlowStore creates its master key lazily only when a
+        # continuation secret is actually written/read. Ordinary provider
+        # commands and connector status checks must not create secret state.
+        return AuthorizationFlowStore(self.paths, owner_user_id)
 
     def _reconcile_authorization_flow_locked(
         self,
@@ -2031,6 +2163,8 @@ class ManagedCliService:
                             network_enabled=False,
                             workspace_writable=False,
                             expected_runtime_image_digest=plan.runtime_image_digest,
+                            owner_user_id=owner_user_id,
+                            profile_id=profile_id,
                         )
                         qr_ascii = _terminal_qr(qr.output)
                 flow = flow_store.begin_or_advance(
@@ -2106,6 +2240,8 @@ class ManagedCliService:
                 network_enabled=True,
                 workspace_writable=False,
                 expected_runtime_image_digest=plan.runtime_image_digest,
+                owner_user_id=plan.owner_user_id,
+                profile_id=profile_id,
             )
             if preflight.credential_state is not None:
                 flow_store.write_staged_state(active, preflight.credential_state)
@@ -2129,6 +2265,8 @@ class ManagedCliService:
                 network_enabled=False,
                 workspace_writable=False,
                 expected_runtime_image_digest=plan.runtime_image_digest,
+                owner_user_id=plan.owner_user_id,
+                profile_id=profile_id,
             )
             if reset.exit_code != 0 or reset.credential_state is None:
                 return self._error(
@@ -2151,6 +2289,8 @@ class ManagedCliService:
             network_enabled=True,
             workspace_writable=False,
             expected_runtime_image_digest=plan.runtime_image_digest,
+            owner_user_id=plan.owner_user_id,
+            profile_id=profile_id,
         )
         if result.exit_code != 0:
             return self._error(
@@ -2186,6 +2326,8 @@ class ManagedCliService:
                 network_enabled=False,
                 workspace_writable=False,
                 expected_runtime_image_digest=plan.runtime_image_digest,
+                owner_user_id=plan.owner_user_id,
+                profile_id=profile_id,
             )
         expires_in = _positive_float(device.get("expires_in"))
         phase = driver.graph.phase(node.phase.phase_id, purpose_id=purpose)
@@ -2543,6 +2685,8 @@ class ManagedCliService:
                             continuation_secret=device_code.encode("utf-8"),
                             continuation_argument=driver.continuation.argument,
                             continuation_trailing_argv=driver.continuation.trailing_argv,
+                            owner_user_id=plan.owner_user_id,
+                            profile_id=profile_id,
                         )
                         if result.credential_state is not None:
                             candidate_state = result.credential_state
@@ -2563,6 +2707,8 @@ class ManagedCliService:
                             network_enabled=True,
                             workspace_writable=False,
                             expected_runtime_image_digest=plan.runtime_image_digest,
+                            owner_user_id=plan.owner_user_id,
+                            profile_id=profile_id,
                         )
                         if candidate_verify.credential_state is not None:
                             candidate_state = candidate_verify.credential_state
@@ -2726,6 +2872,8 @@ class ManagedCliService:
                         network_enabled=True,
                         workspace_writable=False,
                         expected_runtime_image_digest=plan.runtime_image_digest,
+                        owner_user_id=plan.owner_user_id,
+                        profile_id=profile_id,
                     )
                     identity = driver.identity_status(verify.output)
                 if verify.exit_code != 0 or not driver.full_identity_ready(identity):
@@ -2866,19 +3014,35 @@ class ManagedCliService:
         context: dict[str, Any],
     ) -> ManagedCliServiceResult:
         match = plan.match
-        try:
-            runtime_image_digest = self._runtime_image_digest()
-        except (OSError, ValueError) as exc:
-            return self._error(
-                "managed_runtime_unavailable", f"Managed runtime validation failed: {type(exc).__name__}."
-            )
-        if runtime_image_digest != plan.runtime_image_digest:
-            return self._error(
-                "managed_runtime_image_changed",
-                "Managed runtime image changed while approval was pending; prepare a new plan.",
-            )
+        if match.adapter_id == "lark-cli" and plan.toolchain_revision.startswith("host-global:"):
+            resolver = getattr(self.backend, "resolve_host_lark_cli", None)
+            if callable(resolver):
+                current_host_cli = resolver()
+            else:
+                from runtime_identity.host_lark_cli import HostLarkCliRuntime
+
+                current_host_cli = HostLarkCliRuntime(self.paths).resolve()
+            current_path = getattr(current_host_cli, "executable", None)
+            current_version = str(getattr(current_host_cli, "version", "") or "missing")
+            if current_path != plan.executable_path or plan.toolchain_revision != f"host-global:{current_version}":
+                return self._error(
+                    "managed_host_cli_changed",
+                    "The global lark-cli path or version changed while approval was pending; prepare a new plan.",
+                )
+        else:
+            try:
+                runtime_image_digest = self._runtime_image_digest()
+            except (OSError, ValueError) as exc:
+                return self._error(
+                    "managed_runtime_unavailable", f"Managed runtime validation failed: {type(exc).__name__}."
+                )
+            if runtime_image_digest != plan.runtime_image_digest:
+                return self._error(
+                    "managed_runtime_image_changed",
+                    "Managed runtime image changed while approval was pending; prepare a new plan.",
+                )
         adapter = self.registry.adapter(match.adapter_id)
-        executable = plan.toolchain_path / "bin" / adapter.toolchain_package.executable
+        executable = plan.executable_path or (plan.toolchain_path / "bin" / adapter.toolchain_package.executable)
         if not executable.exists():
             package = adapter.toolchain_package
             return ManagedCliServiceResult(
@@ -3151,6 +3315,8 @@ class ManagedCliService:
                             network_enabled=match.requires_network,
                             workspace_writable=match.workspace_writable,
                             expected_runtime_image_digest=plan.runtime_image_digest,
+                            owner_user_id=owner_user_id,
+                            profile_id=profile_id,
                         )
 
                 confirmation = (
@@ -3198,6 +3364,8 @@ class ManagedCliService:
                             network_enabled=match.requires_network,
                             workspace_writable=match.workspace_writable,
                             expected_runtime_image_digest=plan.runtime_image_digest,
+                            owner_user_id=owner_user_id,
+                            profile_id=profile_id,
                         )
                         auto_confirmed = not destructive
                         confirmation = None

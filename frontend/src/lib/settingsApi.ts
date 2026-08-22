@@ -141,6 +141,18 @@ export interface HarnessSettings {
     thread_limit: number | null;
     exit_behavior: "end" | "error";
   };
+  model_resilience?: {
+    transport_retry?: {
+      enabled?: boolean;
+      max_attempts?: number;
+      initial_delay_seconds?: number;
+      max_delay_seconds?: number;
+    };
+    terminal_response?: {
+      enabled?: boolean;
+      max_recovery_attempts?: number;
+    };
+  };
   completion?: {
     rubric?: {
       enabled?: boolean;

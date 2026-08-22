@@ -122,7 +122,11 @@ class SessionManager:
             sessions_dir = base_dir / "sessions"
         else:
             sessions_dir = sessions_dir.expanduser().resolve()
-            self._base_dir = sessions_dir.parent.parent
+            # Production passes ``PUDDINGCLAW_HOME/sessions``. Runtime
+            # artifacts (large Tool Results, query results, scratch and
+            # rewind receipts) are siblings of ``sessions`` below the same
+            # authoritative PUDDINGCLAW_HOME, not below its parent directory.
+            self._base_dir = sessions_dir.parent
         self._sessions_dir = sessions_dir
         self._sessions_dir.mkdir(parents=True, exist_ok=True)
         self._traces_dir = self._sessions_dir / "traces"

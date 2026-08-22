@@ -338,7 +338,9 @@ def test_base_prompt_excludes_request_scoped_tool_guides() -> None:
     assert "## Resource Access" in prompt
     assert "## Completion discipline" in prompt
     assert "## Managed Browser Authorization" in prompt
-    assert "## Managed CLI Toolchain Installation" in prompt
+    assert "## Managed CLI Installation" in prompt
+    assert "The official `lark-cli` is host-native" in prompt
+    assert "Do not describe this as a Toolchain, runtime image" in prompt
     assert "Never use `install_packages`" in prompt
     assert "Do not inspect the host with `which`" in prompt
     assert "Do not request external-directory access" in prompt

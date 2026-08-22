@@ -964,6 +964,7 @@ function ToolActionPermissionCard({
     && request.session_target_kind === "command_pattern"
     && Boolean(request.session_target);
   const reason = request.reason || "需要人工确认";
+  const installsHostCli = reason === "managed_cli_host_install";
   const managesSkills = writesSkills || [
     "prepare_skill_install",
     "prepare_skill_update",
@@ -975,7 +976,7 @@ function ToolActionPermissionCard({
   const riskLabel = ({
     high: "脚本执行 · 需确认",
     network: "联网 · 需确认",
-    package_install: "安装依赖 · 需确认",
+    package_install: installsHostCli ? "安装全局 CLI · 需确认" : "安装依赖 · 需确认",
     managed_write: "写入文件 · 需确认",
     destructive_write: "破坏性写入 · 需确认",
     managed_skill_write: "安装或更新 Skill · 需确认",
@@ -1000,7 +1001,7 @@ function ToolActionPermissionCard({
     : isSearch
       ? "允许联网搜索"
       : installsPackages
-        ? "允许在沙箱中安装依赖"
+        ? installsHostCli ? "允许安装全局飞书 CLI" : "允许在沙箱中安装依赖"
         : managesSkills
           ? request.tool_name === "prepare_skill_update"
             ? "允许检查 Skill 更新"
@@ -1089,7 +1090,7 @@ function ToolActionPermissionCard({
               ) : null}
               {installsPackages ? (
                 <span className="rounded-full bg-violet-100 px-2 py-0.5 text-[10px] font-semibold text-violet-800">
-                  安装依赖
+                  {installsHostCli ? "写入用户级全局 CLI" : "安装依赖"}
                 </span>
               ) : null}
             </div>

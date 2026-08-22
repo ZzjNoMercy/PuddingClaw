@@ -7,7 +7,11 @@ import pytest
 from langchain_core.language_models.chat_models import BaseChatModel
 
 import capabilities
-from llm.model_client import ModelClient
+from llm.model_client import (
+    ModelClient,
+    ModelTransportInterruptedError,
+    _retryable_stream_error,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -50,6 +54,42 @@ def test_model_client_direct_openai(mock_config):
     client = ModelClient(role="agent", force_direct=True)
     llm = client.get_chat_model()
     assert llm.__class__.__name__ == "ChatOpenAI"
+
+
+def test_direct_models_disable_hidden_sdk_retries(mock_config):
+    deepseek = ModelClient(role="agent", force_direct=True).get_chat_model()
+    assert deepseek.root_client.max_retries == 0
+
+    mock_config["provider"] = "openai"
+    mock_config["base_url"] = "https://api.openai.com/v1"
+    openai = ModelClient(role="agent", force_direct=True).get_chat_model()
+    assert openai.root_client.max_retries == 0
+
+
+@pytest.mark.parametrize(
+    ("class_name", "status_code"),
+    [
+        ("APIConnectionError", None),
+        ("APITimeoutError", None),
+        ("APIStatusError", 429),
+        ("APIStatusError", 503),
+    ],
+)
+def test_openai_compatible_transport_errors_are_retryable(class_name, status_code):
+    error_type = type(class_name, (Exception,), {})
+    error = error_type("provider transport failed")
+    if status_code is not None:
+        error.status_code = status_code
+
+    assert _retryable_stream_error(error) is True
+
+
+def test_non_retryable_provider_request_error_is_not_retried():
+    error_type = type("APIStatusError", (Exception,), {})
+    error = error_type("bad request")
+    error.status_code = 400
+
+    assert _retryable_stream_error(error) is False
 
 
 def test_model_client_temperature_override(mock_config):
@@ -183,3 +223,67 @@ def test_model_client_direct_deepseek_passes_thinking_params():
     assert llm.model == "deepseek-v4-pro"
     assert llm.reasoning_effort == "high"
     assert llm.extra_body == {"thinking": {"type": "enabled"}}
+
+
+@pytest.mark.asyncio
+async def test_model_client_retries_transport_error_before_first_chunk(mock_config):
+    from langchain_core.messages import AIMessageChunk
+
+    class FakeStreamingModel:
+        calls = 0
+
+        async def astream(self, *_args, **_kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                raise ConnectionResetError("connection reset before first chunk")
+            yield AIMessageChunk(content="recovered")
+
+    fake = FakeStreamingModel()
+    client = ModelClient(role="agent", force_direct=True)
+    policy = {"harness": {"model_resilience": {"transport_retry": {
+        "enabled": True,
+        "max_attempts": 2,
+        "initial_delay_seconds": 0,
+        "max_delay_seconds": 0,
+    }}}}
+    with (
+        mock.patch.object(client, "get_chat_model", return_value=fake),
+        mock.patch("llm.model_client.load_config", return_value=policy),
+    ):
+        chunks = [chunk async for chunk in client.astream([])]
+
+    assert fake.calls == 2
+    assert "".join(str(chunk.content) for chunk in chunks) == "recovered"
+
+
+@pytest.mark.asyncio
+async def test_model_client_never_replays_after_a_chunk_was_emitted(mock_config):
+    from langchain_core.messages import AIMessageChunk
+
+    class FakeInterruptedStreamingModel:
+        calls = 0
+
+        async def astream(self, *_args, **_kwargs):
+            self.calls += 1
+            yield AIMessageChunk(content="partial")
+            raise ConnectionResetError("connection reset after first chunk")
+
+    fake = FakeInterruptedStreamingModel()
+    client = ModelClient(role="agent", force_direct=True)
+    policy = {"harness": {"model_resilience": {"transport_retry": {
+        "enabled": True,
+        "max_attempts": 5,
+        "initial_delay_seconds": 0,
+        "max_delay_seconds": 0,
+    }}}}
+    received = []
+    with (
+        mock.patch.object(client, "get_chat_model", return_value=fake),
+        mock.patch("llm.model_client.load_config", return_value=policy),
+    ):
+        with pytest.raises(ModelTransportInterruptedError):
+            async for chunk in client.astream([]):
+                received.append(chunk)
+
+    assert fake.calls == 1
+    assert "".join(str(chunk.content) for chunk in received) == "partial"

@@ -565,6 +565,12 @@ class CredentialProfileStore:
         *,
         credential_state: CredentialStateSpec,
     ) -> bytes:
+        if provider == "lark":
+            from runtime_identity.host_lark_cli import HostLarkCliRuntime
+
+            runtime = HostLarkCliRuntime(self.paths)
+            if runtime.profile_state_present(self.owner_user_id, profile_id):
+                return runtime.compatibility_state_marker(credential_state) or b""
         directory = self.paths.provider_profile(self.owner_user_id, provider, profile_id)
         try:
             envelope = (directory / "vault.enc").read_bytes()
@@ -592,6 +598,16 @@ class CredentialProfileStore:
         *,
         credential_state: CredentialStateSpec,
     ) -> None:
+        if provider == "lark":
+            # The official CLI writes directly to its stable config directory
+            # and OS-native credential store.
+            # This legacy method remains callable while the authorization
+            # state-machine metadata is being simplified, but it must never
+            # create a second token archive.
+            from runtime_identity.host_lark_cli import HostLarkCliRuntime
+
+            HostLarkCliRuntime(self.paths).mark_profile_initialized(self.owner_user_id, profile_id)
+            return
         payload = validate_credential_archive(payload, allowed_roots=credential_state.paths)
         directory = self.paths.provider_profile(self.owner_user_id, provider, profile_id)
         directory.mkdir(parents=True, exist_ok=True)
@@ -636,6 +652,8 @@ class CredentialProfileStore:
 
         if self.state_revision(provider, profile_id) != expected_revision:
             return None
+        if provider == "lark":
+            return "host-native-v1"
         self.write_state(
             provider,
             profile_id,
@@ -650,6 +668,18 @@ class CredentialProfileStore:
     def read_state_metadata(self, provider: str, profile_id: str) -> dict[str, Any] | None:
         """Return non-secret Vault metadata when a durable state archive exists."""
 
+        if provider == "lark":
+            from runtime_identity.host_lark_cli import HostLarkCliRuntime
+
+            if not HostLarkCliRuntime(self.paths).profile_state_present(self.owner_user_id, profile_id):
+                return None
+            return {
+                "profile_id": profile_id,
+                "owner_user_id": self.owner_user_id,
+                "provider": provider,
+                "state_model": "provider_native_profile_dirs",
+            }
+
         directory = self.paths.provider_profile(self.owner_user_id, provider, profile_id)
         if not (directory / "vault.enc").is_file() or not (directory / "profile.json").is_file():
             return None
@@ -657,6 +687,9 @@ class CredentialProfileStore:
 
     def state_revision(self, provider: str, profile_id: str) -> str:
         """Return a stable CAS token for the encrypted Profile Vault contents."""
+
+        if provider == "lark":
+            return "host-native-v1"
 
         directory = self.paths.provider_profile(self.owner_user_id, provider, profile_id)
         try:

@@ -3219,6 +3219,30 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             continue;
           }
 
+          if (event.event === "model_response_recovery_started") {
+            appendLifecycleActivity(
+              "模型回答不完整，正在自动恢复",
+              "running",
+              "model-response-recovery",
+              "保留已完成的工具结果和 Todo，从当前 Run 原地继续一次。",
+            );
+            updateSessionRunActivity(sendSessionId, {
+              phase: "running",
+              label: "模型回答不完整，正在自动恢复",
+            });
+            continue;
+          }
+
+          if (event.event === "model_response_incomplete") {
+            appendLifecycleActivity(
+              "模型未形成完整回答",
+              "error",
+              "model-response-recovery",
+              "自动恢复已用尽；当前进度已保留，可从同一会话继续。",
+            );
+            continue;
+          }
+
           if (event.event === "model_stream_attempt") {
             if (event.data.status === "completed") {
               refreshActivityAfterTool();

@@ -221,10 +221,10 @@ _DESTRUCTIVE_LARK_TERMS = frozenset(
     }
 )
 _LARK_CREDENTIAL_STATE = CredentialStateSpec(
-    # Lark's Linux keychain normally falls back to
-    # ~/.local/share/lark-cli. Redirect new writes into .lark-cli so the
-    # provider's native state has one canonical root, while retaining the
-    # legacy path as an exact Adapter allow-list entry for compatibility.
+    # Migration-only contract for credential archives written by PuddingClaw
+    # releases before the host-native runtime. New Lark calls do not inject
+    # this env or export these paths; changing the fingerprint would prevent a
+    # safe one-time import of an existing encrypted archive.
     paths=(".lark-cli", ".local/share/lark-cli"),
     env=(("LARKSUITE_CLI_DATA_DIR", "/home/puddingclaw/.lark-cli/.credential-data"),),
 )

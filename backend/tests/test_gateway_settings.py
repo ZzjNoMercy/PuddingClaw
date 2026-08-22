@@ -712,6 +712,57 @@ def test_settings_api_persists_harness_model_call_limit(tmp_path, monkeypatch):
     assert displayed["harness"]["model_call_limit"]["thread_limit"] == 100
 
 
+def test_settings_api_persists_model_resilience_controls(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.json"
+    config_path.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(config, "CONFIG_FILE", config_path)
+
+    model_resilience = {
+        "transport_retry": {
+            "enabled": True,
+            "max_attempts": 4,
+            "initial_delay_seconds": 0.5,
+            "max_delay_seconds": 8.0,
+        },
+        "terminal_response": {
+            "enabled": True,
+            "max_recovery_attempts": 2,
+        },
+    }
+    client = TestClient(app)
+    response = client.put(
+        "/api/settings",
+        json={"harness": {"model_resilience": model_resilience}},
+    )
+
+    assert response.status_code == 200, response.text
+    displayed = config.get_settings_for_display()["harness"]["model_resilience"]
+    assert displayed == model_resilience
+
+
+def test_settings_api_rejects_invalid_model_resilience_controls(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.json"
+    config_path.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(config, "CONFIG_FILE", config_path)
+    client = TestClient(app)
+
+    response = client.put(
+        "/api/settings",
+        json={
+            "harness": {
+                "model_resilience": {
+                    "transport_retry": {
+                        "max_attempts": 6,
+                    }
+                }
+            }
+        },
+    )
+
+    assert response.status_code == 400
+    assert "max_attempts must be in [1, 5]" in response.json()["detail"]
+
+
 def test_settings_api_persists_harness_prompt_cache_controls(tmp_path, monkeypatch):
     config_path = tmp_path / "config.json"
     config_path.write_text("{}", encoding="utf-8")

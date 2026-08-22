@@ -33,6 +33,7 @@ from deepagents.backends.protocol import ExecuteResponse
 
 from harness.kernel_sandbox import MacOSSeatbeltRunner
 from harness.sandbox_profiles import SandboxGrantProfile
+from runtime_identity.host_lark_cli import HostLarkCliRuntime
 from runtime_identity.paths import PuddingClawPaths
 
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
@@ -103,6 +104,7 @@ class HostSkillRuntimeBackend:
     ) -> None:
         self.paths = paths
         self.timeout = timeout
+        self.lark_cli = HostLarkCliRuntime(paths)
         self._runtime_root = self.paths.root / "runtime"
         self._operations = self._runtime_root / "operations"
         self._node_cache = self._runtime_root / "node-cache"
@@ -618,6 +620,21 @@ class HostSkillRuntimeBackend:
 
         return self.resolve_generic_node_cli(distribution=distribution, package=package)
 
+    def resolve_host_lark_cli(self) -> object:
+        """Resolve the globally installed official CLI without materializing it."""
+
+        return self.lark_cli.resolve()
+
+    def resolve_host_lark_package(self, *, distribution: str, package: str) -> object:
+        return self.lark_cli.resolve_package(distribution, package)
+
+    def install_host_lark_cli(self, distribution: str, *, expected_version: str) -> object:
+        return self.lark_cli.install(
+            distribution,
+            expected_version=expected_version,
+            timeout=self.timeout,
+        )
+
     @staticmethod
     def _credential_paths(spec: object | None) -> tuple[str, ...]:
         from harness.workspace_backends import _credential_state_paths
@@ -742,8 +759,45 @@ class HostSkillRuntimeBackend:
         continuation_trailing_argv: tuple[str, ...] = (),
         timeout: int = 120,
         max_output_bytes: int = 100_000,
+        owner_user_id: str = "local",
+        profile_id: str = "lark_default",
     ) -> object:
-        """Run exact Adapter argv in a private Seatbelt HOME."""
+        """Run exact Adapter argv.
+
+        Lark is a host-native user CLI: its binary and provider state are
+        shared outside Spawn/Kernel. Other managed runtimes retain the generic
+        immutable-runtime path below.
+        """
+
+        if argv and Path(argv[0]).name.lower() == "lark-cli":
+            resolution = self.lark_cli.resolve()
+            if resolution.executable is None:
+                from harness.workspace_backends import ManagedProviderExecutionResult
+
+                return ManagedProviderExecutionResult(
+                    output="lark-cli is not installed globally.",
+                    exit_code=127,
+                    credential_state=None,
+                )
+            return self.lark_cli.execute(
+                executable=resolution.executable,
+                workspace=workspace,
+                argv=argv,
+                environment=environment,
+                owner_user_id=owner_user_id,
+                # Local inspections such as ``lark-cli --version`` have no
+                # CredentialProfile. They still need a deterministic config
+                # directory because the official CLI resolves its runtime
+                # context before dispatching the command.
+                profile_id=profile_id or "lark_default",
+                credential_state=credential_state,
+                credential_state_spec=credential_state_spec,
+                continuation_secret=continuation_secret,
+                continuation_argument=continuation_argument,
+                continuation_trailing_argv=continuation_trailing_argv,
+                timeout=timeout,
+                max_output_bytes=max_output_bytes,
+            )
 
         del container_path
         from harness.workspace_backends import (
@@ -863,6 +917,15 @@ class HostSkillRuntimeBackend:
         authorization_contract_fingerprint: str,
         max_output_bytes: int = 100_000,
     ) -> object:
+        if provider == "lark":
+            return self.lark_cli.collect_browser(
+                owner_user_id=owner_user_id,
+                profile_id=profile_id,
+                adapter_id=adapter_id,
+                authorization_contract_fingerprint=authorization_contract_fingerprint,
+                credential_state_spec=credential_state_spec,
+                max_output_bytes=max_output_bytes,
+            )
         from harness.workspace_backends import ManagedProviderExecutionResult
 
         job_id = self._managed_browser_job_id(owner_user_id, provider, profile_id)
@@ -938,6 +1001,32 @@ class HostSkillRuntimeBackend:
         wait_for_url_seconds: float = 30.0,
         max_output_bytes: int = 100_000,
     ) -> object:
+        if provider == "lark":
+            resolution = self.lark_cli.resolve()
+            if resolution.executable is None:
+                from harness.workspace_backends import ManagedProviderExecutionResult
+
+                return ManagedProviderExecutionResult(
+                    output="lark-cli is not installed globally.",
+                    exit_code=127,
+                    credential_state=None,
+                    browser_status="missing",
+                    browser_job_id=self.lark_cli.job_id(owner_user_id, profile_id),
+                )
+            return self.lark_cli.start_browser(
+                executable=resolution.executable,
+                workspace=workspace,
+                argv=argv,
+                environment=environment,
+                owner_user_id=owner_user_id,
+                profile_id=profile_id,
+                adapter_id=adapter_id,
+                authorization_contract_fingerprint=authorization_contract_fingerprint,
+                credential_state=credential_state,
+                credential_state_spec=credential_state_spec,
+                wait_for_output_seconds=wait_for_url_seconds,
+                max_output_bytes=max_output_bytes,
+            )
         del container_path
         from harness.workspace_backends import (
             ManagedProviderExecutionResult,
@@ -1071,6 +1160,8 @@ class HostSkillRuntimeBackend:
         profile_id: str,
         browser_job_id: str,
     ) -> bool:
+        if provider == "lark":
+            return self.lark_cli.finalize_browser(owner_user_id, profile_id, browser_job_id)
         expected = self._managed_browser_job_id(owner_user_id, provider, profile_id)
         if browser_job_id != expected:
             raise ValueError("browser authorization job identity mismatch")
@@ -1092,9 +1183,10 @@ class HostSkillRuntimeBackend:
             shutil.rmtree(job.operation, ignore_errors=True)
 
     def list_managed_browser_auth_jobs(self, *, owner_user_id: str) -> list[dict[str, str]]:
+        lark_jobs = self.lark_cli.list_browser_jobs(owner_user_id)
         with self._browser_jobs_lock:
             jobs = tuple(self._browser_jobs.values())
-        return [
+        generic_jobs = [
             {
                 "provider": job.provider,
                 "profile_id": job.profile_id,
@@ -1106,6 +1198,7 @@ class HostSkillRuntimeBackend:
             for job in jobs
             if job.owner_user_id == owner_user_id
         ]
+        return [*lark_jobs, *generic_jobs]
 
     def project_cli_execution(self, command: str) -> HostExecutionProjection:
         """Expose only verified credentialless CLI bins to a Seatbelt command."""

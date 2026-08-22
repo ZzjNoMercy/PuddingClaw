@@ -549,6 +549,36 @@ def test_read_evidence_resolves_large_result_from_source_query(tmp_path):
     ).hexdigest()[:20]
 
 
+def test_explicit_sessions_dir_keeps_large_results_below_puddingclaw_home(tmp_path):
+    user_root = tmp_path / ".puddingclaw"
+    sessions_dir = user_root / "sessions"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    session_manager.initialize(sessions_dir=sessions_dir)
+
+    raw_ref = session_manager.materialize_large_tool_result(
+        workspace_path=workspace,
+        session_id="production-layout-session",
+        query_id="query-1",
+        tool_call_id="call-large",
+        output="complete payload",
+    )
+
+    artifact = (
+        user_root
+        / "data"
+        / "large-tool-results"
+        / "projects"
+        / raw_ref["workspace_digest"]
+        / "production-layout-session"
+        / "query-1"
+        / "call-large"
+    )
+    assert session_manager._base_dir == user_root
+    assert artifact.read_text(encoding="utf-8") == "complete payload"
+    assert not (tmp_path / "data" / "large-tool-results").exists()
+
+
 def test_read_sql_evidence_pages_saved_jsonl_without_preview_fallback(tmp_path):
     base_dir = tmp_path / "home"
     base_dir.mkdir()

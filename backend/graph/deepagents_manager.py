@@ -93,6 +93,10 @@ from graph.middlewares.goal_completion import (
     GoalCompletionMiddleware,
 )
 from graph.middlewares.harness_todos import HarnessTodoMiddleware
+from graph.middlewares.model_response_guard import (
+    MODEL_RESPONSE_RECOVERY_SOURCE,
+    TerminalModelResponseGuardMiddleware,
+)
 from graph.middlewares.semantic_assets import SemanticAssetsMiddleware
 from graph.middlewares.skill_intent_router import (
     RequiredSkillBoundaryMiddleware,
@@ -275,6 +279,7 @@ _INTERNAL_CONTROL_SOURCES = frozenset(
         "puddingclaw_completion_gate",
         "puddingclaw_goal_continuation",
         GOAL_COMPLETION_REMINDER_SOURCE,
+        MODEL_RESPONSE_RECOVERY_SOURCE,
         CONTROL_SOURCE,
     }
 )
@@ -1227,6 +1232,9 @@ class PuddingClawAgentState(DeepAgentState):
     run_model_call_count: NotRequired[Annotated[int, PrivateStateAttr]]
     thread_model_call_count: NotRequired[Annotated[int, PrivateStateAttr]]
     _model_call_limit_exceeded: NotRequired[Annotated[dict[str, Any], PrivateStateAttr]]
+    _model_response_recovery_count: NotRequired[Annotated[int, PrivateStateAttr]]
+    _model_response_termination: NotRequired[Annotated[dict[str, Any], PrivateStateAttr]]
+    _model_response_incomplete: NotRequired[Annotated[dict[str, Any] | None, PrivateStateAttr]]
 
 
 class RunScopeMiddleware(AgentMiddleware):
@@ -3363,6 +3371,18 @@ class DeepAgentsAgentManager:
                 query_id=query_id,
             ),
         ]
+        resilience_cfg = config.load_config().get("harness", {}).get("model_resilience", {})
+        terminal_response_cfg = (
+            resilience_cfg.get("terminal_response", {}) if isinstance(resilience_cfg, dict) else {}
+        )
+        if not isinstance(terminal_response_cfg, dict):
+            terminal_response_cfg = {}
+        if terminal_response_cfg.get("enabled", True):
+            middlewares.append(
+                TerminalModelResponseGuardMiddleware(
+                    max_recovery_attempts=int(terminal_response_cfg.get("max_recovery_attempts", 1))
+                )
+            )
         prompt_cache_cfg = config.load_config().get("harness", {}).get("prompt_cache", {})
         if bool(prompt_cache_cfg.get("ordered_system_sections", True)):
             # Memory is versioned context, not stable core.  Put it after the
@@ -8194,6 +8214,7 @@ class DeepAgentsAgentManager:
             rubric_evaluations: list[dict[str, Any]] = []
             deterministic_check_events: list[dict[str, Any]] = []
             verification_retry_pending_segment = False
+            model_response_recovery_pending_segment = False
             last_goal_control_poll = 0.0
             model_call_limit_events: list[dict[str, Any]] = []
             last_snapshot_at = 0.0
@@ -8435,7 +8456,9 @@ class DeepAgentsAgentManager:
                     # Lifecycle of an LLM span: start on the first model or
                     # reasoning chunk, finish when the model node changes or a
                     # tool-call follows.
-                    if verification_retry_pending_segment and is_model_node and (text or reasoning_text):
+                    if (
+                        verification_retry_pending_segment or model_response_recovery_pending_segment
+                    ) and is_model_node and (text or reasoning_text):
                         # Completion-gate and rubric retries jump straight back
                         # to the model without passing through the tools node.
                         # Start a new process segment so revision text cannot
@@ -8443,11 +8466,17 @@ class DeepAgentsAgentManager:
                         self._finalize_reasoning_timeline(active_segment)
                         active_segment = new_segment()
                         segments.append(active_segment)
+                        segment_break_reason = (
+                            "model_response_recovery"
+                            if model_response_recovery_pending_segment
+                            else "verification_retry"
+                        )
                         verification_retry_pending_segment = False
+                        model_response_recovery_pending_segment = False
                         if active_llm_span is not None:
                             trace_collector.finish_llm_span(output=emitted_text)
                             active_llm_span = None
-                        yield self._sse("segment_break", {"reason": "verification_retry"})
+                        yield self._sse("segment_break", {"reason": segment_break_reason})
                     if is_model_node and (text or reasoning_text):
                         if active_llm_span is None:
                             current_model_call_index = model_call_index
@@ -8793,7 +8822,43 @@ class DeepAgentsAgentManager:
                         lifecycle_detail = ""
                         lifecycle_display_status = ""
                         lifecycle_status = str(payload.get("status") or payload.get("result") or "")
-                        if event_type == "rubric_evaluation_start":
+                        if event_type == "model_response_recovery_started":
+                            # The just-finished model turn was rejected by the
+                            # terminal guard. It may already have streamed a
+                            # truncated prefix, so retract it from both the live
+                            # UI and the authoritative Session projection. Raw
+                            # provider output remains available in Trace.
+                            if str(active_segment.get("content") or ""):
+                                active_segment["content"] = ""
+                                emitted_text = "\n\n".join(
+                                    str(segment.get("content") or "")
+                                    for segment in segments
+                                    if segment.get("content")
+                                )
+                                yield self._sse("segment_content_replaced", {"content": ""})
+                                persist_assistant_snapshot(force=True)
+                            model_response_recovery_pending_segment = True
+                            lifecycle_label = "模型回答不完整，正在自动恢复"
+                            lifecycle_detail = "保留已完成的工具结果和 Todo，从当前 Run 原地继续一次。"
+                            lifecycle_status = "running"
+                            lifecycle_display_status = "running"
+                        elif event_type == "model_response_incomplete":
+                            # Do not persist or present a terminal prefix that
+                            # the guard has classified as incomplete.
+                            if str(active_segment.get("content") or ""):
+                                active_segment["content"] = ""
+                                emitted_text = "\n\n".join(
+                                    str(segment.get("content") or "")
+                                    for segment in segments
+                                    if segment.get("content")
+                                )
+                                yield self._sse("segment_content_replaced", {"content": ""})
+                                persist_assistant_snapshot(force=True)
+                            lifecycle_label = "模型未形成完整回答"
+                            lifecycle_detail = "自动恢复已用尽；当前进度已保留，可从同一会话继续。"
+                            lifecycle_status = "failed"
+                            lifecycle_display_status = "failed"
+                        elif event_type == "rubric_evaluation_start":
                             lifecycle_label = "正在核对完成质量"
                             lifecycle_status = "running"
                             lifecycle_display_status = "running"
@@ -9079,7 +9144,24 @@ class DeepAgentsAgentManager:
                     yield self._sse("token", {"content": model_limit_text_buffer})
                 model_limit_text_buffer = ""
 
-            final_content = self._strip_model_call_limit_notice(self._last_ai_content(final_state) or emitted_text)
+            termination_summary = (
+                dict(final_state.get("_model_response_termination") or {})
+                if isinstance(final_state, dict)
+                and isinstance(final_state.get("_model_response_termination"), dict)
+                else {}
+            )
+            incomplete_model_response = (
+                dict(final_state.get("_model_response_incomplete") or {})
+                if isinstance(final_state, dict)
+                and isinstance(final_state.get("_model_response_incomplete"), dict)
+                else None
+            )
+            authoritative_final_content = self._strip_model_call_limit_notice(self._last_ai_content(final_state))
+            final_content = (
+                ""
+                if incomplete_model_response is not None
+                else authoritative_final_content or emitted_text
+            )
             if final_content:
                 current_text = active_segment.get("content", "")
                 if not current_text.strip():
@@ -9098,7 +9180,7 @@ class DeepAgentsAgentManager:
                             "segment_content_replaced",
                             {"content": final_content},
                         )
-            elif emitted_reasoning and not final_content:
+            elif emitted_reasoning and not final_content and incomplete_model_response is None:
                 diagnostic = (
                     "模型本轮只返回了 reasoning_content，没有返回正式回答 content。"
                     "请检查 Higress 路由模型是否应切换为非推理模型，或确认 provider 是否会在流结束前输出 content。"
@@ -9171,6 +9253,7 @@ class DeepAgentsAgentManager:
                 )
             if (
                 run_record.status == RunStatus.RUNNING
+                and incomplete_model_response is None
                 and run_record.requires_goal_verification
                 and isinstance(pending_completion_request, dict)
                 and pending_completion_request.get("status") == "requested"
@@ -9190,6 +9273,7 @@ class DeepAgentsAgentManager:
                 int(verification_state.get("run_model_call_count") or 0),
                 model_call_index,
             )
+            run_record.model_termination = termination_summary or None
             final_usage_summary = current_usage_summary(final_rounds=run_record.model_call_count)
             verification_state["_harness_context"] = {
                 # Session-scoped ledger is authoritative. It includes
@@ -9255,7 +9339,37 @@ class DeepAgentsAgentManager:
                     "message": detail,
                 }
             else:
-                if stream_context.get("_headless_needs_input") and run_record.status == RunStatus.RUNNING:
+                if incomplete_model_response is not None and run_record.status in {
+                    RunStatus.RUNNING,
+                    RunStatus.EVALUATING,
+                }:
+                    next_action = (
+                        {
+                            "type": "continue_session",
+                            "session_id": session_id,
+                            "message": "继续完成剩余任务，不要重复已成功的工具调用。",
+                        }
+                        if incomplete_model_response.get("recoverable") is True
+                        else None
+                    )
+                    run_record.failure_detail = incomplete_model_response
+                    run_record.next_action = next_action
+                    run_record = self._run_coordinator.fail(
+                        run_record,
+                        outcome=RunOutcome.FAILED,
+                        error="model_response_incomplete",
+                    )
+                    if goal_record is not None:
+                        goal_record = self._run_coordinator.goals.release_run(
+                            goal_record,
+                            run=run_record,
+                            gap=(
+                                "模型未形成完整最终回答；已保留 Todo、证据和产物，"
+                                "可从当前会话继续。"
+                            ),
+                        )
+                    verification_report = None
+                elif stream_context.get("_headless_needs_input") and run_record.status == RunStatus.RUNNING:
                     run_record = self._run_coordinator.fail(
                         run_record,
                         outcome=RunOutcome.BLOCKED,
@@ -9427,6 +9541,9 @@ class DeepAgentsAgentManager:
                     "outcome": run_record.outcome.value if run_record.outcome else None,
                     "budget_exhaustion_reason": run_record.budget_exhaustion_reason,
                     "model_call_count": run_record.model_call_count,
+                    "error": run_record.failure_detail,
+                    "next_action": run_record.next_action,
+                    "termination": run_record.model_termination,
                     "auto_resolved": list(stream_context.get("_headless_auto_resolved") or []),
                     "interrupt_summary": dict(
                         stream_context.get("_headless_interrupt_summary")
@@ -9434,6 +9551,22 @@ class DeepAgentsAgentManager:
                     ),
                 },
             )
+            if incomplete_model_response is not None:
+                yield self._sse(
+                    "error",
+                    {
+                        "session_id": session_id,
+                        "query_id": query_id,
+                        "run_id": run_record.run_id,
+                        "message": str(
+                            (run_record.failure_detail or {}).get("message")
+                            or "模型未形成完整回答；当前进度已保留。"
+                        ),
+                        "error": run_record.failure_detail,
+                        "next_action": run_record.next_action,
+                        "termination": run_record.model_termination,
+                    },
+                )
             if run_limit_payload is not None:
                 yield self._sse("run_limit_reached", run_limit_payload)
             if goal_record is not None:

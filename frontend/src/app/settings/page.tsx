@@ -561,6 +561,12 @@ export default function SettingsPage() {
   const [modelCallRunLimit, setModelCallRunLimit] = useState("50");
   const [modelCallThreadLimit, setModelCallThreadLimit] = useState("");
   const [modelCallExitBehavior, setModelCallExitBehavior] = useState<"end" | "error">("end");
+  const [modelTransportRetryEnabled, setModelTransportRetryEnabled] = useState(true);
+  const [modelTransportMaxAttempts, setModelTransportMaxAttempts] = useState("2");
+  const [modelTransportInitialDelay, setModelTransportInitialDelay] = useState("0.25");
+  const [modelTransportMaxDelay, setModelTransportMaxDelay] = useState("2");
+  const [terminalResponseGuardEnabled, setTerminalResponseGuardEnabled] = useState(true);
+  const [terminalResponseRecoveryAttempts, setTerminalResponseRecoveryAttempts] = useState("1");
   const [rubricEnabled, setRubricEnabled] = useState(false);
   const [rubricMaxIterations, setRubricMaxIterations] = useState("2");
   const [rubricMaxStagnantRepairs, setRubricMaxStagnantRepairs] = useState("2");
@@ -732,6 +738,15 @@ export default function SettingsPage() {
         setModelCallRunLimit(modelLimit?.run_limit ? String(modelLimit.run_limit) : "50");
         setModelCallThreadLimit(modelLimit?.thread_limit ? String(modelLimit.thread_limit) : "");
         setModelCallExitBehavior(modelLimit?.exit_behavior === "error" ? "error" : "end");
+        const modelResilience = s.harness?.model_resilience;
+        const transportRetry = modelResilience?.transport_retry;
+        setModelTransportRetryEnabled(transportRetry?.enabled ?? true);
+        setModelTransportMaxAttempts(String(transportRetry?.max_attempts ?? 2));
+        setModelTransportInitialDelay(String(transportRetry?.initial_delay_seconds ?? 0.25));
+        setModelTransportMaxDelay(String(transportRetry?.max_delay_seconds ?? 2));
+        const terminalResponse = modelResilience?.terminal_response;
+        setTerminalResponseGuardEnabled(terminalResponse?.enabled ?? true);
+        setTerminalResponseRecoveryAttempts(String(terminalResponse?.max_recovery_attempts ?? 1));
         const rubric = s.harness?.completion?.rubric;
         setRubricEnabled(rubric?.enabled ?? false);
         setRubricMaxIterations(String(rubric?.max_iterations ?? 3));
@@ -1167,6 +1182,21 @@ export default function SettingsPage() {
             thread_limit: positiveIntOrNull(modelCallThreadLimit),
             exit_behavior: modelCallExitBehavior,
           },
+          model_resilience: {
+            transport_retry: {
+              enabled: modelTransportRetryEnabled,
+              max_attempts: positiveIntOrNull(modelTransportMaxAttempts) ?? 2,
+              initial_delay_seconds: Math.max(0, Number.parseFloat(modelTransportInitialDelay) || 0),
+              max_delay_seconds: Math.max(0, Number.parseFloat(modelTransportMaxDelay) || 0),
+            },
+            terminal_response: {
+              enabled: terminalResponseGuardEnabled,
+              max_recovery_attempts: Math.max(
+                0,
+                Math.min(3, Number.parseInt(terminalResponseRecoveryAttempts, 10) || 0),
+              ),
+            },
+          },
           completion: {
             rubric: {
               enabled: rubricEnabled,
@@ -1220,7 +1250,7 @@ export default function SettingsPage() {
     } finally {
       setSaving(false);
     }
-  }, [activeCategory, ragTopK, ragThreshold, ragTextVectorWeight, ragImageVectorWeight, ragBm25Weight, ragHybridCandidateTopK, ragRerankEnabled, ragRerankCandidateTopK, dbQaFullRowsTokenBudget, dbQaPreviewRowsTokenBudget, dbQaProfileTokenBudget, dbQaFullRowsHardRowCap, dbQaFullRowsHardColumnCap, dbQaMaxCellCharsForLlm, dbQaResultMaterializationRowCap, dbQaQueryTimeoutSeconds, dbQaSqlGenerationTimeoutSeconds, dbQaResultStoreEnabled, dbQaResultStoreTtlHours, dbQaDefaultPageSize, dbQaMaxPageSize, dbQaExportEnabled, dbQaProfileEnabled, dbQaAgentSqlFallbackEnabled, databaseMode, databaseHost, databasePort, databaseName, databaseUsername, databasePassword, mmBatchSize, knowledgeRootDir, wikiCompilerModelId, wikiHybridEnabled, wikiGbrainEmbeddingModelId, wikiGbrainThinkModelId, kbIndexEnabled, kbVectorStore, kbMilvusUri, kbTextCollection, kbImageCollection, contextSummaryTriggerTokens, contextSummaryKeepTokens, toolContextEnabled, immediateToolCompactionEnabled, singleToolTriggerTokens, backgroundMinResultTokens, retainToolContextTokens, modelCallLimitEnabled, modelCallRunLimit, modelCallThreadLimit, modelCallExitBehavior, rubricEnabled, rubricMaxIterations, rubricMaxStagnantRepairs, customRubricRulesEnabled, customRubricRules, goalsEnabled, goalMaxRounds, executionMode, subagentItems, showToast, runtimeExtensions]);
+  }, [activeCategory, ragTopK, ragThreshold, ragTextVectorWeight, ragImageVectorWeight, ragBm25Weight, ragHybridCandidateTopK, ragRerankEnabled, ragRerankCandidateTopK, dbQaFullRowsTokenBudget, dbQaPreviewRowsTokenBudget, dbQaProfileTokenBudget, dbQaFullRowsHardRowCap, dbQaFullRowsHardColumnCap, dbQaMaxCellCharsForLlm, dbQaResultMaterializationRowCap, dbQaQueryTimeoutSeconds, dbQaSqlGenerationTimeoutSeconds, dbQaResultStoreEnabled, dbQaResultStoreTtlHours, dbQaDefaultPageSize, dbQaMaxPageSize, dbQaExportEnabled, dbQaProfileEnabled, dbQaAgentSqlFallbackEnabled, databaseMode, databaseHost, databasePort, databaseName, databaseUsername, databasePassword, mmBatchSize, knowledgeRootDir, wikiCompilerModelId, wikiHybridEnabled, wikiGbrainEmbeddingModelId, wikiGbrainThinkModelId, kbIndexEnabled, kbVectorStore, kbMilvusUri, kbTextCollection, kbImageCollection, contextSummaryTriggerTokens, contextSummaryKeepTokens, toolContextEnabled, immediateToolCompactionEnabled, singleToolTriggerTokens, backgroundMinResultTokens, retainToolContextTokens, modelCallLimitEnabled, modelCallRunLimit, modelCallThreadLimit, modelCallExitBehavior, modelTransportRetryEnabled, modelTransportMaxAttempts, modelTransportInitialDelay, modelTransportMaxDelay, terminalResponseGuardEnabled, terminalResponseRecoveryAttempts, rubricEnabled, rubricMaxIterations, rubricMaxStagnantRepairs, customRubricRulesEnabled, customRubricRules, goalsEnabled, goalMaxRounds, executionMode, subagentItems, showToast, runtimeExtensions]);
 
   const handleWikiHybridChange = useCallback(async (enabled: boolean) => {
     if (wikiHybridSaving) return;
@@ -3516,6 +3546,89 @@ export default function SettingsPage() {
                               <p className="mt-1 text-[10px] text-gray-400">推荐 end，命中后注入限制消息并结束。</p>
                             </FormField>
                           </div>
+
+                          <div className="mt-5 border-t border-black/[0.06] pt-4">
+                            <div className="flex items-center justify-between gap-4">
+                              <div>
+                                <p className="text-[12px] font-semibold text-gray-900">模型传输重试</p>
+                                <p className="mt-1 text-[10px] leading-4 text-gray-500">
+                                  仅在首个模型 Chunk 到达前重试；SDK 内部重试关闭，由 Harness 统一控制实际请求上限。
+                                </p>
+                              </div>
+                              <SwitchButton
+                                checked={modelTransportRetryEnabled}
+                                onChange={setModelTransportRetryEnabled}
+                                ariaLabel="启用模型传输重试"
+                              />
+                            </div>
+                            <div className="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-3">
+                              <FormField label="总尝试次数（含首次）">
+                                <input
+                                  type="number"
+                                  min={1}
+                                  max={5}
+                                  value={modelTransportMaxAttempts}
+                                  onChange={(e) => setModelTransportMaxAttempts(e.target.value)}
+                                  className="form-input"
+                                  disabled={!modelTransportRetryEnabled}
+                                />
+                              </FormField>
+                              <FormField label="初始等待（秒）">
+                                <input
+                                  type="number"
+                                  min={0}
+                                  max={10}
+                                  step="0.05"
+                                  value={modelTransportInitialDelay}
+                                  onChange={(e) => setModelTransportInitialDelay(e.target.value)}
+                                  className="form-input"
+                                  disabled={!modelTransportRetryEnabled}
+                                />
+                              </FormField>
+                              <FormField label="最大等待（秒）">
+                                <input
+                                  type="number"
+                                  min={0}
+                                  max={60}
+                                  step="0.25"
+                                  value={modelTransportMaxDelay}
+                                  onChange={(e) => setModelTransportMaxDelay(e.target.value)}
+                                  className="form-input"
+                                  disabled={!modelTransportRetryEnabled}
+                                />
+                              </FormField>
+                            </div>
+                          </div>
+
+                          <div className="mt-5 border-t border-black/[0.06] pt-4">
+                            <div className="flex items-center justify-between gap-4">
+                              <div>
+                                <p className="text-[12px] font-semibold text-gray-900">最终回答完整性守卫</p>
+                                <p className="mt-1 text-[10px] leading-4 text-gray-500">
+                                  Provider 正常结束但没有 final content 时，保留当前 Run 进度并原地恢复。
+                                </p>
+                              </div>
+                              <SwitchButton
+                                checked={terminalResponseGuardEnabled}
+                                onChange={setTerminalResponseGuardEnabled}
+                                ariaLabel="启用最终回答完整性守卫"
+                              />
+                            </div>
+                            <div className="mt-3 max-w-[220px]">
+                              <FormField label="自动恢复次数">
+                                <input
+                                  type="number"
+                                  min={0}
+                                  max={3}
+                                  value={terminalResponseRecoveryAttempts}
+                                  onChange={(e) => setTerminalResponseRecoveryAttempts(e.target.value)}
+                                  className="form-input"
+                                  disabled={!terminalResponseGuardEnabled}
+                                />
+                                <p className="mt-1 text-[10px] text-gray-400">默认 1；用尽后以结构化失败结束。</p>
+                              </FormField>
+                            </div>
+                          </div>
                         </div>
                         <SpecPreview
                           spec={{
@@ -3525,6 +3638,21 @@ export default function SettingsPage() {
                                 run_limit: positiveIntOrNull(modelCallRunLimit) ?? 50,
                                 thread_limit: positiveIntOrNull(modelCallThreadLimit),
                                 exit_behavior: modelCallExitBehavior,
+                              },
+                              model_resilience: {
+                                transport_retry: {
+                                  enabled: modelTransportRetryEnabled,
+                                  max_attempts: positiveIntOrNull(modelTransportMaxAttempts) ?? 2,
+                                  initial_delay_seconds: Math.max(0, Number.parseFloat(modelTransportInitialDelay) || 0),
+                                  max_delay_seconds: Math.max(0, Number.parseFloat(modelTransportMaxDelay) || 0),
+                                },
+                                terminal_response: {
+                                  enabled: terminalResponseGuardEnabled,
+                                  max_recovery_attempts: Math.max(
+                                    0,
+                                    Math.min(3, Number.parseInt(terminalResponseRecoveryAttempts, 10) || 0),
+                                  ),
+                                },
                               },
                             },
                           }}

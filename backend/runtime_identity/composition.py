@@ -1,10 +1,10 @@
-"""Composition boundary for the managed integration control plane.
+"""Composition boundary for local integration CLIs.
 
 Ordinary project commands run through the user-selected Spawn or Kernel
-backend.  Credential-bearing integration CLIs are deliberately different:
-they use the platform-owned host Toolchain and a private kernel-sandbox HOME,
-not the project shell environment.  This module supplies that explicit control
-plane lazily, without making Docker a product prerequisite.
+backend. Host-native integrations such as the official Lark CLI use one global
+binary plus provider-native credential storage, while command classification,
+HITL and output redaction remain platform-owned. Generic software runtimes keep
+their immutable publication path. Docker is not a local product prerequisite.
 """
 
 from __future__ import annotations
@@ -39,9 +39,9 @@ class LazyManagedCliService:
 class ManagedIntegrationBackend:
     """Bind managed host-kernel operations to one workspace.
 
-    Adapter-owned and credentialless CLIs share declaratively published Node
-    bytes.  Only Adapter-owned commands may receive Vault state, and those run
-    in a private kernel-sandbox HOME.  No method guesses a workspace from cwd.
+    Lark executes as an exact host argv against its stable user/profile config
+    directory. Generic credentialless CLIs may still use declaratively
+    published Node bytes. No method guesses a workspace from cwd.
     """
 
     def __init__(self, host_backend: object, workspace_path: Path) -> None:
@@ -58,6 +58,18 @@ class ManagedIntegrationBackend:
 
     def resolve_managed_node_cli(self, **kwargs: Any) -> object:
         return self._host_backend.resolve_managed_node_cli(**kwargs)
+
+    def resolve_host_lark_cli(self) -> object:
+        return self._host_backend.resolve_host_lark_cli()
+
+    def resolve_host_lark_package(self, **kwargs: Any) -> object:
+        return self._host_backend.resolve_host_lark_package(**kwargs)
+
+    def install_host_lark_cli(self, distribution: str, *, expected_version: str) -> object:
+        return self._host_backend.install_host_lark_cli(
+            distribution,
+            expected_version=expected_version,
+        )
 
     def resolve_shared_node_runtime(self, **kwargs: Any) -> object:
         return self._host_backend.resolve_shared_node_runtime(**kwargs)

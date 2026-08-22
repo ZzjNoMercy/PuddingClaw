@@ -674,6 +674,77 @@ async def test_headless_stream_hides_reasoning_but_keeps_user_content():
 
 
 @pytest.mark.asyncio
+async def test_headless_stream_exposes_response_recovery_and_structured_failure():
+    failure = {
+        "code": "model_response_incomplete",
+        "message": "模型未返回完整的最终回答或可执行工具调用。",
+        "recoverable": True,
+    }
+    next_action = {
+        "type": "continue_session",
+        "session_id": "headless-incomplete-session",
+        "message": "继续完成剩余任务，不要重复已成功的工具调用。",
+    }
+    termination = {
+        "finish_reason": None,
+        "content_chars": 0,
+        "reasoning_chars": 16,
+        "tool_call_count": 0,
+        "invalid_reason": "reasoning_without_final_content",
+        "recovery_attempts": 1,
+    }
+
+    async def fake_stream():
+        yield {
+            "event": "model_response_recovery_started",
+            "data": json.dumps({"status": "running", "attempt": 1}),
+        }
+        yield {
+            "event": "model_response_incomplete",
+            "data": json.dumps({"status": "failed", "failure": failure}),
+        }
+        yield {
+            "event": "run_outcome",
+            "data": json.dumps(
+                {
+                    "run_id": "run-incomplete",
+                    "status": "failed",
+                    "outcome": "failed",
+                    "error": failure,
+                    "next_action": next_action,
+                    "termination": termination,
+                }
+            ),
+        }
+        yield {"event": "done", "data": json.dumps({"content": "", "run_outcome": "failed"})}
+
+    execution = _HeadlessExecution(
+        stream=fake_stream(),
+        session_id="headless-incomplete-session",
+        project_id="project-test",
+        approval_mode="smart",
+        analytics_model_id="",
+        analytics_model_match={"status": "general"},
+    )
+    execution.start()
+    events = [item async for item in _stream_headless_execution(execution)]
+
+    assert [item["event"] for item in events] == [
+        "run_starting",
+        "model_response_recovery_started",
+        "model_response_incomplete",
+        "run_outcome",
+        "done",
+        "result",
+    ]
+    result = events[-1]["data"]
+    assert result["status"] == "failed"
+    assert result["error"] == failure
+    assert result["next_action"] == next_action
+    assert result["termination"] == termination
+
+
+@pytest.mark.asyncio
 async def test_headless_execution_broadcasts_same_ordered_events_to_multiple_observers():
     async def fake_stream():
         yield {"event": "token", "data": json.dumps({"content": "增量"})}

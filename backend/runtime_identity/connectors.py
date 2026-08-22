@@ -10,6 +10,7 @@ from typing import Any
 from runtime_identity.adapters import ManagedCliRegistry
 from runtime_identity.authorization import AuthorizationFlowStore
 from runtime_identity.authorization_drivers import AuthorizationDriverRegistry
+from runtime_identity.host_lark_cli import HostLarkCliRuntime
 from runtime_identity.paths import PuddingClawPaths, trusted_owner_user_id
 from runtime_identity.profiles import CredentialProfileStore
 from runtime_identity.toolchains import ToolchainManager
@@ -142,6 +143,20 @@ class ConnectorRegistry:
 
     def _managed_environment(self, definition: ConnectorDefinition) -> dict[str, Any]:
         adapter = self.managed_registry.adapter(definition.adapter_id)
+        if definition.adapter_id == "lark-cli":
+            resolution = HostLarkCliRuntime(self.paths).resolve()
+            return {
+                "health": "available" if resolution.available else "unavailable",
+                "runtime": "host",
+                "executable": (
+                    str(resolution.executable) if resolution.executable is not None else definition.executable
+                ),
+                "package": definition.package,
+                "version": resolution.version,
+                "availability_scope": "all_projects",
+                "toolchain_revision": None,
+                "state_model": "provider_native_profile_dirs",
+            }
         adapter_fingerprint = self.managed_registry.adapter_contract_fingerprint(adapter.adapter_id)
         driver = self.authorization_drivers.for_adapter(adapter.adapter_id, required=False)
         if driver is not None:

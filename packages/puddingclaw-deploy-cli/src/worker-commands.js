@@ -290,6 +290,11 @@ function progressMessage(event) {
   if (event?.event === "task_preflight_started") return "正在准备任务上下文";
   if (event?.event === "task_preflight_completed") return "任务上下文已准备";
   if (event?.event === "run_started") return "Agent 已开始执行";
+  if (event?.event === "model_transport_interrupted") {
+    return data.next_action === "retry_same_model_node" ? "模型连接中断，正在重试" : "模型连接中断";
+  }
+  if (event?.event === "model_response_recovery_started") return "模型回答不完整，正在自动恢复";
+  if (event?.event === "model_response_incomplete") return "模型未形成完整回答";
   if (event?.event === "permission_required") return "等待人工审批";
   if (event?.event === "tool_start") {
     const tool = data.tool || data.tool_name;
@@ -297,7 +302,13 @@ function progressMessage(event) {
   }
   if (event?.event === "tool_end") return "工具调用完成";
   if (event?.event === "final_response") return "正在整理最终结果";
-  if (event?.event === "done" || event?.event === "result") return "任务完成";
+  if (event?.event === "done" || event?.event === "result") {
+    const completed = data.outcome === "completed" || data.status === "completed"
+      || data.run_outcome === "completed";
+    const cancelled = data.outcome === "cancelled" || data.status === "cancelled"
+      || data.run_outcome === "cancelled";
+    return completed ? "任务完成" : cancelled ? "任务已取消" : "任务未完成";
+  }
   return "Agent 正在执行";
 }
 
@@ -306,6 +317,9 @@ const HUMAN_PROGRESS_EVENTS = new Set([
   "task_preflight_started",
   "task_preflight_completed",
   "run_started",
+  "model_transport_interrupted",
+  "model_response_recovery_started",
+  "model_response_incomplete",
   "permission_required",
   "tool_start",
   "tool_end",

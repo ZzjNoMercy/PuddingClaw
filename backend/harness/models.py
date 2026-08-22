@@ -684,6 +684,9 @@ class RunRecord(BaseModel):
     model_call_count: int = 0
     budget_exhaustion_reason: str | None = None
     error: str | None = None
+    failure_detail: dict[str, Any] | None = None
+    next_action: dict[str, Any] | None = None
+    model_termination: dict[str, Any] | None = None
     config_snapshot: dict[str, Any] = Field(default_factory=dict)
     created_at: float = Field(default_factory=time.time)
     updated_at: float = Field(default_factory=time.time)

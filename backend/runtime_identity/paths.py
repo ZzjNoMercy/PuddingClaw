@@ -173,6 +173,25 @@ class PuddingClawPaths:
         owner = safe_identity_component(owner_user_id, field="owner_user_id")
         return self.root / "users" / owner / "credentials"
 
+    def integration_root(self, owner_user_id: str, integration: str) -> Path:
+        """Return persistent host state for one user-owned CLI integration.
+
+        Provider-native CLIs own the files below this directory.  PuddingClaw
+        supplies an isolated directory per local user/profile but does not
+        serialize the provider's state through the Agent workspace.
+        """
+
+        owner = safe_identity_component(owner_user_id, field="owner_user_id")
+        name = safe_identity_component(integration, field="integration")
+        return self.root / "users" / owner / "integrations" / name
+
+    def lark_cli_profile_root(self, owner_user_id: str, profile_id: str) -> Path:
+        profile = safe_identity_component(profile_id, field="profile_id")
+        return self.integration_root(owner_user_id, "lark-cli") / "profiles" / profile
+
+    def lark_cli_config_dir(self, owner_user_id: str, profile_id: str) -> Path:
+        return self.lark_cli_profile_root(owner_user_id, profile_id) / "config"
+
     def skill_secret_registry(self, owner_user_id: str) -> Path:
         owner = safe_identity_component(owner_user_id, field="owner_user_id")
         return self.root / "users" / owner / "skill-secrets" / "registry.enc"

@@ -291,6 +291,24 @@ _DEFAULT_CONFIG: dict[str, Any] = {
             "thread_limit": None,
             "exit_behavior": "end",
         },
+        "model_resilience": {
+            # Transport retries are safe only before the first provider chunk
+            # crosses into the Agent graph. Provider SDK retries are disabled;
+            # this is the single PuddingClaw-owned retry boundary.
+            "transport_retry": {
+                "enabled": True,
+                "max_attempts": 2,
+                "initial_delay_seconds": 0.25,
+                "max_delay_seconds": 2.0,
+            },
+            # A normal provider EOF is not necessarily a valid Agent result.
+            # Give a terminal response without deliverable content one bounded
+            # semantic continuation before failing the Run explicitly.
+            "terminal_response": {
+                "enabled": True,
+                "max_recovery_attempts": 1,
+            },
+        },
         "completion": {
             "rubric": {
                 "enabled": False,
@@ -1921,6 +1939,60 @@ def _normalize_harness_update(value: Any) -> dict[str, Any]:
         ):
             if key in prompt_cache and not isinstance(prompt_cache[key], bool):
                 raise ValueError(f"harness.prompt_cache.{key} must be a boolean")
+
+    model_resilience = result.get("model_resilience")
+    if model_resilience is not None:
+        if not isinstance(model_resilience, dict):
+            raise ValueError("harness.model_resilience must be an object")
+        transport_retry = model_resilience.get("transport_retry")
+        if transport_retry is not None:
+            if not isinstance(transport_retry, dict):
+                raise ValueError("harness.model_resilience.transport_retry must be an object")
+            if "enabled" in transport_retry and not isinstance(transport_retry["enabled"], bool):
+                raise ValueError("harness.model_resilience.transport_retry.enabled must be a boolean")
+            max_attempts = transport_retry.get("max_attempts", 2)
+            if (
+                not isinstance(max_attempts, int)
+                or isinstance(max_attempts, bool)
+                or not 1 <= max_attempts <= 5
+            ):
+                raise ValueError(
+                    "harness.model_resilience.transport_retry.max_attempts must be in [1, 5]"
+                )
+            for key, default, maximum in (
+                ("initial_delay_seconds", 0.25, 10.0),
+                ("max_delay_seconds", 2.0, 60.0),
+            ):
+                item = transport_retry.get(key, default)
+                if (
+                    not isinstance(item, (int, float))
+                    or isinstance(item, bool)
+                    or not 0 <= float(item) <= maximum
+                ):
+                    raise ValueError(
+                        f"harness.model_resilience.transport_retry.{key} must be in [0, {maximum:g}]"
+                    )
+                transport_retry[key] = float(item)
+            if transport_retry["max_delay_seconds"] < transport_retry["initial_delay_seconds"]:
+                raise ValueError(
+                    "harness.model_resilience.transport_retry.max_delay_seconds must be "
+                    ">= initial_delay_seconds"
+                )
+        terminal_response = model_resilience.get("terminal_response")
+        if terminal_response is not None:
+            if not isinstance(terminal_response, dict):
+                raise ValueError("harness.model_resilience.terminal_response must be an object")
+            if "enabled" in terminal_response and not isinstance(terminal_response["enabled"], bool):
+                raise ValueError("harness.model_resilience.terminal_response.enabled must be a boolean")
+            max_recovery_attempts = terminal_response.get("max_recovery_attempts", 1)
+            if (
+                not isinstance(max_recovery_attempts, int)
+                or isinstance(max_recovery_attempts, bool)
+                or not 0 <= max_recovery_attempts <= 3
+            ):
+                raise ValueError(
+                    "harness.model_resilience.terminal_response.max_recovery_attempts must be in [0, 3]"
+                )
 
     goals = result.get("goals")
     if goals is not None:

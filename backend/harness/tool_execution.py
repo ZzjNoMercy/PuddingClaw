@@ -5605,7 +5605,6 @@ class ToolExecutionPipeline(AgentMiddleware):
         match = getattr(plan, "match", plan)
         route = str(getattr(getattr(match, "route", None), "value", ""))
         requires_profile = bool(getattr(match, "requires_profile", False))
-        requires_network = bool(getattr(match, "requires_network", False))
         credential_state = getattr(match, "credential_state", None)
         if requires_profile and credential_state is None:
             return ToolPolicyResult(
@@ -5621,16 +5620,14 @@ class ToolExecutionPipeline(AgentMiddleware):
                 "critical",
                 explanation="Adapter 不能在未声明 profile 需求时注入凭证状态。",
             )
-        if requires_profile and requires_network:
-            return ToolPolicyResult(
-                PolicyDecision.ASK,
-                "managed_cli_credential_network_authorization",
-                "high",
-                explanation=(
-                    "本次 Managed CLI 同时使用用户凭证和网络；必须由用户批准这对绑定，网络授权或凭证授权不能单独复用。"
-                ),
-            )
         if route == "installer":
+            if str(getattr(match, "adapter_id", "")) == "lark-cli":
+                return ToolPolicyResult(
+                    PolicyDecision.ASK,
+                    "managed_cli_host_install",
+                    "package_install",
+                    explanation="安装或更新用户级全局飞书 CLI 需要确认。",
+                )
             return ToolPolicyResult(
                 PolicyDecision.ASK,
                 "managed_cli_toolchain_install",
@@ -5648,7 +5645,9 @@ class ToolExecutionPipeline(AgentMiddleware):
             PolicyDecision.ALLOW,
             "managed_cli_personal_autonomy",
             "managed_write",
-            explanation="受管 CLI 非删除操作按 Adapter 契约执行。",
+            explanation=(
+                "受管 CLI 仅能访问 Adapter 声明的 Provider 能力；普通查询和非删除操作不重复请求 Harness 授权。"
+            ),
         )
 
     def _required_capabilities(
