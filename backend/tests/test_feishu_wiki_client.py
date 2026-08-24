@@ -12,7 +12,7 @@ from knowledge.connectors.feishu_bitable import parse_feishu_bitable_url
 from knowledge.connectors.feishu_blocks import convert_feishu_blocks_to_markdown
 from knowledge.connectors.feishu_sync import process_feishu_sync_run
 from knowledge.models import Base, FeishuAppCredential, KnowledgeDocument, KnowledgeSourceItem
-from knowledge.sources import create_source_connection, create_sync_run
+from knowledge.sources import create_source_connection, create_sync_run, upsert_source_item
 
 
 def test_bitable_links_normalize_direct_and_wiki_entries() -> None:
@@ -116,6 +116,10 @@ def test_direct_bitable_sync_refreshes_schema_without_reading_records(tmp_path, 
         class FakeApi:
             record_calls = 0
 
+            async def list_bitable_tables(self, _session, _source, *, app_token):
+                assert app_token == "base-token"
+                return [{"table_id": "table-token", "name": "项目"}]
+
             async def list_bitable_fields(self, _session, _source, *, app_token, table_id):
                 assert app_token == "base-token"
                 assert table_id == "table-token"
@@ -154,6 +158,128 @@ def test_direct_bitable_sync_refreshes_schema_without_reading_records(tmp_path, 
             assert item.metadata_json["fields"][0]["field_name"] == "项目"
             assert run_.stats_json["schema_changed"] == 1
             assert api.record_calls == 0
+        await engine.dispose()
+
+    asyncio.run(run())
+
+
+def test_direct_bitable_sync_registers_every_configured_sheet(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("PUDDINGCLAW_KNOWLEDGE_DIR", str(tmp_path / "knowledge"))
+
+    async def run() -> None:
+        class FakeApi:
+            async def list_bitable_tables(self, _session, _source, *, app_token):
+                assert app_token == "base-token"
+                return [
+                    {"table_id": "members", "name": "社区成员"},
+                    {"table_id": "content", "name": "内容发布"},
+                ]
+
+            async def list_bitable_fields(self, _session, _source, *, app_token, table_id):
+                assert app_token == "base-token"
+                return [{"field_id": f"{table_id}-id", "field_name": f"{table_id}_id", "type": 1, "is_primary": True}]
+
+            async def list_bitable_records_page(self, *_args, **_kwargs):
+                raise AssertionError("schema refresh must not read records")
+
+        engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'bitable-multi-sync.db'}")
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+        sessions = async_sessionmaker(engine, expire_on_commit=False)
+        async with sessions() as session:
+            source = await create_source_connection(
+                session,
+                connector_key="feishu_wiki",
+                name="社区数据",
+                auth_type="tenant",
+                config={
+                    "source_mode": "bitable",
+                    "app_token": "base-token",
+                    "table_id": "members",
+                    "table_ids": ["members", "content"],
+                    "tables": [
+                        {"table_id": "members", "table_name": "社区成员", "view_id": ""},
+                        {"table_id": "content", "table_name": "内容发布", "view_id": ""},
+                    ],
+                    "source_url": "https://example.feishu.cn/base/base-token",
+                },
+            )
+            source.status = "ready"
+            run_ = await create_sync_run(session, source=source, mode="incremental")
+            await session.commit()
+            await process_feishu_sync_run(session, base_dir=tmp_path, run=run_, api=FakeApi())
+            items = (await session.execute(select(KnowledgeSourceItem).order_by(KnowledgeSourceItem.title))).scalars().all()
+            assert [(item.title, item.metadata_json["table_id"]) for item in items] == [
+                ("内容发布", "content"),
+                ("社区成员", "members"),
+            ]
+            assert run_.stats_json["linked"] == 2
+            assert run_.stats_json["schema_changed"] == 2
+            assert source.config_json["table_ids"] == ["members", "content"]
+        await engine.dispose()
+
+    asyncio.run(run())
+
+
+def test_direct_bitable_sync_with_explicit_empty_scope_registers_nothing(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("PUDDINGCLAW_KNOWLEDGE_DIR", str(tmp_path / "knowledge"))
+
+    async def run() -> None:
+        class FakeApi:
+            field_calls = 0
+
+            async def list_bitable_tables(self, _session, _source, *, app_token):
+                assert app_token == "base-token"
+                return [
+                    {"table_id": "members", "name": "社区成员"},
+                    {"table_id": "content", "name": "内容发布"},
+                ]
+
+            async def list_bitable_fields(self, *_args, **_kwargs):
+                self.field_calls += 1
+                raise AssertionError("an unselected sheet must not have its schema read")
+
+        engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'bitable-empty-scope.db'}")
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+        sessions = async_sessionmaker(engine, expire_on_commit=False)
+        api = FakeApi()
+        async with sessions() as session:
+            source = await create_source_connection(
+                session,
+                connector_key="feishu_wiki",
+                name="社区数据",
+                auth_type="tenant",
+                config={
+                    "source_mode": "bitable",
+                    "app_token": "base-token",
+                    "table_id": "",
+                    "table_ids": [],
+                    "tables": [],
+                    "source_url": "https://example.feishu.cn/base/base-token",
+                },
+            )
+            source.status = "ready"
+            old_item = await upsert_source_item(
+                session,
+                source=source,
+                external_id="bitable:base-token:members",
+                external_type="bitable",
+                title="社区成员",
+                status="linked",
+                metadata={"app_token": "base-token", "table_id": "members", "fields": []},
+            )
+            run_ = await create_sync_run(session, source=source, mode="incremental")
+            await session.commit()
+
+            await process_feishu_sync_run(session, base_dir=tmp_path, run=run_, api=api)
+
+            assert old_item.status == "deleted"
+            assert api.field_calls == 0
+            assert run_.stats_json["linked"] == 0
+            assert run_.stats_json["deleted"] == 1
+            assert source.config_json["table_ids"] == []
+            assert source.config_json["tables"] == []
         await engine.dispose()
 
     asyncio.run(run())

@@ -6,14 +6,17 @@ from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qs, urlparse
 
 import httpx
+import pytest
 from fastapi import FastAPI
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from api import feishu_connector as feishu_api
 from knowledge.connectors import feishu
+from knowledge.connectors.feishu_bitable import FeishuBitableReference
 from knowledge.models import Base, FeishuAppCredential, KnowledgeSourceConnection
-from knowledge.sources import create_source_connection
+from knowledge.sources import create_source_connection, upsert_source_item
+from tools import feishu_bitable_tools
 
 
 def test_feishu_app_secret_stays_in_vault_and_tenant_token_is_singleflight(tmp_path) -> None:
@@ -370,6 +373,237 @@ def test_editing_source_can_switch_auth_identity(tmp_path, monkeypatch) -> None:
                 assert switched_back.auth_type == "user"
                 assert switched_back.status == "pending_auth"
                 assert switched_back.credential_ref == ""
+        await engine.dispose()
+
+    asyncio.run(run())
+
+
+def test_bitable_relation_api_uses_stable_schema_ids_and_rejects_duplicates(tmp_path) -> None:
+    async def run() -> None:
+        engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'bitable-relations.db'}")
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+        sessions = async_sessionmaker(engine, expire_on_commit=False)
+
+        async def session_override():
+            async with sessions() as session:
+                yield session
+
+        app = FastAPI()
+        app.include_router(feishu_api.router, prefix="/api")
+        app.dependency_overrides[feishu_api.get_db_session] = session_override
+
+        async with sessions() as session:
+            source = await create_source_connection(
+                session,
+                connector_key="feishu_wiki",
+                name="社区数据",
+                auth_type="tenant",
+                config={
+                    "source_mode": "bitable",
+                    "app_token": "base-token",
+                    "table_ids": ["members", "content"],
+                },
+            )
+            source.status = "ready"
+            await upsert_source_item(
+                session,
+                source=source,
+                external_id="bitable:base-token:members",
+                external_type="bitable",
+                title="社区成员",
+                status="linked",
+                metadata={
+                    "app_token": "base-token",
+                    "table_id": "members",
+                    "row_storage": False,
+                    "fields": [{"field_id": "member-id", "field_name": "member_id", "type": 1, "is_primary": True}],
+                },
+            )
+            await upsert_source_item(
+                session,
+                source=source,
+                external_id="bitable:base-token:content",
+                external_type="bitable",
+                title="内容发布",
+                status="linked",
+                metadata={
+                    "app_token": "base-token",
+                    "table_id": "content",
+                    "row_storage": False,
+                    "fields": [{"field_id": "author-id", "field_name": "author_id", "type": 1}],
+                },
+            )
+            await session.commit()
+            source_id = source.id
+
+        payload = {
+            "name": "内容作者",
+            "source_table_id": "content",
+            "source_field_id": "author-id",
+            "target_table_id": "members",
+            "target_field_id": "member-id",
+            "cardinality": "many_to_one",
+            "on_target_delete": "retain_orphans",
+        }
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            created = await client.post(f"/api/knowledge/feishu/sources/{source_id}/bitable/relations", json=payload)
+            assert created.status_code == 201
+            relation = created.json()["relation"]
+            assert relation["source_table_name"] == "内容发布"
+            assert relation["target_field_name"] == "member_id"
+            assert relation["validation_status"] == "schema_valid"
+            assert relation["validation_scope"] == "schema_only"
+            assert relation["row_values_stored"] is False
+
+            duplicate = await client.post(
+                f"/api/knowledge/feishu/sources/{source_id}/bitable/relations",
+                json={
+                    **payload,
+                    "source_table_id": "members",
+                    "source_field_id": "member-id",
+                    "target_table_id": "content",
+                    "target_field_id": "author-id",
+                },
+            )
+            assert duplicate.status_code == 409
+
+            listed = await client.get(f"/api/knowledge/feishu/sources/{source_id}/bitable/relations")
+            assert [item["id"] for item in listed.json()["relations"]] == [relation["id"]]
+
+            deleted = await client.delete(
+                f"/api/knowledge/feishu/sources/{source_id}/bitable/relations/{relation['id']}"
+            )
+            assert deleted.status_code == 200
+            listed_after = await client.get(f"/api/knowledge/feishu/sources/{source_id}/bitable/relations")
+            assert listed_after.json()["relations"] == []
+        await engine.dispose()
+
+    asyncio.run(run())
+
+
+def test_bitable_scope_explicit_empty_selection_is_preserved(tmp_path, monkeypatch) -> None:
+    async def run() -> None:
+        engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'bitable-empty-scope-api.db'}")
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+        sessions = async_sessionmaker(engine, expire_on_commit=False)
+
+        async def session_override():
+            async with sessions() as session:
+                yield session
+
+        async def fake_resolve(_session, _source, *, url, api):
+            return (
+                FeishuBitableReference(
+                    original_url=url,
+                    entry_kind="direct_bitable",
+                    app_token="base-token",
+                    table_id="members",
+                ),
+                [
+                    {"table_id": "members", "name": "社区成员"},
+                    {"table_id": "content", "name": "内容发布"},
+                ],
+            )
+
+        monkeypatch.setattr(feishu_api, "resolve_feishu_bitable_reference", fake_resolve)
+        app = FastAPI()
+        app.include_router(feishu_api.router, prefix="/api")
+        app.dependency_overrides[feishu_api.get_db_session] = session_override
+
+        async with sessions() as session:
+            source = await create_source_connection(
+                session,
+                connector_key="feishu_wiki",
+                name="社区数据",
+                auth_type="tenant",
+                config={
+                    "source_mode": "bitable",
+                    "app_token": "base-token",
+                    "table_id": "members",
+                    "table_ids": ["members", "content"],
+                },
+            )
+            source.status = "ready"
+            await session.commit()
+            source_id = source.id
+
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.put(
+                f"/api/knowledge/feishu/sources/{source_id}/bitable/scope",
+                json={
+                    "url": "https://example.feishu.cn/base/base-token?table=members",
+                    "table_id": "members",
+                    "table_ids": [],
+                },
+            )
+            assert response.status_code == 200
+            config = response.json()["source"]["config"]
+            assert config["table_ids"] == []
+            assert config["tables"] == []
+            assert config["table_id"] == ""
+            assert config["table_name"] == ""
+        await engine.dispose()
+
+    asyncio.run(run())
+
+
+def test_agent_rejects_visible_but_unselected_bitable_sheet(tmp_path, monkeypatch) -> None:
+    async def run() -> None:
+        engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'bitable-agent-scope.db'}")
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+        sessions = async_sessionmaker(engine, expire_on_commit=False)
+        monkeypatch.setattr(feishu_bitable_tools, "get_sessionmaker", lambda: sessions)
+
+        class FakeApi:
+            async def list_bitable_tables(self, _session, _source, *, app_token):
+                assert app_token == "base-token"
+                return [
+                    {"table_id": "members", "name": "社区成员"},
+                    {"table_id": "content", "name": "内容发布"},
+                ]
+
+        async with sessions() as session:
+            source = await create_source_connection(
+                session,
+                connector_key="feishu_wiki",
+                name="社区数据",
+                auth_type="tenant",
+                config={
+                    "source_mode": "bitable",
+                    "app_token": "base-token",
+                    "table_id": "members",
+                    "table_ids": ["members"],
+                },
+            )
+            source.status = "ready"
+            await session.commit()
+            source_id = source.id
+
+        with pytest.raises(feishu.FeishuConnectorError, match="当前可见范围"):
+            await feishu_bitable_tools._registered_locator(
+                source_id,
+                "",
+                "content",
+                api=FakeApi(),
+            )
+
+        source, locator, candidates, opened_session = await feishu_bitable_tools._registered_locator(
+            source_id,
+            "",
+            "members",
+            api=FakeApi(),
+        )
+        try:
+            assert source.id == source_id
+            assert locator["table_id"] == "members"
+            assert [table["table_id"] for table in candidates] == ["members"]
+        finally:
+            await opened_session.close()
         await engine.dispose()
 
     asyncio.run(run())

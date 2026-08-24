@@ -172,6 +172,8 @@ Memory 读取与写入必须使用同一个全局或项目目录。写入必须�
 | Analytics Model | `$PUDDINGCLAW_HOME/definitions/analytics-models/` | Manager + Middleware | 用户拥有、版本化 | 主 Agent与相关 Subagent |
 | Memory | `$PUDDINGCLAW_HOME/memory/` | `MemoryMiddleware` | 用户拥有、动态 | 主 Agent当前作用域 |
 | Skill | `/skills/` Home 运行时视图 | `SkillsMiddleware` + `ToolsetMiddleware` | 安装与激活时变化 | 主 Agent与相关 Subagent |
+| Knowledge Catalog（目标） | `$PUDDINGCLAW_HOME/knowledge/*/KNOWLEDGE.md` | `KnowledgeMiddleware` | 连接、资料集合或知识说明变化时 | 主 Agent；Subagent 只接收委派范围 |
+| 语义资产发现 | `$PUDDINGCLAW_HOME/definitions/semantic-assets/` | `KnowledgeMiddleware` 轻量全局索引 + `SemanticAssetsMiddleware` 模型专属索引 | 资产保存或模型切换时 | 主 Agent与相关分析 Subagent |
 | 按需 Tool Guide | `backend/prompts/tool_guides/*.md` | `ToolGuideMiddleware` | 按能力激活 | 当前模型调用 |
 | 能力与权限 | Harness Runtime | `ToolsetMiddleware` 等 | 高频变化 | 当前模型调用 |
 | Todo 与 Run Delta | Harness Runtime | Middleware / Manager | 高频变化 | 当前 Run/调用 |
@@ -188,6 +190,8 @@ Memory 读取与写入必须使用同一个全局或项目目录。写入必须�
 | 所有 Tool 都需要的通用协议 | `backend/prompts/tool_guides/core.md` |
 | 某 Skill/Tool 才需要的使用协议 | 按需 Tool Guide + `manifest.yaml` |
 | 可按需执行的专业方法和工作流 | `SKILL.md` |
+| 可供 Agent 发现和选择的知识源 | `$PUDDINGCLAW_HOME/knowledge/<id>/KNOWLEDGE.md` |
+| 度量、维度、颗粒度与关系语义 | `$PUDDINGCLAW_HOME/definitions/semantic-assets/` 现有 Markdown 资产；不新增 `SEMANTIC.md` |
 | 权限、安全或强制校验 | Backend 策略、Tool Gate 或验证器 |
 
 ### 6.1 新增按需 Tool Guide
@@ -204,6 +208,46 @@ Memory 读取与写入必须使用同一个全局或项目目录。写入必须�
 专业工作流应写成 `SKILL.md`，通过渐进披露按需读取。不要为了让模型“总能看到”而把完整 Skill、参考资料或脚本说明放入 Stable Core。
 
 Skill 文档本身不授予 Tool 权限；实际可用能力以 Toolset、Capability Manifest 和 Tool Gate 为准。
+
+### 6.3 新增 Knowledge Package
+
+Knowledge Package 使用 `$PUDDINGCLAW_HOME/knowledge/<knowledge-id>/KNOWLEDGE.md`。Middleware 只把 frontmatter 的稳定摘要和虚拟路径放入动态 Prompt 区；Agent 成功读取权威文件后，才把 hash-bound activation 写入私有 State。Knowledge activation 表示“本轮已选择并理解该知识源”，不表示“获得了新工具权限”。
+
+Knowledge frontmatter 可以引用现有 `measure.md`、`dimension.md`、`grain.md` 和 `relation.md`。`KnowledgeMiddleware` 复用 Semantic Asset Registry 校验引用并注入轻量发现索引；正文由选中知识或具体工具按需加载。不得创建平行的 `SEMANTIC.md`，不得把全部 Knowledge 或全部语义正文常驻 Stable Core。
+
+目标运行链路仿照 `SkillsMiddleware` 的 metadata-first 渐进披露，但不复用 Skill 的权限语义：
+
+```text
+before_agent
+  -> 扫描/读取 Knowledge Registry snapshot
+  -> 复用 Semantic Asset Registry 的轻量 metadata
+  -> 可信地重建 Knowledge State
+
+wrap_model_call
+  -> 注入 Available Knowledge 与 Available Semantic Assets 目录
+  -> 仅包含 id、名称、描述、类型、标签和虚拟路径
+
+read_file(/knowledge/<id>/KNOWLEDGE.md) 成功
+  -> 校验规范路径、当前 hash 和语义资产引用
+  -> 写入 hash-bound Knowledge activation
+  -> 后续模型轮次按需使用完整知识说明和相关语义正文
+```
+
+目标 State 字段如下；全部由 Middleware 或服务端 Registry 写入，不接受客户端伪造：
+
+| 字段 | 含义 |
+|---|---|
+| `knowledge_catalog_revision` | 当前 Knowledge Catalog snapshot revision |
+| `knowledge_metadata` | 可用 `KNOWLEDGE.md` 的轻量索引 |
+| `knowledge_semantic_assets_metadata` | 现有全局语义资产的轻量发现索引；不覆盖模型专属 `semantic_assets_metadata` |
+| `knowledge_load_errors` | 无效包、重复 ID 和断裂引用 |
+| `active_knowledge_ids` | 当前 Run 已读取权威说明的知识 ID |
+| `knowledge_activations` | 绑定知识 ID、文件 hash、Run 和来源 tool call 的激活记录 |
+| `active_knowledge_semantic_asset_ids` | 已激活知识声明且经 Registry 校验的语义资产 ID |
+
+`before_agent` 必须按当前 snapshot 重建目录 State；`active_knowledge_ids` 和 `knowledge_activations` 使用确定性 reducer 合并；文件 hash 或 catalog revision 变化时旧激活失效。Task Router 可以推荐知识，但不得裁掉目录。Subagent 和 headless worker 不默认继承全量知识，只接收委派范围。
+
+Knowledge Catalog 第一版不依赖数据库。Markdown 是目录事实源，应用级 Registry 是可重建缓存；PostgreSQL、SQLite、Milvus 只能承担任务账本、UI 性能或检索索引，不能成为 Agent 发现“有哪些知识可用”的唯一权威。
 
 ## 7. Prompt Cache 标准
 
@@ -255,6 +299,8 @@ Subagent 是独立构建的 Agent，不复制主 Agent 的完整 SystemMessage�
 | Memory 注入 | DeepAgents `MemoryMiddleware` + Home-backed `FilesystemBackend` |
 | Memory 写入 | `backend/tools/update_memory_tool.py` |
 | Skill/能力/权限清单 | `backend/graph/middlewares/toolset.py` |
+| Knowledge Catalog 与激活（目标） | `backend/graph/middlewares/knowledge.py` |
+| 模型专属语义资产索引 | `backend/graph/middlewares/semantic_assets.py` |
 | 按需 Tool Guide | `backend/graph/middlewares/tool_guides.py` |
 | Todo 协议 | `backend/graph/middlewares/harness_todos.py` |
 | 最终模型输入 Trace | `backend/graph/trace_collector.py` |

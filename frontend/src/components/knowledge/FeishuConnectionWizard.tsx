@@ -152,6 +152,7 @@ export default function FeishuConnectionWizard({ open, existingSource = null, on
   const [bitableUrl, setBitableUrl] = useState("");
   const [bitableTables, setBitableTables] = useState<FeishuBitableTable[]>([]);
   const [bitableTableId, setBitableTableId] = useState("");
+  const [bitableSelectedTableIds, setBitableSelectedTableIds] = useState<string[]>([]);
   const [bitableViewId, setBitableViewId] = useState("");
   const [bitableResolved, setBitableResolved] = useState(false);
   const [bitablePreview, setBitablePreview] = useState<FeishuBitablePreview | null>(null);
@@ -192,6 +193,11 @@ export default function FeishuConnectionWizard({ open, existingSource = null, on
     setBitableUrl(typeof existingSource?.config.source_url === "string" ? existingSource.config.source_url : "");
     setBitableTables([]);
     setBitableTableId(typeof existingSource?.config.table_id === "string" ? existingSource.config.table_id : "");
+    setBitableSelectedTableIds(Array.isArray(existingSource?.config.table_ids)
+      ? existingSource.config.table_ids.map(String)
+      : typeof existingSource?.config.table_id === "string" && existingSource.config.table_id
+        ? [existingSource.config.table_id]
+        : []);
     setBitableViewId(typeof existingSource?.config.view_id === "string" ? existingSource.config.view_id : "");
     setBitableResolved(existingMode === "bitable" && Boolean(existingSource?.config.app_token));
     setBitablePreview(null);
@@ -377,6 +383,7 @@ export default function FeishuConnectionWizard({ open, existingSource = null, on
         ? await configureFeishuBitableScope(source.id, {
             url: bitableUrl.trim(),
             table_id: bitableTableId,
+            table_ids: bitableSelectedTableIds,
             view_id: bitableViewId,
             monitor_changes: false,
             interval_minutes: 0,
@@ -433,6 +440,7 @@ export default function FeishuConnectionWizard({ open, existingSource = null, on
       const resolved = await resolveFeishuBitable(sourceId, url);
       setBitableTables(resolved.tables);
       const visibleIds = new Set(resolved.tables.map((table) => table.table_id));
+      setBitableSelectedTableIds((current) => current.filter((tableId) => visibleIds.has(tableId)));
       const selectedTable = (bitableTableId && visibleIds.has(bitableTableId) ? bitableTableId : "")
         || resolved.reference.table_id
         || (resolved.tables.length === 1 ? resolved.tables[0].table_id : "");
@@ -564,12 +572,19 @@ export default function FeishuConnectionWizard({ open, existingSource = null, on
                     <div className="flex items-center gap-2 font-semibold text-gray-900"><Link2 className="h-4 w-4 text-[#002fa7]" />支持 Wiki 节点链接和直接 Base 链接</div>
                     <p className="mt-1">粘贴 <code>/wiki/&lt;node_token&gt;</code> 或 <code>/base/&lt;app_token&gt;?table=...</code>。平台只登记实时定位与字段 Schema；查询结果不会写入本地资料库或向量索引。</p><p className="mt-2 font-medium text-[#002fa7]">飞书应用需启用 <code>bitable:app:readonly</code>；Wiki 链接还需 <code>wiki:wiki:readonly</code>，并拥有目标资源权限。</p>
                   </div>
-                  <label className="block"><span className="text-xs font-semibold text-gray-700">多维表格链接</span><span className="mt-2 flex gap-2"><input value={bitableUrl} onChange={(event) => { setBitableUrl(event.target.value); setBitableResolved(false); setBitableTables([]); setBitablePreview(null); }} placeholder="https://tenant.feishu.cn/base/... 或 /wiki/..." className="h-11 min-w-0 flex-1 rounded-xl border border-black/10 px-3.5 text-sm outline-none focus:border-[#002fa7]/40 focus:ring-4 focus:ring-[#002fa7]/10" /><button type="button" disabled={busy || !bitableUrl.trim()} onClick={() => void inspectBitableLink()} className="inline-flex h-11 shrink-0 items-center gap-2 rounded-xl border border-[#002fa7]/25 px-4 text-xs font-semibold text-[#002fa7] disabled:opacity-40">{busy ? <Loader2 className="h-4 w-4 animate-spin" /> : null}解析链接</button></span></label>
+                  <label className="block"><span className="text-xs font-semibold text-gray-700">多维表格链接</span><span className="mt-2 flex gap-2"><input value={bitableUrl} onChange={(event) => { setBitableUrl(event.target.value); setBitableResolved(false); setBitableTables([]); setBitableSelectedTableIds([]); setBitablePreview(null); }} placeholder="https://tenant.feishu.cn/base/... 或 /wiki/..." className="h-11 min-w-0 flex-1 rounded-xl border border-black/10 px-3.5 text-sm outline-none focus:border-[#002fa7]/40 focus:ring-4 focus:ring-[#002fa7]/10" /><button type="button" disabled={busy || !bitableUrl.trim()} onClick={() => void inspectBitableLink()} className="inline-flex h-11 shrink-0 items-center gap-2 rounded-xl border border-[#002fa7]/25 px-4 text-xs font-semibold text-[#002fa7] disabled:opacity-40">{busy ? <Loader2 className="h-4 w-4 animate-spin" /> : null}解析链接</button></span></label>
                   {bitableResolved ? (
                     <div className="grid gap-4 rounded-2xl border border-emerald-100 bg-emerald-50/50 p-4 sm:grid-cols-2">
-                      <label className="block"><span className="text-xs font-semibold text-gray-700">数据表</span><select value={bitableTableId} onChange={(event) => { const next = event.target.value; setBitableTableId(next); setBitablePreview(null); event.currentTarget.blur(); if (source && next) void loadBitablePreview(source.id, bitableUrl.trim(), next, bitableViewId); }} className="mt-2 h-10 w-full rounded-xl border border-black/10 bg-white px-3 text-sm outline-none"><option value="">请选择数据表</option>{bitableTables.map((table) => <option key={table.table_id} value={table.table_id}>{table.name || table.table_id}</option>)}</select></label>
+                      <div className="sm:col-span-2">
+                        <div className="flex flex-wrap items-center justify-between gap-2"><div><div className="text-xs font-semibold text-gray-700">允许使用的数据表</div><p className="mt-1 text-[11px] text-gray-500">默认全不选。只有勾选的 Sheet 会登记到资料库并允许 Agent 查询。</p></div><div className="flex items-center gap-2"><button type="button" onClick={() => setBitableSelectedTableIds(bitableTables.map((table) => table.table_id))} className="text-[11px] font-semibold text-[#002fa7]">全选</button><span className="text-gray-300">/</span><button type="button" onClick={() => setBitableSelectedTableIds([])} className="text-[11px] font-semibold text-gray-500">全不选</button></div></div>
+                        <div className="mt-3 grid max-h-40 gap-2 overflow-y-auto rounded-xl border border-black/[0.07] bg-white p-2 sm:grid-cols-2">
+                          {bitableTables.map((table) => { const checked = bitableSelectedTableIds.includes(table.table_id); return <label key={table.table_id} className={`flex cursor-pointer items-center gap-2 rounded-lg px-2.5 py-2 text-xs ${checked ? "bg-[#002fa7]/[0.06] text-[#002fa7]" : "text-gray-600 hover:bg-gray-50"}`}><input type="checkbox" checked={checked} onChange={(event) => setBitableSelectedTableIds((current) => event.target.checked ? [...current, table.table_id] : current.filter((tableId) => tableId !== table.table_id))} className="accent-[#002fa7]" /><span className="min-w-0 flex-1 truncate font-medium">{table.name || table.table_id}</span></label>; })}
+                        </div>
+                        <p className="mt-2 text-[11px] font-medium text-emerald-700">已选择 {bitableSelectedTableIds.length} / {bitableTables.length} 张；允许部分选择或全不选。</p>
+                      </div>
+                      <label className="block"><span className="text-xs font-semibold text-gray-700">预览数据表</span><select value={bitableTableId} onChange={(event) => { const next = event.target.value; setBitableTableId(next); setBitablePreview(null); event.currentTarget.blur(); if (source && next) void loadBitablePreview(source.id, bitableUrl.trim(), next, bitableViewId); }} className="mt-2 h-10 w-full rounded-xl border border-black/10 bg-white px-3 text-sm outline-none"><option value="">请选择数据表</option>{bitableTables.map((table) => <option key={table.table_id} value={table.table_id}>{table.name || table.table_id}</option>)}</select></label>
                       <label className="block"><span className="text-xs font-semibold text-gray-700">视图 ID（可选）</span><input value={bitableViewId} onChange={(event) => { setBitableViewId(event.target.value); setBitablePreview(null); }} onBlur={() => { if (source && bitableTableId) void loadBitablePreview(source.id, bitableUrl.trim(), bitableTableId, bitableViewId); }} placeholder="默认读取整个表" className="mt-2 h-10 w-full rounded-xl border border-black/10 bg-white px-3 text-sm outline-none" /></label>
-                      <p className="sm:col-span-2 text-xs text-emerald-700">已验证当前身份可读取 {bitableTables.length} 个数据表。保存后 Agent 可通过只读工具实时查看字段和分页记录。</p>
+                      <p className="sm:col-span-2 text-xs text-emerald-700">当前身份可见 {bitableTables.length} 个数据表；“可见”不等于“已授权给 PuddingClaw”，最终以勾选范围为准。</p>
                     </div>
                   ) : null}
                   {previewBusy ? <div className="flex items-center justify-center gap-2 rounded-2xl border border-black/[0.06] py-10 text-xs text-gray-400"><Loader2 className="h-4 w-4 animate-spin" />读取实时预览…</div> : null}
@@ -596,7 +611,7 @@ export default function FeishuConnectionWizard({ open, existingSource = null, on
           <button type="button" onClick={step === "credential" || step === "scope" ? onClose : () => setStep("credential")} className="h-10 rounded-xl border border-black/10 px-4 text-sm font-semibold text-gray-600 hover:bg-gray-50">{step === "credential" ? "取消" : step === "scope" ? "稍后设置" : "上一步"}</button>
           {step === "credential" ? <button type="button" disabled={busy || !appId.trim() || appSecret.length < 8} onClick={() => void saveCredential()} className="inline-flex h-10 items-center gap-2 rounded-xl bg-[#002fa7] px-5 text-sm font-semibold text-white disabled:opacity-40">{busy ? <Loader2 className="h-4 w-4 animate-spin" /> : null}验证并继续</button> : null}
           {step === "authorization" ? <button type="button" disabled={busy} onClick={() => void authorize()} className="inline-flex h-10 items-center gap-2 rounded-xl bg-[#002fa7] px-5 text-sm font-semibold text-white disabled:opacity-40">{busy ? <Loader2 className="h-4 w-4 animate-spin" /> : authType === "user" ? <ExternalLink className="h-4 w-4" /> : null}{authType === "tenant" ? "验证应用身份" : "打开飞书授权"}</button> : null}
-          {step === "scope" ? <button type="button" disabled={busy || (scopeMode === "wiki" ? !spaceId : !bitableResolved || !bitableTableId)} onClick={() => void finish()} className="inline-flex h-10 items-center gap-2 rounded-xl bg-[#002fa7] px-5 text-sm font-semibold text-white disabled:opacity-40">{busy ? <Loader2 className="h-4 w-4 animate-spin" /> : null}{scopeMode === "wiki" ? "保存并开始同步" : "保存实时连接"}</button> : null}
+          {step === "scope" ? <button type="button" disabled={busy || (scopeMode === "wiki" ? !spaceId : !bitableResolved)} onClick={() => void finish()} className="inline-flex h-10 items-center gap-2 rounded-xl bg-[#002fa7] px-5 text-sm font-semibold text-white disabled:opacity-40">{busy ? <Loader2 className="h-4 w-4 animate-spin" /> : null}{scopeMode === "wiki" ? "保存并开始同步" : bitableSelectedTableIds.length ? "保存授权范围" : "保存（不授权数据表）"}</button> : null}
         </div>
       </div>
     </div>

@@ -153,6 +153,42 @@ export interface FeishuBitablePreview {
   };
 }
 
+export type FeishuBitableCardinality = "one_to_one" | "one_to_many" | "many_to_one" | "many_to_many";
+export type FeishuBitableDeletePolicy = "retain_orphans" | "restrict" | "cascade";
+
+export interface FeishuBitableRelation {
+  id: string;
+  name: string;
+  description: string;
+  source_table_id: string;
+  source_table_name: string;
+  source_field_id: string;
+  source_field_name: string;
+  target_table_id: string;
+  target_table_name: string;
+  target_field_id: string;
+  target_field_name: string;
+  cardinality: FeishuBitableCardinality;
+  on_target_delete: FeishuBitableDeletePolicy;
+  validation_status: "schema_valid" | "needs_review" | "stale_endpoint" | string;
+  validation_scope: "schema_only" | string;
+  validation_warnings: string[];
+  row_values_stored: false;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface FeishuBitableRelationInput {
+  name?: string;
+  description?: string;
+  source_table_id: string;
+  source_field_id: string;
+  target_table_id: string;
+  target_field_id: string;
+  cardinality: FeishuBitableCardinality;
+  on_target_delete: FeishuBitableDeletePolicy;
+}
+
 export async function listKnowledgeConnectors(): Promise<KnowledgeConnector[]> {
   return (await requestJson<{ connectors: KnowledgeConnector[] }>("/connectors")).connectors;
 }
@@ -334,6 +370,7 @@ export async function previewFeishuBitable(sourceId: string, input: {
 export async function configureFeishuBitableScope(sourceId: string, input: {
   url: string;
   table_id: string;
+  table_ids: string[];
   view_id?: string;
   monitor_changes?: boolean;
   interval_minutes?: number;
@@ -342,4 +379,38 @@ export async function configureFeishuBitableScope(sourceId: string, input: {
     `/feishu/sources/${encodeURIComponent(sourceId)}/bitable/scope`,
     { method: "PUT", body: JSON.stringify(input) },
   )).source;
+}
+
+export async function listFeishuBitableRelations(sourceId: string): Promise<FeishuBitableRelation[]> {
+  return (await requestJson<{ relations: FeishuBitableRelation[] }>(
+    `/feishu/sources/${encodeURIComponent(sourceId)}/bitable/relations`,
+  )).relations;
+}
+
+export async function createFeishuBitableRelation(
+  sourceId: string,
+  input: FeishuBitableRelationInput,
+): Promise<FeishuBitableRelation> {
+  return (await requestJson<{ relation: FeishuBitableRelation }>(
+    `/feishu/sources/${encodeURIComponent(sourceId)}/bitable/relations`,
+    { method: "POST", body: JSON.stringify(input) },
+  )).relation;
+}
+
+export async function updateFeishuBitableRelation(
+  sourceId: string,
+  relationId: string,
+  input: FeishuBitableRelationInput,
+): Promise<FeishuBitableRelation> {
+  return (await requestJson<{ relation: FeishuBitableRelation }>(
+    `/feishu/sources/${encodeURIComponent(sourceId)}/bitable/relations/${encodeURIComponent(relationId)}`,
+    { method: "PUT", body: JSON.stringify(input) },
+  )).relation;
+}
+
+export async function deleteFeishuBitableRelation(sourceId: string, relationId: string): Promise<void> {
+  await requestJson(
+    `/feishu/sources/${encodeURIComponent(sourceId)}/bitable/relations/${encodeURIComponent(relationId)}`,
+    { method: "DELETE" },
+  );
 }

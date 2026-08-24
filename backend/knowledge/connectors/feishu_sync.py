@@ -205,59 +205,163 @@ class FeishuWikiSync:
 
         config = dict(source.config_json or {})
         app_token = str(config.get("app_token") or "").strip()
-        table_id = str(config.get("table_id") or "").strip()
-        if not app_token or not table_id:
-            raise FeishuConnectorError("请先粘贴多维表格链接并选择数据表。")
+        if not app_token:
+            raise FeishuConnectorError("请先粘贴并保存多维表格链接。")
         run.status = "running"
         run.current_step = "reading_schema"
-        run.progress = 20
+        run.progress = 10
         run.started_at = run.started_at or datetime.now(timezone.utc)
         source.status = "syncing"
         await session.commit()
 
-        fields = await self.api.list_bitable_fields(
-            session,
-            source,
-            app_token=app_token,
-            table_id=table_id,
-        )
-        schema_revision = hashlib.sha256(
-            json.dumps(fields, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
-        ).hexdigest()
+        visible_tables = await self.api.list_bitable_tables(session, source, app_token=app_token)
+        visible = {
+            str(table.get("table_id") or ""): table
+            for table in visible_tables
+            if str(table.get("table_id") or "")
+        }
+        configured_tables = config.get("tables") if isinstance(config.get("tables"), list) else []
+        view_by_table = {
+            str(table.get("table_id") or ""): str(table.get("view_id") or "")
+            for table in configured_tables
+            if isinstance(table, dict) and str(table.get("table_id") or "")
+        }
+        raw_table_ids = config.get("table_ids")
+        has_explicit_scope = isinstance(raw_table_ids, list)
+        requested_ids = [
+            str(value).strip()
+            for value in raw_table_ids if str(value).strip()
+        ] if isinstance(raw_table_ids, list) else []
+        legacy_table_id = str(config.get("table_id") or "").strip()
+        if legacy_table_id and legacy_table_id not in view_by_table:
+            view_by_table[legacy_table_id] = str(config.get("view_id") or "")
+        if not has_explicit_scope and not requested_ids and legacy_table_id:
+            requested_ids = [legacy_table_id]
+        table_ids = list(dict.fromkeys(requested_ids))
+        if any(table_id not in visible for table_id in table_ids):
+            raise FeishuConnectorError("已登记的数据表不再对当前身份可见，请编辑连接并重新确认范围。")
+
+        schemas: list[dict[str, Any]] = []
+        for index, table_id in enumerate(table_ids, start=1):
+            fields = await self.api.list_bitable_fields(
+                session,
+                source,
+                app_token=app_token,
+                table_id=table_id,
+            )
+            schema_revision = hashlib.sha256(
+                json.dumps(fields, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            ).hexdigest()
+            schemas.append(
+                {
+                    "table_id": table_id,
+                    "table_name": str(visible[table_id].get("name") or table_id),
+                    "view_id": view_by_table.get(table_id, ""),
+                    "fields": fields,
+                    "revision": schema_revision,
+                }
+            )
+            run.progress = min(70, 10 + int(index / len(table_ids) * 60))
         await session.commit()
-        existing = await self._item_for_node(session, source.id, f"bitable:{app_token}:{table_id}")
-        changed = existing is None or existing.revision != schema_revision
-        item = await upsert_source_item(
-            session,
-            source=source,
-            external_id=f"bitable:{app_token}:{table_id}",
-            external_type="bitable",
-            title=str(config.get("table_name") or table_id),
-            source_url=str(config.get("source_url") or "") or None,
-            status="linked",
-            revision=schema_revision,
-            path=[str(config.get("table_name") or table_id)],
-            metadata={
-                "entry_kind": str(config.get("entry_kind") or "direct_bitable"),
-                "node_token": str(config.get("node_token") or ""),
-                "app_token": app_token,
-                "table_id": table_id,
-                "view_id": str(config.get("view_id") or ""),
-                "storage_mode": "live",
-                "row_storage": False,
-                "fields": fields,
-            },
-        )
-        item.last_seen_run_id = run.id
+
+        existing_items = (
+            await session.execute(
+                select(KnowledgeSourceItem).where(
+                    KnowledgeSourceItem.source_connection_id == source.id,
+                    KnowledgeSourceItem.external_type == "bitable",
+                )
+            )
+        ).scalars().all()
+        existing_by_external_id = {item.external_id: item for item in existing_items}
+        schema_changed = 0
+        for schema in schemas:
+            table_id = str(schema["table_id"])
+            external_id = f"bitable:{app_token}:{table_id}"
+            existing = existing_by_external_id.get(external_id)
+            changed = existing is None or existing.revision != schema["revision"]
+            schema_changed += 1 if changed else 0
+            item = await upsert_source_item(
+                session,
+                source=source,
+                external_id=external_id,
+                external_type="bitable",
+                title=str(schema["table_name"]),
+                source_url=str(config.get("source_url") or "") or None,
+                status="linked",
+                revision=str(schema["revision"]),
+                path=[str(schema["table_name"])],
+                metadata={
+                    "entry_kind": str(config.get("entry_kind") or "direct_bitable"),
+                    "node_token": str(config.get("node_token") or ""),
+                    "app_token": app_token,
+                    "table_id": table_id,
+                    "table_name": str(schema["table_name"]),
+                    "view_id": str(schema["view_id"]),
+                    "storage_mode": "live",
+                    "row_storage": False,
+                    "fields": list(schema["fields"]),
+                },
+            )
+            item.last_seen_run_id = run.id
+
+        selected_external_ids = {f"bitable:{app_token}:{table_id}" for table_id in table_ids}
+        deleted = 0
+        for item in existing_items:
+            if item.external_id in selected_external_ids:
+                continue
+            if item.status != "deleted":
+                item.status = "deleted"
+                deleted += 1
+
+        field_catalog = {
+            str(schema["table_id"]): {
+                str(field.get("field_id") or ""): field
+                for field in schema["fields"]
+                if isinstance(field, dict) and str(field.get("field_id") or "")
+            }
+            for schema in schemas
+        }
+        table_name_by_id = {str(schema["table_id"]): str(schema["table_name"]) for schema in schemas}
+        relations = [dict(item) for item in config.get("bitable_relations") or [] if isinstance(item, dict)]
+        for relation in relations:
+            source_table_id = str(relation.get("source_table_id") or "")
+            target_table_id = str(relation.get("target_table_id") or "")
+            source_field = field_catalog.get(source_table_id, {}).get(str(relation.get("source_field_id") or ""))
+            target_field = field_catalog.get(target_table_id, {}).get(str(relation.get("target_field_id") or ""))
+            if source_field is None or target_field is None:
+                relation["validation_status"] = "stale_endpoint"
+                relation["validation_warnings"] = ["数据表或字段已不可见，请修复关系端点。"]
+                continue
+            relation["source_table_name"] = table_name_by_id[source_table_id]
+            relation["target_table_name"] = table_name_by_id[target_table_id]
+            relation["source_field_name"] = str(source_field.get("field_name") or relation.get("source_field_id") or "")
+            relation["target_field_name"] = str(target_field.get("field_name") or relation.get("target_field_id") or "")
+
+        default_table_id = legacy_table_id if legacy_table_id in table_ids else (table_ids[0] if table_ids else "")
+        source.config_json = {
+            **config,
+            "table_id": default_table_id,
+            "table_name": table_name_by_id[default_table_id] if default_table_id else "",
+            "table_ids": table_ids,
+            "tables": [
+                {
+                    "table_id": str(schema["table_id"]),
+                    "table_name": str(schema["table_name"]),
+                    "view_id": str(schema["view_id"]),
+                }
+                for schema in schemas
+            ],
+            "bitable_relations": relations,
+        }
         now = datetime.now(timezone.utc)
         stats = {
-            "discovered": 1,
-            "linked": 1,
-            "schema_changed": 1 if changed else 0,
+            "discovered": len(schemas),
+            "linked": len(schemas),
+            "schema_changed": schema_changed,
             "changed": 0,
-            "unchanged": 0 if changed else 1,
+            "unchanged": len(schemas) - schema_changed,
             "failed": 0,
-            "deleted": 0,
+            "deleted": deleted,
             "unsupported": 0,
         }
         run.status = "succeeded"

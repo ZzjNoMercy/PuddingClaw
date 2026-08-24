@@ -45,10 +45,16 @@ async def _registered_locator(
         source = await session.get(KnowledgeSourceConnection, source_id)
         if source is None or source.connector_key != "feishu_wiki" or source.status == "disabled":
             raise FeishuConnectorError("已登记的飞书 Source 不存在或已停用。")
-        raw: dict[str, Any] = dict(source.config_json or {})
+        source_config: dict[str, Any] = dict(source.config_json or {})
+        raw: dict[str, Any] = dict(source_config)
         if source_item_id:
             item = await session.get(KnowledgeSourceItem, source_item_id)
-            if item is None or item.source_connection_id != source.id or item.external_type != "bitable":
+            if (
+                item is None
+                or item.source_connection_id != source.id
+                or item.external_type != "bitable"
+                or item.status == "deleted"
+            ):
                 raise FeishuConnectorError("该 Bitable 条目不属于指定 Source。")
             raw = {**raw, **dict(item.metadata_json or {})}
         app_token = str(raw.get("app_token") or "").strip()
@@ -56,11 +62,18 @@ async def _registered_locator(
             raise FeishuConnectorError("该 Source 尚未登记可实时查询的 Bitable 定位。")
         tables = await api.list_bitable_tables(session, source, app_token=app_token)
         visible = {str(item.get("table_id") or ""): item for item in tables}
+        configured_ids = source_config.get("table_ids")
+        if str(source_config.get("source_mode") or "") == "bitable" and isinstance(configured_ids, list):
+            allowed = {str(value).strip() for value in configured_ids if str(value).strip()}
+            visible = {table_id: table for table_id, table in visible.items() if table_id in allowed}
+            tables = list(visible.values())
         table_id = requested_table_id.strip() or str(raw.get("table_id") or "").strip()
         if not table_id and len(visible) == 1:
             table_id = next(iter(visible))
         if not table_id:
-            raise FeishuConnectorError("该 Bitable 包含多个数据表，请从返回候选中明确 table_id。")
+            if not visible:
+                raise FeishuConnectorError("该 Bitable 当前没有授权给 Agent 的数据表，请先编辑连接并勾选 Sheet。")
+            raise FeishuConnectorError("该 Bitable 包含多个已授权数据表，请从返回候选中明确 table_id。")
         if table_id not in visible:
             raise FeishuConnectorError("请求的数据表不在已登记 Source 的当前可见范围内。")
         locator = {
@@ -104,6 +117,13 @@ class FeishuBitableDescribeTool(BaseTool):
                 app_token=locator["app_token"],
                 table_id=locator["table_id"],
             )
+            relations = [
+                dict(item)
+                for item in (_source.config_json or {}).get("bitable_relations") or []
+                if isinstance(item, dict)
+                and locator["table_id"]
+                in {str(item.get("source_table_id") or ""), str(item.get("target_table_id") or "")}
+            ]
             return json.dumps(
                 {
                     "ok": True,
@@ -113,6 +133,11 @@ class FeishuBitableDescribeTool(BaseTool):
                     "locator": {key: value for key, value in locator.items() if key != "app_token"},
                     "tables": tables,
                     "fields": fields,
+                    "relations": relations,
+                    "relation_guidance": (
+                        "Use only relations whose validation_status is schema_valid or needs_review; "
+                        "never infer an undeclared cross-table join from similar field names."
+                    ),
                 },
                 ensure_ascii=False,
             )
@@ -155,9 +180,27 @@ class FeishuBitableListSourcesTool(BaseTool):
                 represented: set[str] = set()
                 for item in items:
                     source = source_by_id.get(item.source_connection_id)
-                    if source is None or (source.status == "disabled" and not include_disabled):
+                    if item.status == "deleted" or source is None or (source.status == "disabled" and not include_disabled):
                         continue
                     metadata = dict(item.metadata_json or {})
+                    config = dict(source.config_json or {})
+                    configured_ids = config.get("table_ids")
+                    if str(config.get("source_mode") or "") == "bitable" and isinstance(configured_ids, list):
+                        allowed = {str(value).strip() for value in configured_ids if str(value).strip()}
+                        if str(metadata.get("table_id") or "") not in allowed:
+                            # Scope changes take effect immediately, even before
+                            # the background schema refresh tombstones old items.
+                            continue
+                    relations = [
+                        relation
+                        for relation in config.get("bitable_relations") or []
+                        if isinstance(relation, dict)
+                        and str(metadata.get("table_id") or "")
+                        in {
+                            str(relation.get("source_table_id") or ""),
+                            str(relation.get("target_table_id") or ""),
+                        }
+                    ]
                     entries.append(
                         {
                             "source_id": source.id,
@@ -169,6 +212,8 @@ class FeishuBitableListSourcesTool(BaseTool):
                             "view_id": str(metadata.get("view_id") or ""),
                             "source_url": item.source_url,
                             "entry_kind": str(metadata.get("entry_kind") or "wiki_bitable"),
+                            "relation_count": len(relations),
+                            "access_scope": "selected",
                         }
                     )
                     represented.add(source.id)
@@ -189,6 +234,9 @@ class FeishuBitableListSourcesTool(BaseTool):
                             "view_id": str(config.get("view_id") or ""),
                             "source_url": str(config.get("source_url") or ""),
                             "entry_kind": str(config.get("entry_kind") or "direct_bitable"),
+                            "relation_count": len(config.get("bitable_relations") or []),
+                            "authorized_table_count": len(config.get("table_ids") or []),
+                            "access_scope": "deny_all" if not config.get("table_ids") else "selected",
                         }
                     )
             return json.dumps({"ok": True, "row_storage": False, "sources": entries}, ensure_ascii=False)
