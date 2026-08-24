@@ -115,6 +115,44 @@ export interface FeishuWikiNode {
   has_child?: boolean;
 }
 
+export interface FeishuBitableReference {
+  original_url: string;
+  entry_kind: "direct_bitable" | "wiki_bitable";
+  node_token: string;
+  app_token: string;
+  table_id: string;
+  view_id: string;
+}
+
+export interface FeishuBitableTable {
+  table_id: string;
+  name?: string;
+  revision?: number;
+}
+
+export interface FeishuBitableField {
+  field_id: string;
+  field_name: string;
+  type?: number;
+  ui_type?: string;
+  is_primary?: boolean;
+  property?: Record<string, unknown> | null;
+}
+
+export interface FeishuBitablePreview {
+  live: true;
+  row_storage: false;
+  reference: FeishuBitableReference;
+  table: FeishuBitableTable;
+  fields: FeishuBitableField[];
+  records: {
+    items: Array<{ record_id?: string; fields?: Record<string, unknown> }>;
+    has_more: boolean;
+    page_token: string;
+    total?: number | null;
+  };
+}
+
 export async function listKnowledgeConnectors(): Promise<KnowledgeConnector[]> {
   return (await requestJson<{ connectors: KnowledgeConnector[] }>("/connectors")).connectors;
 }
@@ -267,6 +305,41 @@ export async function configureFeishuScope(sourceId: string, input: {
 }): Promise<KnowledgeSource> {
   return (await requestJson<{ source: KnowledgeSource }>(
     `/feishu/sources/${encodeURIComponent(sourceId)}/scope`,
+    { method: "PUT", body: JSON.stringify(input) },
+  )).source;
+}
+
+export async function resolveFeishuBitable(
+  sourceId: string,
+  url: string,
+): Promise<{ reference: FeishuBitableReference; tables: FeishuBitableTable[] }> {
+  return requestJson(`/feishu/sources/${encodeURIComponent(sourceId)}/bitable/resolve`, {
+    method: "POST",
+    body: JSON.stringify({ url }),
+  });
+}
+
+export async function previewFeishuBitable(sourceId: string, input: {
+  url: string;
+  table_id: string;
+  view_id?: string;
+  page_size?: number;
+}): Promise<FeishuBitablePreview> {
+  return requestJson(`/feishu/sources/${encodeURIComponent(sourceId)}/bitable/preview`, {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+export async function configureFeishuBitableScope(sourceId: string, input: {
+  url: string;
+  table_id: string;
+  view_id?: string;
+  monitor_changes?: boolean;
+  interval_minutes?: number;
+}): Promise<KnowledgeSource> {
+  return (await requestJson<{ source: KnowledgeSource }>(
+    `/feishu/sources/${encodeURIComponent(sourceId)}/bitable/scope`,
     { method: "PUT", body: JSON.stringify(input) },
   )).source;
 }

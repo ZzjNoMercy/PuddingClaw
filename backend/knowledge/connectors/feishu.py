@@ -49,6 +49,7 @@ DEFAULT_USER_SCOPES = (
     "docx:document:readonly",
     "drive:drive:readonly",
     "docs:document.media:download",
+    "bitable:app:readonly",
     "offline_access",
 )
 
@@ -681,7 +682,7 @@ user_token_broker = UserTokenBroker()
 
 
 class FeishuOpenApi:
-    """Authenticated Wiki/Docx client with one token-refresh retry."""
+    """Authenticated Wiki/Docx/Bitable client with one token-refresh retry."""
 
     _INVALID_TOKEN_CODES = {99991661, 99991663, 99991664, 99991668}
 
@@ -836,6 +837,75 @@ class FeishuOpenApi:
             page_size=500,
             extra_params={"document_revision_id": document_revision_id},
         )
+
+    async def list_bitable_tables(
+        self,
+        session: AsyncSession,
+        source: KnowledgeSourceConnection,
+        *,
+        app_token: str,
+    ) -> list[dict[str, Any]]:
+        return await self._paginate(
+            session,
+            source,
+            f"/open-apis/bitable/v1/apps/{app_token}/tables",
+            item_key="items",
+            page_size=100,
+        )
+
+    async def list_bitable_fields(
+        self,
+        session: AsyncSession,
+        source: KnowledgeSourceConnection,
+        *,
+        app_token: str,
+        table_id: str,
+    ) -> list[dict[str, Any]]:
+        return await self._paginate(
+            session,
+            source,
+            f"/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/fields",
+            item_key="items",
+            page_size=100,
+        )
+
+    async def list_bitable_records_page(
+        self,
+        session: AsyncSession,
+        source: KnowledgeSourceConnection,
+        *,
+        app_token: str,
+        table_id: str,
+        view_id: str = "",
+        page_size: int = 50,
+        page_token: str = "",
+        field_names: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Read one bounded live page.  The caller owns presentation only;
+        record values must not be persisted by the connector."""
+
+        params: dict[str, Any] = {"page_size": max(1, min(int(page_size), 100))}
+        if page_token:
+            params["page_token"] = page_token
+        if view_id:
+            params["view_id"] = view_id
+        if field_names:
+            params["field_names"] = json.dumps(list(dict.fromkeys(field_names[:100])), ensure_ascii=False)
+        payload = await self.request(
+            session,
+            source,
+            "GET",
+            f"/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/records",
+            params=params,
+        )
+        data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+        items = data.get("items") if isinstance(data.get("items"), list) else []
+        return {
+            "items": [item for item in items if isinstance(item, dict)],
+            "has_more": bool(data.get("has_more")),
+            "page_token": str(data.get("page_token") or ""),
+            "total": data.get("total"),
+        }
 
     async def download_media_assets(
         self,

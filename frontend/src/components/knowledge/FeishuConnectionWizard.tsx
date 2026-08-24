@@ -5,11 +5,13 @@ import {
   Check,
   ChevronDown,
   ChevronRight,
+  Database,
   ExternalLink,
   Eye,
   EyeOff,
   FolderTree,
   KeyRound,
+  Link2,
   Loader2,
   ShieldCheck,
   UserRound,
@@ -19,17 +21,22 @@ import {
 
 import {
   bindFeishuTenantAuth,
+  configureFeishuBitableScope,
   configureFeishuScope,
   createFeishuApp,
   createKnowledgeSource,
   listFeishuNodes,
   listFeishuSpaces,
+  previewFeishuBitable,
   rotateFeishuApp,
+  resolveFeishuBitable,
   startFeishuUserOAuth,
   startKnowledgeSourceSync,
   testFeishuApp,
   updateKnowledgeSource,
   type FeishuSpace,
+  type FeishuBitablePreview,
+  type FeishuBitableTable,
   type FeishuWikiNode,
   type KnowledgeSource,
 } from "@/lib/knowledgeSourcesApi";
@@ -45,6 +52,16 @@ type Props = {
 
 function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error || "未知错误");
+}
+
+function previewValue(value: unknown): string {
+  if (value === null || value === undefined || value === "") return "—";
+  if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") return String(value);
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
 }
 
 function NodeRow({
@@ -123,6 +140,7 @@ export default function FeishuConnectionWizard({ open, existingSource = null, on
   const [appCredentialId, setAppCredentialId] = useState("");
   const [source, setSource] = useState<KnowledgeSource | null>(null);
   const [spaces, setSpaces] = useState<FeishuSpace[]>([]);
+  const [scopeMode, setScopeMode] = useState<"wiki" | "bitable">("wiki");
   const [spaceId, setSpaceId] = useState("");
   const [nodes, setNodes] = useState<FeishuWikiNode[]>([]);
   const [childrenByParent, setChildrenByParent] = useState<Record<string, FeishuWikiNode[]>>({});
@@ -131,6 +149,13 @@ export default function FeishuConnectionWizard({ open, existingSource = null, on
   const [rootNodeTitle, setRootNodeTitle] = useState("");
   const [schedule, setSchedule] = useState("60");
   const [publishVector, setPublishVector] = useState(true);
+  const [bitableUrl, setBitableUrl] = useState("");
+  const [bitableTables, setBitableTables] = useState<FeishuBitableTable[]>([]);
+  const [bitableTableId, setBitableTableId] = useState("");
+  const [bitableViewId, setBitableViewId] = useState("");
+  const [bitableResolved, setBitableResolved] = useState(false);
+  const [bitablePreview, setBitablePreview] = useState<FeishuBitablePreview | null>(null);
+  const [previewBusy, setPreviewBusy] = useState(false);
   const [busy, setBusy] = useState(false);
   const [loadingToken, setLoadingToken] = useState("");
   const [error, setError] = useState("");
@@ -144,6 +169,7 @@ export default function FeishuConnectionWizard({ open, existingSource = null, on
     const existingSpaceId = typeof existingSource?.config.space_id === "string" ? existingSource.config.space_id : "";
     const existingRootToken = typeof existingSource?.config.root_node_token === "string" ? existingSource.config.root_node_token : "";
     const existingInterval = Number(existingSource?.schedule?.interval_minutes || 0);
+    const existingMode = existingSource?.config.source_mode === "bitable" ? "bitable" : "wiki";
     setStep(existingAppId ? "authorization" : "credential");
     setAppId("");
     setAppSecret("");
@@ -154,6 +180,7 @@ export default function FeishuConnectionWizard({ open, existingSource = null, on
     setAppCredentialId(existingAppId);
     setSource(existingSource);
     setSpaces([]);
+    setScopeMode(existingMode);
     setSpaceId(existingSpaceId);
     setNodes([]);
     setChildrenByParent({});
@@ -162,6 +189,12 @@ export default function FeishuConnectionWizard({ open, existingSource = null, on
     setRootNodeTitle("");
     setSchedule(existingInterval > 0 ? String(existingInterval) : existingSource ? "manual" : "60");
     setPublishVector(existingSource ? existingSource.config.publish_vector !== false : true);
+    setBitableUrl(typeof existingSource?.config.source_url === "string" ? existingSource.config.source_url : "");
+    setBitableTables([]);
+    setBitableTableId(typeof existingSource?.config.table_id === "string" ? existingSource.config.table_id : "");
+    setBitableViewId(typeof existingSource?.config.view_id === "string" ? existingSource.config.view_id : "");
+    setBitableResolved(existingMode === "bitable" && Boolean(existingSource?.config.app_token));
+    setBitablePreview(null);
     prevSpaceIdRef.current = existingSpaceId;
     setError("");
     setNameSaved(false);
@@ -188,7 +221,9 @@ export default function FeishuConnectionWizard({ open, existingSource = null, on
         return;
       }
       oauthCompletedRef.current = true;
-      void loadSpaces(source.id);
+      setStep("scope");
+      if (scopeMode === "bitable" && bitableUrl.trim()) void hydrateBitable(source.id, bitableUrl.trim());
+      else void loadSpaces(source.id);
     };
     window.addEventListener("message", onMessage);
     return () => window.removeEventListener("message", onMessage);
@@ -225,7 +260,7 @@ export default function FeishuConnectionWizard({ open, existingSource = null, on
       setStep("scope");
       if (result.length === 1) setSpaceId(result[0].space_id);
     } catch (nextError) {
-      setError(messageOf(nextError));
+      if (scopeMode === "wiki") setError(messageOf(nextError));
     } finally {
       setBusy(false);
     }
@@ -268,7 +303,9 @@ export default function FeishuConnectionWizard({ open, existingSource = null, on
       if (authType === "tenant") {
         const bound = await bindFeishuTenantAuth(created.id, appCredentialId);
         setSource(bound);
-        await loadSpaces(created.id);
+        setStep("scope");
+        if (scopeMode === "bitable" && bitableUrl.trim()) await hydrateBitable(bound.id, bitableUrl.trim());
+        else await loadSpaces(bound.id);
         return;
       }
       const oauth = await startFeishuUserOAuth(created.id, appCredentialId, redirectUri);
@@ -332,19 +369,78 @@ export default function FeishuConnectionWizard({ open, existingSource = null, on
   }
 
   async function finish() {
-    if (!source || !spaceId) return;
+    if (!source) return;
     setBusy(true);
     setError("");
     try {
-      const configured = await configureFeishuScope(source.id, {
-        space_id: spaceId,
-        root_node_token: rootNodeToken,
-        publish_vector: publishVector,
-        interval_minutes: schedule === "manual" ? 0 : Number(schedule),
-      });
+      const configured = scopeMode === "bitable"
+        ? await configureFeishuBitableScope(source.id, {
+            url: bitableUrl.trim(),
+            table_id: bitableTableId,
+            view_id: bitableViewId,
+            monitor_changes: false,
+            interval_minutes: 0,
+          })
+        : await configureFeishuScope(source.id, {
+            space_id: spaceId,
+            root_node_token: rootNodeToken,
+            publish_vector: publishVector,
+            interval_minutes: schedule === "manual" ? 0 : Number(schedule),
+          });
       await startKnowledgeSourceSync(source.id, "incremental");
       await onConnected({ ...configured, status: "syncing" });
       onClose();
+    } catch (nextError) {
+      setError(messageOf(nextError));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function inspectBitableLink() {
+    if (!source || !bitableUrl.trim()) return;
+    await hydrateBitable(source.id, bitableUrl.trim());
+  }
+
+  async function loadBitablePreview(sourceId: string, url: string, tableId: string, viewId: string) {
+    if (!tableId) {
+      setBitablePreview(null);
+      return;
+    }
+    setPreviewBusy(true);
+    try {
+      const preview = await previewFeishuBitable(sourceId, {
+        url,
+        table_id: tableId,
+        view_id: viewId,
+        page_size: 10,
+      });
+      setBitablePreview(preview);
+    } catch (nextError) {
+      setBitablePreview(null);
+      setError(messageOf(nextError));
+    } finally {
+      setPreviewBusy(false);
+    }
+  }
+
+  async function hydrateBitable(sourceId: string, url: string) {
+    setBusy(true);
+    setError("");
+    setBitableResolved(false);
+    setBitablePreview(null);
+    try {
+      const resolved = await resolveFeishuBitable(sourceId, url);
+      setBitableTables(resolved.tables);
+      const visibleIds = new Set(resolved.tables.map((table) => table.table_id));
+      const selectedTable = (bitableTableId && visibleIds.has(bitableTableId) ? bitableTableId : "")
+        || resolved.reference.table_id
+        || (resolved.tables.length === 1 ? resolved.tables[0].table_id : "");
+      const selectedView = bitableViewId || resolved.reference.view_id || "";
+      setBitableTableId(selectedTable);
+      setBitableViewId(selectedView);
+      setBitableResolved(true);
+      if (selectedTable) await loadBitablePreview(sourceId, url, selectedTable, selectedView);
     } catch (nextError) {
       setError(messageOf(nextError));
     } finally {
@@ -382,7 +478,6 @@ export default function FeishuConnectionWizard({ open, existingSource = null, on
             <div className="mx-auto max-w-xl space-y-5">
               <div className="rounded-2xl border border-[#002fa7]/10 bg-[#002fa7]/[0.035] p-4 text-sm leading-6 text-gray-600">
                 <div className="flex items-center gap-2 font-semibold text-gray-900"><ShieldCheck className="h-4 w-4 text-[#002fa7]" />凭据只进入后端加密凭据库</div>
-                <p className="mt-1">前端不会保存或回显 App Secret；tenant_access_token 与 user_access_token 也不会返回浏览器。</p>
               </div>
               <label className="block"><span className="text-xs font-semibold text-gray-700">应用名称（可选）</span><input value={appName} onChange={(event) => setAppName(event.target.value)} placeholder="例如：PuddingKnowledge 连接器" className="mt-2 h-11 w-full rounded-xl border border-black/10 px-3.5 text-sm outline-none focus:border-[#002fa7]/40 focus:ring-4 focus:ring-[#002fa7]/10" /></label>
               <label className="block"><span className="text-xs font-semibold text-gray-700">App ID</span><input value={appId} onChange={(event) => setAppId(event.target.value)} autoComplete="off" placeholder="cli_xxxxxxxxxxxxxxxx" className="mt-2 h-11 w-full rounded-xl border border-black/10 px-3.5 font-mono text-sm outline-none focus:border-[#002fa7]/40 focus:ring-4 focus:ring-[#002fa7]/10" /></label>
@@ -408,11 +503,11 @@ export default function FeishuConnectionWizard({ open, existingSource = null, on
                 {existingSource ? <p className="mt-1.5 text-[11px] text-gray-400">名称等非授权信息可直接保存，无需重新验证身份。</p> : null}
               </div>
               <div className="grid gap-3 sm:grid-cols-2">
-                <button type="button" onClick={() => setAuthType("tenant")} className={`rounded-2xl border p-5 text-left transition ${authType === "tenant" ? "border-[#002fa7]/30 bg-[#002fa7]/[0.045] ring-2 ring-[#002fa7]/10" : "border-black/[0.07] hover:border-[#002fa7]/20"}`}>
+                <button type="button" onClick={() => { setAuthType("tenant"); setError(""); }} className={`rounded-2xl border p-5 text-left transition ${authType === "tenant" ? "border-[#002fa7]/30 bg-[#002fa7]/[0.045] ring-2 ring-[#002fa7]/10" : "border-black/[0.07] hover:border-[#002fa7]/20"}`}>
                   <div className="flex items-center justify-between"><UsersRound className="h-5 w-5 text-[#002fa7]" />{authType === "tenant" ? <Check className="h-4 w-4 text-[#002fa7]" /> : null}</div>
                   <div className="mt-4 text-sm font-semibold">应用身份</div><p className="mt-1 text-xs leading-5 text-gray-500">使用 tenant_access_token。适合组织统一同步，能读取应用已获授权的内容。</p>
                 </button>
-                <button type="button" onClick={() => setAuthType("user")} className={`rounded-2xl border p-5 text-left transition ${authType === "user" ? "border-[#002fa7]/30 bg-[#002fa7]/[0.045] ring-2 ring-[#002fa7]/10" : "border-black/[0.07] hover:border-[#002fa7]/20"}`}>
+                <button type="button" onClick={() => { setAuthType("user"); setError(""); }} className={`rounded-2xl border p-5 text-left transition ${authType === "user" ? "border-[#002fa7]/30 bg-[#002fa7]/[0.045] ring-2 ring-[#002fa7]/10" : "border-black/[0.07] hover:border-[#002fa7]/20"}`}>
                   <div className="flex items-center justify-between"><UserRound className="h-5 w-5 text-[#002fa7]" />{authType === "user" ? <Check className="h-4 w-4 text-[#002fa7]" /> : null}</div>
                   <div className="mt-4 text-sm font-semibold">用户身份</div><p className="mt-1 text-xs leading-5 text-gray-500">通过 OAuth 获取 user_access_token。同步范围遵循该用户在飞书中的可见权限。</p>
                 </button>
@@ -427,30 +522,70 @@ export default function FeishuConnectionWizard({ open, existingSource = null, on
           ) : null}
 
           {step === "scope" ? (
-            <div className="grid gap-6 lg:grid-cols-[280px_minmax(0,1fr)]">
-              <div>
-                <div className="text-xs font-semibold text-gray-700">选择知识空间</div>
-                <div className="mt-2 space-y-1 rounded-2xl border border-black/[0.07] p-2">
-                  {spaces.length ? spaces.map((space) => (
-                    <button type="button" key={space.space_id} onClick={() => setSpaceId(space.space_id)} className={`flex w-full items-center gap-3 rounded-xl px-3 py-3 text-left text-sm ${spaceId === space.space_id ? "bg-[#002fa7] text-white" : "hover:bg-gray-50"}`}>
-                      <FolderTree className="h-4 w-4 shrink-0" /><span className="min-w-0 flex-1 truncate font-medium">{space.name || space.space_id}</span>
-                    </button>
-                  )) : <div className="px-3 py-8 text-center text-xs text-gray-400">当前身份看不到可同步的 Wiki 空间。</div>}
-                </div>
-                <label className="mt-4 block text-xs font-semibold text-gray-700">自动同步</label>
-                <select value={schedule} onChange={(event) => { setSchedule(event.target.value); event.currentTarget.blur(); }} className="mt-2 h-10 w-full rounded-xl border border-black/10 bg-white px-3 text-sm outline-none focus:border-[#002fa7]/40">
-                  <option value="manual">仅手动</option><option value="15">每 15 分钟</option><option value="60">每小时</option><option value="360">每 6 小时</option><option value="1440">每天</option>
-                </select>
+            <div>
+              <div className="mb-6 grid gap-3 sm:grid-cols-2">
+                <button type="button" onClick={() => { setScopeMode("wiki"); if (source && !spaces.length) void loadSpaces(source.id); }} className={`rounded-2xl border p-4 text-left transition ${scopeMode === "wiki" ? "border-[#002fa7]/30 bg-[#002fa7]/[0.045] ring-2 ring-[#002fa7]/10" : "border-black/[0.07] hover:border-[#002fa7]/20"}`}>
+                  <div className="flex items-center gap-3"><FolderTree className="h-5 w-5 text-[#002fa7]" /><div><div className="text-sm font-semibold">Wiki 文档同步</div><p className="mt-1 text-xs text-gray-500">选择空间或根节点，Docx 转为 Markdown 并进入资料库。</p></div></div>
+                </button>
+                <button type="button" onClick={() => { setScopeMode("bitable"); setError(""); }} className={`rounded-2xl border p-4 text-left transition ${scopeMode === "bitable" ? "border-[#002fa7]/30 bg-[#002fa7]/[0.045] ring-2 ring-[#002fa7]/10" : "border-black/[0.07] hover:border-[#002fa7]/20"}`}>
+                  <div className="flex items-center gap-3"><Database className="h-5 w-5 text-[#002fa7]" /><div><div className="text-sm font-semibold">多维表格实时连接</div><p className="mt-1 text-xs text-gray-500">只保存链接与 Schema，Agent 按需实时读取，不复制行数据。</p></div></div>
+                </button>
               </div>
-              <div className="min-w-0">
-                <div className="flex items-end justify-between gap-3"><div><div className="text-xs font-semibold text-gray-700">选择同步根节点</div><p className="mt-1 text-xs text-gray-400">不选节点时同步整个空间；选择后递归同步其下文档和子节点。</p></div>{rootNodeToken ? <button type="button" onClick={() => { setRootNodeToken(""); setRootNodeTitle(""); }} className="shrink-0 text-xs font-semibold text-[#002fa7]">同步整个空间</button> : null}</div>
-                <div className="mt-3 max-h-[340px] min-h-[240px] overflow-y-auto rounded-2xl border border-black/[0.07] p-2">
-                  {!spaceId ? <div className="grid min-h-[220px] place-items-center text-xs text-gray-400">先选择一个知识空间</div> : busy && !nodes.length ? <div className="grid min-h-[220px] place-items-center"><Loader2 className="h-5 w-5 animate-spin text-[#002fa7]" /></div> : nodes.length ? nodes.map((node) => (
-                    <NodeRow key={node.node_token} node={node} depth={0} selectedToken={rootNodeToken} childrenByParent={childrenByParent} expanded={expanded} loadingToken={loadingToken} onToggle={toggleNode} onSelect={(next) => { setRootNodeToken(next.node_token); setRootNodeTitle(next.title); }} />
-                  )) : <div className="grid min-h-[220px] place-items-center text-xs text-gray-400">这个空间没有可读取的 Wiki 节点。</div>}
+
+              {scopeMode === "wiki" ? (
+                <div className="grid gap-6 lg:grid-cols-[280px_minmax(0,1fr)]">
+                  <div>
+                    <div className="text-xs font-semibold text-gray-700">选择知识空间</div>
+                    <div className="mt-2 space-y-1 rounded-2xl border border-black/[0.07] p-2">
+                      {spaces.length ? spaces.map((space) => (
+                        <button type="button" key={space.space_id} onClick={() => setSpaceId(space.space_id)} className={`flex w-full items-center gap-3 rounded-xl px-3 py-3 text-left text-sm ${spaceId === space.space_id ? "bg-[#002fa7] text-white" : "hover:bg-gray-50"}`}>
+                          <FolderTree className="h-4 w-4 shrink-0" /><span className="min-w-0 flex-1 truncate font-medium">{space.name || space.space_id}</span>
+                        </button>
+                      )) : <div className="px-3 py-8 text-center text-xs text-gray-400">当前身份看不到可同步的 Wiki 空间。</div>}
+                    </div>
+                    <label className="mt-4 block text-xs font-semibold text-gray-700">自动同步</label>
+                    <select value={schedule} onChange={(event) => { setSchedule(event.target.value); event.currentTarget.blur(); }} className="mt-2 h-10 w-full rounded-xl border border-black/10 bg-white px-3 text-sm outline-none focus:border-[#002fa7]/40">
+                      <option value="manual">仅手动</option><option value="15">每 15 分钟</option><option value="60">每小时</option><option value="360">每 6 小时</option><option value="1440">每天</option>
+                    </select>
+                  </div>
+                  <div className="min-w-0">
+                    <div className="flex items-end justify-between gap-3"><div><div className="text-xs font-semibold text-gray-700">选择同步根节点</div><p className="mt-1 text-xs text-gray-400">不选节点时同步整个空间；选择后递归同步其下文档和子节点。</p></div>{rootNodeToken ? <button type="button" onClick={() => { setRootNodeToken(""); setRootNodeTitle(""); }} className="shrink-0 text-xs font-semibold text-[#002fa7]">同步整个空间</button> : null}</div>
+                    <div className="mt-3 max-h-[340px] min-h-[240px] overflow-y-auto rounded-2xl border border-black/[0.07] p-2">
+                      {!spaceId ? <div className="grid min-h-[220px] place-items-center text-xs text-gray-400">先选择一个知识空间</div> : busy && !nodes.length ? <div className="grid min-h-[220px] place-items-center"><Loader2 className="h-5 w-5 animate-spin text-[#002fa7]" /></div> : nodes.length ? nodes.map((node) => (
+                        <NodeRow key={node.node_token} node={node} depth={0} selectedToken={rootNodeToken} childrenByParent={childrenByParent} expanded={expanded} loadingToken={loadingToken} onToggle={toggleNode} onSelect={(next) => { setRootNodeToken(next.node_token); setRootNodeTitle(next.title); }} />
+                      )) : <div className="grid min-h-[220px] place-items-center text-xs text-gray-400">这个空间没有可读取的 Wiki 节点。</div>}
+                    </div>
+                    <div className="mt-3 flex flex-wrap items-center justify-between gap-3 rounded-xl bg-gray-50 px-4 py-3 text-xs"><span className="text-gray-500">同步范围：<strong className="text-gray-800">{selectedSpace?.name || (spaceId ? "已保存空间" : "未选择")}{rootNodeToken ? ` / ${rootNodeTitle || "指定根节点"}` : spaceId ? " / 整个空间" : ""}</strong></span><label className="flex items-center gap-2 font-medium text-gray-700"><input type="checkbox" checked={publishVector} onChange={(event) => setPublishVector(event.target.checked)} className="accent-[#002fa7]" />同步后写入向量索引</label></div>
+                  </div>
                 </div>
-                <div className="mt-3 flex flex-wrap items-center justify-between gap-3 rounded-xl bg-gray-50 px-4 py-3 text-xs"><span className="text-gray-500">同步范围：<strong className="text-gray-800">{selectedSpace?.name || (spaceId ? "已保存空间" : "未选择")}{rootNodeToken ? ` / ${rootNodeTitle || "指定根节点"}` : spaceId ? " / 整个空间" : ""}</strong></span><label className="flex items-center gap-2 font-medium text-gray-700"><input type="checkbox" checked={publishVector} onChange={(event) => setPublishVector(event.target.checked)} className="accent-[#002fa7]" />同步后写入向量索引</label></div>
-              </div>
+              ) : (
+                <div className="mx-auto max-w-2xl space-y-4">
+                  <div className="rounded-2xl border border-[#002fa7]/10 bg-[#002fa7]/[0.035] p-4 text-xs leading-5 text-gray-600">
+                    <div className="flex items-center gap-2 font-semibold text-gray-900"><Link2 className="h-4 w-4 text-[#002fa7]" />支持 Wiki 节点链接和直接 Base 链接</div>
+                    <p className="mt-1">粘贴 <code>/wiki/&lt;node_token&gt;</code> 或 <code>/base/&lt;app_token&gt;?table=...</code>。平台只登记实时定位与字段 Schema；查询结果不会写入本地资料库或向量索引。</p><p className="mt-2 font-medium text-[#002fa7]">飞书应用需启用 <code>bitable:app:readonly</code>；Wiki 链接还需 <code>wiki:wiki:readonly</code>，并拥有目标资源权限。</p>
+                  </div>
+                  <label className="block"><span className="text-xs font-semibold text-gray-700">多维表格链接</span><span className="mt-2 flex gap-2"><input value={bitableUrl} onChange={(event) => { setBitableUrl(event.target.value); setBitableResolved(false); setBitableTables([]); setBitablePreview(null); }} placeholder="https://tenant.feishu.cn/base/... 或 /wiki/..." className="h-11 min-w-0 flex-1 rounded-xl border border-black/10 px-3.5 text-sm outline-none focus:border-[#002fa7]/40 focus:ring-4 focus:ring-[#002fa7]/10" /><button type="button" disabled={busy || !bitableUrl.trim()} onClick={() => void inspectBitableLink()} className="inline-flex h-11 shrink-0 items-center gap-2 rounded-xl border border-[#002fa7]/25 px-4 text-xs font-semibold text-[#002fa7] disabled:opacity-40">{busy ? <Loader2 className="h-4 w-4 animate-spin" /> : null}解析链接</button></span></label>
+                  {bitableResolved ? (
+                    <div className="grid gap-4 rounded-2xl border border-emerald-100 bg-emerald-50/50 p-4 sm:grid-cols-2">
+                      <label className="block"><span className="text-xs font-semibold text-gray-700">数据表</span><select value={bitableTableId} onChange={(event) => { const next = event.target.value; setBitableTableId(next); setBitablePreview(null); event.currentTarget.blur(); if (source && next) void loadBitablePreview(source.id, bitableUrl.trim(), next, bitableViewId); }} className="mt-2 h-10 w-full rounded-xl border border-black/10 bg-white px-3 text-sm outline-none"><option value="">请选择数据表</option>{bitableTables.map((table) => <option key={table.table_id} value={table.table_id}>{table.name || table.table_id}</option>)}</select></label>
+                      <label className="block"><span className="text-xs font-semibold text-gray-700">视图 ID（可选）</span><input value={bitableViewId} onChange={(event) => { setBitableViewId(event.target.value); setBitablePreview(null); }} onBlur={() => { if (source && bitableTableId) void loadBitablePreview(source.id, bitableUrl.trim(), bitableTableId, bitableViewId); }} placeholder="默认读取整个表" className="mt-2 h-10 w-full rounded-xl border border-black/10 bg-white px-3 text-sm outline-none" /></label>
+                      <p className="sm:col-span-2 text-xs text-emerald-700">已验证当前身份可读取 {bitableTables.length} 个数据表。保存后 Agent 可通过只读工具实时查看字段和分页记录。</p>
+                    </div>
+                  ) : null}
+                  {previewBusy ? <div className="flex items-center justify-center gap-2 rounded-2xl border border-black/[0.06] py-10 text-xs text-gray-400"><Loader2 className="h-4 w-4 animate-spin" />读取实时预览…</div> : null}
+                  {bitablePreview ? (
+                    <div className="overflow-hidden rounded-2xl border border-black/[0.07] bg-white">
+                      <div className="flex flex-wrap items-center justify-between gap-2 border-b border-black/[0.06] px-4 py-3"><div><div className="text-sm font-semibold text-gray-900">实时预览 · {bitablePreview.table.name || bitablePreview.table.table_id}</div><p className="mt-0.5 text-[11px] text-gray-400">{bitablePreview.fields.length} 个字段 · 最多显示 10 行 · 不保存行数据</p></div><span className="rounded-full bg-emerald-50 px-2.5 py-1 text-[10px] font-semibold text-emerald-700">实时读取</span></div>
+                      <div className="max-h-64 overflow-auto">
+                        <table className="min-w-full border-collapse text-left text-xs"><thead className="sticky top-0 bg-gray-50"><tr>{bitablePreview.fields.map((field) => <th key={field.field_id} className="whitespace-nowrap border-b border-black/[0.06] px-3 py-2 font-semibold text-gray-600">{field.field_name}<span className="ml-1 font-mono text-[9px] font-normal text-gray-400">{field.ui_type || field.type || ""}</span></th>)}</tr></thead><tbody>{bitablePreview.records.items.map((record, index) => <tr key={record.record_id || index} className="border-b border-black/[0.04] last:border-0">{bitablePreview.fields.map((field) => <td key={field.field_id} title={previewValue(record.fields?.[field.field_name])} className="max-w-56 truncate whitespace-nowrap px-3 py-2 text-gray-600">{previewValue(record.fields?.[field.field_name])}</td>)}</tr>)}</tbody></table>
+                        {!bitablePreview.records.items.length ? <div className="px-4 py-10 text-center text-xs text-gray-400">该数据表当前没有可预览的记录。</div> : null}
+                      </div>
+                      <div className="border-t border-black/[0.06] px-4 py-2 text-[10px] text-gray-400">Schema：字段名称、类型、主字段和格式规则；不包含表格中的行数据。</div>
+                    </div>
+                  ) : null}
+                  <div className="rounded-xl bg-amber-50 px-4 py-3 text-xs leading-5 text-amber-800">隐私提示：实时查询返回的行数据会进入当前 Agent/模型上下文，但 Connector 不保存行、单元格、附件或向量副本。</div>
+                </div>
+              )}
             </div>
           ) : null}
 
@@ -461,7 +596,7 @@ export default function FeishuConnectionWizard({ open, existingSource = null, on
           <button type="button" onClick={step === "credential" || step === "scope" ? onClose : () => setStep("credential")} className="h-10 rounded-xl border border-black/10 px-4 text-sm font-semibold text-gray-600 hover:bg-gray-50">{step === "credential" ? "取消" : step === "scope" ? "稍后设置" : "上一步"}</button>
           {step === "credential" ? <button type="button" disabled={busy || !appId.trim() || appSecret.length < 8} onClick={() => void saveCredential()} className="inline-flex h-10 items-center gap-2 rounded-xl bg-[#002fa7] px-5 text-sm font-semibold text-white disabled:opacity-40">{busy ? <Loader2 className="h-4 w-4 animate-spin" /> : null}验证并继续</button> : null}
           {step === "authorization" ? <button type="button" disabled={busy} onClick={() => void authorize()} className="inline-flex h-10 items-center gap-2 rounded-xl bg-[#002fa7] px-5 text-sm font-semibold text-white disabled:opacity-40">{busy ? <Loader2 className="h-4 w-4 animate-spin" /> : authType === "user" ? <ExternalLink className="h-4 w-4" /> : null}{authType === "tenant" ? "验证应用身份" : "打开飞书授权"}</button> : null}
-          {step === "scope" ? <button type="button" disabled={busy || !spaceId} onClick={() => void finish()} className="inline-flex h-10 items-center gap-2 rounded-xl bg-[#002fa7] px-5 text-sm font-semibold text-white disabled:opacity-40">{busy ? <Loader2 className="h-4 w-4 animate-spin" /> : null}保存并开始同步</button> : null}
+          {step === "scope" ? <button type="button" disabled={busy || (scopeMode === "wiki" ? !spaceId : !bitableResolved || !bitableTableId)} onClick={() => void finish()} className="inline-flex h-10 items-center gap-2 rounded-xl bg-[#002fa7] px-5 text-sm font-semibold text-white disabled:opacity-40">{busy ? <Loader2 className="h-4 w-4 animate-spin" /> : null}{scopeMode === "wiki" ? "保存并开始同步" : "保存实时连接"}</button> : null}
         </div>
       </div>
     </div>

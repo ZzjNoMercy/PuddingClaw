@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import mimetypes
 import re
 import shutil
@@ -75,6 +76,8 @@ class FeishuWikiSync:
         if source.connector_key != "feishu_wiki":
             raise FeishuConnectorError("Sync run is not bound to a Feishu source.")
         config = dict(source.config_json or {})
+        if str(config.get("source_mode") or "wiki") == "bitable":
+            return await self._run_bitable_source(session, source=source, run=run)
         if run.mode == "reindex":
             return await self._run_local_reindex(session, source=source, run=run)
         space_id = str(config.get("space_id") or "").strip()
@@ -99,7 +102,7 @@ class FeishuWikiSync:
         # which busy_timeout does not cover. Commit (not rollback) so the
         # loaded ORM objects stay usable (rollback would expire them).
         await session.commit()
-        stats = {"discovered": len(nodes), "changed": 0, "unchanged": 0, "failed": 0, "deleted": 0, "unsupported": 0, "empty": 0}
+        stats = {"discovered": len(nodes), "changed": 0, "unchanged": 0, "linked": 0, "failed": 0, "deleted": 0, "unsupported": 0, "empty": 0}
         run.stats_json = stats
         run.current_step = "syncing_items"
         await session.commit()
@@ -127,6 +130,8 @@ class FeishuWikiSync:
                 )
                 if outcome == "unsupported":
                     stats["unsupported"] += 1
+                elif outcome == "linked":
+                    stats["linked"] += 1
                 elif outcome == "empty":
                     stats["empty"] += 1
                 elif outcome == "changed":
@@ -180,6 +185,88 @@ class FeishuWikiSync:
         if run.status == "succeeded":
             # A clean run supersedes earlier failures; drop the stale banner.
             source.last_error_json = {}
+        source.last_synced_at = now
+        source.last_sync_run_id = run.id
+        await self._lease_fence(session, run, terminal=True)
+        run.lease_owner = None
+        run.lease_expires_at = None
+        run.heartbeat_at = None
+        await session.commit()
+        return run
+
+    async def _run_bitable_source(
+        self,
+        session: AsyncSession,
+        *,
+        source: KnowledgeSourceConnection,
+        run: KnowledgeSyncRun,
+    ) -> KnowledgeSyncRun:
+        """Refresh Bitable control-plane metadata without reading row values."""
+
+        config = dict(source.config_json or {})
+        app_token = str(config.get("app_token") or "").strip()
+        table_id = str(config.get("table_id") or "").strip()
+        if not app_token or not table_id:
+            raise FeishuConnectorError("请先粘贴多维表格链接并选择数据表。")
+        run.status = "running"
+        run.current_step = "reading_schema"
+        run.progress = 20
+        run.started_at = run.started_at or datetime.now(timezone.utc)
+        source.status = "syncing"
+        await session.commit()
+
+        fields = await self.api.list_bitable_fields(
+            session,
+            source,
+            app_token=app_token,
+            table_id=table_id,
+        )
+        schema_revision = hashlib.sha256(
+            json.dumps(fields, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        await session.commit()
+        existing = await self._item_for_node(session, source.id, f"bitable:{app_token}:{table_id}")
+        changed = existing is None or existing.revision != schema_revision
+        item = await upsert_source_item(
+            session,
+            source=source,
+            external_id=f"bitable:{app_token}:{table_id}",
+            external_type="bitable",
+            title=str(config.get("table_name") or table_id),
+            source_url=str(config.get("source_url") or "") or None,
+            status="linked",
+            revision=schema_revision,
+            path=[str(config.get("table_name") or table_id)],
+            metadata={
+                "entry_kind": str(config.get("entry_kind") or "direct_bitable"),
+                "node_token": str(config.get("node_token") or ""),
+                "app_token": app_token,
+                "table_id": table_id,
+                "view_id": str(config.get("view_id") or ""),
+                "storage_mode": "live",
+                "row_storage": False,
+                "fields": fields,
+            },
+        )
+        item.last_seen_run_id = run.id
+        now = datetime.now(timezone.utc)
+        stats = {
+            "discovered": 1,
+            "linked": 1,
+            "schema_changed": 1 if changed else 0,
+            "changed": 0,
+            "unchanged": 0 if changed else 1,
+            "failed": 0,
+            "deleted": 0,
+            "unsupported": 0,
+        }
+        run.status = "succeeded"
+        run.current_step = "completed"
+        run.progress = 100
+        run.stats_json = stats
+        run.finished_at = now
+        source.status = "ready"
+        source.last_error_json = {}
         source.last_synced_at = now
         source.last_sync_run_id = run.id
         await self._lease_fence(session, run, terminal=True)
@@ -285,6 +372,28 @@ class FeishuWikiSync:
         # asset downloads stalled every other writer past busy_timeout, which
         # surfaced as "database is locked" on the queue claim path.
         existing = await self._item_for_node(session, source.id, node_token)
+        if obj_type == "bitable" and obj_token:
+            item = await self._upsert_node_item(
+                session,
+                source=source,
+                run=run,
+                node=node,
+                path=path,
+                source_url=source_url,
+                existing=existing,
+            )
+            item.status = "linked"
+            item.revision = str(node.get("obj_edit_time") or node.get("node_edit_time") or "")
+            item.metadata_json = {
+                **(item.metadata_json or {}),
+                "entry_kind": "wiki_bitable",
+                "node_token": node_token,
+                "app_token": obj_token,
+                "storage_mode": "live",
+                "row_storage": False,
+            }
+            await session.flush()
+            return "linked"
         if obj_type != "docx" or not obj_token:
             item = await self._upsert_node_item(
                 session,

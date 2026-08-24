@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import socket
+import ssl
 
 import pytest
 
 from tools.fetch_url_tool import (
     FetchURLTool,
     UnsafePublicURL,
+    _configured_https_proxy_url,
     _FetchedResponse,
+    _invalidate_https_proxy_cache,
     _parse_macos_https_proxy,
     _resolve_public_addresses,
     _validated_url,
@@ -123,6 +126,29 @@ def test_macos_https_proxy_parser_requires_enabled_valid_proxy() -> None:
     assert _parse_macos_https_proxy(output.replace("HTTPSPort : 27890", "HTTPSPort : invalid")) == ""
 
 
+def test_macos_proxy_discovery_cache_expires_when_vpn_is_enabled(monkeypatch) -> None:
+    from tools import fetch_url_tool
+
+    for key in fetch_url_tool._PROXY_ENV_KEYS:
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setattr(fetch_url_tool.sys, "platform", "darwin")
+    discoveries = iter(["", "http://127.0.0.1:27890"])
+    monkeypatch.setattr(
+        fetch_url_tool,
+        "_discover_macos_https_proxy_url",
+        lambda: next(discoveries),
+    )
+    times = iter([100.0, 101.0, 106.0])
+    monkeypatch.setattr(fetch_url_tool.time, "monotonic", lambda: next(times))
+    _invalidate_https_proxy_cache()
+
+    assert _configured_https_proxy_url() == ""
+    assert _configured_https_proxy_url() == ""
+    assert _configured_https_proxy_url() == "http://127.0.0.1:27890"
+
+    _invalidate_https_proxy_cache()
+
+
 def test_fake_ip_https_request_uses_configured_proxy(monkeypatch) -> None:
     class FakeResponse:
         status = 200
@@ -176,6 +202,127 @@ def test_fake_ip_https_request_uses_configured_proxy(monkeypatch) -> None:
     assert response.status == 200
     assert response.headers["content-type"] == "image/jpeg"
     assert response.body == b"x" * 300
+
+
+def test_fake_ip_tls_retry_rediscovers_proxy_after_vpn_switch(monkeypatch) -> None:
+    class FailingDirectPool:
+        @staticmethod
+        def urlopen(*_args, **_kwargs):
+            raise ssl.SSLError("[SSL: UNEXPECTED_EOF_WHILE_READING]")
+
+        @staticmethod
+        def close():
+            return None
+
+    proxy_lookups = iter(["", "http://127.0.0.1:27890"])
+    direct_attempts = 0
+    proxy_attempts = 0
+
+    def direct_pool(**_kwargs):
+        nonlocal direct_attempts
+        direct_attempts += 1
+        return FailingDirectPool()
+
+    def proxy_request(cls, url: str, *, hostname: str, proxy_url: str) -> _FetchedResponse:
+        nonlocal proxy_attempts
+        proxy_attempts += 1
+        assert cls is FetchURLTool
+        assert url == "https://wttr.in/Ningbo?format=3"
+        assert hostname == "wttr.in"
+        assert proxy_url == "http://127.0.0.1:27890"
+        return _FetchedResponse(200, {"content-type": "text/plain"}, b"Ningbo: 28 C")
+
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda *_args, **_kwargs: [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("198.18.0.104", 443)),
+        ],
+    )
+    monkeypatch.setattr(
+        "tools.fetch_url_tool._configured_https_proxy_url",
+        lambda: next(proxy_lookups),
+    )
+    monkeypatch.setattr("tools.fetch_url_tool.time.sleep", lambda _delay: None)
+    monkeypatch.setattr(FetchURLTool, "_pool", staticmethod(direct_pool))
+    monkeypatch.setattr(FetchURLTool, "_request_via_proxy", classmethod(proxy_request))
+
+    response = FetchURLTool._request_once("https://wttr.in/Ningbo?format=3")
+
+    assert response.status == 200
+    assert response.body == b"Ningbo: 28 C"
+    assert direct_attempts == 1
+    assert proxy_attempts == 1
+
+
+def test_wechat_request_uses_configured_proxy_and_retries_transient_tls_eof(monkeypatch) -> None:
+    attempts = 0
+
+    def flaky_proxy_request(cls, url: str, *, hostname: str, proxy_url: str) -> _FetchedResponse:
+        nonlocal attempts
+        attempts += 1
+        assert cls is FetchURLTool
+        assert url == "https://mp.weixin.qq.com/s/example"
+        assert hostname == "mp.weixin.qq.com"
+        assert proxy_url == "http://127.0.0.1:27890"
+        if attempts < 3:
+            raise ssl.SSLError("[SSL: UNEXPECTED_EOF_WHILE_READING] EOF occurred in violation of protocol")
+        return _FetchedResponse(200, {"content-type": "text/html"}, b"wechat article")
+
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda *_args, **_kwargs: [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("101.32.104.4", 443)),
+        ],
+    )
+    monkeypatch.setattr(
+        "tools.fetch_url_tool._configured_https_proxy_url",
+        lambda: "http://127.0.0.1:27890",
+    )
+    monkeypatch.setattr("tools.fetch_url_tool.time.sleep", lambda _delay: None)
+    monkeypatch.setattr(FetchURLTool, "_request_via_proxy", classmethod(flaky_proxy_request))
+    monkeypatch.setattr(
+        FetchURLTool,
+        "_pool",
+        staticmethod(lambda **_kwargs: pytest.fail("WeChat request should honor the configured HTTPS proxy")),
+    )
+
+    response = FetchURLTool._request_once("https://mp.weixin.qq.com/s/example")
+
+    assert attempts == 3
+    assert response.status == 200
+    assert response.body == b"wechat article"
+
+
+def test_tls_certificate_verification_failure_is_not_retried(monkeypatch) -> None:
+    attempts = 0
+
+    def invalid_certificate(cls, _url: str, *, hostname: str, proxy_url: str) -> _FetchedResponse:
+        nonlocal attempts
+        attempts += 1
+        assert cls is FetchURLTool
+        assert hostname == "mp.weixin.qq.com"
+        assert proxy_url
+        raise ssl.SSLCertVerificationError(1, "certificate verify failed")
+
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda *_args, **_kwargs: [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("101.32.104.4", 443)),
+        ],
+    )
+    monkeypatch.setattr(
+        "tools.fetch_url_tool._configured_https_proxy_url",
+        lambda: "http://127.0.0.1:27890",
+    )
+    monkeypatch.setattr(FetchURLTool, "_request_via_proxy", classmethod(invalid_certificate))
+
+    with pytest.raises(ssl.SSLCertVerificationError):
+        FetchURLTool._request_once("https://mp.weixin.qq.com/s/example")
+
+    assert attempts == 1
 
 
 def test_redirect_is_revalidated_before_following(monkeypatch) -> None:

@@ -25,6 +25,7 @@ from knowledge.connectors.feishu import (
     start_user_oauth,
     tenant_token_broker,
 )
+from knowledge.connectors.feishu_bitable import resolve_feishu_bitable_reference
 from knowledge.models import FeishuAppCredential, FeishuUserGrant, KnowledgeSourceConnection
 from knowledge.sources import source_to_dict
 from runtime_identity.paths import trusted_owner_user_id
@@ -70,6 +71,24 @@ class FeishuScopeRequest(BaseModel):
     tenant_domain: str = Field(default="", max_length=300)
     publish_vector: bool = True
     interval_minutes: int = Field(default=60, ge=0, le=43_200)
+
+
+class FeishuBitableResolveRequest(BaseModel):
+    url: str = Field(min_length=12, max_length=2_000)
+
+
+class FeishuBitableScopeRequest(BaseModel):
+    url: str = Field(min_length=12, max_length=2_000)
+    table_id: str = Field(default="", max_length=220)
+    view_id: str = Field(default="", max_length=220)
+    monitor_changes: bool = False
+    interval_minutes: int = Field(default=0, ge=0, le=43_200)
+
+
+class FeishuBitablePreviewRequest(FeishuBitableResolveRequest):
+    table_id: str = Field(default="", max_length=220)
+    view_id: str = Field(default="", max_length=220)
+    page_size: int = Field(default=10, ge=1, le=20)
 
 
 feishu_open_api = FeishuOpenApi()
@@ -354,6 +373,7 @@ async def configure_feishu_scope(
         raise HTTPException(status_code=400, detail="飞书租户域名格式不正确。")
     source.config_json = {
         **(source.config_json or {}),
+        "source_mode": "wiki",
         "space_id": request.space_id.strip(),
         "root_node_token": request.root_node_token.strip(),
         "tenant_domain": tenant_domain,
@@ -362,3 +382,134 @@ async def configure_feishu_scope(
     source.schedule_json = {**(source.schedule_json or {}), "interval_minutes": request.interval_minutes}
     await session.commit()
     return {"source": source_to_dict(source)}
+
+
+@router.post("/sources/{source_id}/bitable/resolve")
+async def resolve_feishu_bitable(
+    source_id: str,
+    request: FeishuBitableResolveRequest,
+    session: AsyncSession = Depends(get_db_session),
+):
+    source = await session.get(KnowledgeSourceConnection, source_id)
+    if source is None or source.connector_key != "feishu_wiki":
+        raise HTTPException(status_code=404, detail="飞书知识 Source 不存在。")
+    try:
+        reference, tables = await resolve_feishu_bitable_reference(
+            session,
+            source,
+            url=request.url,
+            api=feishu_open_api,
+        )
+        return {"reference": reference.as_dict(), "tables": tables}
+    except FeishuConnectorError as exc:
+        if exc.status_code in {401, 403}:
+            source.status = "needs_reauth"
+            await session.commit()
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/sources/{source_id}/bitable/preview")
+async def preview_feishu_bitable(
+    source_id: str,
+    request: FeishuBitablePreviewRequest,
+    session: AsyncSession = Depends(get_db_session),
+):
+    """Return a small live preview without persisting record values."""
+
+    source = await session.get(KnowledgeSourceConnection, source_id)
+    if source is None or source.connector_key != "feishu_wiki":
+        raise HTTPException(status_code=404, detail="飞书知识 Source 不存在。")
+    try:
+        reference, tables = await resolve_feishu_bitable_reference(
+            session,
+            source,
+            url=request.url,
+            api=feishu_open_api,
+        )
+        visible = {str(item.get("table_id") or ""): item for item in tables}
+        table_id = request.table_id.strip() or reference.table_id
+        if not table_id and len(visible) == 1:
+            table_id = next(iter(visible))
+        if not table_id:
+            raise FeishuConnectorError("该多维表格包含多个数据表，请先选择要预览的数据表。")
+        if table_id not in visible:
+            raise FeishuConnectorError("选择的数据表不在当前身份可见范围内。")
+        fields = await feishu_open_api.list_bitable_fields(
+            session,
+            source,
+            app_token=reference.app_token,
+            table_id=table_id,
+        )
+        records = await feishu_open_api.list_bitable_records_page(
+            session,
+            source,
+            app_token=reference.app_token,
+            table_id=table_id,
+            view_id=request.view_id.strip() or reference.view_id,
+            page_size=request.page_size,
+        )
+        return {
+            "live": True,
+            "row_storage": False,
+            "reference": reference.as_dict(),
+            "table": visible[table_id],
+            "fields": fields,
+            "records": records,
+        }
+    except FeishuConnectorError as exc:
+        if exc.status_code in {401, 403}:
+            source.status = "needs_reauth"
+            await session.commit()
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.put("/sources/{source_id}/bitable/scope")
+async def configure_feishu_bitable_scope(
+    source_id: str,
+    request: FeishuBitableScopeRequest,
+    session: AsyncSession = Depends(get_db_session),
+):
+    source = await session.get(KnowledgeSourceConnection, source_id)
+    if source is None or source.connector_key != "feishu_wiki":
+        raise HTTPException(status_code=404, detail="飞书知识 Source 不存在。")
+    try:
+        reference, tables = await resolve_feishu_bitable_reference(
+            session,
+            source,
+            url=request.url,
+            api=feishu_open_api,
+        )
+        table_ids = {str(item.get("table_id") or "") for item in tables}
+        selected_table = request.table_id.strip() or reference.table_id
+        if not selected_table and len(table_ids) == 1:
+            selected_table = next(iter(table_ids))
+        if not selected_table:
+            raise FeishuConnectorError("该多维表格包含多个数据表，请明确选择一个。")
+        if selected_table not in table_ids:
+            raise FeishuConnectorError("选择的数据表不在当前身份可见范围内。")
+        selected = next((item for item in tables if str(item.get("table_id") or "") == selected_table), {})
+        view_id = request.view_id.strip() or reference.view_id
+        source.config_json = {
+            **(source.config_json or {}),
+            "source_mode": "bitable",
+            "source_url": reference.original_url,
+            "entry_kind": reference.entry_kind,
+            "node_token": reference.node_token,
+            "app_token": reference.app_token,
+            "table_id": selected_table,
+            "table_name": str(selected.get("name") or ""),
+            "view_id": view_id,
+            "storage_mode": "live",
+            "row_storage": False,
+            "monitor_changes": bool(request.monitor_changes),
+        }
+        source.schedule_json = {
+            **(source.schedule_json or {}),
+            "interval_minutes": request.interval_minutes if request.monitor_changes else 0,
+        }
+        source.status = "ready"
+        await session.commit()
+        return {"source": source_to_dict(source)}
+    except FeishuConnectorError as exc:
+        await session.rollback()
+        raise HTTPException(status_code=400, detail=str(exc)) from exc

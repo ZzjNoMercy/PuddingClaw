@@ -15,6 +15,7 @@ from extensions import extension_enabled
 _tool_instance_cache: dict[tuple[str, str], List[BaseTool]] = {}
 
 KNOWLEDGE_TOOL_MODULES = {
+    "feishu_bitable_tools",
     "llm_wiki_tools",
     "mineru_tool",
     "read_later_tool",

@@ -83,6 +83,14 @@ function kindOf(doc: KnowledgeDocument, sources: KnowledgeSource[]): SourceKind 
   return "local";
 }
 
+function readLaterStatus(item: ReadLaterItem): { label: string; className: string } {
+  if (item.parse_status === "queued") return { label: "等待解析", className: "bg-amber-50 text-amber-700" };
+  if (item.parse_status === "processing") return { label: "解析中", className: "bg-[#002fa7]/10 text-[#002fa7]" };
+  if (item.parse_status === "failed") return { label: "解析失败", className: "bg-red-50 text-red-600" };
+  if (item.parse_status === "link_only") return { label: "仅保留链接", className: "bg-amber-50 text-amber-700" };
+  return { label: "正文就绪", className: "bg-emerald-50 text-emerald-700" };
+}
+
 export default function KnowledgeOverview({ documents, jobs, loading, onRefresh }: Props) {
   const router = useRouter();
   const uploadInputRef = useRef<HTMLInputElement>(null);
@@ -113,6 +121,11 @@ export default function KnowledgeOverview({ documents, jobs, loading, onRefresh 
     void listReadLaterItems().then(setReadLater).catch(() => setReadLater([]));
     void listKnowledgeSources().then(setSources).catch(() => setSources([]));
   }, []);
+
+  useEffect(() => {
+    if (!jobs.some((job) => job.metadata?.kind === "read_later_capture" && isActive(job))) return;
+    void listReadLaterItems().then(setReadLater).catch(() => undefined);
+  }, [jobs]);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -168,6 +181,11 @@ export default function KnowledgeOverview({ documents, jobs, loading, onRefresh 
     }
     return groups;
   }, [documents, sources]);
+
+  const projectedReadLater = useMemo(() => {
+    const documentIds = new Set(documents.map((document) => document.id));
+    return readLater.filter((item) => !item.document_id || !documentIds.has(item.document_id));
+  }, [documents, readLater]);
 
   function sourceNameOf(kind: SourceKind): string {
     if (kind === "feishu") return feishuSourceName;
@@ -295,6 +313,25 @@ export default function KnowledgeOverview({ documents, jobs, loading, onRefresh 
     );
   }
 
+  function renderReadLaterRow(item: ReadLaterItem) {
+    const status = readLaterStatus(item);
+    return (
+      <button
+        key={`read-later-${item.id}`}
+        type="button"
+        onClick={() => router.push("/knowledge/read-later")}
+        className="flex w-full items-center gap-2.5 rounded-2xl px-2.5 py-2.5 text-left transition hover:bg-[#002fa7]/[0.04]"
+      >
+        <span className="grid h-8 w-8 shrink-0 place-items-center rounded-xl bg-[#002fa7]/[0.06] text-[9px] font-bold text-[#002fa7]">网页</span>
+        <span className="min-w-0 flex-1">
+          <span className="block truncate text-xs font-medium text-gray-800">{item.title || item.original_url}</span>
+          <span className="mt-0.5 block truncate text-[10px] text-gray-400">{item.site_name || item.canonical_url} · {relativeTime(item.updated_at)}</span>
+        </span>
+        <span className={`shrink-0 rounded-full px-2 py-0.5 text-[10px] font-semibold ${status.className}`}>{status.label}</span>
+      </button>
+    );
+  }
+
   return (
     <>
       <KnowledgeWorkspaceHeader
@@ -389,6 +426,12 @@ export default function KnowledgeOverview({ documents, jobs, loading, onRefresh 
       <section className="grid items-start gap-4 lg:grid-cols-3">
         {sourceColumns.map((column) => {
           const docs = sourceGroups[column.kind];
+          const entries = [
+            ...docs.map((doc) => ({ type: "document" as const, updatedAt: doc.updated_at || "", doc })),
+            ...(column.kind === "web"
+              ? projectedReadLater.map((item) => ({ type: "read-later" as const, updatedAt: item.updated_at || "", item }))
+              : []),
+          ].sort((left, right) => Date.parse(right.updatedAt) - Date.parse(left.updatedAt));
           return (
             <div key={column.kind} className="flex flex-col rounded-[28px] border border-black/[0.06] bg-white p-5 shadow-sm">
               <div className="flex items-center justify-between gap-3">
@@ -396,7 +439,7 @@ export default function KnowledgeOverview({ documents, jobs, loading, onRefresh 
                   <KindLogo kind={column.kind} />
                   <div className="min-w-0">
                     <h3 className="truncate text-sm font-semibold text-gray-950">{column.title}</h3>
-                    <p className="mt-0.5 text-[11px] text-gray-400">{column.hint} · {docs.length} 项</p>
+                    <p className="mt-0.5 text-[11px] text-gray-400">{column.hint} · {entries.length} 项</p>
                   </div>
                 </div>
                 <Link
@@ -407,8 +450,10 @@ export default function KnowledgeOverview({ documents, jobs, loading, onRefresh 
                 </Link>
               </div>
               <div className="mt-3 space-y-1">
-                {docs.slice(0, 5).map((doc) => renderDocRow(doc, column.kind))}
-                {!docs.length ? (
+                {entries.slice(0, 5).map((entry) => entry.type === "document"
+                  ? renderDocRow(entry.doc, column.kind)
+                  : renderReadLaterRow(entry.item))}
+                {!entries.length ? (
                   <div className="rounded-2xl border border-dashed border-black/[0.08] px-4 py-8 text-center text-xs text-gray-400">还没有内容。</div>
                 ) : null}
               </div>

@@ -69,6 +69,7 @@ BUSINESS_TOOLSETS: dict[str, frozenset[str]] = {
         "update_skill",
     }),
     "knowledge_analysis": frozenset({"llamaindex_knowledge_query", "pandas_knowledge_query"}),
+    "feishu_bitable": frozenset({"feishu_bitable_list_sources", "feishu_bitable_describe", "feishu_bitable_query"}),
     "llm_wiki": frozenset(
         {
             "llm_wiki_context",
@@ -193,6 +194,13 @@ _CONTROLLED_NETWORK = ToolControlDescriptor(
     approval_scope="mode",
     policy="dynamic",
 )
+_PRIVATE_EXTERNAL_READ = ToolControlDescriptor(
+    side_effect="none",
+    data_classification="external_private",
+    network_scope="feishu_openapi",
+    approval_scope="none",
+    policy="registered_source_only",
+)
 _PACKAGE_INSTALL = ToolControlDescriptor(
     side_effect="runtime_dependency_write",
     network_scope="package_registry",
@@ -303,6 +311,9 @@ TOOL_CONTROL_DESCRIPTORS: dict[str, ToolControlDescriptor] = {
     # Read-only business analysis.
     "llamaindex_knowledge_query": _READ_ONLY,
     "pandas_knowledge_query": _READ_ONLY,
+    "feishu_bitable_describe": _PRIVATE_EXTERNAL_READ,
+    "feishu_bitable_list_sources": _READ_ONLY,
+    "feishu_bitable_query": _PRIVATE_EXTERNAL_READ,
     "llm_wiki_context": _READ_ONLY,
     "llm_wiki_lint": _READ_ONLY,
     "llm_wiki_query": _READ_ONLY,
@@ -388,7 +399,7 @@ def agent_custom_tool_names() -> frozenset[str]:
     """Return the single-source registration set for PuddingClaw Agent tools."""
     enabled_business = {"skill_management"}
     if extension_enabled("knowledge"):
-        enabled_business.update({"knowledge_analysis", "llm_wiki", "gbrain_query"})
+        enabled_business.update({"knowledge_analysis", "feishu_bitable", "llm_wiki", "gbrain_query"})
     if extension_enabled("analytics"):
         enabled_business.update(
             {

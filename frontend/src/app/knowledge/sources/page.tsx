@@ -5,6 +5,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   AlertCircle,
   ChevronRight,
+  Database,
   ExternalLink,
   FileText,
   FileUp,
@@ -20,6 +21,7 @@ import {
 } from "lucide-react";
 
 import FeishuConnectionWizard from "@/components/knowledge/FeishuConnectionWizard";
+import FeishuBitableDetailModal from "@/components/knowledge/FeishuBitableDetailModal";
 import DocumentDetailModal, { type SourceKind } from "@/components/knowledge/DocumentDetailModal";
 import KnowledgeWorkspaceHeader from "@/components/knowledge/KnowledgeWorkspaceHeader";
 import KnowledgeWorkspaceNav from "@/components/knowledge/KnowledgeWorkspaceNav";
@@ -80,6 +82,7 @@ function sourceItemStatusView(status: string): { label: string; className: strin
     return { label: "处理中", className: "bg-blue-50 text-[#002fa7]" };
   }
   if (["failed", "error"].includes(status)) return { label: "失败", className: "bg-red-50 text-red-600" };
+  if (status === "linked") return { label: "实时连接", className: "bg-violet-50 text-violet-700" };
   if (status === "ready" || status === "succeeded") return { label: "可用", className: "bg-emerald-50 text-emerald-700" };
   return { label: status || "未知", className: "bg-gray-100 text-gray-600" };
 }
@@ -141,8 +144,8 @@ function ConnectorPicker({ open, onClose, onPickFeishu }: { open: boolean; onClo
           <button type="button" onClick={onPickFeishu} className="flex w-full items-center gap-4 rounded-2xl border border-black/[0.07] p-4 text-left transition hover:border-[#002fa7]/25 hover:bg-[#002fa7]/[0.03]">
             <img src="/brands/feishu-logo.svg" alt="飞书" className="h-11 w-11 shrink-0 rounded-2xl border border-black/[0.06] object-cover" />
             <span className="min-w-0 flex-1">
-              <span className="block text-sm font-semibold text-gray-900">飞书知识库</span>
-              <span className="mt-0.5 block text-xs leading-5 text-gray-500">同步飞书 Wiki 空间文档，支持应用身份与用户身份（OAuth）授权。</span>
+              <span className="block text-sm font-semibold text-gray-900">飞书 Wiki / 多维表格</span>
+              <span className="mt-0.5 block text-xs leading-5 text-gray-500">同步 Wiki 文档，或登记 Bitable 供 Agent 实时只读查询。</span>
             </span>
             <ChevronRight className="h-4 w-4 shrink-0 text-gray-300" />
           </button>
@@ -304,7 +307,7 @@ function WebCapturePanel({ source, onChanged, onOpenDoc }: { source: KnowledgeSo
   );
 }
 
-function RecentItems({ items, empty, onOpen }: { items: KnowledgeSourceItem[]; empty: string; onOpen?: (item: KnowledgeSourceItem) => void }) {
+function RecentItems({ items, empty, onOpen, onOpenBitable }: { items: KnowledgeSourceItem[]; empty: string; onOpen?: (item: KnowledgeSourceItem) => void; onOpenBitable?: (item: KnowledgeSourceItem) => void }) {
   return (
     <div>
       <div className="mb-3 flex items-center justify-between">
@@ -319,12 +322,12 @@ function RecentItems({ items, empty, onOpen }: { items: KnowledgeSourceItem[]; e
           const content = (
             <>
               <span className={`grid h-9 w-9 shrink-0 place-items-center rounded-xl ${item.status === "staged" ? "bg-amber-50 text-amber-700" : "bg-[#002fa7]/[0.05] text-[#002fa7]"}`}>
-                <FileText className="h-4 w-4" />
+                {item.external_type === "bitable" ? <Database className="h-4 w-4" /> : <FileText className="h-4 w-4" />}
               </span>
               <span className="min-w-0 flex-1">
                 <span className="block truncate text-sm font-medium text-gray-800">{item.title || item.external_id}</span>
                 <span className="mt-0.5 block truncate text-[10px] text-gray-400">
-                  {item.path?.join(" / ") || item.external_type} · {relativeTime(item.updated_at)}
+                  {item.external_type === "bitable" ? `${Array.isArray(item.metadata.fields) ? item.metadata.fields.length : 0} 个字段 · 不保存行数据` : item.path?.join(" / ") || item.external_type} · {relativeTime(item.updated_at)}
                 </span>
               </span>
               <span className={`rounded-full px-2.5 py-1 text-[10px] font-semibold ${status.className}`}>{status.label}</span>
@@ -340,6 +343,18 @@ function RecentItems({ items, empty, onOpen }: { items: KnowledgeSourceItem[]; e
               >
                 {content}
               </Link>
+            );
+          }
+          if (item.external_type === "bitable") {
+            return (
+              <button
+                type="button"
+                key={item.id}
+                onClick={() => onOpenBitable?.(item)}
+                className="group flex w-full items-center gap-3 border-b border-black/[0.05] px-4 py-3 text-left transition last:border-0 hover:bg-[#002fa7]/[0.03] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-[#002fa7]/30"
+              >
+                {content}<ChevronRight className="h-4 w-4 shrink-0 text-gray-300 transition group-hover:translate-x-0.5 group-hover:text-[#002fa7]" />
+              </button>
             );
           }
           return (
@@ -359,17 +374,18 @@ function RecentItems({ items, empty, onOpen }: { items: KnowledgeSourceItem[]; e
   );
 }
 
-function FeishuPanel({ source, items, runs, onChanged, onReconnect, onOpenDoc }: { source: KnowledgeSource; items: KnowledgeSourceItem[]; runs: KnowledgeSyncRun[]; onChanged: () => void | Promise<void>; onReconnect: () => void; onOpenDoc: (item: KnowledgeSourceItem) => void }) {
+function FeishuPanel({ source, items, runs, onChanged, onReconnect, onOpenDoc, onOpenBitable }: { source: KnowledgeSource; items: KnowledgeSourceItem[]; runs: KnowledgeSyncRun[]; onChanged: () => void | Promise<void>; onReconnect: () => void; onOpenDoc: (item: KnowledgeSourceItem) => void; onOpenBitable: (item: KnowledgeSourceItem) => void }) {
   const [busyMode, setBusyMode] = useState("");
   const [notice, setNotice] = useState("");
   const status = statusView(source.status);
+  const isBitable = source.config.source_mode === "bitable";
 
   async function sync(mode: "incremental" | "full_scan" | "reindex") {
     setBusyMode(mode);
     setNotice("");
     try {
       await startKnowledgeSourceSync(source.id, mode);
-      setNotice(mode === "full_scan" ? "已提交完整扫描；缺失的远端条目会在扫描结束后标记删除。" : mode === "reindex" ? "已提交重建索引；文档将重新规范化并写入索引。" : "已提交增量同步。 ");
+      setNotice(isBitable ? "已提交字段 Schema 刷新；不会读取或保存行数据。" : mode === "full_scan" ? "已提交完整扫描；缺失的远端条目会在扫描结束后标记删除。" : mode === "reindex" ? "已提交重建索引；文档将重新规范化并写入索引。" : "已提交增量同步。 ");
       await onChanged();
     } catch (error) {
       setNotice(messageOf(error));
@@ -394,15 +410,17 @@ function FeishuPanel({ source, items, runs, onChanged, onReconnect, onOpenDoc }:
   }
 
   const lastRun = runs[0];
-  const scopeLabel = typeof source.config.space_id === "string" ? `${source.config.space_id}${source.config.root_node_token ? " / 指定根节点" : " / 整个空间"}` : "尚未选择同步范围";
+  const scopeLabel = isBitable
+    ? `多维表格实时读取 · ${String(source.config.table_name || source.config.table_id || "尚未选择数据表")}`
+    : typeof source.config.space_id === "string" ? `${source.config.space_id}${source.config.root_node_token ? " / 指定根节点" : " / 整个空间"}` : "尚未选择同步范围";
   return (
     <div className="space-y-5">
-      <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between"><div><div className="flex items-center gap-2"><span className={`h-2.5 w-2.5 rounded-full ${status.className}`} /><span className="text-xs font-semibold text-gray-600">{status.label}</span><span className="rounded-full bg-blue-50 px-2 py-1 text-[10px] font-semibold text-blue-700">{source.auth_type === "user" ? "用户身份" : "应用身份"}</span></div><p className="mt-2 text-xs leading-5 text-gray-400">{scopeLabel}</p></div><div className="flex flex-wrap gap-2"><button type="button" onClick={onReconnect} className="inline-flex h-9 items-center gap-2 rounded-xl border border-black/10 px-3 text-xs font-semibold text-gray-700"><Settings2 className="h-3.5 w-3.5" />编辑连接</button>{lastRun && ["queued", "running"].includes(lastRun.status) ? <button type="button" disabled={!!busyMode} onClick={() => void cancel()} className="inline-flex h-9 items-center gap-2 rounded-xl border border-red-200 px-3 text-xs font-semibold text-red-600 disabled:opacity-40">取消同步</button> : <><button type="button" disabled={!!busyMode || !["ready", "error"].includes(source.status)} onClick={() => void sync("reindex")} className="inline-flex h-9 items-center gap-2 rounded-xl border border-black/10 px-3 text-xs font-semibold text-gray-700 disabled:opacity-40">重建索引</button><button type="button" disabled={!!busyMode || !["ready", "error"].includes(source.status)} onClick={() => void sync("full_scan")} className="inline-flex h-9 items-center gap-2 rounded-xl border border-black/10 px-3 text-xs font-semibold text-gray-700 disabled:opacity-40"><RotateCcw className={`h-3.5 w-3.5 ${busyMode === "full_scan" ? "animate-spin" : ""}`} />完整扫描</button><button type="button" disabled={!!busyMode || !["ready", "error"].includes(source.status)} onClick={() => void sync("incremental")} className="inline-flex h-9 items-center gap-2 rounded-xl bg-[#002fa7] px-3.5 text-xs font-semibold text-white disabled:opacity-40"><RefreshCw className={`h-3.5 w-3.5 ${busyMode === "incremental" ? "animate-spin" : ""}`} />立即同步</button></>}</div></div>
+      <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between"><div><div className="flex items-center gap-2"><span className={`h-2.5 w-2.5 rounded-full ${status.className}`} /><span className="text-xs font-semibold text-gray-600">{status.label}</span><span className="rounded-full bg-blue-50 px-2 py-1 text-[10px] font-semibold text-blue-700">{source.auth_type === "user" ? "用户身份" : "应用身份"}</span>{isBitable ? <span className="rounded-full bg-violet-50 px-2 py-1 text-[10px] font-semibold text-violet-700">不保存行数据</span> : null}</div><p className="mt-2 text-xs leading-5 text-gray-400">{scopeLabel}</p></div><div className="flex flex-wrap gap-2"><button type="button" onClick={onReconnect} className="inline-flex h-9 items-center gap-2 rounded-xl border border-black/10 px-3 text-xs font-semibold text-gray-700"><Settings2 className="h-3.5 w-3.5" />编辑连接</button>{lastRun && ["queued", "running"].includes(lastRun.status) ? <button type="button" disabled={!!busyMode} onClick={() => void cancel()} className="inline-flex h-9 items-center gap-2 rounded-xl border border-red-200 px-3 text-xs font-semibold text-red-600 disabled:opacity-40">取消同步</button> : isBitable ? <button type="button" disabled={!!busyMode || !["ready", "error"].includes(source.status)} onClick={() => void sync("incremental")} className="inline-flex h-9 items-center gap-2 rounded-xl bg-[#002fa7] px-3.5 text-xs font-semibold text-white disabled:opacity-40"><RefreshCw className={`h-3.5 w-3.5 ${busyMode === "incremental" ? "animate-spin" : ""}`} />刷新字段 Schema</button> : <><button type="button" disabled={!!busyMode || !["ready", "error"].includes(source.status)} onClick={() => void sync("reindex")} className="inline-flex h-9 items-center gap-2 rounded-xl border border-black/10 px-3 text-xs font-semibold text-gray-700 disabled:opacity-40">重建索引</button><button type="button" disabled={!!busyMode || !["ready", "error"].includes(source.status)} onClick={() => void sync("full_scan")} className="inline-flex h-9 items-center gap-2 rounded-xl border border-black/10 px-3 text-xs font-semibold text-gray-700 disabled:opacity-40"><RotateCcw className={`h-3.5 w-3.5 ${busyMode === "full_scan" ? "animate-spin" : ""}`} />完整扫描</button><button type="button" disabled={!!busyMode || !["ready", "error"].includes(source.status)} onClick={() => void sync("incremental")} className="inline-flex h-9 items-center gap-2 rounded-xl bg-[#002fa7] px-3.5 text-xs font-semibold text-white disabled:opacity-40"><RefreshCw className={`h-3.5 w-3.5 ${busyMode === "incremental" ? "animate-spin" : ""}`} />立即同步</button></>}</div></div>
       {notice ? <div className={`rounded-xl px-4 py-3 text-xs ${notice.includes("已提交") ? "bg-emerald-50 text-emerald-700" : "bg-red-50 text-red-700"}`}>{notice}</div> : null}
-      <div className="grid grid-cols-2 gap-3 lg:grid-cols-4"><Metric label="内容条目" value={source.item_count || items.length} /><Metric label="同步状态" value={lastRun ? statusView(lastRun.status).label : "尚未运行"} hint={lastRun?.current_step} /><Metric label="上次同步" value={relativeTime(source.last_synced_at)} /><Metric label="失败条目" value={lastRun?.stats.failed || 0} /></div>
-      {lastRun ? <div className="grid grid-cols-2 gap-px overflow-hidden rounded-2xl border border-black/[0.06] bg-black/[0.06] sm:grid-cols-5">{[["发现", lastRun.stats.discovered || 0], ["更新", lastRun.stats.changed || 0], ["跳过", lastRun.stats.unchanged || 0], ["删除", lastRun.stats.deleted || 0], ["失败", lastRun.stats.failed || 0]].map(([label, value]) => <div key={String(label)} className="bg-white px-4 py-3"><div className="text-[10px] text-gray-400">{label}</div><div className="mt-1 text-base font-semibold text-gray-900">{value}</div></div>)}</div> : null}
+      <div className="grid grid-cols-2 gap-3 lg:grid-cols-4"><Metric label={isBitable ? "已登记数据表" : "内容条目"} value={source.item_count || items.length} /><Metric label={isBitable ? "Schema 状态" : "同步状态"} value={lastRun ? statusView(lastRun.status).label : "尚未运行"} hint={lastRun?.current_step} /><Metric label={isBitable ? "上次探测" : "上次同步"} value={relativeTime(source.last_synced_at)} /><Metric label="失败条目" value={lastRun?.stats.failed || 0} /></div>
+      {lastRun ? <div className="grid grid-cols-2 gap-px overflow-hidden rounded-2xl border border-black/[0.06] bg-black/[0.06] sm:grid-cols-5">{(isBitable ? [["数据表", lastRun.stats.discovered || 0], ["实时关联", lastRun.stats.linked || 0], ["Schema 更新", lastRun.stats.schema_changed || 0], ["行数据落库", 0], ["失败", lastRun.stats.failed || 0]] : [["发现", lastRun.stats.discovered || 0], ["更新", lastRun.stats.changed || 0], ["跳过", lastRun.stats.unchanged || 0], ["删除", lastRun.stats.deleted || 0], ["失败", lastRun.stats.failed || 0]]).map(([label, value]) => <div key={String(label)} className="bg-white px-4 py-3"><div className="text-[10px] text-gray-400">{label}</div><div className="mt-1 text-base font-semibold text-gray-900">{value}</div></div>)}</div> : null}
       {source.last_error && Object.keys(source.last_error).length ? <div className="flex gap-3 rounded-2xl bg-red-50 p-4 text-xs leading-5 text-red-700"><AlertCircle className="mt-0.5 h-4 w-4 shrink-0" /><span>{String(source.last_error.message || source.last_error.detail || "最近一次同步出现错误。")}</span></div> : null}
-      <RecentItems items={items} empty="完成首次同步后，飞书文档会出现在这里。" onOpen={onOpenDoc} />
+      <RecentItems items={items} empty={isBitable ? "保存连接后会登记数据表与字段 Schema，不会复制记录正文。" : "完成首次同步后，飞书文档会出现在这里。"} onOpen={onOpenDoc} onOpenBitable={onOpenBitable} />
     </div>
   );
 }
@@ -421,6 +439,7 @@ export default function KnowledgeSourcesPage() {
   const [reconnectSource, setReconnectSource] = useState<KnowledgeSource | null>(null);
   const [notice, setNotice] = useState("");
   const [detail, setDetail] = useState<{ doc: KnowledgeDocument; kind: SourceKind; sourceName: string } | null>(null);
+  const [bitableDetail, setBitableDetail] = useState<{ item: KnowledgeSourceItem; source: KnowledgeSource } | null>(null);
 
   useEffect(() => setMounted(true), []);
   const selected = useMemo(() => sources.find((source) => source.id === selectedId) || sources[0] || null, [selectedId, sources]);
@@ -494,7 +513,7 @@ export default function KnowledgeSourcesPage() {
                 <SourceList sources={sources} selectedId={selected?.id || ""} onSelect={setSelectedId} onAdd={() => setPickerOpen(true)} />
                 <div className="min-w-0 rounded-3xl border border-black/[0.06] bg-white p-5 shadow-sm sm:p-6">
                   {selected && !selected.builtin ? <div className="mb-6 flex items-center gap-3 border-b border-black/[0.055] pb-5"><SourceMark kind={selected.connector_key} /><div className="min-w-0"><h2 className="truncate text-lg font-semibold tracking-tight text-gray-950">{selected.name}</h2><div className="mt-1 flex items-center gap-2 text-[11px] text-gray-400"><span>可同步 Connector</span><span>·</span><span>{selected.item_count || 0} 项</span></div></div></div> : null}
-                  {!selected ? <div className="grid min-h-[300px] place-items-center text-sm text-gray-400"><div className="text-center"><Unplug className="mx-auto mb-3 h-7 w-7" />还没有资料来源</div></div> : selected.connector_key === "local_upload" ? <LocalUploadPanel source={selected} items={items} onChanged={changed} onOpenDoc={(item) => openDocument(selected, item.document_id)} /> : selected.connector_key === "web_capture" ? <WebCapturePanel source={selected} onChanged={changed} onOpenDoc={(item) => openDocument(selected, item.document_id)} /> : <FeishuPanel source={selected} items={items} runs={runs} onChanged={changed} onReconnect={() => { setReconnectSource(selected); setWizardOpen(true); }} onOpenDoc={(item) => openDocument(selected, item.document_id)} />}
+                  {!selected ? <div className="grid min-h-[300px] place-items-center text-sm text-gray-400"><div className="text-center"><Unplug className="mx-auto mb-3 h-7 w-7" />还没有资料来源</div></div> : selected.connector_key === "local_upload" ? <LocalUploadPanel source={selected} items={items} onChanged={changed} onOpenDoc={(item) => openDocument(selected, item.document_id)} /> : selected.connector_key === "web_capture" ? <WebCapturePanel source={selected} onChanged={changed} onOpenDoc={(item) => openDocument(selected, item.document_id)} /> : <FeishuPanel source={selected} items={items} runs={runs} onChanged={changed} onReconnect={() => { setReconnectSource(selected); setWizardOpen(true); }} onOpenDoc={(item) => openDocument(selected, item.document_id)} onOpenBitable={(item) => setBitableDetail({ item, source: selected })} />}
                 </div>
               </section>
             )}
@@ -504,6 +523,7 @@ export default function KnowledgeSourcesPage() {
       <ConnectorPicker open={pickerOpen} onClose={() => setPickerOpen(false)} onPickFeishu={() => { setPickerOpen(false); setReconnectSource(null); setWizardOpen(true); }} />
       <FeishuConnectionWizard open={wizardOpen} existingSource={reconnectSource} onClose={() => setWizardOpen(false)} onConnected={async (next) => { await refreshSources(); setSelectedId(next.id); }} />
       {detail ? <DocumentDetailModal doc={detail.doc} kind={detail.kind} sourceName={detail.sourceName} onClose={() => setDetail(null)} /> : null}
+      {bitableDetail ? <FeishuBitableDetailModal item={bitableDetail.item} source={bitableDetail.source} onClose={() => setBitableDetail(null)} /> : null}
     </div>
   );
 }

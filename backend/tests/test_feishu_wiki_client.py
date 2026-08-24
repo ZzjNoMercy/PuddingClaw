@@ -3,14 +3,160 @@ from __future__ import annotations
 import asyncio
 
 import httpx
+import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-from knowledge.connectors.feishu import FeishuHttpClient, FeishuOpenApi
+from knowledge.connectors.feishu import FeishuConnectorError, FeishuHttpClient, FeishuOpenApi
+from knowledge.connectors.feishu_bitable import parse_feishu_bitable_url
 from knowledge.connectors.feishu_blocks import convert_feishu_blocks_to_markdown
 from knowledge.connectors.feishu_sync import process_feishu_sync_run
 from knowledge.models import Base, FeishuAppCredential, KnowledgeDocument, KnowledgeSourceItem
 from knowledge.sources import create_source_connection, create_sync_run
+
+
+def test_bitable_links_normalize_direct_and_wiki_entries() -> None:
+    direct = parse_feishu_bitable_url(
+        "https://example.feishu.cn/base/bascnExample123?table=tblExample123&view=vewExample123"
+    )
+    assert direct.entry_kind == "direct_bitable"
+    assert direct.app_token == "bascnExample123"
+    assert direct.table_id == "tblExample123"
+    assert direct.view_id == "vewExample123"
+
+    wiki = parse_feishu_bitable_url("https://example.feishu.cn/wiki/wikcnExample123?table=tblExample123")
+    assert wiki.entry_kind == "wiki_bitable"
+    assert wiki.node_token == "wikcnExample123"
+    assert wiki.app_token == ""
+
+    with pytest.raises(FeishuConnectorError, match="官方租户域名"):
+        parse_feishu_bitable_url("https://feishu.cn.attacker.invalid/base/bascnExample123")
+
+
+def test_bitable_open_api_reads_one_bounded_record_page(tmp_path) -> None:
+    async def run() -> None:
+        observed: dict[str, str] = {}
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            observed.update(dict(request.url.params))
+            return httpx.Response(
+                200,
+                json={"code": 0, "data": {"items": [{"record_id": "rec1", "fields": {"名称": "示例"}}], "has_more": True, "page_token": "next", "total": 2}},
+            )
+
+        class StubTenantBroker:
+            async def get(self, _session, _app, *, force_refresh: bool = False):
+                return "token"
+
+        engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'bitable-api.db'}")
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+        sessions = async_sessionmaker(engine, expire_on_commit=False)
+        api = FeishuOpenApi(
+            http_client=FeishuHttpClient(transport=httpx.MockTransport(handler)),
+            tenant_broker=StubTenantBroker(),
+        )
+        async with sessions() as session:
+            app = FeishuAppCredential(id="fapp-bitable", app_id_masked="cli_••••test", credential_ref="unused", api_base_url="https://open.feishu.cn")
+            session.add(app)
+            source = await create_source_connection(session, connector_key="feishu_wiki", name="Base", auth_type="tenant", config={"app_credential_id": app.id})
+            source.status = "ready"
+            await session.commit()
+            result = await api.list_bitable_records_page(
+                session,
+                source,
+                app_token="bascnExample123",
+                table_id="tblExample123",
+                view_id="vewExample123",
+                page_size=500,
+                field_names=["名称"],
+            )
+            assert result["items"][0]["record_id"] == "rec1"
+            assert result["page_token"] == "next"
+            assert observed["page_size"] == "100"
+            assert observed["view_id"] == "vewExample123"
+        await engine.dispose()
+
+    asyncio.run(run())
+
+
+def test_wiki_bitable_node_is_registered_as_live_link_not_document(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("PUDDINGCLAW_KNOWLEDGE_DIR", str(tmp_path / "knowledge"))
+
+    async def run() -> None:
+        class FakeApi:
+            async def list_nodes(self, _session, _source, *, space_id, parent_node_token=None):
+                return [{"space_id": space_id, "node_token": "wiki-base", "obj_token": "base-token", "obj_type": "bitable", "title": "项目台账", "has_child": False, "obj_edit_time": "1700000000"}]
+
+        engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'bitable-sync.db'}")
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+        sessions = async_sessionmaker(engine, expire_on_commit=False)
+        async with sessions() as session:
+            source = await create_source_connection(session, connector_key="feishu_wiki", name="Wiki", auth_type="tenant", config={"space_id": "space-1", "publish_vector": False})
+            source.status = "ready"
+            run_ = await create_sync_run(session, source=source, mode="incremental")
+            await session.commit()
+            await process_feishu_sync_run(session, base_dir=tmp_path, run=run_, api=FakeApi())
+            item = (await session.execute(select(KnowledgeSourceItem))).scalar_one()
+            assert item.status == "linked"
+            assert item.external_type == "bitable"
+            assert item.metadata_json["app_token"] == "base-token"
+            assert run_.stats_json["linked"] == 1
+            assert (await session.execute(select(KnowledgeDocument))).scalars().all() == []
+        await engine.dispose()
+
+    asyncio.run(run())
+
+
+def test_direct_bitable_sync_refreshes_schema_without_reading_records(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("PUDDINGCLAW_KNOWLEDGE_DIR", str(tmp_path / "knowledge"))
+
+    async def run() -> None:
+        class FakeApi:
+            record_calls = 0
+
+            async def list_bitable_fields(self, _session, _source, *, app_token, table_id):
+                assert app_token == "base-token"
+                assert table_id == "table-token"
+                return [{"field_id": "fld1", "field_name": "项目", "type": 1}]
+
+            async def list_bitable_records_page(self, *_args, **_kwargs):
+                self.record_calls += 1
+                raise AssertionError("schema refresh must not read records")
+
+        engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'bitable-direct-sync.db'}")
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+        sessions = async_sessionmaker(engine, expire_on_commit=False)
+        api = FakeApi()
+        async with sessions() as session:
+            source = await create_source_connection(
+                session,
+                connector_key="feishu_wiki",
+                name="项目台账",
+                auth_type="tenant",
+                config={
+                    "source_mode": "bitable",
+                    "app_token": "base-token",
+                    "table_id": "table-token",
+                    "table_name": "项目",
+                    "source_url": "https://example.feishu.cn/base/base-token?table=table-token",
+                },
+            )
+            source.status = "ready"
+            run_ = await create_sync_run(session, source=source, mode="incremental")
+            await session.commit()
+            await process_feishu_sync_run(session, base_dir=tmp_path, run=run_, api=api)
+            item = (await session.execute(select(KnowledgeSourceItem))).scalar_one()
+            assert item.status == "linked"
+            assert item.metadata_json["row_storage"] is False
+            assert item.metadata_json["fields"][0]["field_name"] == "项目"
+            assert run_.stats_json["schema_changed"] == 1
+            assert api.record_calls == 0
+        await engine.dispose()
+
+    asyncio.run(run())
 
 
 def test_feishu_open_api_refreshes_once_and_paginates_empty_filtered_pages(tmp_path) -> None:

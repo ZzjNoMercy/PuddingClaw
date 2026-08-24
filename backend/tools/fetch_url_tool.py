@@ -9,9 +9,10 @@ import socket
 import ssl
 import subprocess
 import sys
+import threading
+import time
 from collections.abc import Mapping
 from dataclasses import dataclass
-from functools import lru_cache
 from urllib.parse import urljoin, urlsplit, urlunsplit
 
 import certifi
@@ -33,6 +34,9 @@ from utils.network_safety import (
 MAX_REDIRECTS = 5
 MAX_RESPONSE_BYTES = 5 * 1024 * 1024
 READ_CHUNK_BYTES = 64 * 1024
+TRANSPORT_ATTEMPTS = 3
+TRANSPORT_RETRY_DELAYS = (0.2, 0.6)
+PROXY_DISCOVERY_CACHE_TTL_SECONDS = 5.0
 _PROXY_ENV_KEYS = (
     "PUDDINGCLAW_HTTPS_PROXY",
     "HTTPS_PROXY",
@@ -40,6 +44,14 @@ _PROXY_ENV_KEYS = (
     "ALL_PROXY",
     "all_proxy",
 )
+_PROXY_PREFERRED_HOST_SUFFIXES = (
+    "mp.weixin.qq.com",
+    "mmbiz.qpic.cn",
+    "twimg.com",
+)
+_proxy_discovery_lock = threading.Lock()
+_proxy_discovery_value = ""
+_proxy_discovery_expires_at = 0.0
 
 
 class UnsafePublicURL(ValueError):
@@ -132,6 +144,54 @@ def _uses_trusted_https_fake_ip(addresses: list[str], *, scheme: str) -> bool:
     )
 
 
+def _prefers_configured_proxy(hostname: str, *, scheme: str) -> bool:
+    """Route known proxy-sensitive public CDNs through the user's HTTPS proxy."""
+
+    if scheme != "https":
+        return False
+    normalized = hostname.rstrip(".").lower()
+    return any(
+        normalized == suffix or normalized.endswith(f".{suffix}")
+        for suffix in _PROXY_PREFERRED_HOST_SUFFIXES
+    )
+
+
+def _is_retryable_transport_error(exc: Exception) -> bool:
+    """Classify transient connection failures without weakening TLS validation."""
+
+    current: BaseException | None = exc
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        message = str(current).lower()
+        if isinstance(current, ssl.SSLCertVerificationError) or "certificate verify failed" in message:
+            return False
+        if isinstance(
+            current,
+            (
+                ssl.SSLError,
+                TimeoutError,
+                ConnectionError,
+                OSError,
+                urllib3.exceptions.HTTPError,
+            ),
+        ):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
+def _friendly_transport_error(exc: Exception) -> ConnectionError:
+    message = str(exc)
+    if "unexpected_eof" in message.lower() or "eof occurred in violation of protocol" in message.lower():
+        return ConnectionError(
+            f"TLS 连接被代理或远端服务器提前关闭，已自动重试 {TRANSPORT_ATTEMPTS} 次；请稍后重新解析"
+        )
+    return ConnectionError(
+        f"网络连接失败，已自动重试 {TRANSPORT_ATTEMPTS} 次：{type(exc).__name__}: {message}"
+    )
+
+
 def _normalized_proxy_url(value: str) -> str:
     candidate = value.strip()
     if not candidate:
@@ -169,9 +229,13 @@ def _parse_macos_https_proxy(output: str) -> str:
     return _normalized_proxy_url(f"http://{host}:{port}")
 
 
-@lru_cache(maxsize=1)
 def _configured_https_proxy_url() -> str:
-    """Resolve an explicit or macOS system HTTPS proxy without proxying normal traffic."""
+    """Resolve the active HTTPS proxy while allowing VPN hot switching.
+
+    Environment overrides are checked on every call. macOS system-proxy
+    discovery is cached only briefly because VPN clients can enable, disable or
+    replace the local proxy while the long-lived backend process keeps running.
+    """
 
     for key in _PROXY_ENV_KEYS:
         proxy_url = _normalized_proxy_url(os.getenv(key, ""))
@@ -179,6 +243,21 @@ def _configured_https_proxy_url() -> str:
             return proxy_url
     if sys.platform != "darwin":
         return ""
+
+    global _proxy_discovery_expires_at, _proxy_discovery_value
+    now = time.monotonic()
+    with _proxy_discovery_lock:
+        if now < _proxy_discovery_expires_at:
+            return _proxy_discovery_value
+        proxy_url = _discover_macos_https_proxy_url()
+        _proxy_discovery_value = proxy_url
+        _proxy_discovery_expires_at = now + PROXY_DISCOVERY_CACHE_TTL_SECONDS
+        return proxy_url
+
+
+def _discover_macos_https_proxy_url() -> str:
+    """Read the current macOS HTTPS proxy without applying process-lifetime caching."""
+
     try:
         completed = subprocess.run(
             ["/usr/sbin/scutil", "--proxy"],
@@ -194,6 +273,15 @@ def _configured_https_proxy_url() -> str:
     return _parse_macos_https_proxy(completed.stdout)
 
 
+def _invalidate_https_proxy_cache() -> None:
+    """Force the next transport attempt to rediscover the macOS proxy."""
+
+    global _proxy_discovery_expires_at, _proxy_discovery_value
+    with _proxy_discovery_lock:
+        _proxy_discovery_value = ""
+        _proxy_discovery_expires_at = 0.0
+
+
 class FetchURLTool(BaseTool):
     name: str = "fetch_url"
     description: str = (
@@ -207,9 +295,14 @@ class FetchURLTool(BaseTool):
     def _headers(hostname: str) -> dict[str, str]:
         return {
             "Host": hostname,
-            "User-Agent": "Mozilla/5.0 (compatible; PuddingClaw/0.1)",
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"
+            ),
             "Accept": "text/html,application/json,text/plain,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.1",
             "Accept-Encoding": "gzip, deflate",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+            "Connection": "close",
         }
 
     @staticmethod
@@ -282,48 +375,71 @@ class FetchURLTool(BaseTool):
     @classmethod
     def _request_once(cls, url: str) -> _FetchedResponse:
         scheme, hostname, port, path = _validated_url(url)
-        addresses = _resolve_public_addresses(hostname, port, scheme=scheme)
-        if _uses_trusted_https_fake_ip(addresses, scheme=scheme):
-            proxy_url = _configured_https_proxy_url()
-            if proxy_url:
-                return cls._request_via_proxy(url, hostname=hostname, proxy_url=proxy_url)
         last_error: Exception | None = None
-        for address in addresses:
-            pool = cls._pool(
-                scheme=scheme,
-                address=address,
-                port=port,
-                hostname=hostname,
-            )
-            response: urllib3.HTTPResponse | None = None
-            try:
-                response = pool.urlopen(
-                    "GET",
-                    path,
-                    headers=cls._headers(hostname),
-                    redirect=False,
-                    preload_content=False,
-                    decode_content=False,
-                    release_conn=False,
+        for attempt in range(TRANSPORT_ATTEMPTS):
+            # DNS and proxy state may both change when a VPN is toggled. Resolve
+            # them again for each bounded retry instead of pinning the first
+            # observation for the lifetime of this request (or backend).
+            addresses = _resolve_public_addresses(hostname, port, scheme=scheme)
+            proxy_url = _configured_https_proxy_url()
+            use_proxy = bool(
+                proxy_url
+                and (
+                    _uses_trusted_https_fake_ip(addresses, scheme=scheme)
+                    or _prefers_configured_proxy(hostname, scheme=scheme)
                 )
-                connection = response.connection
-                peer = connection.sock.getpeername()[0] if connection and connection.sock else ""
-                if not peer or str(_public_ip(str(peer), scheme=scheme, hostname=hostname)) != str(
-                    _public_ip(address, scheme=scheme, hostname=hostname)
-                ):
-                    raise UnsafePublicURL("connected peer does not match the validated address")
+            )
+            if use_proxy:
+                try:
+                    return cls._request_via_proxy(url, hostname=hostname, proxy_url=proxy_url)
+                except Exception as exc:  # noqa: BLE001 - classify below
+                    if not _is_retryable_transport_error(exc):
+                        raise
+                    last_error = exc
+            else:
+                for address in addresses:
+                    pool = cls._pool(
+                        scheme=scheme,
+                        address=address,
+                        port=port,
+                        hostname=hostname,
+                    )
+                    response: urllib3.HTTPResponse | None = None
+                    try:
+                        response = pool.urlopen(
+                            "GET",
+                            path,
+                            headers=cls._headers(hostname),
+                            redirect=False,
+                            preload_content=False,
+                            decode_content=False,
+                            release_conn=False,
+                        )
+                        connection = response.connection
+                        peer = connection.sock.getpeername()[0] if connection and connection.sock else ""
+                        if not peer or str(_public_ip(str(peer), scheme=scheme, hostname=hostname)) != str(
+                            _public_ip(address, scheme=scheme, hostname=hostname)
+                        ):
+                            raise UnsafePublicURL("connected peer does not match the validated address")
 
-                return cls._read_response(response)
-            except (UnsafePublicURL, ValueError):
-                raise
-            except Exception as exc:  # noqa: BLE001 - try another validated address
-                last_error = exc
-            finally:
-                if response is not None:
-                    response.release_conn()
-                pool.close()
+                        return cls._read_response(response)
+                    except (UnsafePublicURL, ValueError):
+                        raise
+                    except Exception as exc:  # noqa: BLE001 - try another validated address
+                        if not _is_retryable_transport_error(exc):
+                            raise
+                        last_error = exc
+                    finally:
+                        if response is not None:
+                            response.release_conn()
+                        pool.close()
+            if attempt < TRANSPORT_ATTEMPTS - 1:
+                # A cached empty/stale proxy is a common consequence of
+                # enabling or switching a VPN after backend startup.
+                _invalidate_https_proxy_cache()
+                time.sleep(TRANSPORT_RETRY_DELAYS[attempt])
         if last_error is not None:
-            raise last_error
+            raise _friendly_transport_error(last_error) from last_error
         raise UnsafePublicURL("no validated public address could be reached")
 
     @staticmethod

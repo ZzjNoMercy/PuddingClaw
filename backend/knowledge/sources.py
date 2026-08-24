@@ -44,10 +44,10 @@ BUILTIN_CONNECTORS: tuple[dict[str, Any], ...] = (
     },
     {
         "key": "feishu_wiki",
-        "name": "飞书知识库",
-        "description": "同步指定 Wiki 空间或根节点下的文档",
+        "name": "飞书 Wiki / 多维表格",
+        "description": "同步 Wiki 文档，或登记一个多维表格供 Agent 实时只读查询",
         "auth_types": ["tenant", "user"],
-        "capabilities": ["discover", "incremental_sync", "full_scan", "docx", "attachments"],
+        "capabilities": ["discover", "incremental_sync", "full_scan", "docx", "attachments", "bitable_live_query"],
         "builtin": False,
     },
 )

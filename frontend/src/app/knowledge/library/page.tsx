@@ -1,7 +1,7 @@
 "use client";
 
 import { Suspense, useCallback, useEffect, useMemo, useState } from "react";
-import { useSearchParams } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
 import { Loader2, Search } from "lucide-react";
 
 import Navbar from "@/components/layout/Navbar";
@@ -17,11 +17,25 @@ import DocumentDetailModal, {
 } from "@/components/knowledge/DocumentDetailModal";
 import KnowledgeWorkspaceHeader from "@/components/knowledge/KnowledgeWorkspaceHeader";
 import KnowledgeWorkspaceNav from "@/components/knowledge/KnowledgeWorkspaceNav";
-import { listKnowledgeDocuments, type KnowledgeDocument } from "@/lib/api";
-import { listKnowledgeSources, type KnowledgeSource } from "@/lib/knowledgeSourcesApi";
+import FeishuBitableDetailModal from "@/components/knowledge/FeishuBitableDetailModal";
+import { listKnowledgeDocuments, listReadLaterItems, type KnowledgeDocument, type ReadLaterItem } from "@/lib/api";
+import {
+  listKnowledgeSourceItems,
+  listKnowledgeSources,
+  type KnowledgeSource,
+  type KnowledgeSourceItem,
+} from "@/lib/knowledgeSourcesApi";
 import { useApp } from "@/lib/store";
 
 const PAGE_SIZE = 10;
+
+function readLaterStatus(item: ReadLaterItem): { label: string; className: string } {
+  if (item.parse_status === "queued") return { label: "等待解析", className: "bg-amber-50 text-amber-700" };
+  if (item.parse_status === "processing") return { label: "解析中", className: "bg-[#002fa7]/10 text-[#002fa7]" };
+  if (item.parse_status === "failed") return { label: "失败", className: "bg-red-50 text-red-600" };
+  if (item.parse_status === "link_only") return { label: "仅保留链接", className: "bg-amber-50 text-amber-700" };
+  return { label: "已入库", className: "bg-emerald-50 text-emerald-700" };
+}
 
 function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error || "未知错误");
@@ -50,10 +64,13 @@ function relativeTime(value: string | null | undefined): string {
 
 function KnowledgeLibraryContent() {
   const { sidebarOpen, toggleSidebar, sidebarWidth, setSidebarWidth } = useApp();
+  const router = useRouter();
   const searchParams = useSearchParams();
   const [mounted, setMounted] = useState(false);
   const [documents, setDocuments] = useState<KnowledgeDocument[]>([]);
+  const [readLater, setReadLater] = useState<ReadLaterItem[]>([]);
   const [sources, setSources] = useState<KnowledgeSource[]>([]);
+  const [bitableItems, setBitableItems] = useState<KnowledgeSourceItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [notice, setNotice] = useState("");
   const [query, setQuery] = useState("");
@@ -64,15 +81,26 @@ function KnowledgeLibraryContent() {
   const [statusFilter, setStatusFilter] = useState("all");
   const [page, setPage] = useState(0);
   const [selectedDocId, setSelectedDocId] = useState("");
+  const [selectedBitableId, setSelectedBitableId] = useState("");
 
   useEffect(() => setMounted(true), []);
   useEffect(() => setPage(0), [query, sourceFilter, statusFilter]);
 
   const refresh = useCallback(async () => {
     try {
-      const [nextDocuments, nextSources] = await Promise.all([listKnowledgeDocuments(), listKnowledgeSources()]);
+      const [nextDocuments, nextSources, nextReadLater] = await Promise.all([
+        listKnowledgeDocuments(),
+        listKnowledgeSources(),
+        listReadLaterItems(),
+      ]);
+      const bitableSources = nextSources.filter((source) => source.connector_key === "feishu_wiki");
+      const nextBitableItems = (await Promise.all(
+        bitableSources.map((source) => listKnowledgeSourceItems(source.id)),
+      )).flat().filter((item) => item.external_type === "bitable" && item.status !== "deleted");
       setDocuments(nextDocuments);
       setSources(nextSources);
+      setReadLater(nextReadLater);
+      setBitableItems(nextBitableItems);
       setNotice("");
     } catch (error) {
       setNotice(messageOf(error));
@@ -83,39 +111,98 @@ function KnowledgeLibraryContent() {
 
   useEffect(() => { void refresh(); }, [refresh]);
 
+  useEffect(() => {
+    const delay = readLater.some((item) => item.parse_status === "queued" || item.parse_status === "processing") ? 2500 : 10000;
+    const timer = window.setInterval(() => { void refresh(); }, delay);
+    return () => window.clearInterval(timer);
+  }, [readLater, refresh]);
+
   const sourceById = useMemo(() => new Map(sources.map((source) => [source.id, source])), [sources]);
 
-  const rows = useMemo(() => documents.map((doc) => {
-    const source = doc.source_connection_id ? sourceById.get(doc.source_connection_id) : undefined;
-    const kind: SourceKind = source
-      ? (source.connector_key === "feishu_wiki" ? "feishu" : source.connector_key === "web_capture" ? "web" : "local")
-      : doc.source_type.startsWith("feishu") ? "feishu"
-        : doc.source_type === "read_later" || doc.source_type === "web" ? "web"
-          : "local";
-    const location = (doc.virtual_path || doc.source_path || "").replace(/^\/+|\/+$/g, "").split("/").filter(Boolean).join(" / ");
-    return {
-      doc,
-      kind,
-      sourceName: source?.name || KIND_LABEL[kind],
-      location,
-      type: docType(doc),
-      status: statusView(doc),
-    };
-  }), [documents, sourceById]);
+  const rows = useMemo(() => {
+    const documentRows = documents.map((doc) => {
+      const source = doc.source_connection_id ? sourceById.get(doc.source_connection_id) : undefined;
+      const kind: SourceKind = source
+        ? (source.connector_key === "feishu_wiki" ? "feishu" : source.connector_key === "web_capture" ? "web" : "local")
+        : doc.source_type.startsWith("feishu") ? "feishu"
+          : doc.source_type === "read_later" || doc.source_type === "web" ? "web"
+            : "local";
+      const location = (doc.virtual_path || doc.source_path || "").replace(/^\/+|\/+$/g, "").split("/").filter(Boolean).join(" / ");
+      return {
+        id: `document:${doc.id}`,
+        doc,
+        bitable: null as KnowledgeSourceItem | null,
+        title: doc.title,
+        secondary: `${docType(doc).label} · ${formatSize(doc.size_bytes)}`,
+        updatedAt: doc.updated_at,
+        kind,
+        sourceName: source?.name || KIND_LABEL[kind],
+        location,
+        type: docType(doc),
+        status: statusView(doc),
+      };
+    });
+    const documentIds = new Set(documents.map((document) => document.id));
+    const pendingRows = readLater
+      .filter((item) => !item.document_id || !documentIds.has(item.document_id))
+      .map((item) => ({
+        id: `read-later:${item.id}`,
+        doc: null as KnowledgeDocument | null,
+        bitable: null as KnowledgeSourceItem | null,
+        title: item.title || item.original_url,
+        secondary: item.parse_status === "failed"
+          ? "网页 · 解析失败"
+          : item.parse_status === "link_only"
+            ? "网页 · 仅保留链接"
+            : item.parse_status === "ready"
+              ? "网页 · 正文已生成"
+              : "网页 · 正文生成中",
+        updatedAt: item.updated_at,
+        kind: "web" as SourceKind,
+        sourceName: "网页收藏",
+        location: item.site_name || new URL(item.canonical_url).hostname,
+        type: { glyph: "网页", label: "网页" },
+        status: readLaterStatus(item),
+      }));
+    const bitableRows = bitableItems.map((item) => {
+      const source = sourceById.get(item.source_connection_id);
+      const fields = Array.isArray(item.metadata.fields) ? item.metadata.fields : [];
+      return {
+        id: `bitable:${item.id}`,
+        doc: null as KnowledgeDocument | null,
+        bitable: item,
+        title: item.title || source?.name || "飞书多维表格",
+        secondary: `多维表格 · ${fields.length} 个字段`,
+        updatedAt: item.updated_at,
+        kind: "feishu" as SourceKind,
+        sourceName: source?.name || "飞书",
+        location: "飞书 / 多维表格 / 实时连接",
+        type: { glyph: "表", label: "多维表格" },
+        status: { label: "实时连接", className: "bg-emerald-50 text-emerald-700" },
+      };
+    });
+    return [...documentRows, ...bitableRows, ...pendingRows].sort(
+      (left, right) => Date.parse(right.updatedAt || "") - Date.parse(left.updatedAt || "")
+    );
+  }, [bitableItems, documents, readLater, sourceById]);
 
   const visible = useMemo(() => rows.filter((row) => {
     if (sourceFilter !== "all" && row.kind !== sourceFilter) return false;
     if (statusFilter !== "all" && row.status.label !== statusFilter) return false;
     const keyword = query.trim().toLowerCase();
     if (!keyword) return true;
-    return row.doc.title.toLowerCase().includes(keyword) || row.location.toLowerCase().includes(keyword);
+    return row.title.toLowerCase().includes(keyword) || row.location.toLowerCase().includes(keyword) || row.sourceName.toLowerCase().includes(keyword);
   }), [rows, sourceFilter, statusFilter, query]);
 
   const pageCount = Math.max(1, Math.ceil(visible.length / PAGE_SIZE));
   const currentPage = Math.min(page, pageCount - 1);
   const paged = visible.slice(currentPage * PAGE_SIZE, (currentPage + 1) * PAGE_SIZE);
 
-  const selectedRow = useMemo(() => rows.find((row) => row.doc.id === selectedDocId) || null, [rows, selectedDocId]);
+  const selectedRow = useMemo(() => rows.find((row) => row.doc?.id === selectedDocId) || null, [rows, selectedDocId]);
+  const selectedBitableRow = useMemo(() => rows.find((row) => row.bitable?.id === selectedBitableId) || null, [rows, selectedBitableId]);
+  const selectedBitableSource = selectedBitableRow?.bitable
+    ? sourceById.get(selectedBitableRow.bitable.source_connection_id)
+    : undefined;
 
   return (
     <div className="h-screen app-bg text-gray-950">
@@ -146,7 +233,10 @@ function KnowledgeLibraryContent() {
                     <option value="已索引">已索引</option>
                     <option value="待索引">待索引</option>
                     <option value="已入库">已入库</option>
+                    <option value="等待解析">等待解析</option>
+                    <option value="解析中">解析中</option>
                     <option value="处理中">处理中</option>
+                    <option value="实时连接">实时连接</option>
                     <option value="失败">失败</option>
                   </select>
                   <span className="ml-auto text-[11px] text-gray-400">{visible.length} 项 · 来源已统一但可追踪</span>
@@ -157,17 +247,17 @@ function KnowledgeLibraryContent() {
                       <div>名称</div><div>来源</div><div>所在位置</div><div>更新时间</div><div>状态</div>
                     </div>
                     {paged.map((row) => (
-                      <button type="button" key={row.doc.id} onClick={() => setSelectedDocId(row.doc.id)} className="grid w-full cursor-pointer grid-cols-[minmax(0,2.2fr)_minmax(0,1.2fr)_minmax(0,1.2fr)_120px_90px] items-center gap-4 border-b border-black/[0.04] px-5 py-3.5 text-left transition last:border-b-0 hover:bg-[#002fa7]/[0.03]">
+                      <button type="button" key={row.id} onClick={() => row.doc ? setSelectedDocId(row.doc.id) : row.bitable ? setSelectedBitableId(row.bitable.id) : router.push("/knowledge/read-later")} className="grid w-full cursor-pointer grid-cols-[minmax(0,2.2fr)_minmax(0,1.2fr)_minmax(0,1.2fr)_120px_90px] items-center gap-4 border-b border-black/[0.04] px-5 py-3.5 text-left transition last:border-b-0 hover:bg-[#002fa7]/[0.03]">
                         <div className="flex min-w-0 items-center gap-3">
                           <span className="grid h-9 w-9 shrink-0 place-items-center rounded-xl bg-[#002fa7]/[0.06] text-[10px] font-bold text-[#002fa7]">{row.type.glyph}</span>
                           <span className="min-w-0">
-                            <span className="block truncate text-sm font-semibold text-gray-900">{row.doc.title}</span>
-                            <span className="mt-0.5 block text-[11px] text-gray-400">{row.type.label} · {formatSize(row.doc.size_bytes)}</span>
+                            <span className="block truncate text-sm font-semibold text-gray-900">{row.title}</span>
+                            <span className="mt-0.5 block text-[11px] text-gray-400">{row.secondary}</span>
                           </span>
                         </div>
                         <div className="flex min-w-0 items-center gap-2"><KindLogo kind={row.kind} /><span className="truncate text-xs text-gray-600">{row.sourceName}</span></div>
                         <div className="truncate text-xs text-gray-500">{row.location || "—"}</div>
-                        <div className="text-xs text-gray-500">{relativeTime(row.doc.updated_at)}</div>
+                        <div className="text-xs text-gray-500">{relativeTime(row.updatedAt)}</div>
                         <div><span className={`inline-flex rounded-full px-2.5 py-1 text-[11px] font-semibold ${row.status.className}`}>{row.status.label}</span></div>
                       </button>
                     ))}
@@ -186,12 +276,19 @@ function KnowledgeLibraryContent() {
           </div>
         </main>
       </div>
-      {selectedRow ? (
+      {selectedRow?.doc ? (
         <DocumentDetailModal
           doc={selectedRow.doc}
           kind={selectedRow.kind}
           sourceName={selectedRow.sourceName}
           onClose={() => setSelectedDocId("")}
+        />
+      ) : null}
+      {selectedBitableRow?.bitable && selectedBitableSource ? (
+        <FeishuBitableDetailModal
+          item={selectedBitableRow.bitable}
+          source={selectedBitableSource}
+          onClose={() => setSelectedBitableId("")}
         />
       ) : null}
     </div>
