@@ -1281,6 +1281,110 @@ def test_upsert_assistant_message_replaces_same_query_draft(tmp_path):
     assert assistant["error_notice"] == "模型连接中断"
 
 
+def test_running_tool_snapshot_becomes_one_final_evidence_record(tmp_path):
+    """A ToolCall start event is lifecycle state, not interrupted evidence."""
+
+    session_manager.initialize(tmp_path)
+    session_manager.create_session("tool-lifecycle-session")
+    session_manager.upsert_assistant_message(
+        "tool-lifecycle-session",
+        query_id="query-lifecycle",
+        content="正在检索",
+        tool_calls=[{
+            "id": "call-lifecycle",
+            "tool": "llamaindex_knowledge_query",
+            "input": {"query": "多智能体省 token"},
+            "status": "running",
+        }],
+        status="running",
+    )
+
+    session_manager.ensure_tool_call_ids("tool-lifecycle-session")
+    pending = session_manager._read_file("tool-lifecycle-session")
+    pending_call = pending["messages"][0]["tool_calls"][0]
+    assert "evidence_id" not in pending_call
+    assert not pending.get("evidence_index")
+
+    session_manager.upsert_assistant_message(
+        "tool-lifecycle-session",
+        query_id="query-lifecycle",
+        content="检索完成",
+        tool_calls=[{
+            "id": "call-lifecycle",
+            "tool": "llamaindex_knowledge_query",
+            "input": {"query": "多智能体省 token"},
+            "output": "文本命中 3；图片命中 2。",
+            "status": "success",
+            "completed_at": 123.0,
+        }],
+        status="completed",
+    )
+
+    history = session_manager.load_session_for_agent("tool-lifecycle-session")
+    final_call = history[0]["tool_calls"][0]
+    persisted = session_manager._read_file("tool-lifecycle-session")
+    evidence = list(persisted["evidence_index"].values())
+
+    assert final_call["evidence_id"].startswith("evidence-")
+    assert final_call["status"] == "success"
+    assert final_call["output_complete"] is True
+    assert len(evidence) == 1
+    assert evidence[0]["tool_call_id"] == "call-lifecycle"
+    assert evidence[0]["status"] == "success"
+
+
+def test_evidence_migration_keeps_success_id_and_prunes_interrupted_duplicate(tmp_path):
+    session_manager.initialize(tmp_path)
+    session_manager.create_session("evidence-migration-session")
+    session_manager.upsert_assistant_message(
+        "evidence-migration-session",
+        query_id="query-migration",
+        content="完成",
+        tool_calls=[{
+            "id": "call-migration",
+            "tool": "read_file",
+            "output": "最终证据",
+            "status": "success",
+            "completed_at": 123.0,
+            "evidence_id": "evidence-success-existing",
+        }],
+        status="completed",
+    )
+    data = session_manager._read_file("evidence-migration-session")
+    common = {
+        "tool_call_id": "call-migration",
+        "tool": "read_file",
+        "source_session_id": "evidence-migration-session",
+        "source_run_id": "",
+        "source_query_id": "query-migration",
+        "source_hash": "sha256:legacy",
+        "raw_output_ref": {"kind": "session_tool_call"},
+        "projection": {"profile": "detailed", "version": "evidence-projection-v1"},
+    }
+    data["evidence_index"] = {
+        "evidence-interrupted-old": {
+            **common,
+            "evidence_id": "evidence-interrupted-old",
+            "status": "interrupted",
+            "output_complete": False,
+        },
+        "evidence-success-existing": {
+            **common,
+            "evidence_id": "evidence-success-existing",
+            "status": "success",
+            "output_complete": True,
+        },
+    }
+    session_manager._write_file("evidence-migration-session", data)
+
+    session_manager.ensure_tool_call_ids("evidence-migration-session")
+    migrated = session_manager._read_file("evidence-migration-session")
+    migrated_call = migrated["display_messages"][0]["tool_calls"][0]
+
+    assert migrated_call["evidence_id"] == "evidence-success-existing"
+    assert set(migrated["evidence_index"]) == {"evidence-success-existing"}
+
+
 def test_message_timestamp_uses_explicit_query_input_time(tmp_path):
     session_manager.initialize(tmp_path)
     session_manager.create_session("timestamp-session")

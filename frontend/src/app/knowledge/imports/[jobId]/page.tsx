@@ -1617,9 +1617,6 @@ export default function KnowledgeImportJobDetailPage() {
                         <p className="mt-3 break-all rounded-2xl bg-black/[0.025] px-4 py-3 text-sm leading-6 text-gray-600">
                           {originalPath}
                         </p>
-                        <p className="mt-4 text-sm leading-6 text-gray-400">
-                          PDF 原文预览后面可以接浏览器内嵌 PDF viewer；当前先把源文件路径和解析产物关联起来。
-                        </p>
                       </div>
                     ) : null}
 
@@ -1665,7 +1662,7 @@ export default function KnowledgeImportJobDetailPage() {
                             })}
                           </div>
                         ) : (
-                          <p className="mt-4 text-sm text-gray-400">暂时没有图片资源。后面 MinerU 图片预览 API 接上后，这里会直接显示缩略图。</p>
+                          <p className="mt-4 text-sm text-gray-400">该文档没有可预览的图片资源。</p>
                         )}
                       </div>
                     ) : null}

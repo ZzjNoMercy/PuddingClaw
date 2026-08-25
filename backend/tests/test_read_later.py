@@ -214,8 +214,21 @@ def test_read_later_capture_extracts_article_and_registers_markdown(tmp_path: Pa
         assert "source_url: https://example.com/article?utm_source=test" in markdown
         assert "navigation noise" not in markdown
         assert "reliable tool contracts" in markdown
-        assert "![Agent architecture](/knowledge/assets/read-later/" in markdown
+        relative_image = f"../../assets/read-later/{item.id}/image-01.png"
+        assert f"![Agent architecture]({relative_image})" in markdown
+        assert (Path(refreshed.storage_path).parent / relative_image).resolve().is_file()
         assert (tmp_path / "knowledge" / "assets" / "read-later" / item.id / "image-01.png").is_file()
+        preview = KnowledgeService(tmp_path).preview_file(virtual_path=refreshed.virtual_path)
+        assert "](/api/knowledge/file/raw?virtual_path=" in preview["content"]
+        document_metadata = read_later_documents[0].doc_metadata
+        assets = document_metadata["assets"]
+        assert len(assets) == 1
+        assert assets[0]["virtual_path"] == f"/knowledge/assets/read-later/{item.id}/image-01.png"
+        assert Path(assets[0]["path"]).is_file()
+        assert assets[0]["context"]["caption"] == "Agent architecture"
+        assert document_metadata["multimodal"]["image_asset_count"] == 1
+        chunks = document_metadata["llamaindex_chunks"]["chunks"]
+        assert any(chunk["linked_images"] for chunk in chunks)
         await engine.dispose()
 
     asyncio.run(run())

@@ -138,6 +138,7 @@ def test_macos_proxy_discovery_cache_expires_when_vpn_is_enabled(monkeypatch) ->
         "_discover_macos_https_proxy_url",
         lambda: next(discoveries),
     )
+    monkeypatch.setattr(fetch_url_tool, "_proxy_url_is_available", lambda _url: True)
     times = iter([100.0, 101.0, 106.0])
     monkeypatch.setattr(fetch_url_tool.time, "monotonic", lambda: next(times))
     _invalidate_https_proxy_cache()
@@ -147,6 +148,30 @@ def test_macos_proxy_discovery_cache_expires_when_vpn_is_enabled(monkeypatch) ->
     assert _configured_https_proxy_url() == "http://127.0.0.1:27890"
 
     _invalidate_https_proxy_cache()
+
+
+def test_stale_explicit_local_proxy_falls_back_to_live_system_proxy(monkeypatch) -> None:
+    from tools import fetch_url_tool
+
+    for key in fetch_url_tool._PROXY_ENV_KEYS:
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("PUDDINGCLAW_HTTPS_PROXY", "http://127.0.0.1:7897")
+    monkeypatch.setattr(fetch_url_tool.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        fetch_url_tool,
+        "_cached_macos_https_proxy_url",
+        lambda: "http://127.0.0.1:27890",
+    )
+    checked: list[str] = []
+
+    def available(url: str) -> bool:
+        checked.append(url)
+        return url.endswith(":27890")
+
+    monkeypatch.setattr(fetch_url_tool, "_proxy_url_is_available", available)
+
+    assert _configured_https_proxy_url() == "http://127.0.0.1:27890"
+    assert checked == ["http://127.0.0.1:7897", "http://127.0.0.1:27890"]
 
 
 def test_fake_ip_https_request_uses_configured_proxy(monkeypatch) -> None:
@@ -188,7 +213,7 @@ def test_fake_ip_https_request_uses_configured_proxy(monkeypatch) -> None:
     )
     monkeypatch.setattr(
         "tools.fetch_url_tool._configured_https_proxy_url",
-        lambda: "http://127.0.0.1:27890",
+        lambda **_kwargs: "http://127.0.0.1:27890",
     )
     monkeypatch.setattr("tools.fetch_url_tool.ProxyManager", FakeProxyManager)
     monkeypatch.setattr(
@@ -241,7 +266,7 @@ def test_fake_ip_tls_retry_rediscovers_proxy_after_vpn_switch(monkeypatch) -> No
     )
     monkeypatch.setattr(
         "tools.fetch_url_tool._configured_https_proxy_url",
-        lambda: next(proxy_lookups),
+        lambda **_kwargs: next(proxy_lookups),
     )
     monkeypatch.setattr("tools.fetch_url_tool.time.sleep", lambda _delay: None)
     monkeypatch.setattr(FetchURLTool, "_pool", staticmethod(direct_pool))
@@ -278,7 +303,7 @@ def test_wechat_request_uses_configured_proxy_and_retries_transient_tls_eof(monk
     )
     monkeypatch.setattr(
         "tools.fetch_url_tool._configured_https_proxy_url",
-        lambda: "http://127.0.0.1:27890",
+        lambda **_kwargs: "http://127.0.0.1:27890",
     )
     monkeypatch.setattr("tools.fetch_url_tool.time.sleep", lambda _delay: None)
     monkeypatch.setattr(FetchURLTool, "_request_via_proxy", classmethod(flaky_proxy_request))
@@ -292,6 +317,38 @@ def test_wechat_request_uses_configured_proxy_and_retries_transient_tls_eof(monk
 
     assert attempts == 3
     assert response.status == 200
+    assert response.body == b"wechat article"
+
+
+def test_retryable_tls_failure_switches_to_next_proxy_candidate(monkeypatch) -> None:
+    attempts: list[str] = []
+
+    def configured_proxy(*, excluded: frozenset[str] = frozenset()) -> str:
+        candidates = ["http://127.0.0.1:7897", "http://127.0.0.1:27890"]
+        return next((candidate for candidate in candidates if candidate not in excluded), candidates[0])
+
+    def proxy_request(cls, _url: str, *, hostname: str, proxy_url: str) -> _FetchedResponse:
+        assert cls is FetchURLTool
+        assert hostname == "mp.weixin.qq.com"
+        attempts.append(proxy_url)
+        if proxy_url.endswith(":7897"):
+            raise ssl.SSLError("[SSL: UNEXPECTED_EOF_WHILE_READING]")
+        return _FetchedResponse(200, {"content-type": "text/html"}, b"wechat article")
+
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda *_args, **_kwargs: [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("101.32.104.4", 443)),
+        ],
+    )
+    monkeypatch.setattr("tools.fetch_url_tool._configured_https_proxy_url", configured_proxy)
+    monkeypatch.setattr("tools.fetch_url_tool.time.sleep", lambda _delay: None)
+    monkeypatch.setattr(FetchURLTool, "_request_via_proxy", classmethod(proxy_request))
+
+    response = FetchURLTool._request_once("https://mp.weixin.qq.com/s/example")
+
+    assert attempts == ["http://127.0.0.1:7897", "http://127.0.0.1:27890"]
     assert response.body == b"wechat article"
 
 
@@ -315,7 +372,7 @@ def test_tls_certificate_verification_failure_is_not_retried(monkeypatch) -> Non
     )
     monkeypatch.setattr(
         "tools.fetch_url_tool._configured_https_proxy_url",
-        lambda: "http://127.0.0.1:27890",
+        lambda **_kwargs: "http://127.0.0.1:27890",
     )
     monkeypatch.setattr(FetchURLTool, "_request_via_proxy", classmethod(invalid_certificate))
 

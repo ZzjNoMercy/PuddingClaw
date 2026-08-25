@@ -2135,6 +2135,7 @@ const SourceItem = React.forwardRef<HTMLDivElement, {
   const openUrl = sourceOpenUrl(source);
   const isLocalSource = isLocalResourceUri(source.uri);
   const displayTitle = sourceDisplayTitle(source);
+  const isKnowledgeImage = source.source_type === "knowledge_image";
 
   return (
     <div
@@ -2147,7 +2148,9 @@ const SourceItem = React.forwardRef<HTMLDivElement, {
     >
       <div className="flex items-start gap-2.5">
         <div className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-md bg-black/[0.055]">
-          <FileText className="h-3 w-3 text-slate-600" />
+          {isKnowledgeImage
+            ? <Images className="h-3 w-3 text-[#002fa7]" />
+            : <FileText className="h-3 w-3 text-slate-600" />}
         </div>
         <div className="min-w-0 flex-1">
           <div className="flex items-center gap-2">
@@ -2159,7 +2162,22 @@ const SourceItem = React.forwardRef<HTMLDivElement, {
             <p className="truncate text-[13px] font-medium text-slate-800" title={displayTitle}>
               {displayTitle}
             </p>
+            {isKnowledgeImage && (
+              <span className="rounded bg-[#002fa7]/10 px-1.5 py-0.5 text-[9px] font-semibold text-[#002fa7]">
+                图片命中
+              </span>
+            )}
           </div>
+          {isKnowledgeImage && openUrl && (
+            <a href={openUrl} target="_blank" rel="noreferrer" className="mt-2 block overflow-hidden rounded-lg border border-black/[0.06] bg-slate-50">
+              <img
+                src={openUrl}
+                alt={displayTitle}
+                className="max-h-36 w-full object-contain"
+                loading="lazy"
+              />
+            </a>
+          )}
           {source.quote && (
             <p className="mt-1 line-clamp-2 text-[11px] leading-relaxed text-slate-500">
               {source.quote}

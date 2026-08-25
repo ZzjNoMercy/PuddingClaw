@@ -1,4 +1,5 @@
 import asyncio
+import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -22,7 +23,7 @@ from knowledge.import_jobs import (
     process_vector_publish_job,
     task_source_path,
 )
-from knowledge.indexer import _build_milvus_storage_context, _build_multimodal_nodes
+from knowledge.indexer import _build_milvus_storage_context, _build_multimodal_nodes, _linked_images_for_markdown
 from knowledge.mineru_client import MinerUClient, MinerUParseResult
 from knowledge.models import Base, KnowledgeSourceItem
 from knowledge.paths import get_knowledge_root
@@ -208,7 +209,7 @@ def test_refresh_document_index_selects_complete_linked_pdf_image_directory(tmp_
     markdown_path.parent.mkdir(parents=True)
     linked_image.parent.mkdir(parents=True)
     unrelated_image.parent.mkdir(parents=True)
-    markdown_path.write_text("# Report\n\n![](../../../assets/report/figure.png)\n", encoding="utf-8")
+    markdown_path.write_text("# Report\n\n![](../../assets/report/figure.png)\n", encoding="utf-8")
     linked_image.write_bytes(b"linked")
     sibling_images = [linked_image.parent / f"unreferenced-{index:02d}.png" for index in range(25)]
     for image_path in sibling_images:
@@ -295,6 +296,36 @@ def test_search_knowledge_tool_has_no_query_time_index_builder(tmp_path: Path):
 
     assert not hasattr(tool, "_build_index")
     assert not hasattr(tool, "_compute_knowledge_signature")
+
+
+def test_search_knowledge_result_reports_text_and_image_hits(tmp_path: Path, monkeypatch):
+    tool = LlamaIndexKnowledgeQueryTool(base_dir=str(tmp_path))
+    monkeypatch.setattr(
+        tool,
+        "_query_milvus_multimodal_hits",
+        lambda _query, *, top_k=3: {
+            "chunks": ["工具上下文是多智能体成本的重要组成。"],
+            "image_hits": [{
+                "title": "成本拆解图",
+                "file_path": "",
+                "virtual_path": "/knowledge/assets/article/image-06.jpg",
+                "context": {"snippet": "图示工具结果与历史消息的 token 占比。"},
+            }],
+            "sources": [{
+                "title": "成本拆解图",
+                "uri": "/knowledge/assets/article/image-06.jpg",
+                "source_type": "knowledge_image",
+                "quote": "图示工具结果与历史消息的 token 占比。",
+            }],
+        },
+    )
+
+    result = json.loads(tool._query_milvus_multimodal("省 token 策略", top_k=3))
+    context = result["answer_context"]
+
+    assert "文本命中：1；图片命中：1" in context
+    assert "/knowledge/assets/article/image-06.jpg" in context
+    assert result["sources"][0]["source_type"] == "knowledge_image"
 
 
 def test_rag_trace_candidate_summary_includes_complete_content_preview():
@@ -806,6 +837,36 @@ def test_multimodal_index_builds_markdown_parser_nodes_with_image_context(tmp_pa
     assert images[0]["context"]["heading"] == "架构图"
     assert "下面这张图解释系统关系" in images[0]["context"]["snippet"]
     assert images[0]["linked_markdown_virtual_path"] == "/knowledge/imported/20260702/报告.md"
+
+
+def test_linked_images_use_exact_paths_when_asset_names_repeat(tmp_path: Path):
+    knowledge_dir = tmp_path / "knowledge"
+    markdown_dir = knowledge_dir / "imported" / "20260825"
+    selected_dir = knowledge_dir / "assets" / "read-later" / "selected"
+    unrelated_dir = knowledge_dir / "assets" / "read-later" / "unrelated"
+    markdown_dir.mkdir(parents=True)
+    selected_dir.mkdir(parents=True)
+    unrelated_dir.mkdir(parents=True)
+
+    selected_image = selected_dir / "image-01.png"
+    selected_sibling = selected_dir / "image-02.png"
+    unrelated_image = unrelated_dir / "image-01.png"
+    for path in (selected_image, selected_sibling, unrelated_image):
+        path.write_bytes(b"image")
+
+    markdown_path = markdown_dir / "文章.md"
+    markdown_path.write_text(
+        "![文章配图](../../assets/read-later/selected/image-01.png)\n",
+        encoding="utf-8",
+    )
+
+    linked = _linked_images_for_markdown(
+        markdown_path,
+        [selected_image, selected_sibling, unrelated_image],
+        knowledge_dir=knowledge_dir,
+    )
+
+    assert linked == [str(selected_image), str(selected_sibling)]
 
 
 def test_ingest_pdf_upload_stores_original_markdown_and_catalog_record(tmp_path: Path):

@@ -208,6 +208,28 @@ def _normalized_proxy_url(value: str) -> str:
     return candidate
 
 
+def _proxy_url_is_available(proxy_url: str) -> bool:
+    """Reject a stale local proxy endpoint without probing remote proxies."""
+
+    parsed = urlsplit(proxy_url)
+    hostname = (parsed.hostname or "").lower()
+    try:
+        address = ipaddress.ip_address(hostname)
+    except ValueError:
+        is_local = hostname == "localhost"
+    else:
+        is_local = address.is_loopback
+    if not is_local:
+        return True
+    port = parsed.port or (443 if parsed.scheme.lower() == "https" else 80)
+    try:
+        connection = socket.create_connection((hostname, port), timeout=0.25)
+    except OSError:
+        return False
+    connection.close()
+    return True
+
+
 def _parse_macos_https_proxy(output: str) -> str:
     values = {
         match.group("key"): match.group("value").strip()
@@ -229,7 +251,7 @@ def _parse_macos_https_proxy(output: str) -> str:
     return _normalized_proxy_url(f"http://{host}:{port}")
 
 
-def _configured_https_proxy_url() -> str:
+def _configured_https_proxy_url(*, excluded: frozenset[str] = frozenset()) -> str:
     """Resolve the active HTTPS proxy while allowing VPN hot switching.
 
     Environment overrides are checked on every call. macOS system-proxy
@@ -237,12 +259,26 @@ def _configured_https_proxy_url() -> str:
     replace the local proxy while the long-lived backend process keeps running.
     """
 
+    candidates: list[str] = []
     for key in _PROXY_ENV_KEYS:
         proxy_url = _normalized_proxy_url(os.getenv(key, ""))
-        if proxy_url:
-            return proxy_url
-    if sys.platform != "darwin":
+        if proxy_url and proxy_url not in candidates:
+            candidates.append(proxy_url)
+    if sys.platform == "darwin":
+        system_proxy = _cached_macos_https_proxy_url()
+        if system_proxy and system_proxy not in candidates:
+            candidates.append(system_proxy)
+    available = [candidate for candidate in candidates if _proxy_url_is_available(candidate)]
+    if not available:
         return ""
+    # Prefer an untried proxy after a retryable transport failure. If every
+    # candidate has already failed, retry the primary candidate so a transient
+    # failure does not permanently suppress the only configured route.
+    return next((candidate for candidate in available if candidate not in excluded), available[0])
+
+
+def _cached_macos_https_proxy_url() -> str:
+    """Return the briefly cached macOS system HTTPS proxy."""
 
     global _proxy_discovery_expires_at, _proxy_discovery_value
     now = time.monotonic()
@@ -376,12 +412,13 @@ class FetchURLTool(BaseTool):
     def _request_once(cls, url: str) -> _FetchedResponse:
         scheme, hostname, port, path = _validated_url(url)
         last_error: Exception | None = None
+        failed_proxy_urls: set[str] = set()
         for attempt in range(TRANSPORT_ATTEMPTS):
             # DNS and proxy state may both change when a VPN is toggled. Resolve
             # them again for each bounded retry instead of pinning the first
             # observation for the lifetime of this request (or backend).
             addresses = _resolve_public_addresses(hostname, port, scheme=scheme)
-            proxy_url = _configured_https_proxy_url()
+            proxy_url = _configured_https_proxy_url(excluded=frozenset(failed_proxy_urls))
             use_proxy = bool(
                 proxy_url
                 and (
@@ -396,6 +433,7 @@ class FetchURLTool(BaseTool):
                     if not _is_retryable_transport_error(exc):
                         raise
                     last_error = exc
+                    failed_proxy_urls.add(proxy_url)
             else:
                 for address in addresses:
                     pool = cls._pool(

@@ -4268,7 +4268,7 @@ def test_agent_stream_persists_user_message_before_first_event(tmp_path, monkeyp
     assert history[1]["content"] == "收到。"
 
 
-def test_build_backend_resolves_workspace_and_skills(tmp_path):
+def test_build_backend_resolves_workspace_and_skills(tmp_path, monkeypatch):
     """/workspace/ and /skills/ routes should resolve to the correct directories."""
 
     from graph import deepagents_manager as manager_module
@@ -4290,6 +4290,7 @@ def test_build_backend_resolves_workspace_and_skills(tmp_path):
     knowledge_dir = tmp_path / "knowledge"
     knowledge_dir.mkdir(parents=True)
     (knowledge_dir / "test.md").write_text("kb doc")
+    monkeypatch.setenv("PUDDINGCLAW_KNOWLEDGE_DIR", str(knowledge_dir))
     backend = manager._build_backend(workspace)
 
     assert backend.read("/workspace/dashboard.html").file_data["content"] == "dashboard"
@@ -4318,6 +4319,28 @@ def test_build_backend_resolves_workspace_and_skills(tmp_path):
     }
     # Bare POSIX roots are external host paths; project files use /workspace.
     assert backend.read("/dashboard.html").error is not None
+
+
+def test_build_backend_uses_configured_knowledge_root(tmp_path, monkeypatch):
+    """Every knowledge surface must share the configured physical root."""
+
+    from graph import deepagents_manager as manager_module
+    from projects.registry import project_registry
+
+    project_registry.initialize(tmp_path)
+    manager = manager_module.DeepAgentsAgentManager()
+    manager.initialize(tmp_path / "backend", user_root=tmp_path / "runtime")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    configured_root = tmp_path / "external-knowledge"
+    configured_root.mkdir()
+    (configured_root / "imported.md").write_text("configured knowledge", encoding="utf-8")
+    monkeypatch.setenv("PUDDINGCLAW_KNOWLEDGE_DIR", str(configured_root))
+
+    backend = manager._build_backend(workspace)
+
+    assert Path(backend.managed_host_path_aliases["/knowledge"]) == configured_root.resolve()
+    assert backend.read("/knowledge/imported.md").file_data["content"] == "configured knowledge"
 
 
 def test_large_tool_results_are_isolated_by_session_and_query(tmp_path, monkeypatch):

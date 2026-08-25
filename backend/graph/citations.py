@@ -10,7 +10,6 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
-
 STRUCTURED_TOOL_RESULT_KEY = "puddingclaw_tool_result"
 STRUCTURED_TOOL_RESULT_VERSION = 1
 _CITATION_MARKER_RE = re.compile(r"\[\^(src_[A-Za-z0-9_-]+)\]")
@@ -212,14 +211,20 @@ def format_sources_for_model(
         location = f"，第 {source['page']} 页" if source.get("page") not in (None, "") else ""
         uri = _clean_text(source.get("uri"))
         link = f"\n  链接：{uri}" if urlsplit(uri).scheme in {"http", "https"} else ""
+        is_image = source.get("source_type") == "knowledge_image"
+        source_label = "（图片来源）" if is_image else ""
+        local_resource = f"\n  图片资源：{uri}" if is_image and uri else ""
         if include_evidence:
             catalog.append(
-                f"- {source['source_id']}: {source['title']}{location}\n"
+                f"- {source['source_id']}: {source['title']}{source_label}{location}\n"
                 f"  证据：{source.get('quote') or '见工具返回内容'}"
+                f"{local_resource}"
                 f"{link}"
             )
         else:
-            catalog.append(f"- {source['source_id']}: {source['title']}{location}{link}")
+            catalog.append(
+                f"- {source['source_id']}: {source['title']}{source_label}{location}{local_resource}{link}"
+            )
     omitted_note = ""
     if not include_evidence:
         # Tell the model the omission is deliberate and recoverable, otherwise

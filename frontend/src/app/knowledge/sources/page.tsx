@@ -110,7 +110,7 @@ function SourceList({ sources, selectedId, onSelect, onAdd }: {
 }) {
   return (
     <section className="overflow-hidden rounded-3xl border border-black/[0.06] bg-white shadow-sm">
-      <div className="flex items-center justify-between border-b border-black/[0.055] px-5 py-4">
+      <div className="flex h-[72px] items-center justify-between border-b border-black/[0.055] px-5">
         <div><h2 className="text-sm font-semibold text-gray-950">已连接来源</h2><p className="mt-0.5 text-[11px] text-gray-400">{sources.length} 个来源</p></div>
         <button type="button" onClick={onAdd} className="grid h-8 w-8 place-items-center rounded-xl bg-[#002fa7]/[0.06] text-[#002fa7] hover:bg-[#002fa7]/10" aria-label="添加来源"><Plus className="h-4 w-4" /></button>
       </div>
@@ -511,9 +511,11 @@ export default function KnowledgeSourcesPage() {
             {loading ? <div className="grid min-h-[360px] place-items-center"><Loader2 className="h-6 w-6 animate-spin text-[#002fa7]" /></div> : (
               <section className="grid min-w-0 gap-5 lg:grid-cols-[300px_minmax(0,1fr)]">
                 <SourceList sources={sources} selectedId={selected?.id || ""} onSelect={setSelectedId} onAdd={() => setPickerOpen(true)} />
-                <div className="min-w-0 rounded-3xl border border-black/[0.06] bg-white p-5 shadow-sm sm:p-6">
-                  {selected && !selected.builtin ? <div className="mb-6 flex items-center gap-3 border-b border-black/[0.055] pb-5"><SourceMark kind={selected.connector_key} /><div className="min-w-0"><h2 className="truncate text-lg font-semibold tracking-tight text-gray-950">{selected.name}</h2><div className="mt-1 flex items-center gap-2 text-[11px] text-gray-400"><span>可同步 Connector</span><span>·</span><span>{selected.item_count || 0} 项</span></div></div></div> : null}
-                  {!selected ? <div className="grid min-h-[300px] place-items-center text-sm text-gray-400"><div className="text-center"><Unplug className="mx-auto mb-3 h-7 w-7" />还没有资料来源</div></div> : selected.connector_key === "local_upload" ? <LocalUploadPanel source={selected} items={items} onChanged={changed} onOpenDoc={(item) => openDocument(selected, item.document_id)} /> : selected.connector_key === "web_capture" ? <WebCapturePanel source={selected} onChanged={changed} onOpenDoc={(item) => openDocument(selected, item.document_id)} /> : <FeishuPanel source={selected} items={items} runs={runs} onChanged={changed} onReconnect={() => { setReconnectSource(selected); setWizardOpen(true); }} onOpenDoc={(item) => openDocument(selected, item.document_id)} onOpenBitable={(item) => setBitableDetail({ item, source: selected })} />}
+                <div className="min-w-0 overflow-hidden rounded-3xl border border-black/[0.06] bg-white shadow-sm">
+                  {selected && !selected.builtin ? <div className="flex h-[72px] items-center gap-3 border-b border-black/[0.055] px-5 sm:px-6"><SourceMark kind={selected.connector_key} /><div className="min-w-0"><h2 className="truncate text-lg font-semibold tracking-tight text-gray-950">{selected.name}</h2><div className="mt-1 flex items-center gap-2 text-[11px] text-gray-400"><span>可同步 Connector</span><span>·</span><span>{selected.item_count || 0} 项</span></div></div></div> : null}
+                  <div className="p-5 sm:p-6">
+                    {!selected ? <div className="grid min-h-[300px] place-items-center text-sm text-gray-400"><div className="text-center"><Unplug className="mx-auto mb-3 h-7 w-7" />还没有资料来源</div></div> : selected.connector_key === "local_upload" ? <LocalUploadPanel source={selected} items={items} onChanged={changed} onOpenDoc={(item) => openDocument(selected, item.document_id)} /> : selected.connector_key === "web_capture" ? <WebCapturePanel source={selected} onChanged={changed} onOpenDoc={(item) => openDocument(selected, item.document_id)} /> : <FeishuPanel source={selected} items={items} runs={runs} onChanged={changed} onReconnect={() => { setReconnectSource(selected); setWizardOpen(true); }} onOpenDoc={(item) => openDocument(selected, item.document_id)} onOpenBitable={(item) => setBitableDetail({ item, source: selected })} />}
+                  </div>
                 </div>
               </section>
             )}

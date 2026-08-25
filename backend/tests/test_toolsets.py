@@ -1553,7 +1553,7 @@ def test_session_skill_restore_is_disabled_outside_standalone_runs(tmp_path) -> 
     assert update == {"active_skill_ids": [], "skill_activations": []}
 
 
-def test_restored_session_tool_loads_instructions_on_first_use_then_rechecks(
+def test_restored_session_tool_executes_without_duplicate_context_round(
     tmp_path,
 ) -> None:
     from graph.session_manager import session_manager
@@ -1591,6 +1591,15 @@ def test_restored_session_tool_loads_instructions_on_first_use_then_rechecks(
     )
     assert update is not None
     executed: list[str] = []
+    def execute(_request):
+        executed.append("executed")
+        return ToolMessage(
+            content="ok",
+            name="database_evidence_search",
+            tool_call_id="first-restored-call",
+            status="success",
+        )
+
     result = middleware.wrap_tool_call(
         ToolCallRequest(
             tool_call={
@@ -1603,30 +1612,12 @@ def test_restored_session_tool_loads_instructions_on_first_use_then_rechecks(
             state={"messages": [], "task_profile": run.task_profile.model_dump(mode="json"), **update},
             runtime=runtime,
         ),
-        lambda _request: executed.append("executed"),
+        execute,
     )
 
-    assert executed == []
+    assert executed == ["executed"]
     assert isinstance(result, ToolMessage)
-    assert result.name == "load_skill_context"
-    assert result.additional_kwargs["puddingclaw_control_plane"]["type"] == ("skill_context_loaded_on_demand")
-    assert "重新判断它是否仍与当前任务相关" in str(result.content)
-    refreshed = middleware.before_model(
-        {"messages": [], "task_profile": run.task_profile.model_dump(mode="json"), **update},
-        runtime=runtime,
-    )
-    assert refreshed is not None
-    prompt_request = middleware._request_with_capability_manifest(
-        ModelRequest(
-            model=None,
-            messages=[HumanMessage(content="继续")],
-            system_message=SystemMessage(content="base"),
-            tools=[{"name": "read_file"}, {"name": "database_evidence_search"}],
-            state={"messages": [], **refreshed},
-            runtime=runtime,
-        )
-    )
-    assert "# Test" in str(prompt_request.system_message.content)
+    assert result.name == "database_evidence_search"
 
 
 def test_shared_tool_provider_uses_first_activation_and_reports_reason(tmp_path) -> None:
@@ -1681,26 +1672,37 @@ def test_shared_tool_provider_uses_first_activation_and_reports_reason(tmp_path)
         runtime=runtime,
     )
     assert update is not None
+    request = ToolCallRequest(
+        tool_call={
+            "name": "database_evidence_search",
+            "args": {"question": "配置率"},
+            "id": "shared-provider-call",
+            "type": "tool_call",
+        },
+        tool=None,
+        state={"messages": [], "task_profile": run.task_profile.model_dump(mode="json"), **update},
+        runtime=runtime,
+    )
+    selected, reason, providers = middleware._resolve_active_tool_provider(
+        request,
+        tool_name="database_evidence_search",
+        policy_epoch=1,
+    )
     result = middleware.wrap_tool_call(
-        ToolCallRequest(
-            tool_call={
-                "name": "database_evidence_search",
-                "args": {"question": "配置率"},
-                "id": "shared-provider-call",
-                "type": "tool_call",
-            },
-            tool=None,
-            state={"messages": [], "task_profile": run.task_profile.model_dump(mode="json"), **update},
-            runtime=runtime,
+        request,
+        lambda _request: ToolMessage(
+            content="ok",
+            name="database_evidence_search",
+            tool_call_id="shared-provider-call",
+            status="success",
         ),
-        lambda _request: None,
     )
 
     assert isinstance(result, ToolMessage)
-    control = result.additional_kwargs["puddingclaw_control_plane"]
-    assert control["skill_id"] == "database-analysis"
-    assert control["provider_candidates"] == ["database-alt", "database-analysis"]
-    assert control["provider_reason"] == "first_activation_then_skill_id"
+    assert result.status == "success"
+    assert selected == "database-analysis"
+    assert providers == ["database-alt", "database-analysis"]
+    assert reason == "first_activation_then_skill_id"
 
 
 def test_skill_cache_invalidates_on_hash_or_policy_epoch_change(tmp_path) -> None:

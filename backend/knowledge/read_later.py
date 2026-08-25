@@ -32,6 +32,8 @@ from knowledge.service import (
     DEFAULT_KNOWLEDGE_BASE_ID,
     KnowledgeService,
     KnowledgeServiceError,
+    _build_llamaindex_chunk_metadata,
+    _extract_markdown_image_contexts,
     assert_writes_allowed_tolerant,
 )
 from tools.fetch_url_tool import MAX_REDIRECTS, FetchURLTool, _validated_url
@@ -402,8 +404,13 @@ def _cache_article_images(
     page_url: str,
     knowledge_dir: Path,
     item_id: str,
-) -> tuple[str, str]:
-    """Replace remote Markdown images with local, SSRF-safe asset copies."""
+) -> tuple[str, str, list[dict[str, object]]]:
+    """Cache remote images for both local Markdown and virtual-path consumers.
+
+    Persisted Markdown uses paths relative to its ``imported/YYYYMMDD``
+    directory so desktop editors can render it directly. The returned cover
+    path remains a ``/knowledge`` virtual path for API and Agent consumers.
+    """
 
     cover_url = metadata.get("image_url", "").strip()
     source = markdown
@@ -412,7 +419,9 @@ def _cache_article_images(
 
     assets_dir = knowledge_dir / "assets" / "read-later" / item_id
     virtual_prefix = f"/knowledge/assets/read-later/{item_id}"
-    cached: dict[str, str] = {}
+    markdown_prefix = f"../../assets/read-later/{item_id}"
+    cached: dict[str, tuple[str, str]] = {}
+    cached_assets: list[dict[str, object]] = []
     cached_cover = ""
     image_index = 0
 
@@ -422,8 +431,8 @@ def _cache_article_images(
         raw_url = match.group("url").strip("<>")
         resolved_url = urljoin(page_url, raw_url)
         if resolved_url in cached:
-            virtual_path = cached[resolved_url]
-            return f"![{alt}]({virtual_path}{match.group('suffix') or ''})"
+            markdown_path, _virtual_path = cached[resolved_url]
+            return f"![{alt}]({markdown_path}{match.group('suffix') or ''})"
         if image_index >= MAX_ARTICLE_IMAGES or not resolved_url.lower().startswith(("http://", "https://")):
             return f"*图片未保存：{alt or '无标题图片'}*"
         try:
@@ -433,15 +442,34 @@ def _cache_article_images(
         image_index += 1
         assets_dir.mkdir(parents=True, exist_ok=True)
         filename = f"image-{image_index:02d}{extension}"
-        (assets_dir / filename).write_bytes(image_bytes)
+        asset_path = assets_dir / filename
+        asset_path.write_bytes(image_bytes)
         virtual_path = f"{virtual_prefix}/{filename}"
-        cached[resolved_url] = virtual_path
+        markdown_path = f"{markdown_prefix}/{filename}"
+        cached[resolved_url] = (markdown_path, virtual_path)
+        cached_assets.append(
+            {
+                "name": filename,
+                "path": str(asset_path),
+                "relative_path": filename,
+                "original_relative_path": resolved_url,
+                "aliases": [resolved_url],
+                "virtual_path": virtual_path,
+                "size_bytes": len(image_bytes),
+            }
+        )
         if cover_url and resolved_url == urljoin(page_url, cover_url):
             cached_cover = virtual_path
-        return f"![{alt}]({virtual_path}{match.group('suffix') or ''})"
+        return f"![{alt}]({markdown_path}{match.group('suffix') or ''})"
 
     rewritten = _MARKDOWN_IMAGE_PATTERN.sub(replace, source)
-    return rewritten, cached_cover
+    image_contexts = _extract_markdown_image_contexts(rewritten)
+    for asset in cached_assets:
+        relative_path = str(asset.get("relative_path") or "")
+        context = image_contexts.get(relative_path) or image_contexts.get(Path(relative_path).name)
+        if context:
+            asset["context"] = context
+    return rewritten, cached_cover, cached_assets
 
 
 def _fetch_and_parse(url: str) -> tuple[dict[str, str], str, str]:
@@ -514,7 +542,7 @@ async def process_read_later_capture_job(
         item.error_message = "网页正文过短，可能需要登录或由脚本动态加载"
     else:
         service = KnowledgeService(base_dir)
-        body, cached_cover = await asyncio.to_thread(
+        body, cached_cover, cached_assets = await asyncio.to_thread(
             _cache_article_images,
             body,
             metadata=metadata,
@@ -567,6 +595,31 @@ async def process_read_later_capture_job(
             **(document.doc_metadata or {}),
             "read_later_item_id": item.id,
             "canonical_url": frontmatter["canonical_url"],
+            "mode": "multimodal_web",
+            "parser": "read_later_html",
+            "parser_trace": {
+                "id": "read_later_html",
+                "version": "1",
+                "warnings": [],
+                "metadata": {
+                    "source_url": frontmatter["canonical_url"],
+                    "site": metadata["site_name"],
+                },
+            },
+            "assets": cached_assets,
+            "llamaindex_chunks": _build_llamaindex_chunk_metadata(
+                service.knowledge_dir,
+                Path(document.storage_path),
+                [Path(str(asset["path"])) for asset in cached_assets if asset.get("path")],
+            ),
+            "multimodal": {
+                "llamaindex": True,
+                "text_artifact": document.virtual_path,
+                "image_asset_count": len(cached_assets),
+                "image_assets_dir": str(service.knowledge_dir / "assets" / "read-later" / item.id),
+                "image_assets_virtual_prefix": f"/knowledge/assets/read-later/{item.id}",
+                "markdown_asset_link_mode": "relative",
+            },
         }
         item.title = str(frontmatter["title"])
         item.site_name = metadata["site_name"]

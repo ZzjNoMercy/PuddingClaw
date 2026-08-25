@@ -5,7 +5,6 @@ import json
 import sys
 from pathlib import Path
 
-
 BACKEND_DIR = Path(__file__).resolve().parent.parent
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
@@ -276,9 +275,10 @@ def test_session_message_persists_sources_and_citations(tmp_path):
 
 
 def test_agent_tool_end_emits_sources_without_embedding_them_in_preview():
+    from langchain_core.messages import AIMessage, ToolMessage
+
     from graph.agent import AgentManager
     from graph.citations import encode_tool_result
-    from langchain_core.messages import AIMessage, ToolMessage
 
     encoded = encode_tool_result("简洁答案", [{
         "title": "检索文档",
@@ -369,6 +369,7 @@ def test_chat_stream_emits_and_persists_sources_and_citations(tmp_path, monkeypa
 
 def test_historical_tool_message_readapts_raw_output_without_mutating_session():
     import json
+
     from graph.agent import AgentManager
 
     raw_output = json.dumps({
@@ -400,6 +401,7 @@ def test_historical_tool_message_readapts_raw_output_without_mutating_session():
 
 def test_tool_result_adapter_handles_aihot_items_json():
     import json
+
     from graph.tool_result_adapter import tool_result_adapter
 
     output = json.dumps({
@@ -495,6 +497,7 @@ def test_execute_skill_stdout_links_are_generic_sources():
 
 def test_tool_result_adapter_handles_tavily_schema():
     import json
+
     from graph.tool_result_adapter import tool_result_adapter
 
     output = json.dumps({
@@ -542,6 +545,7 @@ def test_tavily_search_tool_returns_structured_sources(monkeypatch):
 
 def test_tavily_search_retries_transient_connection_error(monkeypatch):
     import requests
+
     from graph.citations import parse_tool_result
     from tools.tavily_search_tool import TavilySearchTool
 
@@ -706,6 +710,7 @@ curl https://aihot.virxact.com/api/public/items
 
 def test_read_file_json_document_does_not_create_sources():
     import json
+
     from graph.tool_result_adapter import tool_result_adapter
 
     output = json.dumps({
@@ -743,3 +748,21 @@ def test_format_sources_for_model_omits_evidence_quotes_when_historical():
     assert "这段证据原文不应该出现在历史投影里。" not in slim
     assert "read_evidence" in slim  # 省略是刻意的,且原文可恢复
     assert "[^source_id]" in slim  # 引用协议说明保留
+
+
+def test_format_sources_for_model_marks_knowledge_images_with_resource_path():
+    from graph.citations import format_sources_for_model
+
+    rendered = format_sources_for_model(
+        "图像结论",
+        [{
+            "source_id": "src_image123",
+            "source_type": "knowledge_image",
+            "title": "多智能体成本拆解图",
+            "uri": "/knowledge/assets/article/image-06.jpg",
+            "quote": "图中比较了工具上下文与历史消息成本。",
+        }],
+    )
+
+    assert "src_image123: 多智能体成本拆解图（图片来源）" in rendered
+    assert "图片资源：/knowledge/assets/article/image-06.jpg" in rendered

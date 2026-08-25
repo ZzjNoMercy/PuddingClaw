@@ -5189,6 +5189,7 @@ class SessionManager:
         source_query_id: str = "",
         source_hash_scope: str = "raw_result",
         workspace_path: str = "",
+        output_complete: bool = True,
     ) -> dict[str, Any]:
         result_id = cls._tool_context_result_id(output)
         session_ref = {
@@ -5196,7 +5197,7 @@ class SessionManager:
             "session_id": session_id,
             "tool_call_id": tool_call_id,
             "source_hash": source_hash,
-            "output_complete": True,
+            "output_complete": bool(output_complete),
         }
         if source_query_id:
             session_ref["source_query_id"] = source_query_id
@@ -5275,7 +5276,13 @@ class SessionManager:
 
     @classmethod
     def _ensure_evidence_metadata(cls, session_id: str, data: dict[str, Any]) -> bool:
-        """Attach stable, deterministic Evidence metadata to persisted calls."""
+        """Attach one stable Evidence record to each completed logical call.
+
+        Tool-start snapshots are intentionally persisted while a Run is live,
+        but a pending call is not evidence.  Evidence identity therefore uses
+        the call provenance rather than its still-changing output hash; the
+        status and digest are updated in place when the result arrives.
+        """
 
         harness = data.get("harness")
         runs = harness.get("runs") if isinstance(harness, dict) else None
@@ -5290,13 +5297,65 @@ class SessionManager:
             evidence_index = {}
             data["evidence_index"] = evidence_index
             changed = True
+        # Evidence ids are externally referenceable.  Preserve the best
+        # already-published id for a logical call and only discard weaker
+        # live-snapshot placeholders.  New calls receive the hash-independent
+        # id below; old successful evidence keeps working across migration.
+        preferred_existing_by_call: dict[tuple[str, str, str], tuple[int, str]] = {}
+        for existing_id, existing in evidence_index.items():
+            if not isinstance(existing, dict) or existing.get("source_session_id") != session_id:
+                continue
+            existing_run_id = str(existing.get("source_run_id") or "")
+            existing_query_id = str(existing.get("source_query_id") or "")
+            existing_provenance = existing_run_id or (
+                f"query:{existing_query_id}" if existing_query_id else ""
+            )
+            existing_key = (
+                existing_provenance,
+                existing_query_id,
+                str(existing.get("tool_call_id") or ""),
+            )
+            if not existing_key[2]:
+                continue
+            score = 2 if existing.get("output_complete") is True else 0
+            if str(existing.get("status") or "") in {"success", "failed"}:
+                score += 1
+            current = preferred_existing_by_call.get(existing_key)
+            candidate = (score, str(existing_id))
+            if current is None or candidate > current:
+                preferred_existing_by_call[existing_key] = candidate
+        canonical_by_call: dict[tuple[str, str, str], str | None] = {}
         for _, _, message, tool_call in cls._iter_persisted_tool_calls(data):
             tool_call_id = str(tool_call.get("id") or "")
             if not tool_call_id:
                 continue
             source_query_id = str(message.get("query_id") or "")
             source_run_id = str(tool_call.get("source_run_id") or run_by_query.get(source_query_id) or "")
+            provenance_id = source_run_id or (f"query:{source_query_id}" if source_query_id else "")
+            logical_key = (provenance_id, source_query_id, tool_call_id)
             raw_source = cls._tool_context_source(tool_call)
+            call_status = str(tool_call.get("status") or "")
+            message_status = str(message.get("status") or "")
+            pending = (
+                not raw_source
+                and not tool_call.get("completed_at")
+                and call_status not in {"error", "failed", "interrupted"}
+                and message_status == "running"
+            )
+            if pending:
+                canonical_by_call[logical_key] = None
+                for key in (
+                    "evidence_id",
+                    "source_run_id",
+                    "source_query_id",
+                    "source_hash",
+                    "raw_output_ref",
+                    "output_complete",
+                ):
+                    if key in tool_call:
+                        tool_call.pop(key, None)
+                        changed = True
+                continue
             context_metadata = tool_call.get("context_compaction")
             tagged_hash = str(
                 tool_call.get("source_hash")
@@ -5304,11 +5363,12 @@ class SessionManager:
                 or ""
             )
             source_hash = tagged_hash or cls._tool_context_source_hash(raw_source)
-            provenance_id = source_run_id or (f"query:{source_query_id}" if source_query_id else "")
             digest = hashlib.sha256(
-                "\0".join((session_id, provenance_id, tool_call_id, source_hash)).encode("utf-8")
+                "\0".join((session_id, provenance_id, source_query_id, tool_call_id)).encode("utf-8")
             ).hexdigest()[:32]
-            evidence_id = f"evidence-{digest}"
+            preferred = preferred_existing_by_call.get(logical_key)
+            evidence_id = preferred[1] if preferred is not None else f"evidence-{digest}"
+            canonical_by_call[logical_key] = evidence_id
             status, output_complete = cls._evidence_status(tool_call, message)
             raw_ref = tool_call.get("raw_output_ref")
             if not isinstance(raw_ref, dict):
@@ -5320,9 +5380,12 @@ class SessionManager:
                     tool_name=str(tool_call.get("tool") or tool_call.get("name") or ""),
                     source_query_id=source_query_id,
                     source_hash_scope=("raw_result" if tagged_hash else "pointer"),
+                    output_complete=output_complete,
                 )
             elif raw_ref.get("kind") == "deepagents_large_tool_result" and not raw_ref.get("source_query_id"):
                 raw_ref = {**raw_ref, "source_query_id": source_query_id}
+            if raw_ref.get("output_complete") != output_complete:
+                raw_ref = {**raw_ref, "output_complete": output_complete}
             metadata = {
                 "evidence_id": evidence_id,
                 "tool_call_id": tool_call_id,
@@ -5354,6 +5417,22 @@ class SessionManager:
                     changed = True
             if evidence_index.get(evidence_id) != metadata:
                 evidence_index[evidence_id] = metadata
+                changed = True
+        # Older live snapshots used the output hash in Evidence identity, so
+        # one logical call could retain an interrupted placeholder beside its
+        # final success.  Keep exactly the canonical lifecycle record.
+        for evidence_id, metadata in list(evidence_index.items()):
+            if not isinstance(metadata, dict) or metadata.get("source_session_id") != session_id:
+                continue
+            source_run_id = str(metadata.get("source_run_id") or "")
+            source_query_id = str(metadata.get("source_query_id") or "")
+            provenance_id = source_run_id or (f"query:{source_query_id}" if source_query_id else "")
+            logical_key = (provenance_id, source_query_id, str(metadata.get("tool_call_id") or ""))
+            if logical_key not in canonical_by_call:
+                continue
+            canonical_id = canonical_by_call[logical_key]
+            if canonical_id != evidence_id:
+                evidence_index.pop(evidence_id, None)
                 changed = True
         return changed
 

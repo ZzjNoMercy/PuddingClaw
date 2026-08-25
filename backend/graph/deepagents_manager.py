@@ -3104,7 +3104,12 @@ class DeepAgentsAgentManager:
         analytics_models_dir = (
             reference_root / "analytics-models" if reference_root else user_root / "definitions" / "analytics-models"
         )
-        knowledge_dir = reference_root / "knowledge" if reference_root else user_root / "knowledge"
+        # `/knowledge` is one logical resource and must resolve through the
+        # same configured root used by indexing, preview, RAG and terminal
+        # aliases.  Using ``user_root / "knowledge"`` here created a second,
+        # usually empty tree whenever the user configured an external
+        # knowledge directory.
+        knowledge_dir = reference_root / "knowledge" if reference_root else get_knowledge_root(self._base_dir)
         if reference_root:
             skills_dir.mkdir(parents=True, exist_ok=True)
         knowledge_dir.mkdir(parents=True, exist_ok=True)

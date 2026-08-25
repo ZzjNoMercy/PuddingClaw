@@ -90,7 +90,14 @@ def refresh_document_knowledge_index(
         return {"refreshed": False, "reason": "single-document rebuild requires the Milvus multimodal index"}
 
     all_images = _collect_image_files(knowledge_dir) if include_linked_images else []
-    image_files = [Path(path) for path in _linked_images_for_markdown(markdown_path, all_images)]
+    image_files = [
+        Path(path)
+        for path in _linked_images_for_markdown(
+            markdown_path,
+            all_images,
+            knowledge_dir=knowledge_dir,
+        )
+    ]
     virtual_path = f"/knowledge/{markdown_path.relative_to(knowledge_dir).as_posix()}"
     result = _try_build_multimodal_index(
         base_dir=base_dir,
@@ -356,14 +363,14 @@ def _try_build_multimodal_index(
 
 
 def _normalize_asset_ref(value: str) -> str:
-    normalized = (value or "").replace("\\", "/").strip().strip("'\"").lstrip("/")
+    normalized = (value or "").replace("\\", "/").strip().strip("'\"").strip("<>")
     if not normalized:
         return ""
     if re.match(r"^(?:https?:|data:)", normalized, flags=re.IGNORECASE):
         return normalized
     if normalized.startswith("/knowledge/"):
         return normalized
-    return posixpath.normpath(normalized).lstrip("./")
+    return posixpath.normpath(normalized)
 
 
 def _plain_context_line(line: str) -> str:
@@ -486,7 +493,7 @@ def _build_multimodal_nodes(
     image_contexts = _all_image_contexts(knowledge_dir, markdown_files)
     for path in markdown_files:
         rel = path.relative_to(knowledge_dir).as_posix()
-        linked_images = _linked_images_for_markdown(path, image_files)
+        linked_images = _linked_images_for_markdown(path, image_files, knowledge_dir=knowledge_dir)
         markdown_text = path.read_text(encoding="utf-8", errors="replace")
         document_nodes = parser.get_nodes_from_documents([
             Document(
@@ -582,7 +589,7 @@ def build_markdown_chunk_manifest(
     parser = MarkdownNodeParser()
     for path in markdown_files:
         rel = path.relative_to(knowledge_dir).as_posix()
-        linked_images = _linked_images_for_markdown(path, image_files)
+        linked_images = _linked_images_for_markdown(path, image_files, knowledge_dir=knowledge_dir)
         markdown_text = path.read_text(encoding="utf-8", errors="replace")
         document_nodes = parser.get_nodes_from_documents([
             Document(
@@ -626,15 +633,31 @@ def _linked_images_for_markdown_text(text: str, linked_images: list[str]) -> lis
     return matched[:20]
 
 
-def _linked_images_for_markdown(markdown_path: Path, image_files: list[Path]) -> list[str]:
+def _linked_images_for_markdown(
+    markdown_path: Path,
+    image_files: list[Path],
+    *,
+    knowledge_dir: Path | None = None,
+) -> list[str]:
     try:
         text = markdown_path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return []
+
+    root = (knowledge_dir or markdown_path.parent).resolve()
+    markdown_image_re = re.compile(r"!\[[^\]]*\]\((?P<url>[^)\s]+)(?:\s+\"[^\"]*\")?\)")
+    html_image_re = re.compile(r"<img\b[^>]*?\bsrc=[\"'](?P<url>.*?)[\"'][^>]*>", flags=re.IGNORECASE)
+    referenced_paths: set[Path] = set()
+    for pattern in (markdown_image_re, html_image_re):
+        for match in pattern.finditer(text):
+            resolved = _resolve_markdown_asset_path(root, markdown_path, match.group("url"))
+            if resolved is not None:
+                referenced_paths.add(resolved)
+
     directly_linked = [
         image_path
         for image_path in image_files
-        if image_path.name in text or str(image_path) in text
+        if image_path.resolve() in referenced_paths
     ]
     if not directly_linked:
         return []

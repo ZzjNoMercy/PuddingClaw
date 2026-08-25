@@ -1101,11 +1101,13 @@ class ToolsetMiddleware(AgentMiddleware):
             policy_epoch=policy_epoch,
         ):
             activation = SkillActivation.model_validate(raw)
-            if (
-                activation.skill_id == skill_id
-                and activation.run_id == run_id
-                and not activation.source_tool_call_id.startswith("skill-cache:session-available:")
-            ):
+            if activation.skill_id == skill_id and activation.run_id == run_id:
+                # A Session cache entry is already hash-bound to the current
+                # Skill bytes and policy epoch.  Restoring that capability is
+                # the authoritative continuation contract; making the first
+                # real call fail only to re-inject the same cached text adds a
+                # model round without adding permission or freshness.  The
+                # per-call Tool/permission gates remain authoritative.
                 return True
         return False
 

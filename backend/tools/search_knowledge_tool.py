@@ -24,8 +24,11 @@ class LlamaIndexKnowledgeQueryTool(BaseTool):
     description: str = (
         "Query the local knowledge base through the project's LlamaIndex retrieval layer. "
         "Use this for RAG over uploaded PDFs, imported Markdown, and other indexed knowledge artifacts. "
+        "The result explicitly reports text-hit and image-hit counts and includes exact virtual paths for images. "
         "Do not switch to glob/grep on your own after this tool returns results; only use glob/grep under "
-        "/knowledge/ when the user explicitly asks for exact file-name or raw Markdown text lookup."
+        "/knowledge/ when the user explicitly asks for exact file-name or raw Markdown text lookup. If more "
+        "source text is required, read the exact linked Markdown path returned by this tool instead of exploring "
+        "the knowledge directory."
     )
     args_schema: type[BaseModel] = LlamaIndexKnowledgeInput
     risk_level: str = "safe"
@@ -530,7 +533,7 @@ class LlamaIndexKnowledgeQueryTool(BaseTool):
                         "linked_markdown": metadata.get("linked_markdown"),
                         "linked_markdown_virtual_path": metadata.get("linked_markdown_virtual_path"),
                         "context": metadata.get("context"),
-                    } if modality == "image" and file_path else None,
+                    } if modality == "image" and (file_path or virtual_path) else None,
                     "retrieval_channel": retrieval_channel,
                     "retrieval_rank": index + 1,
                 }
@@ -748,7 +751,9 @@ class LlamaIndexKnowledgeQueryTool(BaseTool):
         image_hits = payload.get("image_hits") if isinstance(payload.get("image_hits"), list) else []
         sources = payload.get("sources") if isinstance(payload.get("sources"), list) else []
 
-        sections: list[str] = []
+        sections: list[str] = [
+            f"[检索统计]\n文本命中：{len(chunks)}；图片命中：{len(image_hits)}。"
+        ]
         if chunks:
             sections.append("[文本命中]\n" + "\n\n---\n\n".join(chunks[:top_k]))
         if image_hits:
@@ -759,7 +764,7 @@ class LlamaIndexKnowledgeQueryTool(BaseTool):
                 resource_path = hit.get("virtual_path") or hit.get("file_path") or ""
                 lines.append(
                     f"- {hit['title']}\n"
-                    f"  图片路径：{hit['file_path']}\n"
+                    f"  图片路径：{hit.get('file_path') or '无'}\n"
                     f"  虚拟路径：{hit.get('virtual_path') or '无'}\n"
                     f"  文档上下文：{context_snippet or '无'}"
                 )
