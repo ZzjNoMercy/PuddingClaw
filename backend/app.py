@@ -254,6 +254,9 @@ async def lifespan(app: FastAPI):
         print("ℹ️ Server will continue running; the maintained Agent runtime initializes separately.")
     try:
         deepagents_agent_manager.initialize(BASE_DIR, user_root=user_paths.root)
+        recovered_reviews = await deepagents_agent_manager.recover_pending_run_reviews()
+        if recovered_reviews:
+            print(f"🔁 Recovered {len(recovered_reviews)} pending ordinary Run review(s)")
     except Exception as e:
         print(f"⚠️ DeepAgents initialization failed: {e}")
         traceback.print_exc()

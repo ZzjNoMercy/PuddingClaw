@@ -6,10 +6,13 @@ import hashlib
 from pathlib import Path
 
 import pytest
-from langchain_core.messages import ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from graph.session_manager import SessionManager
+from graph.verification.models import stable_digest
+from graph.verification.orchestrator import OnlineVerificationOrchestrator
 from harness.coordinators import GoalActivationError, HarnessRunCoordinator
+from harness.deterministic_checks import evaluate_deterministic_criteria
 from harness.models import (
     GoalCompletionPolicy,
     GoalRecord,
@@ -25,6 +28,7 @@ from harness.models import (
     SkillCandidate,
     VerificationMode,
     VerificationStatus,
+    VerifierKind,
 )
 from harness.rubric_compiler import RubricBuildContext, RunRubricCompiler
 from harness.verification_activations import build_verification_activations
@@ -73,6 +77,114 @@ def _request_goal_completion(
         run_id=run.run_id,
         tool_call_id=f"complete-{run.run_id}",
     )
+
+
+def _materialize_current_proposal(
+    sessions: SessionManager,
+    coordinator: HarnessRunCoordinator,
+    run: RunRecord,
+    goal: GoalRecord,
+    final_state: dict,
+) -> dict:
+    """Simulate the post-freeze verifier boundary for coordinator unit tests."""
+
+    coordinator._refresh_runtime_fields(run)
+    context = dict(final_state.get("_harness_context") or {})
+    persisted_goal = sessions.get_goal_state(run.session_id, goal.goal_id) or {}
+    goal_refs = [item for item in persisted_goal.get("evidence_refs") or [] if isinstance(item, dict)]
+    goal_records = []
+    for evidence_ref in goal_refs:
+        resolved = sessions.resolve_evidence_ref(
+            run.session_id,
+            evidence_ref,
+            goal_id=goal.goal_id,
+            goal_revision=goal.objective_revision,
+            allow_artifact_revision_inheritance=True,
+        )
+        if not isinstance(resolved, dict):
+            continue
+        record = dict(resolved.get("payload") or {})
+        record.update(
+            {
+                "evidence_ref": evidence_ref,
+                "evidence_type": resolved.get("kind"),
+                "evidence_id": resolved.get("id"),
+                "verification_pack": resolved.get("verification_pack"),
+                "origin_run_id": resolved.get("source_run_id"),
+                "run_id": resolved.get("source_run_id"),
+                "tool_call_id": resolved.get("origin_tool_call_id"),
+                "output_digest": resolved.get("output_digest"),
+                "source_goal_revision": resolved.get("goal_revision"),
+                "revision_inherited": bool(
+                    resolved.get("goal_revision") is not None
+                    and int(resolved["goal_revision"]) < goal.objective_revision
+                ),
+            }
+        )
+        goal_records.append(record)
+    context.update(
+        {
+            "verification_activations": [
+                item.model_dump(mode="json") for item in run.verification_activations
+            ],
+            "goal_evidence_refs": goal_refs,
+            "goal_evidence_records": goal_records,
+            "run_id": run.run_id,
+            "goal_id": goal.goal_id,
+            "goal_revision": goal.objective_revision,
+            "declared_artifact_targets": list(run.declared_artifact_targets),
+            "active_permission_grant_ids": [
+                str(item.get("id"))
+                for item in sessions.list_permission_grants(run.session_id)
+                if item.get("id")
+            ],
+            "permission_grants_authoritative": True,
+        }
+    )
+    candidate = str(context.get("final_content") or "completed")
+    verifier_state = {
+        **final_state,
+        "_harness_context": context,
+        "messages": [HumanMessage(content=run.objective), AIMessage(content=candidate)],
+    }
+    orchestrator = OnlineVerificationOrchestrator(sessions)
+    snapshot = orchestrator.freeze_goal_snapshot(
+        run=run,
+        goal=goal,
+        final_state=verifier_state,
+        workspace_fingerprint=stable_digest(
+            {"workspace_path": str(context.get("workspace_path") or "")}
+        ),
+    )
+    deterministic = [
+        item.model_dump(mode="json")
+        for item in evaluate_deterministic_criteria(run.verification_contract, verifier_state)
+    ]
+    semantic_ids = {
+        item.id
+        for item in run.verification_contract.criteria
+        if item.verifier == VerifierKind.LLM_GRADER
+    }
+    raw_evaluations = final_state.get("_rubric_evaluations") or []
+    semantic = dict(raw_evaluations[-1]) if raw_evaluations else None
+    if semantic is not None:
+        semantic["criteria"] = [
+            item
+            for item in semantic.get("criteria") or []
+            if str(item.get("name") or "") in semantic_ids
+        ]
+    report = orchestrator.materialize_goal_proposal_from_verifiers(
+        run=run,
+        goal=goal,
+        snapshot=snapshot,
+        deterministic_evaluations=deterministic,
+        semantic_evaluation=semantic,
+    )
+    return {
+        **verifier_state,
+        "_evaluation_snapshot_id": snapshot.snapshot_id,
+        "_verification_proposal_report": report.model_dump(mode="json"),
+    }
 
 
 def test_run_verification_mode_is_owned_by_explicit_goal_state(tmp_path: Path) -> None:
@@ -886,6 +998,13 @@ def test_goal_inherits_authorized_external_artifact_across_runs(tmp_path):
             "final_content": f"已更新外部报告：`{external}`",
         },
     }
+    satisfied_state = _materialize_current_proposal(
+        session_manager,
+        coordinator,
+        second,
+        goal,
+        satisfied_state,
+    )
     second, goal, report = coordinator.complete_from_final_state(second, goal, satisfied_state)
 
     artifact = next(item for item in report.evaluations if item.criterion_id == "artifact_delivery")
@@ -1213,10 +1332,17 @@ def test_explicit_goal_can_advance_across_runs(tmp_path):
     coordinator.transition(second_run, RunStatus.RUNNING)
     _request_goal_completion(sessions, second_run, resumed_goal)
     _persist_satisfied_evidence(sessions, second_run, tmp_path)
-    second_run, achieved_goal, second_report = coordinator.complete_from_final_state(
+    satisfied_state = _materialize_current_proposal(
+        sessions,
+        coordinator,
         second_run,
         resumed_goal,
         _satisfied_final_state(tmp_path),
+    )
+    second_run, achieved_goal, second_report = coordinator.complete_from_final_state(
+        second_run,
+        resumed_goal,
+        satisfied_state,
     )
 
     assert second_report.status == VerificationStatus.SATISFIED
@@ -1224,7 +1350,7 @@ def test_explicit_goal_can_advance_across_runs(tmp_path):
     assert achieved_goal is not None
     assert achieved_goal.status == GoalStatus.COMPLETED
     assert achieved_goal.run_ids == [first_run.run_id, second_run.run_id]
-    assert second_report.accepted_for_goal_revision is True
+    assert second_report.accepted_for_goal_revision is None
     assert second_run.run_id in second_report.supporting_run_ids
     # Acceptance is a candidate until the final assistant message is ready;
     # commit all authorities and the message in one Session write.
@@ -1234,7 +1360,9 @@ def test_explicit_goal_can_advance_across_runs(tmp_path):
         run=second_run.model_dump(mode="json"),
         goal=achieved_goal.model_dump(mode="json"),
         query_id=second_run.query_id,
-        content="目标已完成。",
+        content=satisfied_state["messages"][-1].content,
+        verified_candidate_content=satisfied_state["messages"][-1].content,
+        verified_candidate_tool_calls=[],
     )
     assert sessions.get_active_goal_state("session-1") is None
 

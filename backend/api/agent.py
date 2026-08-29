@@ -15,7 +15,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field, model_validator
 from sse_starlette.sse import EventSourceResponse
 
-from config import get_fallback_llm_config
+from config import get_fallback_llm_config, load_config
 from graph.agent_context_compaction import (
     AgentContextCompactionError,
     agent_context_compaction_service,
@@ -144,6 +144,7 @@ class AgentRequest(BaseModel):
     goal_id: str | None = None
     context_goal_id: str | None = None
     goal_control_action: Literal["start"] | None = None
+    run_review_policy: Literal["off", "shadow", "blocking_one_shot"] | None = None
     stream: bool = True
 
     @model_validator(mode="after")
@@ -171,6 +172,8 @@ class AgentRequest(BaseModel):
                 raise ValueError("goal_control_action=start requires goal_mode=true and goal_id")
             if self.attachments:
                 raise ValueError("Goal control actions do not accept attachments")
+        if self.goal_mode and self.run_review_policy not in {None, "off"}:
+            raise ValueError("run_review_policy is available only for ordinary Runs")
         return self
 
 
@@ -178,6 +181,60 @@ class AgentCompactRequest(BaseModel):
     """Optional user emphasis for an Agent-only manual compaction."""
 
     focus: str = Field(default="", max_length=1000)
+
+
+class RunReviewRequest(BaseModel):
+    """Manual ordinary-Run review is intentionally option-free and idempotent."""
+
+    pass
+
+
+@router.post("/agent/sessions/{session_id}/runs/{run_id}/review", status_code=202)
+async def review_agent_run(
+    session_id: str,
+    run_id: str,
+    _request: RunReviewRequest,
+) -> dict[str, Any]:
+    review_config = load_config().get("harness", {}).get("completion", {}).get("run_review", {})
+    if not bool(review_config.get("manual_enabled", True)):
+        raise HTTPException(status_code=403, detail="Manual Run review is disabled")
+    try:
+        return await deepagents_agent_manager.begin_run_review(
+            session_id,
+            run_id,
+            manual=True,
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (PermissionError, ValueError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.get("/agent/sessions/{session_id}/runs/{run_id}/review")
+async def agent_run_review_status(session_id: str, run_id: str) -> dict[str, Any]:
+    raw_run = session_manager.get_run_state(session_id, run_id)
+    if not isinstance(raw_run, dict):
+        raise HTTPException(status_code=404, detail=f"Run {run_id} does not exist")
+    harness = session_manager.get_harness_state(session_id)
+    report_id = str(raw_run.get("run_review_report_id") or "")
+    report = (harness.get("run_review_reports") or {}).get(report_id)
+    if isinstance(report, dict):
+        return {"status": "completed", "report": report}
+    snapshot_id = str(raw_run.get("evaluation_snapshot_id") or "")
+    operations = [
+        item
+        for item in (harness.get("verification_operations") or {}).values()
+        if isinstance(item, dict) and item.get("snapshot_id") == snapshot_id
+    ]
+    if operations:
+        latest = max(operations, key=lambda item: int(item.get("attempt_no") or 0))
+        return {
+            "status": str(latest.get("status") or "pending"),
+            "operation_id": latest.get("operation_id"),
+            "snapshot_id": snapshot_id,
+            "run_id": run_id,
+        }
+    return {"status": "not_requested", "run_id": run_id}
 
 
 def _raise_compaction_http_error(exc: AgentContextCompactionError) -> NoReturn:
@@ -391,6 +448,7 @@ async def agent(request: AgentRequest):
             goal_id=request.goal_id,
             context_goal_id=request.context_goal_id,
             goal_control_action=request.goal_control_action,
+            run_review_policy=request.run_review_policy,
             query_created_at=request_received_at,
         )
         return EventSourceResponse(
@@ -421,6 +479,7 @@ async def agent(request: AgentRequest):
         goal_id=request.goal_id,
         context_goal_id=request.context_goal_id,
         goal_control_action=request.goal_control_action,
+        run_review_policy=request.run_review_policy,
         query_created_at=request_received_at,
     )
     async for event in _instrument_agent_stream(

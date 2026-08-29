@@ -310,6 +310,12 @@ _DEFAULT_CONFIG: dict[str, Any] = {
             },
         },
         "completion": {
+            "run_review": {
+                "policy": "off",
+                "model": "",
+                "environment_profile": "none",
+                "manual_enabled": True,
+            },
             "rubric": {
                 "enabled": False,
                 # Task classification, permission review and completion grading
@@ -317,6 +323,7 @@ _DEFAULT_CONFIG: dict[str, Any] = {
                 "model": "deepseek-v4-flash",
                 "max_iterations": 3,
                 "max_stagnant_repairs": 2,
+                "environment_profile": "none",
                 "custom_rules_enabled": False,
                 "custom_rules": [],
             },
@@ -473,6 +480,13 @@ def _validate_config_document(value: Any) -> dict[str, Any]:
                 + ", ".join(sorted(removed_analytics))
             )
     harness = data.get("harness")
+    completion = harness.get("completion") if isinstance(harness, dict) else None
+    run_review = completion.get("run_review") if isinstance(completion, dict) else None
+    if isinstance(run_review, dict) and run_review.get("policy") not in {None, "off", "shadow"}:
+        raise ValueError(
+            "harness.completion.run_review.policy must be off or shadow; "
+            "blocking_one_shot is request-scoped"
+        )
     terminal = harness.get("terminal") if isinstance(harness, dict) else None
     docker = terminal.get("docker") if isinstance(terminal, dict) else None
     removed_images = {
@@ -2040,6 +2054,31 @@ def _normalize_harness_update(value: Any) -> dict[str, Any]:
     if completion is not None:
         if not isinstance(completion, dict):
             raise ValueError("harness.completion must be an object")
+        run_review = completion.get("run_review")
+        if run_review is not None:
+            if not isinstance(run_review, dict):
+                raise ValueError("harness.completion.run_review must be an object")
+            policy = str(run_review.get("policy") or "off")
+            if policy not in {"off", "shadow"}:
+                raise ValueError(
+                    "harness.completion.run_review.policy must be off or shadow; "
+                    "blocking_one_shot is request-scoped"
+                )
+            run_review["policy"] = policy
+            model = run_review.get("model", "")
+            if not isinstance(model, str) or len(model.strip()) > 200:
+                raise ValueError("harness.completion.run_review.model must be a short string")
+            run_review["model"] = model.strip()
+            profile = str(run_review.get("environment_profile") or "none")
+            if profile not in {
+                "none",
+                "deterministic_only",
+                "independent_evidence_review",
+                "environment_verified",
+            }:
+                raise ValueError("harness.completion.run_review.environment_profile is invalid")
+            run_review["environment_profile"] = profile
+            run_review["manual_enabled"] = bool(run_review.get("manual_enabled", True))
         rubric = completion.get("rubric")
         if rubric is not None:
             if not isinstance(rubric, dict):
@@ -2068,6 +2107,15 @@ def _normalize_harness_update(value: Any) -> dict[str, Any]:
                     "harness.completion.rubric.model must be a string of at most 200 characters"
                 )
             rubric["model"] = model.strip()
+            environment_profile = str(rubric.get("environment_profile") or "none")
+            if environment_profile not in {
+                "none",
+                "deterministic_only",
+                "independent_evidence_review",
+                "environment_verified",
+            }:
+                raise ValueError("harness.completion.rubric.environment_profile is invalid")
+            rubric["environment_profile"] = environment_profile
             rules = rubric.get("custom_rules", [])
             if not isinstance(rules, list) or len(rules) > 50:
                 raise ValueError(

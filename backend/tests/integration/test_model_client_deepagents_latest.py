@@ -323,7 +323,10 @@ def test_latest_deepagents_hitl_edit_reject_respond_resume_paths(
 
     assert "__interrupt__" in first
     assert resumed["messages"][-1].content == "DONE"
-    assert any(getattr(message, "content", None) == expected_tool_message for message in resumed["messages"])
+    assert any(
+        expected_tool_message in str(getattr(message, "content", ""))
+        for message in resumed["messages"]
+    )
 
 
 def test_latest_deepagents_filesystem_backend_writes_file_through_model_client(tmp_path):

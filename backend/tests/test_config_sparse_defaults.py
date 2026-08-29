@@ -3,9 +3,10 @@ from __future__ import annotations
 import copy
 import json
 
+import pytest
+
 import config
 import provider_registry
-import pytest
 
 
 def _isolate(tmp_path, monkeypatch):
@@ -46,6 +47,12 @@ def test_canonical_defaults_match_reviewed_product_behavior(tmp_path, monkeypatc
     assert effective["subagents"]["image_analyzer"]["enabled"] is True
     assert effective["harness"]["completion"]["rubric"]["model"] == "deepseek-v4-flash"
     assert effective["harness"]["completion"]["rubric"]["max_iterations"] == 3
+    assert effective["harness"]["completion"]["run_review"] == {
+        "policy": "off",
+        "model": "",
+        "environment_profile": "none",
+        "manual_enabled": True,
+    }
     assert effective["harness"]["terminal"]["execution_mode"] == "spawn"
     assert effective["harness"]["terminal"]["docker"]["memory_limit_mb"] == 4096
 
@@ -55,6 +62,24 @@ def test_canonical_defaults_match_reviewed_product_behavior(tmp_path, monkeypatc
     assert effective["database"]["username"] == "puddingclaw"
     assert effective["database"]["password"] == ""
     assert effective["knowledge"]["root_dir"] == ""
+
+
+def test_blocking_run_review_cannot_be_configured_as_a_global_default(tmp_path, monkeypatch):
+    config_path = _isolate(tmp_path, monkeypatch)
+    config_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "harness": {
+                    "completion": {"run_review": {"policy": "blocking_one_shot"}}
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="request-scoped"):
+        config.load_config()
 
 
 def test_saving_defaults_keeps_home_config_schema_only(tmp_path, monkeypatch):

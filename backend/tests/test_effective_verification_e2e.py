@@ -27,6 +27,7 @@ class ScriptedModel(BaseChatModel):
     _responses: list[AIMessage] = PrivateAttr()
     _calls: int = PrivateAttr(default=0)
     _received_messages: list[list[Any]] = PrivateAttr(default_factory=list)
+    _structured_tool_name: str | None = PrivateAttr(default=None)
 
     def __init__(self, responses: list[AIMessage]) -> None:
         super().__init__()
@@ -37,6 +38,10 @@ class ScriptedModel(BaseChatModel):
         return "effective_verification_scripted"
 
     def bind_tools(self, tools: list[Any], **kwargs: Any) -> ScriptedModel:
+        for candidate in tools:
+            name = str(getattr(candidate, "name", "") or "")
+            if name == "GraderResponse":
+                self._structured_tool_name = name
         return self
 
     def _generate(
@@ -52,6 +57,23 @@ class ScriptedModel(BaseChatModel):
         except IndexError:
             message = AIMessage(content=f"UNSCRIPTED_{self._calls + 1}")
         self._calls += 1
+        if self._structured_tool_name and isinstance(message.content, str):
+            try:
+                payload = json.loads(message.content)
+            except (TypeError, ValueError):
+                payload = None
+            if isinstance(payload, dict):
+                message = AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "name": self._structured_tool_name,
+                            "args": payload,
+                            "id": f"grader-{self._calls}",
+                            "type": "tool_call",
+                        }
+                    ],
+                )
         return ChatResult(generations=[ChatGeneration(message=message)])
 
 
@@ -157,7 +179,7 @@ def test_runtime_context_scopes_grader_to_current_run(tmp_path, monkeypatch):
     contract = RunRubricCompiler.compile(RubricBuildContext(user_message="L6 年度改款多少钱？", force_required=True))
     assert contract is not None
     main_model = ScriptedModel([AIMessage(content="L6 售价 24.98 万元。")])
-    grader_model = _grader_model("task_fulfillment", "todo_reconciliation")
+    grader_model = _grader_model("task_fulfillment")
     monkeypatch.setattr(
         PuddingClawRubricMiddleware,
         "_effective_contract_update",
@@ -213,7 +235,7 @@ def test_runtime_context_restores_objective_after_user_turn_is_summarized(
     contract = RunRubricCompiler.compile(RubricBuildContext(user_message="L6 年度改款多少钱？", force_required=True))
     assert contract is not None
     main_model = ScriptedModel([AIMessage(content="L6 售价 24.98 万元。")])
-    grader_model = _grader_model("task_fulfillment", "todo_reconciliation")
+    grader_model = _grader_model("task_fulfillment")
     monkeypatch.setattr(
         PuddingClawRubricMiddleware,
         "_effective_contract_update",
@@ -271,15 +293,13 @@ def test_run_scope_survives_one_explicit_rubric_revision(tmp_path, monkeypatch):
                 content=(
                     '{"result":"needs_revision","explanation":"补充置换价",'
                     '"criteria":[{"name":"task_fulfillment","passed":false,'
-                    '"gap":"缺少置换价格"},{"name":"todo_reconciliation",'
-                    '"passed":true}]}'
+                    '"gap":"缺少置换价格"}]}'
                 )
             ),
             AIMessage(
                 content=(
                     '{"result":"satisfied","explanation":"已完成",'
-                    '"criteria":[{"name":"task_fulfillment","passed":true},'
-                    '{"name":"todo_reconciliation","passed":true}]}'
+                    '"criteria":[{"name":"task_fulfillment","passed":true}]}'
                 )
             ),
         ]
@@ -314,9 +334,10 @@ def test_run_scope_survives_one_explicit_rubric_revision(tmp_path, monkeypatch):
         )
     )
 
-    # A rejected request gets one repair jump. The repaired answer must submit
-    # a new completion request before grading can run again.
-    assert len(grader_model._received_messages) == 1
+    # The SDK repair loop may evaluate a replacement candidate under the same
+    # completion request. Each candidate is frozen as a distinct immutable
+    # snapshot before it is graded.
+    assert len(grader_model._received_messages) == 2
     for received in grader_model._received_messages:
         prompt = "\n".join(str(getattr(message, "content", "")) for message in received)
         assert "L6 年度改款多少钱" in prompt
@@ -328,11 +349,15 @@ def test_run_scope_survives_one_explicit_rubric_revision(tmp_path, monkeypatch):
     request = session_manager.get_harness_state(runtime_context["session_id"])[
         "completion_requests"
     ][request_id]
-    assert request["status"] == "needs_revision"
+    assert request["status"] == "evaluating"
+    snapshots = session_manager.get_harness_state(runtime_context["session_id"])[
+        "evaluation_snapshots"
+    ]
+    assert len(snapshots) == 2
 
 
-def test_rubric_revision_requires_a_new_completion_request(tmp_path, monkeypatch):
-    """A repair response alone cannot silently resubmit completion."""
+def test_one_shot_grader_does_not_cross_the_outer_settlement_boundary(tmp_path, monkeypatch):
+    """A one-shot SDK grader reports its verdict without starting repair."""
 
     from harness.rubric_compiler import RubricBuildContext, RunRubricCompiler
 
@@ -357,18 +382,15 @@ def test_rubric_revision_requires_a_new_completion_request(tmp_path, monkeypatch
         [
             AIMessage(content=(
                 '{"result":"needs_revision","explanation":"缺口一",'
-                '"criteria":[{"name":"task_fulfillment","passed":false,"gap":"缺口一"},'
-                '{"name":"todo_reconciliation","passed":true}]}'
+                '"criteria":[{"name":"task_fulfillment","passed":false,"gap":"缺口一"}]}'
             )),
             AIMessage(content=(
                 '{"result":"failed","explanation":"缺口二",'
-                '"criteria":[{"name":"task_fulfillment","passed":false,"gap":"缺口二"},'
-                '{"name":"todo_reconciliation","passed":true}]}'
+                '"criteria":[{"name":"task_fulfillment","passed":false,"gap":"缺口二"}]}'
             )),
             AIMessage(content=(
                 '{"result":"satisfied","explanation":"通过",'
-                '"criteria":[{"name":"task_fulfillment","passed":true},'
-                '{"name":"todo_reconciliation","passed":true}]}'
+                '"criteria":[{"name":"task_fulfillment","passed":true}]}'
             )),
         ]
     )
@@ -400,10 +422,13 @@ def test_rubric_revision_requires_a_new_completion_request(tmp_path, monkeypatch
         )
     )
 
-    assert main_model._calls == 2
+    assert main_model._calls == 1
     assert grader_model._calls == 1
-    assert [item["result"] for item in evaluations] == ["needs_revision"]
-    assert final_state["messages"][-1].content == "第二次申请完成。"
+    # DeepAgents folds a one-shot revision verdict into its terminal
+    # max-iterations status. PuddingClaw reads the persisted criterion
+    # evaluation/proposal rather than treating that SDK status as acceptance.
+    assert [item["result"] for item in evaluations] == ["max_iterations_reached"]
+    assert final_state["messages"][-1].content == "第一次申请完成。"
 
 
 def test_rubric_revision_jump_repairs_hidden_provider_tool_call(tmp_path, monkeypatch):
@@ -442,14 +467,13 @@ def test_rubric_revision_jump_repairs_hidden_provider_tool_call(tmp_path, monkey
                 content=(
                     '{"result":"needs_revision","explanation":"继续修正",'
                     '"criteria":[{"name":"task_fulfillment","passed":false,'
-                    '"gap":"尚未完成"},{"name":"todo_reconciliation","passed":true}]}'
+                    '"gap":"尚未完成"}]}'
                 )
             ),
             AIMessage(
                 content=(
                     '{"result":"satisfied","explanation":"已完成",'
-                    '"criteria":[{"name":"task_fulfillment","passed":true},'
-                    '{"name":"todo_reconciliation","passed":true}]}'
+                    '"criteria":[{"name":"task_fulfillment","passed":true}]}'
                 )
             ),
         ]
@@ -515,9 +539,7 @@ def test_runtime_database_tool_upgrades_contract_before_grader(tmp_path):
     evaluations = []
     grader_model = _grader_model(
         "task_fulfillment",
-        "todo_reconciliation",
         "metric_consistency",
-        "analytics_evidence_traceability",
         explanation=(
             "已核对最终回答确实返回 12 行销量结果；数据库查询成功完成，"
             "结果可追溯到已登记的数据源。"
@@ -554,7 +576,7 @@ def test_runtime_database_tool_upgrades_contract_before_grader(tmp_path):
     assert evaluations
     grader_prompt = "\n".join(str(getattr(message, "content", "")) for message in grader_model._received_messages[0])
     assert "[metric_consistency]" in grader_prompt
-    assert "[analytics_evidence_traceability]" in grader_prompt
+    assert "[analytics_evidence_traceability]" not in grader_prompt
     final_state["_rubric_status"] = evaluations[-1]["result"]
     final_state["_rubric_evaluations"] = evaluations
     completed, _, report = coordinator.complete_from_final_state(
@@ -605,8 +627,6 @@ def test_runtime_fetch_url_activates_web_without_selected_model_pollution(tmp_pa
             PuddingClawRubricMiddleware(
                 model=_grader_model(
                     "task_fulfillment",
-                    "todo_reconciliation",
-                    "web_evidence_traceability",
                 ),
                 max_iterations=2,
                 on_evaluation=evaluations.append,
@@ -766,9 +786,7 @@ def test_manager_standard_run_persists_activation_without_rubric_contract(
     )
     grader_model = _grader_model(
         "task_fulfillment",
-        "todo_reconciliation",
         "metric_consistency",
-        "analytics_evidence_traceability",
         explanation=(
             "已核对最终回答确实返回 12 行销量结果；数据库查询成功完成，"
             "结果可追溯到已登记的数据源。"

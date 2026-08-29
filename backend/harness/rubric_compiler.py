@@ -439,11 +439,16 @@ class RunRubricCompiler:
         browser_e2e_required: bool = False,
         base_contract_id: str | None = None,
     ) -> RunVerificationContract:
-        rubric_lines = [
-            "逐项审查以下标准；每个 required 标准都必须明确返回，缺失视为未通过："
+        semantic_criteria = [
+            criterion
+            for criterion in criteria
+            if criterion.verifier == VerifierKind.LLM_GRADER
         ]
-        rubric_lines.extend(
-            f"- [{criterion.id}] {criterion.statement}" for criterion in criteria
+        rubric_lines = (
+            ["逐项审查以下标准；每个 required 标准都必须明确返回，缺失视为未通过："]
+            + [f"- [{criterion.id}] {criterion.statement}" for criterion in semantic_criteria]
+            if semantic_criteria
+            else []
         )
         canonical_criteria = "\n".join(
             "|".join(

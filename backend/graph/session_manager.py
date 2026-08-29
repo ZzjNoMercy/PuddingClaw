@@ -10,6 +10,7 @@ import threading
 import time
 import uuid
 from collections.abc import Callable
+from contextlib import contextmanager
 from copy import deepcopy
 from datetime import datetime, timezone
 from functools import wraps
@@ -53,7 +54,8 @@ def _session_write_locked(method):
     @wraps(method)
     def wrapped(self, session_id: str, *args, **kwargs):
         with self._tool_context_lock(session_id):
-            return method(self, session_id, *args, **kwargs)
+            with self._session_process_lock(session_id):
+                return method(self, session_id, *args, **kwargs)
 
     return wrapped
 
@@ -66,6 +68,7 @@ class SessionManager:
     # so the complete read-modify-write transaction remains serialized.
     _shared_session_locks: dict[str, threading.RLock] = {}
     _shared_session_locks_guard = threading.Lock()
+    _process_lock_state = threading.local()
     _AGENT_CONTEXT_COMPACTION_TTL_SECONDS = 15 * 60
 
     @classmethod
@@ -99,6 +102,38 @@ class SessionManager:
             key = str(self._session_path(session_id).resolve())
         with type(self)._shared_session_locks_guard:
             return type(self)._shared_session_locks.setdefault(key, threading.RLock())
+
+    @contextmanager
+    def _session_process_lock(self, session_id: str):
+        """Serialize decorated Session transactions across worker processes."""
+
+        if self._sessions_dir is None:
+            yield
+            return
+        import fcntl
+
+        lock_path = self._session_path(session_id).with_suffix(".lock")
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        key = str(lock_path.resolve())
+        depths = getattr(type(self)._process_lock_state, "depths", None)
+        if not isinstance(depths, dict):
+            depths = {}
+            type(self)._process_lock_state.depths = depths
+        if depths.get(key, 0):
+            depths[key] += 1
+            try:
+                yield
+            finally:
+                depths[key] -= 1
+            return
+        with lock_path.open("a+b") as stream:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+            depths[key] = 1
+            try:
+                yield
+            finally:
+                depths.pop(key, None)
+                fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
 
     def initialize(
         self,
@@ -1055,6 +1090,8 @@ class SessionManager:
         goal: dict[str, Any] | None,
         query_id: str,
         content: str,
+        verified_candidate_content: str | None = None,
+        verified_candidate_tool_calls: list[dict[str, Any]] | None = None,
         tool_calls: list[dict[str, Any]] | None = None,
         sources: list[dict[str, Any]] | None = None,
         citations: list[dict[str, Any]] | None = None,
@@ -1073,6 +1110,15 @@ class SessionManager:
         RunOutcome and Goal decision together.
         """
 
+        from graph.verification.models import (
+            EvaluationInputSnapshot,
+            EvaluationSubjectKind,
+            VerificationProposal,
+            VerificationRecord,
+            VerificationRecordStatus,
+            stable_digest,
+        )
+        from graph.verification.snapshots import stale_artifact_reasons
         from harness.models import (
             GoalCompletionPolicy,
             GoalCompletionRequest,
@@ -1135,6 +1181,10 @@ class SessionManager:
             for lease_collection, draft_statuses in (
                 ("external_artifact_leases", {"claiming", "staged"}),
                 ("external_directory_leases", {"claiming", "staged", "prepared"}),
+                (
+                    "attachment_edit_leases",
+                    {"claiming", "staged", "prepared", "publishing", "committing"},
+                ),
             ):
                 leases = data.get(lease_collection)
                 if any(
@@ -1145,6 +1195,11 @@ class SessionManager:
                 ) if isinstance(leases, dict) else False:
                     raise ValueError("Goal completion is blocked by an unfinished external mutation")
             request_id = str(validated_run.completion_request_id or "")
+            if (
+                str(raw_run.get("completion_request_id") or "") != request_id
+                or str(raw_goal.get("latest_completion_request_id") or "") != request_id
+            ):
+                raise ValueError("Goal completion request is no longer authoritative")
             raw_request = completion_requests.get(request_id)
             if not isinstance(raw_request, dict):
                 raise ValueError("Goal completion requires a persisted completion request")
@@ -1164,9 +1219,89 @@ class SessionManager:
             if completion_request.policy == GoalCompletionPolicy.RUBRIC and not (
                 report is not None
                 and report.status == VerificationStatus.SATISFIED
-                and report.accepted_for_goal_revision is True
             ):
                 raise ValueError("Rubric completion requires an accepted report")
+            if report is not None and (
+                report.run_id != validated_run.run_id
+                or report.goal_revision != validated_goal.objective_revision
+            ):
+                raise ValueError("Verification report identity does not match current Goal authority")
+            if report is not None and report.source_format == "verification_records_v1":
+                snapshot_id = str(report.snapshot_id or "")
+                if not snapshot_id or completion_request.evaluation_snapshot_id != snapshot_id:
+                    raise ValueError("Verification report snapshot does not match completion request")
+                raw_snapshot = harness.get("evaluation_snapshots", {}).get(snapshot_id)
+                if not isinstance(raw_snapshot, dict):
+                    raise ValueError("Verification snapshot does not exist")
+                snapshot = EvaluationInputSnapshot.model_validate(raw_snapshot)
+                if (
+                    snapshot.subject.kind != EvaluationSubjectKind.GOAL_COMPLETION_REQUEST
+                    or snapshot.subject.run_id != validated_run.run_id
+                    or snapshot.subject.query_id != query_id
+                    or snapshot.subject.goal_id != validated_goal.goal_id
+                    or snapshot.subject.goal_revision != validated_goal.objective_revision
+                    or snapshot.subject.completion_request_id != request_id
+                ):
+                    raise ValueError("Verification snapshot authority is stale")
+                if snapshot.candidate_message_id != query_id:
+                    raise ValueError("Candidate message identity does not match final publication")
+                if verified_candidate_content is None:
+                    raise ValueError("Verified candidate content is required for snapshot settlement")
+                if snapshot.candidate_content_digest != stable_digest(verified_candidate_content):
+                    raise ValueError("Candidate response changed after verification")
+                if snapshot.candidate_tool_calls_digest != stable_digest(
+                    verified_candidate_tool_calls or []
+                ):
+                    raise ValueError("Candidate tool calls changed after verification")
+                if content != verified_candidate_content and not content.startswith(
+                    verified_candidate_content + "\n"
+                ):
+                    raise ValueError("Published response is not a presentation of the verified candidate")
+                if validated_run.verification_contract is not None and (
+                    snapshot.contract_hash
+                    != stable_digest(validated_run.verification_contract.model_dump(mode="json"))
+                ):
+                    raise ValueError("Verification contract changed after snapshot")
+                raw_proposal = harness.get("verification_proposals", {}).get(report.report_id)
+                if not isinstance(raw_proposal, dict):
+                    raise ValueError("Verification proposal does not exist")
+                proposal = VerificationProposal.model_validate(raw_proposal)
+                if (
+                    proposal.snapshot_id != snapshot_id
+                    or proposal.run_id != validated_run.run_id
+                    or proposal.status != VerificationRecordStatus.SATISFIED
+                    or set(proposal.verification_record_ids) != set(report.verification_record_ids)
+                ):
+                    raise ValueError("Verification proposal is not accepted for this snapshot")
+                invalidated_ids = {
+                    str(item.get("verification_id") or "")
+                    for item in harness.get("verification_invalidations", {}).values()
+                    if isinstance(item, dict) and item.get("snapshot_id") == snapshot_id
+                }
+                records = harness.get("verification_records", {})
+                for verification_id in proposal.verification_record_ids:
+                    raw_record = records.get(verification_id) if isinstance(records, dict) else None
+                    if not isinstance(raw_record, dict):
+                        raise ValueError("Verification proposal references a missing record")
+                    record = VerificationRecord.model_validate(raw_record)
+                    if record.snapshot_id != snapshot_id or verification_id in invalidated_ids:
+                        raise ValueError("Verification proposal references stale evidence")
+                stale_reasons = stale_artifact_reasons(snapshot)
+                if stale_reasons:
+                    self.mark_verification_records_stale(
+                        session_id,
+                        snapshot_id=snapshot_id,
+                        reason="artifact_freshness:" + ",".join(stale_reasons),
+                    )
+                    raise ValueError(
+                        "Verification artifact freshness check failed: " + ",".join(stale_reasons)
+                    )
+                report.accepted_for_goal_revision = True
+                validated_run.verification_report = report
+            elif completion_request.policy == GoalCompletionPolicy.RUBRIC and (
+                report is None or report.accepted_for_goal_revision is not True
+            ):
+                raise ValueError("Legacy Rubric completion requires an accepted report")
             if completion_request.policy == GoalCompletionPolicy.STANDARD and report is not None:
                 raise ValueError("Standard completion must not create a Rubric report")
             completion_request.status = GoalCompletionRequestStatus.ACCEPTED
@@ -1234,6 +1369,7 @@ class SessionManager:
 
         from harness.models import (
             GoalCompletionRequest,
+            GoalCompletionRequestStatus,
             GoalRecord,
             GoalStatus,
             RunRecord,
@@ -1263,6 +1399,10 @@ class SessionManager:
         if not call_id:
             raise ValueError("Completion request requires tool_call_id")
         requests = harness.setdefault("completion_requests", {})
+        live_statuses = {
+            GoalCompletionRequestStatus.REQUESTED,
+            GoalCompletionRequestStatus.EVALUATING,
+        }
         for raw in requests.values():
             if not isinstance(raw, dict):
                 continue
@@ -1275,6 +1415,13 @@ class SessionManager:
                 ):
                     return existing.model_dump(mode="json")
                 raise ValueError("tool_call_id is already bound to another completion request")
+            if (
+                existing.goal_id == goal_id
+                and existing.objective_revision == objective_revision
+                and existing.run_id == run_id
+                and existing.status in live_statuses
+            ):
+                raise ValueError("The active Goal Run already has a live completion request")
         request = GoalCompletionRequest(
             request_id=f"completion-{uuid.uuid4().hex[:16]}",
             goal_id=goal_id,
@@ -1300,6 +1447,9 @@ class SessionManager:
         *,
         run_id: str,
         reason: str,
+        expected_request_id: str | None = None,
+        expected_snapshot_id: str | None = None,
+        expected_revision: int | None = None,
     ) -> dict[str, Any] | None:
         """Invalidate the latest live request when work resumes after declaring done."""
 
@@ -1315,11 +1465,21 @@ class SessionManager:
             for raw in requests.values()
             if isinstance(raw, dict)
             and str(raw.get("run_id") or "") == run_id
-            and str(raw.get("status") or "") == GoalCompletionRequestStatus.REQUESTED.value
+            and str(raw.get("status") or "")
+            in {
+                GoalCompletionRequestStatus.REQUESTED.value,
+                GoalCompletionRequestStatus.EVALUATING.value,
+            }
         ]
         if not candidates:
             return None
         request = max(candidates, key=lambda item: item.requested_at)
+        if expected_request_id is not None and request.request_id != expected_request_id:
+            raise ValueError("Completion request CAS failed: request identity changed")
+        if expected_snapshot_id is not None and request.evaluation_snapshot_id != expected_snapshot_id:
+            raise ValueError("Completion request CAS failed: snapshot identity changed")
+        if expected_revision is not None and request.objective_revision != expected_revision:
+            raise ValueError("Completion request CAS failed: Goal revision changed")
         request.status = GoalCompletionRequestStatus.INVALIDATED
         request.invalidated_reason = str(reason or "post_completion_tool_call")[:500]
         request.decided_at = time.time()
@@ -1350,11 +1510,32 @@ class SessionManager:
         request = GoalCompletionRequest.model_validate(raw)
         next_status = GoalCompletionRequestStatus(status)
         if request.status == next_status:
+            if verification_report_id and request.verification_report_id != verification_report_id:
+                request.verification_report_id = verification_report_id
+                requests[request_id] = request.model_dump(mode="json")
+                self._write_file(session_id, data)
             return request.model_dump(mode="json")
-        if request.status not in {
-            GoalCompletionRequestStatus.REQUESTED,
-            GoalCompletionRequestStatus.EVALUATING,
-        }:
+        allowed_from = {
+            GoalCompletionRequestStatus.REQUESTED: {
+                GoalCompletionRequestStatus.EVALUATING,
+                GoalCompletionRequestStatus.NEEDS_REVISION,
+                GoalCompletionRequestStatus.ACCEPTED,
+                GoalCompletionRequestStatus.REJECTED,
+                GoalCompletionRequestStatus.INVALIDATED,
+            },
+            GoalCompletionRequestStatus.EVALUATING: {
+                GoalCompletionRequestStatus.NEEDS_REVISION,
+                GoalCompletionRequestStatus.ACCEPTED,
+                GoalCompletionRequestStatus.REJECTED,
+                GoalCompletionRequestStatus.INVALIDATED,
+            },
+            GoalCompletionRequestStatus.NEEDS_REVISION: {
+                GoalCompletionRequestStatus.EVALUATING,
+                GoalCompletionRequestStatus.REJECTED,
+                GoalCompletionRequestStatus.INVALIDATED,
+            },
+        }
+        if next_status not in allowed_from.get(request.status, set()):
             raise ValueError(f"Completion request {request_id} is already decided")
         request.status = next_status
         request.verification_report_id = verification_report_id or request.verification_report_id
@@ -1367,6 +1548,8 @@ class SessionManager:
             GoalCompletionRequestStatus.NEEDS_REVISION,
         }:
             request.decided_at = time.time()
+        elif next_status == GoalCompletionRequestStatus.EVALUATING:
+            request.decided_at = None
         requests[request_id] = request.model_dump(mode="json")
         self._write_file(session_id, data)
         return request.model_dump(mode="json")
@@ -1888,7 +2071,635 @@ class SessionManager:
         result.setdefault("run_order", [])
         result.setdefault("goals", {})
         result.setdefault("goal_order", [])
+        result.setdefault("evaluation_snapshots", {})
+        result.setdefault("verification_records", {})
+        result.setdefault("verification_operations", {})
+        result.setdefault("verification_invalidations", {})
+        result.setdefault("verification_proposals", {})
+        result.setdefault("run_review_reports", {})
         return result
+
+    @_session_write_locked
+    def freeze_evaluation_snapshot(
+        self,
+        session_id: str,
+        snapshot: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Persist one immutable verifier input after rechecking its authority."""
+
+        from graph.verification.models import (
+            EvaluationInputSnapshot,
+            EvaluationSubjectKind,
+            stable_digest,
+        )
+        from graph.verification.snapshots import snapshot_id_for
+        from harness.models import (
+            GoalCompletionRequest,
+            GoalCompletionRequestStatus,
+            GoalStatus,
+            RunRecord,
+            RunStatus,
+        )
+
+        parsed = EvaluationInputSnapshot.model_validate(snapshot)
+        expected_snapshot_id = snapshot_id_for(
+            parsed.subject,
+            contract_hash=parsed.contract_hash,
+            transcript_digest=parsed.transcript_digest,
+            evidence_digest=parsed.evidence_digest,
+            artifact_fingerprints=parsed.artifact_fingerprints,
+            workspace_fingerprint=parsed.workspace_fingerprint,
+            transcript_projection_version=parsed.transcript_projection_version,
+            grader_policy_version=parsed.grader_policy_version,
+            grader_policy_hash=parsed.grader_policy_hash,
+            candidate_message_id=parsed.candidate_message_id,
+            candidate_content_digest=parsed.candidate_content_digest,
+            candidate_tool_calls_digest=parsed.candidate_tool_calls_digest,
+            permission_epoch=parsed.permission_epoch,
+        )
+        if parsed.snapshot_id != expected_snapshot_id:
+            raise ValueError("Evaluation snapshot identity does not match its canonical inputs")
+        if parsed.subject.session_id != session_id:
+            raise ValueError("Evaluation snapshot Session identity does not match")
+        data = self._read_file(session_id)
+        if not data:
+            raise FileNotFoundError(f"Session {session_id} not found")
+        harness = data.setdefault("harness", {})
+        runs = harness.setdefault("runs", {})
+        raw_run = runs.get(parsed.subject.run_id)
+        if not isinstance(raw_run, dict):
+            raise ValueError(f"Run {parsed.subject.run_id} does not exist in session {session_id}")
+        run = RunRecord.model_validate(raw_run)
+        if run.query_id != parsed.subject.query_id:
+            raise ValueError("Evaluation snapshot query identity does not match its Run")
+        for binding in parsed.evidence_bindings:
+            resolved_evidence = resolve_evidence_ref(
+                data,
+                binding.ref,
+                goal_id=parsed.subject.goal_id,
+                goal_revision=parsed.subject.goal_revision,
+                require_inheritable=(
+                    parsed.subject.kind == EvaluationSubjectKind.GOAL_COMPLETION_REQUEST
+                ),
+                allow_artifact_revision_inheritance=True,
+            )
+            if resolved_evidence is None:
+                raise ValueError("Evaluation snapshot cites missing or stale evidence")
+            if stable_digest(resolved_evidence.model_dump(mode="json")) != binding.record_digest:
+                raise ValueError("Evaluation snapshot evidence binding digest is stale")
+        contract = run.verification_contract
+        if contract is not None:
+            if stable_digest(contract.model_dump(mode="json")) != parsed.contract_hash:
+                raise ValueError("Evaluation snapshot contract hash does not match its Run")
+
+        if parsed.subject.kind == EvaluationSubjectKind.GOAL_COMPLETION_REQUEST:
+            goals = harness.get("goals")
+            requests = harness.get("completion_requests")
+            raw_goal = goals.get(parsed.subject.goal_id) if isinstance(goals, dict) else None
+            raw_request = (
+                requests.get(parsed.subject.completion_request_id)
+                if isinstance(requests, dict)
+                else None
+            )
+            if not isinstance(raw_goal, dict) or not isinstance(raw_request, dict):
+                raise ValueError("Goal completion evaluation authority does not exist")
+            request = GoalCompletionRequest.model_validate(raw_request)
+            if (
+                str(raw_goal.get("status") or "") != GoalStatus.ACTIVE.value
+                or str(raw_goal.get("current_run_id") or "") != run.run_id
+                or int(raw_goal.get("objective_revision") or 0) != parsed.subject.goal_revision
+                or run.goal_id != parsed.subject.goal_id
+                or run.goal_revision != parsed.subject.goal_revision
+                or request.request_id != parsed.subject.completion_request_id
+                or request.goal_id != parsed.subject.goal_id
+                or request.run_id != run.run_id
+                or request.objective_revision != parsed.subject.goal_revision
+                or request.status not in {
+                    GoalCompletionRequestStatus.REQUESTED,
+                    GoalCompletionRequestStatus.EVALUATING,
+                    GoalCompletionRequestStatus.NEEDS_REVISION,
+                }
+                or run.completion_request_id != request.request_id
+                or str(raw_goal.get("latest_completion_request_id") or "") != request.request_id
+            ):
+                raise ValueError("Goal completion evaluation snapshot is stale before grading")
+        elif run.goal_id is not None or run.completion_request_id is not None:
+            raise ValueError("Ordinary Run review cannot acquire Goal completion authority")
+
+        snapshots = harness.setdefault("evaluation_snapshots", {})
+        payload = parsed.model_dump(mode="json")
+        existing = snapshots.get(parsed.snapshot_id)
+        if isinstance(existing, dict):
+            existing_canonical = {key: value for key, value in existing.items() if key != "created_at"}
+            payload_canonical = {key: value for key, value in payload.items() if key != "created_at"}
+            if existing_canonical != payload_canonical:
+                raise ValueError(f"Evaluation snapshot {parsed.snapshot_id} is immutable")
+            return deepcopy(existing)
+        snapshots[parsed.snapshot_id] = payload
+        raw_run["evaluation_snapshot_id"] = parsed.snapshot_id
+        if parsed.subject.completion_request_id:
+            requests = harness.setdefault("completion_requests", {})
+            raw_request = requests.get(parsed.subject.completion_request_id)
+            if isinstance(raw_request, dict):
+                raw_request["evaluation_snapshot_id"] = parsed.snapshot_id
+                raw_request["status"] = GoalCompletionRequestStatus.EVALUATING.value
+            if run.status == RunStatus.RUNNING:
+                raw_run["status"] = RunStatus.EVALUATING.value
+        self._write_file(session_id, data)
+        return deepcopy(payload)
+
+    @_session_write_locked
+    def reserve_verification_operation(
+        self,
+        session_id: str,
+        *,
+        snapshot_id: str,
+        method: str,
+        verifier_policy_hash: str,
+        operation_metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Atomically allocate a retry attempt and durable operation identity."""
+
+        from graph.verification.models import VerificationMethod, verification_operation_id
+
+        parsed_method = VerificationMethod(method)
+        data = self._read_file(session_id)
+        if not data:
+            raise FileNotFoundError(f"Session {session_id} not found")
+        harness = data.setdefault("harness", {})
+        snapshots = harness.get("evaluation_snapshots")
+        if not isinstance(snapshots, dict) or snapshot_id not in snapshots:
+            raise ValueError(f"Verification snapshot {snapshot_id} does not exist")
+        operations = harness.setdefault("verification_operations", {})
+        # A restart or a duplicate caller must continue the live attempt.  A
+        # completed attempt remains immutable and therefore gets a new retry
+        # number; pending/running are the durable job queue.
+        existing_live = [
+            item
+            for item in operations.values()
+            if isinstance(item, dict)
+            and item.get("snapshot_id") == snapshot_id
+            and item.get("method") == parsed_method.value
+            and item.get("verifier_policy_hash") == verifier_policy_hash
+            and item.get("status") in {"pending", "running"}
+        ]
+        if existing_live:
+            return deepcopy(max(existing_live, key=lambda item: int(item.get("attempt_no") or 0)))
+        attempts = [
+            int(item.get("attempt_no") or 0)
+            for item in operations.values()
+            if isinstance(item, dict)
+            and item.get("snapshot_id") == snapshot_id
+            and item.get("method") == parsed_method.value
+        ]
+        attempt_no = max(attempts, default=-1) + 1
+        operation_id = verification_operation_id(
+            snapshot_id,
+            parsed_method,
+            attempt_no,
+            verifier_policy_hash,
+        )
+        operation = {
+            "operation_id": operation_id,
+            "snapshot_id": snapshot_id,
+            "method": parsed_method.value,
+            "attempt_no": attempt_no,
+            "verifier_policy_hash": verifier_policy_hash,
+            "status": "pending",
+            "created_at": time.time(),
+        }
+        if isinstance(operation_metadata, dict):
+            # Metadata is routing/audit context only; it is not part of the
+            # operation identity and cannot alter a frozen verification input.
+            for key in ("review_policy", "manual"):
+                if key in operation_metadata:
+                    operation[key] = deepcopy(operation_metadata[key])
+        existing = operations.get(operation_id)
+        if isinstance(existing, dict):
+            return deepcopy(existing)
+        operations[operation_id] = operation
+        self._write_file(session_id, data)
+        return deepcopy(operation)
+
+    @_session_write_locked
+    def claim_verification_operation(
+        self,
+        session_id: str,
+        operation_id: str,
+        *,
+        owner: str,
+        lease_seconds: float = 300.0,
+    ) -> dict[str, Any] | None:
+        """Claim one durable verification job, recovering an expired worker lease.
+
+        The claim is the cross-process idempotency boundary.  A live claim is
+        returned unchanged so a second manager can report ``pending`` without
+        starting a second grader call.
+        """
+
+        data = self._read_file(session_id)
+        if not data:
+            raise FileNotFoundError(f"Session {session_id} not found")
+        harness = data.setdefault("harness", {})
+        operations = harness.setdefault("verification_operations", {})
+        operation = operations.get(operation_id)
+        if not isinstance(operation, dict):
+            raise ValueError(f"Verification operation {operation_id} does not exist")
+        now = time.time()
+        status = str(operation.get("status") or "pending")
+        lease_until = float(operation.get("lease_expires_at") or 0)
+        if status == "completed":
+            return deepcopy(operation)
+        if status == "running" and lease_until > now and operation.get("owner") != owner:
+            return deepcopy(operation)
+        operation["status"] = "running"
+        operation["owner"] = owner
+        operation["started_at"] = operation.get("started_at") or now
+        operation["lease_expires_at"] = now + max(1.0, float(lease_seconds))
+        operation["updated_at"] = now
+        self._write_file(session_id, data)
+        return deepcopy(operation)
+
+    @_session_write_locked
+    def release_verification_operation(
+        self,
+        session_id: str,
+        operation_id: str,
+        *,
+        owner: str,
+        error: str | None = None,
+    ) -> dict[str, Any]:
+        """Return a failed review job to the durable pending queue."""
+
+        data = self._read_file(session_id)
+        if not data:
+            raise FileNotFoundError(f"Session {session_id} not found")
+        operations = data.setdefault("harness", {}).setdefault("verification_operations", {})
+        operation = operations.get(operation_id)
+        if not isinstance(operation, dict):
+            raise ValueError(f"Verification operation {operation_id} does not exist")
+        if operation.get("status") == "completed":
+            return deepcopy(operation)
+        if operation.get("owner") not in {None, owner}:
+            return deepcopy(operation)
+        operation["status"] = "pending"
+        operation["retry_count"] = int(operation.get("retry_count") or 0) + 1
+        operation["last_error"] = str(error or "")[:500] or None
+        operation.pop("owner", None)
+        operation.pop("lease_expires_at", None)
+        operation["updated_at"] = time.time()
+        self._write_file(session_id, data)
+        return deepcopy(operation)
+
+    def list_pending_run_reviews(self) -> list[dict[str, Any]]:
+        """Enumerate ordinary Run review jobs that survive a process restart."""
+
+        if self._sessions_dir is None:
+            return []
+        jobs: list[dict[str, Any]] = []
+        # Do not use the sidebar projection here: this is a durable worker
+        # queue and must inspect all eligible session records directly.
+        for path in sorted(self._sessions_dir.glob("*.json")):
+            if not path.is_file() or path.is_symlink() or not re.fullmatch(
+                r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}", path.stem
+            ):
+                continue
+            session_id = path.stem
+            data = self._read_file(session_id)
+            harness = data.get("harness") if isinstance(data, dict) else None
+            runs = harness.get("runs") if isinstance(harness, dict) else None
+            operations = harness.get("verification_operations") if isinstance(harness, dict) else None
+            snapshots = harness.get("evaluation_snapshots") if isinstance(harness, dict) else None
+            if not all(isinstance(item, dict) for item in (runs, operations, snapshots)):
+                continue
+            for run_id, raw_run in runs.items():
+                if not isinstance(raw_run, dict):
+                    continue
+                if raw_run.get("run_kind") != "standalone" or raw_run.get("goal_id") is not None:
+                    continue
+                if raw_run.get("status") not in {
+                    "completed",
+                    "cancelled",
+                    "failed",
+                    "blocked",
+                    "budget_exceeded",
+                    "verification_failed",
+                } or raw_run.get("run_review_report_id"):
+                    continue
+                snapshot_id = str(raw_run.get("evaluation_snapshot_id") or "")
+                snapshot = snapshots.get(snapshot_id)
+                subject = snapshot.get("subject") if isinstance(snapshot, dict) else None
+                if not isinstance(subject, dict) or subject.get("kind") != "run_output":
+                    continue
+                for operation in operations.values():
+                    if not isinstance(operation, dict):
+                        continue
+                    if (
+                        operation.get("snapshot_id") == snapshot_id
+                        and operation.get("method") == "semantic_rubric"
+                        and operation.get("status") in {"pending", "running"}
+                    ):
+                        jobs.append(
+                            {
+                                "session_id": session_id,
+                                "run_id": str(run_id),
+                                "operation_id": operation.get("operation_id"),
+                                "snapshot_id": snapshot_id,
+                                "operation": deepcopy(operation),
+                            }
+                        )
+                        break
+        return jobs
+
+    def get_evaluation_snapshot(self, session_id: str, snapshot_id: str) -> dict[str, Any] | None:
+        harness = self.get_harness_state(session_id)
+        snapshots = harness.get("evaluation_snapshots")
+        item = snapshots.get(snapshot_id) if isinstance(snapshots, dict) else None
+        return deepcopy(item) if isinstance(item, dict) else None
+
+    @_session_write_locked
+    def record_verification_record(
+        self,
+        session_id: str,
+        record: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Persist an immutable verification result bound to a known snapshot."""
+
+        from graph.verification.models import EvaluationInputSnapshot, VerificationRecord, stable_digest
+
+        parsed = VerificationRecord.model_validate(record)
+        data = self._read_file(session_id)
+        if not data:
+            raise FileNotFoundError(f"Session {session_id} not found")
+        harness = data.setdefault("harness", {})
+        snapshots = harness.get("evaluation_snapshots")
+        raw_snapshot = snapshots.get(parsed.snapshot_id) if isinstance(snapshots, dict) else None
+        if not isinstance(raw_snapshot, dict):
+            raise ValueError(f"Verification snapshot {parsed.snapshot_id} does not exist")
+        snapshot = EvaluationInputSnapshot.model_validate(raw_snapshot)
+        if parsed.input_digest != stable_digest(snapshot.model_dump(mode="json")):
+            raise ValueError("Verification record input digest does not match its snapshot")
+        snapshot_refs = {item.model_dump_json() for item in snapshot.evidence_refs}
+        if any(item.model_dump_json() not in snapshot_refs for item in parsed.evidence_refs):
+            raise ValueError("Verification record cites evidence outside its frozen snapshot")
+        records = harness.setdefault("verification_records", {})
+        operations = harness.setdefault("verification_operations", {})
+        payload = parsed.model_dump(mode="json")
+        existing = records.get(parsed.verification_id)
+        if isinstance(existing, dict):
+            if existing != payload:
+                raise ValueError(f"Verification record {parsed.verification_id} is immutable")
+            return deepcopy(existing)
+        existing_operation = operations.get(parsed.operation_id)
+        if isinstance(existing_operation, dict):
+            if (
+                existing_operation.get("snapshot_id") != parsed.snapshot_id
+                or existing_operation.get("method") != parsed.method.value
+                or int(existing_operation.get("attempt_no") or 0) != parsed.attempt_no
+                or existing_operation.get("verifier_policy_hash") != parsed.verifier_policy_hash
+            ):
+                raise ValueError("Verification record does not match its reserved operation")
+            prior_result = existing_operation.get("verification_id")
+            if prior_result and prior_result != parsed.verification_id:
+                raise ValueError(f"Verification operation {parsed.operation_id} already has a result")
+        elif existing_operation:
+            if existing_operation != parsed.verification_id:
+                raise ValueError(f"Verification operation {parsed.operation_id} already has a result")
+        else:
+            raise ValueError("Verification operation must be reserved before recording a result")
+        records[parsed.verification_id] = payload
+        operation = operations[parsed.operation_id]
+        if isinstance(operation, dict):
+            operation["status"] = "completed"
+            operation["verification_id"] = parsed.verification_id
+            operation["completed_at"] = parsed.completed_at
+            operation.pop("owner", None)
+            operation.pop("lease_expires_at", None)
+            operation["updated_at"] = parsed.completed_at
+        self._write_file(session_id, data)
+        return deepcopy(payload)
+
+    def list_verification_records(
+        self,
+        session_id: str,
+        *,
+        snapshot_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        harness = self.get_harness_state(session_id)
+        records = harness.get("verification_records")
+        if not isinstance(records, dict):
+            return []
+        return [
+            deepcopy(item)
+            for item in records.values()
+            if isinstance(item, dict) and (snapshot_id is None or item.get("snapshot_id") == snapshot_id)
+        ]
+
+    @_session_write_locked
+    def mark_verification_records_stale(
+        self,
+        session_id: str,
+        *,
+        snapshot_id: str,
+        reason: str,
+    ) -> list[dict[str, Any]]:
+        """Append invalidations without mutating immutable verification records."""
+
+        import hashlib
+
+        from graph.verification.models import VerificationInvalidation
+
+        stale_reason = str(reason or "verification_input_changed").strip()[:500]
+        if not stale_reason:
+            raise ValueError("stale verification records require a reason")
+        data = self._read_file(session_id)
+        if not data:
+            raise FileNotFoundError(f"Session {session_id} not found")
+        harness = data.get("harness")
+        records = harness.get("verification_records") if isinstance(harness, dict) else None
+        if not isinstance(records, dict):
+            return []
+        invalidations = harness.setdefault("verification_invalidations", {})
+        updated: list[dict[str, Any]] = []
+        for verification_id, raw in records.items():
+            if not isinstance(raw, dict) or raw.get("snapshot_id") != snapshot_id:
+                continue
+            digest = hashlib.sha256(
+                f"{verification_id}\0{snapshot_id}\0{stale_reason}".encode()
+            ).hexdigest()
+            marker = VerificationInvalidation(
+                invalidation_id=f"verification-invalidation-{digest[:24]}",
+                verification_id=verification_id,
+                snapshot_id=snapshot_id,
+                reason=stale_reason,
+            )
+            payload = marker.model_dump(mode="json")
+            existing = invalidations.get(marker.invalidation_id)
+            if isinstance(existing, dict):
+                updated.append(deepcopy(existing))
+                continue
+            invalidations[marker.invalidation_id] = payload
+            updated.append(deepcopy(payload))
+        if updated:
+            self._write_file(session_id, data)
+        return updated
+
+    @_session_write_locked
+    def record_verification_proposal(
+        self,
+        session_id: str,
+        proposal: dict[str, Any],
+    ) -> dict[str, Any]:
+        from graph.verification.models import VerificationProposal, VerificationRecord
+
+        parsed = VerificationProposal.model_validate(proposal)
+        data = self._read_file(session_id)
+        if not data:
+            raise FileNotFoundError(f"Session {session_id} not found")
+        harness = data.setdefault("harness", {})
+        snapshots = harness.get("evaluation_snapshots")
+        records = harness.get("verification_records")
+        raw_snapshot = snapshots.get(parsed.snapshot_id) if isinstance(snapshots, dict) else None
+        if not isinstance(raw_snapshot, dict):
+            raise ValueError("Verification proposal snapshot does not exist")
+        for verification_id in parsed.verification_record_ids:
+            raw = records.get(verification_id) if isinstance(records, dict) else None
+            if not isinstance(raw, dict):
+                raise ValueError(f"Verification record {verification_id} does not exist")
+            record = VerificationRecord.model_validate(raw)
+            if record.snapshot_id != parsed.snapshot_id:
+                raise ValueError("Verification proposal cannot mix snapshots")
+        proposals = harness.setdefault("verification_proposals", {})
+        payload = parsed.model_dump(mode="json")
+        existing = proposals.get(parsed.proposal_id)
+        if isinstance(existing, dict) and existing != payload:
+            raise ValueError(f"Verification proposal {parsed.proposal_id} is immutable")
+        proposals[parsed.proposal_id] = payload
+        self._write_file(session_id, data)
+        return deepcopy(payload)
+
+    def get_verification_proposal(
+        self,
+        session_id: str,
+        proposal_id: str,
+    ) -> dict[str, Any] | None:
+        """Return one immutable verifier proposal from the control plane."""
+
+        harness = self.get_harness_state(session_id)
+        proposals = harness.get("verification_proposals")
+        raw = proposals.get(proposal_id) if isinstance(proposals, dict) else None
+        return deepcopy(raw) if isinstance(raw, dict) else None
+
+    def list_verification_invalidations(
+        self,
+        session_id: str,
+        *,
+        snapshot_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        harness = self.get_harness_state(session_id)
+        invalidations = harness.get("verification_invalidations")
+        if not isinstance(invalidations, dict):
+            return []
+        return [
+            deepcopy(item)
+            for item in invalidations.values()
+            if isinstance(item, dict)
+            and (snapshot_id is None or item.get("snapshot_id") == snapshot_id)
+        ]
+
+    @_session_write_locked
+    def record_run_review_report(
+        self,
+        session_id: str,
+        report: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Attach an ordinary-Run review without granting Goal authority."""
+
+        from graph.verification.models import (
+            EvaluationInputSnapshot,
+            EvaluationSubjectKind,
+            RunReviewReport,
+            VerificationRecord,
+        )
+        from harness.models import RunRecord, RunReviewPolicy
+
+        parsed = RunReviewReport.model_validate(report)
+        data = self._read_file(session_id)
+        if not data:
+            raise FileNotFoundError(f"Session {session_id} not found")
+        harness = data.setdefault("harness", {})
+        prior_reports = harness.get("run_review_reports")
+        if isinstance(prior_reports, dict):
+            for prior in prior_reports.values():
+                if (
+                    isinstance(prior, dict)
+                    and prior.get("run_id") == parsed.run_id
+                    and prior.get("snapshot_id") == parsed.snapshot_id
+                    and prior.get("operation_id") == parsed.operation_id
+                ):
+                    return deepcopy(prior)
+        runs = harness.get("runs")
+        snapshots = harness.get("evaluation_snapshots")
+        raw_run = runs.get(parsed.run_id) if isinstance(runs, dict) else None
+        raw_snapshot = snapshots.get(parsed.snapshot_id) if isinstance(snapshots, dict) else None
+        if not isinstance(raw_run, dict) or not isinstance(raw_snapshot, dict):
+            raise ValueError("Run review requires an existing Run and snapshot")
+        snapshot = EvaluationInputSnapshot.model_validate(raw_snapshot)
+        run = RunRecord.model_validate(raw_run)
+        if (
+            snapshot.subject.kind != EvaluationSubjectKind.RUN_OUTPUT
+            or snapshot.subject.run_id != parsed.run_id
+            or run.goal_id is not None
+            or run.completion_request_id is not None
+        ):
+            raise ValueError("Run review snapshot cannot carry Goal completion authority")
+        expected_policy = RunReviewPolicy(parsed.policy)
+        if (
+            expected_policy == RunReviewPolicy.OFF
+            or (run.run_review_policy != expected_policy and not parsed.manual)
+        ):
+            raise ValueError("Run review report policy does not match its frozen Run policy")
+        published = any(
+            isinstance(message, dict)
+            and message.get("role") == "assistant"
+            and message.get("query_id") == run.query_id
+            and str(message.get("status") or "") == "completed"
+            for message in data.get("messages") or []
+        )
+        if expected_policy == RunReviewPolicy.SHADOW and (not run.terminal or not published):
+            raise ValueError("Shadow review may be recorded only after the Run answer is published")
+        if expected_policy == RunReviewPolicy.BLOCKING_ONE_SHOT and (run.terminal or published):
+            raise ValueError("Blocking review must be recorded before Run publication")
+        records = harness.get("verification_records")
+        for verification_id in parsed.verification_record_ids:
+            raw_record = records.get(verification_id) if isinstance(records, dict) else None
+            if not isinstance(raw_record, dict):
+                raise ValueError(f"Run review record {verification_id} does not exist")
+            if VerificationRecord.model_validate(raw_record).snapshot_id != parsed.snapshot_id:
+                raise ValueError("Run review report cannot mix verification snapshots")
+        operations = harness.get("verification_operations")
+        operation = operations.get(parsed.operation_id) if isinstance(operations, dict) else None
+        if not isinstance(operation, dict):
+            raise ValueError(f"Run review operation {parsed.operation_id} does not exist")
+        if (
+            operation.get("snapshot_id") != parsed.snapshot_id
+            or operation.get("method") != "semantic_rubric"
+        ):
+            raise ValueError("Run review report does not match its operation")
+        reports = harness.setdefault("run_review_reports", {})
+        payload = parsed.model_dump(mode="json")
+        existing = reports.get(parsed.report_id)
+        if isinstance(existing, dict) and existing != payload:
+            raise ValueError(f"Run review report {parsed.report_id} is immutable")
+        reports[parsed.report_id] = payload
+        operation["status"] = "completed"
+        operation["report_id"] = parsed.report_id
+        operation["completed_at"] = parsed.completed_at
+        operation.pop("owner", None)
+        operation.pop("lease_expires_at", None)
+        raw_run["run_review_report_id"] = parsed.report_id
+        self._write_file(session_id, data)
+        return deepcopy(payload)
 
     def get_run_state(
         self,
@@ -1904,6 +2715,37 @@ class SessionManager:
             return None
         run = runs.get(effective_id)
         return deepcopy(run) if isinstance(run, dict) else None
+
+    @_session_write_locked
+    def attach_manual_run_review_contract(
+        self,
+        session_id: str,
+        run_id: str,
+        contract: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Attach the first immutable review contract to a completed ordinary Run."""
+
+        from harness.models import RunKind, RunRecord, RunVerificationContract
+
+        parsed_contract = RunVerificationContract.model_validate(contract)
+        data = self._read_file(session_id)
+        harness = data.get("harness") if data else None
+        runs = harness.get("runs") if isinstance(harness, dict) else None
+        raw_run = runs.get(run_id) if isinstance(runs, dict) else None
+        if not isinstance(raw_run, dict):
+            raise ValueError(f"Run {run_id} does not exist")
+        run = RunRecord.model_validate(raw_run)
+        if run.run_kind != RunKind.STANDALONE or not run.terminal or run.goal_id is not None:
+            raise ValueError("Manual review is available only for completed ordinary Runs")
+        existing = run.verification_contract
+        if existing is not None and existing.model_dump(mode="json") != parsed_contract.model_dump(mode="json"):
+            raise ValueError("Run review contract is immutable")
+        if existing is None:
+            raw_run["verification_enabled"] = True
+            raw_run["declared_verification_contract"] = parsed_contract.model_dump(mode="json")
+            raw_run["verification_contract"] = parsed_contract.model_dump(mode="json")
+            self._write_file(session_id, data)
+        return deepcopy(raw_run)
 
     @_session_write_locked
     def reserve_delta_repair_tool_call(

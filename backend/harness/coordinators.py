@@ -27,6 +27,7 @@ from harness.models import (
     RunKind,
     RunOutcome,
     RunRecord,
+    RunReviewPolicy,
     RunStatus,
     RunTaskProfile,
     RunVerificationContract,
@@ -985,6 +986,7 @@ class HarnessRunCoordinator:
         analytics_model_id: str | None = None,
         config_snapshot: dict[str, Any] | None = None,
         verification_enabled: bool = True,
+        run_review_policy: RunReviewPolicy | str = RunReviewPolicy.OFF,
         completion_policy: GoalCompletionPolicy | str = GoalCompletionPolicy.STANDARD,
         goal_max_rounds: int = 8,
         custom_rubric_rules: list[dict[str, Any]] | None = None,
@@ -1018,16 +1020,30 @@ class HarnessRunCoordinator:
             )
         )
         resolved_completion_policy = GoalCompletionPolicy(completion_policy)
+        resolved_review_policy = RunReviewPolicy(run_review_policy)
+        if resolved_run_kind != RunKind.STANDALONE:
+            resolved_review_policy = RunReviewPolicy.OFF
+        review_contract_required = (
+            resolved_run_kind == RunKind.STANDALONE
+            and resolved_review_policy != RunReviewPolicy.OFF
+        )
         contract = (
             self.verification.compile_contract(
                 user_message=objective,
                 analytics_model_id=analytics_model_id,
                 project_id=project_id,
                 custom_rules=custom_rubric_rules,
-                force_required=(resolved_run_kind == RunKind.GOAL_EXECUTION),
+                force_required=(
+                    resolved_run_kind == RunKind.GOAL_EXECUTION
+                    or review_contract_required
+                ),
                 task_profile=task_profile,
             )
-            if verification_enabled and resolved_completion_policy == GoalCompletionPolicy.RUBRIC
+            # Ordinary Runs still need their proportional verification
+            # contract even when independent review is off. RunReviewPolicy
+            # controls the extra grader, not whether execution evidence and
+            # deterministic checks are modeled at all.
+            if verification_enabled
             else None
         )
         goal = (
@@ -1083,7 +1099,7 @@ class HarnessRunCoordinator:
                 message=effective_objective,
                 activations=[],
             )
-            if verification_enabled
+            if verification_enabled and contract is not None
             else None
         )
         follow_up_artifacts = (
@@ -1139,6 +1155,7 @@ class HarnessRunCoordinator:
             project_id=project_id,
             analytics_model_id=analytics_model_id,
             verification_enabled=verification_enabled,
+            run_review_policy=resolved_review_policy,
             verification_mode=(
                 VerificationMode.RUBRIC
                 if resolved_completion_policy == GoalCompletionPolicy.RUBRIC
@@ -1251,7 +1268,12 @@ class HarnessRunCoordinator:
             request = GoalCompletionRequest.model_validate(raw_request) if isinstance(raw_request, dict) else None
             if not (
                 request is not None
-                and request.status == GoalCompletionRequestStatus.REQUESTED
+                and request.status
+                in {
+                    GoalCompletionRequestStatus.REQUESTED,
+                    GoalCompletionRequestStatus.EVALUATING,
+                    GoalCompletionRequestStatus.NEEDS_REVISION,
+                }
                 and request.policy == GoalCompletionPolicy.RUBRIC
                 and request.goal_id == goal.goal_id
                 and request.run_id == run.run_id
@@ -1389,15 +1411,59 @@ class HarnessRunCoordinator:
             }
         )
         state["_harness_context"] = harness_context
-        report = self.verification.report_from_final_state(
-            run_id=run.run_id,
-            contract=(
-                run.verification_contract
-                if run.requires_goal_verification
-                else None
-            ),
-            final_state=state,
-        )
+        raw_proposal_report = state.get("_verification_proposal_report")
+        if run.requires_goal_verification:
+            # Private graph-state channels are not guaranteed to survive every
+            # LangGraph output projection. The immutable Session control plane
+            # is authoritative once the verifier has persisted a proposal.
+            if not isinstance(raw_proposal_report, dict) and request is not None:
+                raw_proposal = self._sessions.get_verification_proposal(
+                    run.session_id,
+                    str(request.verification_report_id or ""),
+                )
+                if isinstance(raw_proposal, dict) and run.verification_contract is not None:
+                    from graph.verification.models import VerificationProposal
+                    from graph.verification.report_merger import proposal_to_rubric_report
+
+                    restored_report = proposal_to_rubric_report(
+                        VerificationProposal.model_validate(raw_proposal),
+                        contract=run.verification_contract,
+                        goal_revision=run.goal_revision,
+                    )
+                    restored_report.verification_scope = "goal_aggregate"
+                    restored_report.supporting_run_ids = list(
+                        dict.fromkeys([*(goal.run_ids if goal is not None else []), run.run_id])
+                    )
+                    raw_proposal_report = restored_report.model_dump(mode="json")
+            if not isinstance(raw_proposal_report, dict):
+                # Legacy/incomplete state remains readable for diagnostics and
+                # control-budget accounting, but it can never become accepted
+                # completion authority. This preserves safe failure handling
+                # during migration without manufacturing a frozen snapshot.
+                report = self.verification.report_from_final_state(
+                    run_id=run.run_id,
+                    contract=run.verification_contract,
+                    final_state=state,
+                )
+                if report.status == VerificationStatus.SATISFIED:
+                    raise ValueError(
+                        "Goal Rubric completion reached settlement without a frozen verification proposal"
+                    )
+            else:
+                report = RubricEvaluationReport.model_validate(raw_proposal_report)
+                if (
+                    report.source_format != "verification_records_v1"
+                    or report.run_id != run.run_id
+                    or not report.snapshot_id
+                    or report.snapshot_id != run.evaluation_snapshot_id
+                ):
+                    raise ValueError("Verification proposal is not bound to the current Run snapshot")
+        else:
+            report = self.verification.report_from_final_state(
+                run_id=run.run_id,
+                contract=None,
+                final_state=state,
+            )
         if goal is not None:
             report.verification_scope = "goal_aggregate"
             report.supporting_run_ids = list(dict.fromkeys([*goal.run_ids, run.run_id]))
@@ -1419,7 +1485,11 @@ class HarnessRunCoordinator:
             and outcome == RunOutcome.COMPLETED
             and report.status == VerificationStatus.SATISFIED
         ):
-            report.accepted_for_goal_revision = True
+            report.accepted_for_goal_revision = (
+                None
+                if report.source_format == "verification_records_v1"
+                else True
+            )
             report.goal_revision = run.goal_revision
             report.verification_scope = "goal_aggregate"
             report.supporting_run_ids = list(dict.fromkeys([*goal.run_ids, run.run_id]))
@@ -1498,6 +1568,8 @@ class HarnessRunCoordinator:
         run.verification_activations = list(current.verification_activations)
         run.completion_request_id = current.completion_request_id
         run.completion_requested_at = current.completion_requested_at
+        run.evaluation_snapshot_id = current.evaluation_snapshot_id
+        run.run_review_report_id = current.run_review_report_id
         if current.verification_contract is not None:
             run.verification_contract = current.verification_contract
 

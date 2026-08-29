@@ -80,6 +80,20 @@ class VerificationMode(StrEnum):
     RUBRIC = "rubric"
 
 
+class RunReviewPolicy(StrEnum):
+    """Optional independent review applied to an ordinary Run output.
+
+    This is deliberately separate from ``VerificationMode``.  A Run may keep
+    agent/proportional execution semantics while its final output is reviewed
+    asynchronously or once before publication.  Neither review policy creates
+    Goal completion authority.
+    """
+
+    OFF = "off"
+    SHADOW = "shadow"
+    BLOCKING_ONE_SHOT = "blocking_one_shot"
+
+
 class GoalCompletionPolicy(StrEnum):
     """Who accepts an Agent's explicit Goal completion declaration."""
 
@@ -146,6 +160,7 @@ class CriterionSource(StrEnum):
 
 class VerifierKind(StrEnum):
     DETERMINISTIC = "deterministic"
+    ENVIRONMENT = "environment"
     ANALYTICS = "analytics"
     LLM_GRADER = "llm_grader"
 
@@ -619,6 +634,9 @@ class RubricEvaluationReport(BaseModel):
     supporting_run_ids: list[str] = Field(default_factory=list)
     goal_revision: int | None = None
     accepted_for_goal_revision: bool | None = None
+    snapshot_id: str | None = None
+    verification_record_ids: list[str] = Field(default_factory=list)
+    source_format: Literal["verification_records_v1", "legacy_state_projection"] = "legacy_state_projection"
     created_at: float = Field(default_factory=time.time)
 
 
@@ -664,6 +682,9 @@ class RunRecord(BaseModel):
     analytics_model_id: str | None = None
     verification_enabled: bool = True
     verification_mode: VerificationMode = VerificationMode.AGENT
+    run_review_policy: RunReviewPolicy = RunReviewPolicy.OFF
+    evaluation_snapshot_id: str | None = None
+    run_review_report_id: str | None = None
     task_profile: RunTaskProfile = Field(default_factory=RunTaskProfile)
     skill_activations: list[SkillActivation] = Field(default_factory=list)
     capability_manifest: CapabilityManifest | None = None
@@ -804,9 +825,24 @@ class GoalCompletionRequest(BaseModel):
     message: str = ""
     invalidated_reason: str | None = None
     acceptance_snapshot_id: str | None = None
+    evaluation_snapshot_id: str | None = None
     verification_report_id: str | None = None
     requested_at: float = Field(default_factory=time.time)
     decided_at: float | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _migrate_snapshot_identity(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        migrated = dict(value)
+        legacy = migrated.get("acceptance_snapshot_id")
+        canonical = migrated.get("evaluation_snapshot_id")
+        if legacy and canonical and legacy != canonical:
+            raise ValueError("Completion request contains conflicting snapshot identities")
+        if legacy and not canonical:
+            migrated["evaluation_snapshot_id"] = legacy
+        return migrated
 
 
 class GoalRecord(BaseModel):

@@ -36,6 +36,8 @@ import {
   getSessionApprovalMode as apiGetSessionApprovalMode,
   updateSessionApprovalMode as apiUpdateSessionApprovalMode,
   getSessionHarnessState as apiGetSessionHarnessState,
+  requestRunReview as apiRequestRunReview,
+  getRunReviewStatus as apiGetRunReviewStatus,
   pauseGoal as apiPauseGoal,
   resumeGoal as apiResumeGoal,
   cancelGoal as apiCancelGoal,
@@ -59,6 +61,9 @@ import {
   HarnessGoal,
   HarnessRun,
   RubricEvaluationReport,
+  RunReviewPolicy,
+  RunReviewReport,
+  RunReviewStatusResponse,
   ApprovalMode,
   AgentCompactResult,
 } from "./api";
@@ -268,6 +273,7 @@ export interface RunBoundaryNotice {
 export interface ChatMessage {
   id: string;
   queryId?: string;
+  runId?: string;
   role: "user" | "assistant";
   content: string;
   attachments?: AgentAttachment[];
@@ -291,6 +297,8 @@ export interface ChatMessage {
   errorNotice?: string;
   runBoundaryNotice?: RunBoundaryNotice;
   verificationSummary?: string;
+  runReviewStatus?: RunReviewStatusResponse["status"];
+  runReviewReport?: RunReviewReport;
   usageSummary?: UsageSummary;
   timestamp: number;
 }
@@ -345,6 +353,7 @@ export interface RunActivityStatus {
     | "command"
     | "tool"
     | "verification"
+    | "review"
     | "revision"
     | "permission"
     | "hitl"
@@ -398,6 +407,9 @@ interface AppState {
   stopStreaming: () => void;
   goalModeEnabled: boolean;
   setGoalModeEnabled: (enabled: boolean) => void;
+  runReviewPolicy: RunReviewPolicy | null;
+  setRunReviewPolicy: (policy: RunReviewPolicy | null) => void;
+  reviewRun: (runId: string) => Promise<RunReviewStatusResponse>;
   approvalMode: ApprovalMode;
   approvalModeSaving: boolean;
   approvalModeError: string | null;
@@ -658,6 +670,7 @@ function parseHistoryMessages(
       const restored: ChatMessage = {
         id: `hist-asst-${msgIndex++}`,
         queryId: msg.query_id,
+        runId: segments?.findLast((segment) => Boolean(segment.runId))?.runId,
         role: "assistant",
         content: stripPersistedModelCallLimitNotice(msg.content),
         reasoning: msg.reasoning_content,
@@ -710,6 +723,31 @@ function parseHistoryMessages(
     }
   }
   return loaded;
+}
+
+function decorateRunReviews(
+  messages: ChatMessage[],
+  runs: Record<string, HarnessRun> | undefined,
+  reports: Record<string, RunReviewReport> | undefined,
+): ChatMessage[] {
+  if (!reports) return messages;
+  return messages.map((message) => {
+    const run = runs ? Object.values(runs).find((candidate) =>
+      (message.runId && candidate.run_id === message.runId)
+      || (message.queryId && candidate.query_id === message.queryId)
+      || message.segments?.some((segment) => segment.runId === candidate.run_id)
+    ) : undefined;
+    const report = run?.run_review_report_id
+      ? reports[run.run_review_report_id]
+      : Object.values(reports).find((candidate) => candidate.run_id === message.runId);
+    if (!run && !report) return message;
+    return {
+      ...message,
+      runId: message.runId || run?.run_id || report?.run_id,
+      runReviewStatus: report?.status,
+      runReviewReport: report,
+    };
+  });
 }
 
 // ── Timeline helpers ───────────────────────────────────────
@@ -1000,6 +1038,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const currentRunsMapRef = useRef<Record<string, HarnessRun | null>>({});
   const goalRunsMapRef = useRef<Record<string, HarnessRun[]>>({});
   const verificationReportsMapRef = useRef<Record<string, RubricEvaluationReport | null>>({});
+  const runReviewReportsMapRef = useRef<Record<string, Record<string, RunReviewReport>>>({});
   const runActivityStatusesMapRef = useRef<Record<string, RunActivityStatus | null>>({});
   const abortControllersRef = useRef<Map<string, AbortController>>(new Map());
   const assistantIdsRef = useRef<Map<string, string>>(new Map());
@@ -1077,6 +1116,9 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const [thinkingLevel, setThinkingLevelRaw] = useState<"low" | "high" | "max" | null>(null);
   const [credentialName, setCredentialNameRaw] = useState<string | null>(null);
   const [goalModeEnabled, setGoalModeEnabledRaw] = useState(false);
+  // null means inherit the server-side Harness default; a concrete value is
+  // frozen into the next ordinary Run request by sendMessage.
+  const [runReviewPolicy, setRunReviewPolicy] = useState<RunReviewPolicy | null>(null);
   const [approvalMode, setApprovalModeRaw] = useState<ApprovalMode>("smart");
   const [approvalModeSaving, setApprovalModeSaving] = useState(false);
   const [approvalModeError, setApprovalModeError] = useState<string | null>(null);
@@ -1447,6 +1489,53 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     },
     []
   );
+
+  const reviewRun = useCallback(async (runId: string): Promise<RunReviewStatusResponse> => {
+    const sid = sessionIdRef.current;
+    const matchesRun = (message: ChatMessage) =>
+      message.runId === runId || message.segments?.some((segment) => segment.runId === runId);
+    updateSessionMessages(sid, (prev) => prev.map((message) =>
+      matchesRun(message) ? { ...message, runReviewStatus: "pending" } : message
+    ));
+    try {
+      let latest = await apiRequestRunReview(sid, runId);
+      updateSessionMessages(sid, (prev) => prev.map((message) =>
+        matchesRun(message)
+          ? { ...message, runReviewStatus: latest.status, runReviewReport: latest.report }
+          : message
+      ));
+      if (latest.report?.report_id) {
+        runReviewReportsMapRef.current[sid] = {
+          ...(runReviewReportsMapRef.current[sid] || {}),
+          [latest.report.report_id]: latest.report,
+        };
+      }
+      // Manual review is asynchronous. Keep the action useful after the POST
+      // returns 202, while bounding browser-side polling; the server remains
+      // authoritative and the report can be fetched again after refresh.
+      for (let attempt = 0; attempt < 20 && (latest.status === "pending" || latest.status === "running"); attempt += 1) {
+        await new Promise((resolve) => window.setTimeout(resolve, 750));
+        latest = await apiGetRunReviewStatus(sid, runId);
+        updateSessionMessages(sid, (prev) => prev.map((message) =>
+          matchesRun(message)
+            ? { ...message, runReviewStatus: latest.status, runReviewReport: latest.report }
+            : message
+        ));
+        if (latest.report?.report_id) {
+          runReviewReportsMapRef.current[sid] = {
+            ...(runReviewReportsMapRef.current[sid] || {}),
+            [latest.report.report_id]: latest.report,
+          };
+        }
+      }
+      return latest;
+    } catch (error) {
+      updateSessionMessages(sid, (prev) => prev.map((message) =>
+        matchesRun(message) ? { ...message, runReviewStatus: "failed" } : message
+      ));
+      throw error;
+    }
+  }, [updateSessionMessages]);
 
   // ── Helper: update Agent white-box state for a session ──────────────
   const updateSessionTodos = useCallback((
@@ -1912,6 +2001,13 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
                   .map((runId) => data.runs[runId])
                   .filter((candidate): candidate is HarnessRun => Boolean(candidate))
               : [];
+            runReviewReportsMapRef.current[id] = data.run_review_reports || {};
+            const cachedHistory = messagesMapRef.current[id];
+            if (cachedHistory) {
+              const decorated = decorateRunReviews(cachedHistory, data.runs, data.run_review_reports);
+              messagesMapRef.current[id] = decorated;
+              if (sessionIdRef.current === id) setMessages(decorated);
+            }
             activeGoalsMapRef.current[id] = loadedGoal;
             currentRunsMapRef.current[id] = loadedRun;
             goalRunsMapRef.current[id] = loadedGoalRuns;
@@ -2025,7 +2121,11 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             if (data.graph !== undefined) {
               updateSessionGraph(id, data.graph || null);
             }
-            const loaded = data.messages?.length ? parseHistoryMessages(data.messages) : [];
+            const loaded = decorateRunReviews(
+              data.messages?.length ? parseHistoryMessages(data.messages) : [],
+              undefined,
+              runReviewReportsMapRef.current[id],
+            );
             const externalPending = data.headless_pending_input;
             const externalRequests = externalPending?.status === "pending"
               && Array.isArray(externalPending.requests)
@@ -2207,7 +2307,11 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     const loadAuthoritativeHistory = async (resetCurrentRun: boolean) => {
       const history = await apiGetSessionHistory(sessionId);
       if (stopped) return;
-      const loaded = history.messages?.length ? parseHistoryMessages(history.messages) : [];
+      const loaded = decorateRunReviews(
+        history.messages?.length ? parseHistoryMessages(history.messages) : [],
+        undefined,
+        runReviewReportsMapRef.current[sessionId],
+      );
       let targetIndex = -1;
       for (let index = loaded.length - 1; index >= 0; index -= 1) {
         const message = loaded[index];
@@ -2915,8 +3019,9 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         },
         requestedGoalMode:
           options.goalControlAction === "start"
-            ? true
-            : nextRunGoalModeMapRef.current[sendSessionId] ?? goalModeEnabled,
+          ? true
+          : nextRunGoalModeMapRef.current[sendSessionId] ?? goalModeEnabled,
+        requestedRunReviewPolicy: runReviewPolicy,
       };
       if (sendSessionId === "default") {
         const createdSessionId = await createSession();
@@ -3193,6 +3298,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           runOptions.llmSelection.modelId,
           runOptions.llmSelection.thinkingLevel,
           runOptions.llmSelection.credentialName,
+          goalModeForRun ? "off" : runOptions.requestedRunReviewPolicy,
         );
 
         for await (const event of eventStream) {
@@ -3277,9 +3383,18 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             // corrections use the dedicated `segment_content_replaced` event.
             flushPendingTokens();
             const targetId = getAssistantId();
-            const finalContent = String(event.data.content || "");
-            const verificationSummary = String(event.data.verification_summary || "").trim();
-            updateMsgs((prev) => prev.map((message) => {
+              const finalContent = String(event.data.content || "");
+              const verificationSummary = String(event.data.verification_summary || "").trim();
+              const currentRun = currentRunsMapRef.current[sendSessionId];
+              const blockingReviewStatus = currentRun?.run_review_policy === "blocking_one_shot"
+                && verificationSummary
+                ? verificationSummary.includes("复核通过")
+                  ? "satisfied" as const
+                  : verificationSummary.includes("基础设施未完成")
+                    ? "infrastructure_error" as const
+                    : "needs_revision" as const
+                : undefined;
+              updateMsgs((prev) => prev.map((message) => {
               if (message.id !== targetId) return message;
               const segments = message.segments?.length
                 ? [...message.segments]
@@ -3298,6 +3413,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
                 content: currentContent ? message.content : finalContent || message.content,
                 segments,
                 verificationSummary: verificationSummary || message.verificationSummary,
+                runReviewStatus: blockingReviewStatus || message.runReviewStatus,
                 usageSummary:
                   normalizeUsageSummary(event.data.usage_summary) || message.usageSummary,
               };
@@ -3833,9 +3949,30 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
                   ...segments[last],
                   runId: run.run_id,
                 };
-                return { ...message, segments };
+                return {
+                  ...message,
+                  runId: run.run_id,
+                  runReviewStatus: run.run_review_policy && run.run_review_policy !== "off" ? "pending" : message.runReviewStatus,
+                  segments,
+                };
               }));
             }
+            continue;
+          }
+
+          if (event.event === "run_review_started") {
+            const runId = String(event.data.run_id || "");
+            const operationId = String(event.data.operation_id || "");
+            updateSessionRunActivity(sendSessionId, {
+              phase: "review",
+              label: "后台质量复核已开始",
+              detail: operationId || undefined,
+            });
+            updateMsgs((prev) => prev.map((message) =>
+              (!runId || message.runId === runId || message.queryId === String(event.data.query_id || ""))
+                ? { ...message, runReviewStatus: "pending" }
+                : message
+            ));
             continue;
           }
 
@@ -5048,6 +5185,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       thinkingLevel,
       credentialName,
       goalModeEnabled,
+      runReviewPolicy,
       activeGoal,
       updateSessionRunActivity,
       updateStreamingSessions,
@@ -5091,6 +5229,9 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         stopStreaming,
         goalModeEnabled,
         setGoalModeEnabled,
+        runReviewPolicy,
+        setRunReviewPolicy,
+        reviewRun,
         approvalMode,
         approvalModeSaving,
         approvalModeError,

@@ -3,7 +3,7 @@
 import { Children, isValidElement, useEffect, useRef, useState, type ReactNode } from "react";
 import ReactMarkdown from "react-markdown";
 import type { Components } from "react-markdown";
-import { AlertTriangle, CheckCircle2, ChevronDown, ChevronRight, Database, Download, FileSpreadsheet, FileText, FolderOpen, Globe2, HelpCircle, ImageIcon, Key, KeyRound, Layers3, Loader2, Maximize2, PauseCircle, Plus, Sparkles, SquareTerminal, Trash2, XCircle } from "lucide-react";
+import { AlertTriangle, CheckCircle2, ChevronDown, ChevronRight, Database, Download, FileSpreadsheet, FileText, FolderOpen, Globe2, HelpCircle, ImageIcon, Key, KeyRound, Layers3, Loader2, Maximize2, PauseCircle, Plus, ShieldCheck, Sparkles, SquareTerminal, Trash2, XCircle } from "lucide-react";
 import { denyPermissionRequest, grantExternalFilePermission, grantShellDirectoryPermission, grantToolActionPermission, resolveDatabaseSqlRevisionRequest, resolveDimensionBuildRuleRequest, resolveKernelFallbackRequest, resolveLogicalDatasetRuleRequest, resolveSkillSecretRequest, resolveUserInputRequest, type AgentAttachment, type DatabaseSqlRevisionRequest, type DimensionBuildRuleRequest, type KernelFallbackRequest, type LogicalDatasetRuleRequest, type PermissionRequest, type SkillSecretRequest, type UserInputAnswer, type UserInputRequest } from "@/lib/api";
 import { markdownRemarkPlugins, markdownUrlTransform, normalizeLooseStrongMarkdown } from "@/lib/markdown";
 import { useApp, type ChatMessage as ChatMessageType, type SourceRecord, type TimelineItem, type ToolCall } from "@/lib/store";
@@ -232,6 +232,7 @@ export default function ChatMessage({ message, sessionSources = [], isStreaming 
         ) : (
           /* Assistant message — left-aligned */
           <div>
+            <RunReviewControl message={message} isStreaming={isStreaming} />
             <div className="min-w-0">
               <details open>
                   <summary className="hidden" />
@@ -1899,6 +1900,73 @@ function VerificationSummaryText({ text }: { text?: string }) {
       >
         {summary}
       </ReactMarkdown>
+    </div>
+  );
+}
+
+function RunReviewControl({ message, isStreaming }: { message: ChatMessageType; isStreaming?: boolean }) {
+  const { reviewRun } = useApp();
+  const [pending, setPending] = useState(false);
+  const runId = message.runId || message.segments?.findLast((segment) => segment.runId)?.runId;
+  const isGoalRun = Boolean(message.segments?.some((segment) => segment.goalId));
+  if (!runId || isGoalRun || isStreaming) return null;
+
+  const status = message.runReviewStatus;
+  const report = message.runReviewReport;
+  const statusLabel: Record<string, string> = {
+    pending: "质量复核排队中",
+    running: "质量复核进行中",
+    satisfied: "质量复核通过",
+    needs_revision: "复核发现潜在缺口",
+    failed: "复核未通过",
+    grader_error: "复核未完成",
+    infrastructure_error: "复核未完成",
+    stale: "复核已失效",
+  };
+  const terminal = status && status !== "pending" && status !== "running";
+  const handleReview = async () => {
+    if (pending) return;
+    setPending(true);
+    try {
+      await reviewRun(runId);
+    } catch {
+      // The store records a failed local state; keep the transcript intact.
+    } finally {
+      setPending(false);
+    }
+  };
+
+  return (
+    <div className="mb-2 flex flex-wrap items-center gap-2 pl-1 text-[11px]" data-testid="run-review-control">
+      {status ? (
+        <span className={`inline-flex items-center gap-1 rounded-full border px-2.5 py-1 ${
+          terminal && status === "satisfied"
+            ? "border-emerald-200 bg-emerald-50 text-emerald-700"
+            : terminal
+              ? "border-amber-200 bg-amber-50 text-amber-700"
+              : "border-blue-200 bg-blue-50 text-blue-700"
+        }`}>
+          {!terminal && <Loader2 className="h-3 w-3 animate-spin" />}
+          {statusLabel[status] || "质量复核"}
+        </span>
+      ) : null}
+      {report?.summary ? (
+        <span className="max-w-xl text-gray-500" title={report.summary}>
+          {report.summary.length > 140 ? `${report.summary.slice(0, 140)}…` : report.summary}
+        </span>
+      ) : null}
+      {!status || status === "stale" || status === "failed" || status === "grader_error" || status === "infrastructure_error" ? (
+        <button
+          type="button"
+          onClick={handleReview}
+          disabled={pending}
+          className="inline-flex items-center gap-1 rounded-full border border-black/[0.08] bg-white/70 px-2.5 py-1 text-gray-600 transition hover:border-[#002fa7]/20 hover:bg-[#e8edff] hover:text-[#002fa7] disabled:cursor-wait disabled:opacity-60"
+          aria-label="验证此回答"
+        >
+          {pending ? <Loader2 className="h-3 w-3 animate-spin" /> : <ShieldCheck className="h-3 w-3" />}
+          {pending ? "正在验证…" : "验证此回答"}
+        </button>
+      ) : null}
     </div>
   );
 }

@@ -40,6 +40,7 @@ import {
   type AgentAttachment,
   type AnalyticsModelSummary,
   type ApprovalMode,
+  type RunReviewPolicy,
 } from "@/lib/api";
 import {
   getProviders,
@@ -58,7 +59,7 @@ function formatContextPercentage(percentage: number, used: number): string {
 import SlashCommandMenu from "./SlashCommandMenu";
 
 type AttachmentKind = AgentAttachment["type"];
-type OpenPopover = null | "plus" | "plus-model" | "project" | "approval" | "llm";
+type OpenPopover = null | "plus" | "plus-model" | "project" | "approval" | "llm" | "review-policy";
 type SelectedSkillHint = { name: string; start: number; end: number };
 
 const thinkingLevelLabels: Record<ThinkingLevel, string> = {
@@ -157,6 +158,8 @@ export default function ChatInput() {
     setAnalyticsModelId,
     goalModeEnabled,
     setGoalModeEnabled,
+    runReviewPolicy,
+    setRunReviewPolicy,
     activeGoal,
     cancelActiveGoal,
     currentRun,
@@ -985,6 +988,61 @@ export default function ChatInput() {
                         </button>
                       </>
                     )}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {runtimeMode === "agent" && (
+              <div className="relative">
+                <button
+                  type="button"
+                  disabled={goalModeEnabled}
+                  onClick={() => togglePopover("review-policy")}
+                  aria-expanded={openPopover === "review-policy"}
+                  aria-haspopup="menu"
+                  aria-label="选择普通 Run 质量复核"
+                  className={`flex h-8 items-center gap-1.5 rounded-full border px-3 text-[12px] transition-all ${
+                    goalModeEnabled
+                      ? "cursor-not-allowed border-black/[0.04] bg-black/[0.02] text-gray-300"
+                      : openPopover === "review-policy"
+                        ? "border-[#002fa7]/15 bg-[#e8edff] text-[#002fa7]"
+                        : "border-black/[0.06] bg-white/50 text-gray-600 hover:bg-white/80 hover:text-gray-950"
+                  }`}
+                  title={goalModeEnabled ? "Goal Run 不使用普通 Run 复核" : "普通 Run 质量复核"}
+                >
+                  <ShieldCheck className="h-3.5 w-3.5" />
+                  <span className="hidden sm:inline">复核</span>
+                  <ChevronDown className="h-3.5 w-3.5" />
+                </button>
+                {openPopover === "review-policy" && !goalModeEnabled && (
+                  <div role="menu" className="absolute bottom-full left-0 z-50 mb-2 w-64 rounded-2xl border border-black/[0.10] bg-white p-2 shadow-2xl shadow-slate-900/15 animate-fade-in-scale">
+                    <p className="px-3 py-2 text-[11px] text-gray-400">仅对下次普通 Run 生效</p>
+                    {([
+                      [null, "跟随设置", "使用设置页中的默认策略"],
+                      ["off", "关闭复核", "不进行独立质量复核"],
+                      ["shadow", "后台质量复核", "先发布回答，再异步核对"],
+                      ["blocking_one_shot", "发布前复核", "实验性：复核后再发布"],
+                    ] as Array<[RunReviewPolicy | null, string, string]>).map(([policy, label, description]) => (
+                      <button
+                        key={policy || "inherit"}
+                        type="button"
+                        role="menuitemradio"
+                        aria-checked={runReviewPolicy === policy}
+                        onClick={() => {
+                          setRunReviewPolicy(policy);
+                          setOpenPopover(null);
+                        }}
+                        className={`flex w-full items-start gap-2 rounded-xl px-3 py-2 text-left ${runReviewPolicy === policy ? "bg-[#002fa7]/[0.07] text-[#002fa7]" : "text-gray-700 hover:bg-black/[0.04]"}`}
+                      >
+                        <ShieldCheck className="mt-0.5 h-4 w-4 shrink-0" />
+                        <span className="min-w-0 flex-1">
+                          <span className="block text-[13px] font-medium">{label}</span>
+                          <span className="block text-[11px] text-gray-400">{description}</span>
+                        </span>
+                        {runReviewPolicy === policy && <Check className="mt-0.5 h-4 w-4" />}
+                      </button>
+                    ))}
                   </div>
                 )}
               </div>

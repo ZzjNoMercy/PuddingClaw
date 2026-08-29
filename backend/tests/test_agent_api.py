@@ -1,8 +1,28 @@
 import json
 import logging
 
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
+
+
+def test_run_review_policy_is_request_scoped_and_goal_safe():
+    from api.agent import AgentRequest
+
+    blocking = AgentRequest(message="复核后回答", run_review_policy="blocking_one_shot")
+    assert blocking.run_review_policy == "blocking_one_shot"
+    assert AgentRequest(message="普通回答").run_review_policy is None
+    assert AgentRequest(message="显式关闭", run_review_policy="off").run_review_policy == "off"
+
+    with pytest.raises(ValidationError, match="ordinary Runs"):
+        AgentRequest(
+            message="完成 Goal",
+            goal_mode=True,
+            run_review_policy="blocking_one_shot",
+        )
+    with pytest.raises(ValidationError):
+        AgentRequest(message="未知策略", run_review_policy="always")
 
 
 def test_stream_agent_persists_user_message_before_stream(monkeypatch, tmp_path):

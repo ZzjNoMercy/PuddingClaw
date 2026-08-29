@@ -568,6 +568,8 @@ export default function SettingsPage() {
   const [modelTransportMaxDelay, setModelTransportMaxDelay] = useState("2");
   const [terminalResponseGuardEnabled, setTerminalResponseGuardEnabled] = useState(true);
   const [terminalResponseRecoveryAttempts, setTerminalResponseRecoveryAttempts] = useState("1");
+  const [runReviewPolicy, setRunReviewPolicy] = useState<"off" | "shadow">("off");
+  const [runReviewManualEnabled, setRunReviewManualEnabled] = useState(true);
   const [rubricEnabled, setRubricEnabled] = useState(false);
   const [rubricMaxIterations, setRubricMaxIterations] = useState("2");
   const [rubricMaxStagnantRepairs, setRubricMaxStagnantRepairs] = useState("2");
@@ -760,6 +762,11 @@ export default function SettingsPage() {
         const terminalResponse = modelResilience?.terminal_response;
         setTerminalResponseGuardEnabled(terminalResponse?.enabled ?? true);
         setTerminalResponseRecoveryAttempts(String(terminalResponse?.max_recovery_attempts ?? 1));
+        const runReview = s.harness?.completion?.run_review;
+        setRunReviewPolicy(
+          runReview?.policy === "shadow" ? runReview.policy : "off",
+        );
+        setRunReviewManualEnabled(runReview?.manual_enabled ?? true);
         const rubric = s.harness?.completion?.rubric;
         setRubricEnabled(rubric?.enabled ?? false);
         setRubricMaxIterations(String(rubric?.max_iterations ?? 3));
@@ -1211,6 +1218,10 @@ export default function SettingsPage() {
             },
           },
           completion: {
+            run_review: {
+              policy: runReviewPolicy,
+              manual_enabled: runReviewManualEnabled,
+            },
             rubric: {
               enabled: rubricEnabled,
               max_iterations: positiveIntOrNull(rubricMaxIterations) ?? 3,
@@ -1263,7 +1274,7 @@ export default function SettingsPage() {
     } finally {
       setSaving(false);
     }
-  }, [activeCategory, ragTopK, ragThreshold, ragTextVectorWeight, ragImageVectorWeight, ragBm25Weight, ragHybridCandidateTopK, ragRerankEnabled, ragRerankCandidateTopK, dbQaFullRowsTokenBudget, dbQaPreviewRowsTokenBudget, dbQaProfileTokenBudget, dbQaFullRowsHardRowCap, dbQaFullRowsHardColumnCap, dbQaMaxCellCharsForLlm, dbQaResultMaterializationRowCap, dbQaQueryTimeoutSeconds, dbQaSqlGenerationTimeoutSeconds, dbQaResultStoreEnabled, dbQaResultStoreTtlHours, dbQaDefaultPageSize, dbQaMaxPageSize, dbQaExportEnabled, dbQaProfileEnabled, dbQaAgentSqlFallbackEnabled, databaseMode, databaseHost, databasePort, databaseName, databaseUsername, databasePassword, mmBatchSize, knowledgeRootDir, wikiCompilerModelId, wikiHybridEnabled, wikiGbrainEmbeddingModelId, wikiGbrainThinkModelId, kbIndexEnabled, kbVectorStore, kbMilvusUri, kbTextCollection, kbImageCollection, contextSummaryTriggerTokens, contextSummaryKeepTokens, toolContextEnabled, immediateToolCompactionEnabled, singleToolTriggerTokens, backgroundMinResultTokens, retainToolContextTokens, modelCallLimitEnabled, modelCallRunLimit, modelCallThreadLimit, modelCallExitBehavior, modelTransportRetryEnabled, modelTransportMaxAttempts, modelTransportInitialDelay, modelTransportMaxDelay, terminalResponseGuardEnabled, terminalResponseRecoveryAttempts, rubricEnabled, rubricMaxIterations, rubricMaxStagnantRepairs, customRubricRulesEnabled, customRubricRules, goalsEnabled, goalMaxRounds, executionMode, subagentItems, showToast, runtimeExtensions]);
+  }, [activeCategory, ragTopK, ragThreshold, ragTextVectorWeight, ragImageVectorWeight, ragBm25Weight, ragHybridCandidateTopK, ragRerankEnabled, ragRerankCandidateTopK, dbQaFullRowsTokenBudget, dbQaPreviewRowsTokenBudget, dbQaProfileTokenBudget, dbQaFullRowsHardRowCap, dbQaFullRowsHardColumnCap, dbQaMaxCellCharsForLlm, dbQaResultMaterializationRowCap, dbQaQueryTimeoutSeconds, dbQaSqlGenerationTimeoutSeconds, dbQaResultStoreEnabled, dbQaResultStoreTtlHours, dbQaDefaultPageSize, dbQaMaxPageSize, dbQaExportEnabled, dbQaProfileEnabled, dbQaAgentSqlFallbackEnabled, databaseMode, databaseHost, databasePort, databaseName, databaseUsername, databasePassword, mmBatchSize, knowledgeRootDir, wikiCompilerModelId, wikiHybridEnabled, wikiGbrainEmbeddingModelId, wikiGbrainThinkModelId, kbIndexEnabled, kbVectorStore, kbMilvusUri, kbTextCollection, kbImageCollection, contextSummaryTriggerTokens, contextSummaryKeepTokens, toolContextEnabled, immediateToolCompactionEnabled, singleToolTriggerTokens, backgroundMinResultTokens, retainToolContextTokens, modelCallLimitEnabled, modelCallRunLimit, modelCallThreadLimit, modelCallExitBehavior, modelTransportRetryEnabled, modelTransportMaxAttempts, modelTransportInitialDelay, modelTransportMaxDelay, terminalResponseGuardEnabled, terminalResponseRecoveryAttempts, runReviewPolicy, runReviewManualEnabled, rubricEnabled, rubricMaxIterations, rubricMaxStagnantRepairs, customRubricRulesEnabled, customRubricRules, goalsEnabled, goalMaxRounds, executionMode, subagentItems, showToast, runtimeExtensions]);
 
   const handleWikiHybridChange = useCallback(async (enabled: boolean) => {
     if (wikiHybridSaving) return;
@@ -3365,6 +3376,38 @@ export default function SettingsPage() {
                               </p>
                             </FormField>
                           </div> : null}
+                        </div>
+
+                        <div className="rounded-xl border border-black/[0.06] bg-white/55 px-3.5 py-3">
+                          <div className="flex items-center justify-between gap-4">
+                            <div>
+                              <p className="text-[13px] font-semibold text-gray-900">普通 Run 质量复核</p>
+                              <p className="mt-1 text-[11px] leading-relaxed text-gray-500">
+                                独立复核只产生质量报告，不改变普通 Run 的完成结果，也不会获得 Goal 控制权。
+                              </p>
+                            </div>
+                            <select
+                              value={runReviewPolicy}
+                              onChange={(event) => setRunReviewPolicy(event.target.value as typeof runReviewPolicy)}
+                              className="form-input w-auto min-w-[8rem] text-[12px]"
+                              aria-label="普通 Run 默认质量复核策略"
+                            >
+                              <option value="off">关闭</option>
+                              <option value="shadow">后台质量复核</option>
+                            </select>
+                          </div>
+                          <div className="mt-4 max-w-xl">
+                            <FormField label="允许手动验证回答">
+                              <SwitchButton
+                                checked={runReviewManualEnabled}
+                                onChange={setRunReviewManualEnabled}
+                                ariaLabel="允许手动验证普通 Run 回答"
+                              />
+                            </FormField>
+                            <p className="mt-2 text-[10px] leading-relaxed text-gray-400">
+                              发布前复核是单次请求的实验选项，只做一次验收裁决，不自动改写回答或进入 Goal 修正循环。
+                            </p>
+                          </div>
                         </div>
 
                         {rubricEnabled && <div className="rounded-xl border border-black/[0.06] bg-white/55 px-3.5 py-3">

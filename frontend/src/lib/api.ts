@@ -245,6 +245,46 @@ export interface RubricEvaluationReport {
   created_at: number;
 }
 
+/** Independent review policy for an ordinary (non-Goal) Run. */
+export type RunReviewPolicy = "off" | "shadow" | "blocking_one_shot";
+export type RunReviewStatus =
+  | "not_requested"
+  | "pending"
+  | "running"
+  | "satisfied"
+  | "needs_revision"
+  | "failed"
+  | "grader_error"
+  | "infrastructure_error"
+  | "stale";
+
+export interface RunReviewReport {
+  report_id: string;
+  run_id: string;
+  snapshot_id: string;
+  policy: Exclude<RunReviewPolicy, "off">;
+  manual?: boolean;
+  status: RunReviewStatus;
+  verification_record_ids?: string[];
+  operation_id?: string;
+  attempt_no?: number;
+  summary?: string;
+  published_before_review?: boolean;
+  created_at?: number;
+  completed_at?: number | null;
+  error_kind?: string | null;
+}
+
+export interface RunReviewStatusResponse {
+  status: RunReviewStatus;
+  run_id: string;
+  operation_id?: string;
+  snapshot_id?: string;
+  policy?: Exclude<RunReviewPolicy, "off">;
+  manual?: boolean;
+  report?: RunReviewReport;
+}
+
 export interface HarnessRun {
   run_id: string;
   query_id: string;
@@ -257,6 +297,10 @@ export interface HarnessRun {
   goal_revision?: number | null;
   goal_turn_intent?: "inspect_goal" | "continue_goal" | "revise_goal" | "control_goal" | "standalone_task" | "clarify" | null;
   verification_enabled?: boolean;
+  run_review_policy?: RunReviewPolicy;
+  evaluation_snapshot_id?: string | null;
+  run_review_report_id?: string | null;
+  run_review_report?: RunReviewReport | null;
   task_profile?: RunTaskProfile;
   status: RunStatus;
   outcome?: string | null;
@@ -334,6 +378,7 @@ export interface SessionHarnessState {
   goals: Record<string, HarnessGoal>;
   goal_order: string[];
   active_goal_id?: string | null;
+  run_review_reports?: Record<string, RunReviewReport>;
 }
 
 export interface ToolContextJobStatus {
@@ -3881,6 +3926,7 @@ export async function* streamAgent(
   llmModelId?: string | null,
   thinkingLevel?: "low" | "high" | "max" | null,
   credentialName?: string | null,
+  runReviewPolicy?: RunReviewPolicy | null,
 ): AsyncGenerator<SSEEvent> {
   const response = await fetch(`${API_BASE}/agent`, {
     method: "POST",
@@ -3896,6 +3942,7 @@ export async function* streamAgent(
       llm_model_id: llmModelId || null,
       thinking_level: thinkingLevel || null,
       credential_name: credentialName || null,
+      run_review_policy: runReviewPolicy || null,
       goal_mode: goalMode,
       goal_id: goalMode ? goalId || null : null,
       context_goal_id: contextGoalId || null,
@@ -3932,6 +3979,42 @@ export async function* streamAgent(
       yield parsed;
     }
   }
+}
+
+/** Queue an independent review for one completed ordinary Run. */
+export async function requestRunReview(
+  sessionId: string,
+  runId: string,
+): Promise<RunReviewStatusResponse> {
+  const response = await fetch(
+    `${API_BASE}/agent/sessions/${encodeURIComponent(sessionId)}/runs/${encodeURIComponent(runId)}/review`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}",
+    },
+  );
+  const text = await response.text();
+  if (!response.ok) {
+    throw new Error(apiErrorMessage(text, `无法开始回答验收：${response.status}`));
+  }
+  return (text ? JSON.parse(text) : { status: "pending", run_id: runId }) as RunReviewStatusResponse;
+}
+
+/** Read the durable review status for one ordinary Run. */
+export async function getRunReviewStatus(
+  sessionId: string,
+  runId: string,
+): Promise<RunReviewStatusResponse> {
+  const response = await fetch(
+    `${API_BASE}/agent/sessions/${encodeURIComponent(sessionId)}/runs/${encodeURIComponent(runId)}/review`,
+    { cache: "no-store" },
+  );
+  const text = await response.text();
+  if (!response.ok) {
+    throw new Error(apiErrorMessage(text, `无法读取回答验收状态：${response.status}`));
+  }
+  return (text ? JSON.parse(text) : { status: "not_requested", run_id: runId }) as RunReviewStatusResponse;
 }
 
 /** Observe a Headless Run already owned by CLI/PuddingTeams. */

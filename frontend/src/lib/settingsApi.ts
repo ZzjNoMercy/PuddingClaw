@@ -157,6 +157,12 @@ export interface HarnessSettings {
     };
   };
   completion?: {
+    run_review?: {
+      policy?: "off" | "shadow";
+      model?: string;
+      environment_profile?: "none" | "deterministic_only" | "independent_evidence_review" | "environment_verified";
+      manual_enabled?: boolean;
+    };
     rubric?: {
       enabled?: boolean;
       model?: string;

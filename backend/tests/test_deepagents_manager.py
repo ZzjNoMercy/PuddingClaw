@@ -87,6 +87,25 @@ def _renew_rubric_request(run_id: str, *, tool_call_id: str) -> None:
     )
 
 
+def _projected_grader_text(
+    messages,
+    *,
+    run_query_id: str | None = None,
+    objective: str | None = None,
+) -> str:
+    from graph.verification.transcript_projection import (
+        project_messages_for_grader,
+        serialize_projected_messages,
+    )
+
+    projected = project_messages_for_grader(
+        messages,
+        run_query_id=run_query_id,
+        objective=objective,
+    )
+    return json.dumps(serialize_projected_messages(projected), ensure_ascii=False)
+
+
 def test_filesystem_discovery_tool_descriptions_prefer_known_exact_paths():
     # Importing the manager registers PuddingClaw's runtime Harness profile.
     from deepagents.profiles.harness.harness_profiles import _get_harness_profile
@@ -620,6 +639,8 @@ def test_completion_gate_reads_current_run_artifact_receipt_from_session(tmp_pat
         query_id="query-gate-artifact",
         objective="生成报告文件",
         goal_mode=False,
+        verification_enabled=True,
+        run_review_policy="shadow",
     )
     coordinator.transition(run, RunStatus.RUNNING)
     artifact = tmp_path / "report with spaces.md"
@@ -688,16 +709,6 @@ def test_completion_gate_keeps_revising_past_legacy_iteration_limit(tmp_path, mo
         model=SimpleNamespace(),
         max_iterations=2,
     )
-    graded = middleware._parse_grader_response(
-        AIMessage(
-            content=(
-                '{"result":"needs_revision","explanation":"任务没有完成",'
-                '"criteria":[{"name":"task_fulfillment","passed":false,'
-                '"gap":"没有生成报告"}]}'
-            )
-        )
-    )
-    monkeypatch.setattr(middleware, "_grade", lambda _state, _iteration: graded)
     state = {
         "messages": [AIMessage(content="报告还没生成")],
         "todos": [{"id": "todo-1", "content": "生成报告", "status": "in_progress"}],
@@ -906,29 +917,29 @@ def test_deterministic_and_grader_share_attempt_counter_without_ending_run(tmp_p
     contract = RunRubricCompiler.compile(RubricBuildContext(user_message="完成任务", force_required=True))
     assert contract is not None
     middleware = PuddingClawRubricMiddleware(model=SimpleNamespace(), max_iterations=2)
+    from deepagents.middleware.rubric import GraderResponse
+
     verdicts = iter(
         [
-            middleware._parse_grader_response(
-                AIMessage(
-                    content=(
-                        '{"result":"needs_revision","explanation":"仍需修正",'
-                        '"criteria":[{"name":"task_fulfillment","passed":false,"gap":"未完成"}]}'
-                    )
-                )
+            GraderResponse.model_validate(
+                {
+                    "result": "needs_revision",
+                    "explanation": "仍需修正",
+                    "criteria": [{"name": "task_fulfillment", "passed": False, "gap": "未完成"}],
+                }
             ),
-            middleware._parse_grader_response(
-                AIMessage(
-                    content=(
-                        '{"result":"satisfied","explanation":"模型认为完成",'
-                        '"criteria":[{"name":"task_fulfillment","passed":true,"gap":null}]}'
-                    )
-                )
+            GraderResponse.model_validate(
+                {
+                    "result": "satisfied",
+                    "explanation": "模型认为完成",
+                    "criteria": [{"name": "task_fulfillment", "passed": True}],
+                }
             ),
         ]
     )
     grader_calls: list[int] = []
 
-    def grade(_state, iteration):
+    def grade(_state, iteration, *, context=None):
         grader_calls.append(iteration)
         return next(verdicts)
 
@@ -944,8 +955,6 @@ def test_deterministic_and_grader_share_attempt_counter_without_ending_run(tmp_p
     first = middleware.after_agent(initial, runtime)
     assert first is not None and first["jump_to"] == "model"
     assert first["_verification_attempts"] == 1
-    _renew_rubric_request(runtime.context["run_id"], tool_call_id="complete-2")
-
     from graph.session_manager import session_manager
 
     persisted_run = session_manager.get_run_state(
@@ -979,7 +988,6 @@ def test_deterministic_and_grader_share_attempt_counter_without_ending_run(tmp_p
     assert second["_verification_attempts"] == 2
     assert second["_completion_gate_status"] == "needs_revision"
     assert second["jump_to"] == "model"
-    _renew_rubric_request(runtime.context["run_id"], tool_call_id="complete-3")
     session_manager.update_todos(
         "rubric-unit-session",
         [],
@@ -997,35 +1005,11 @@ def test_deterministic_and_grader_share_attempt_counter_without_ending_run(tmp_p
     assert grader_calls == [0, 2]
 
 
-def test_rubric_grader_parses_plain_json_without_tool_binding():
-    from graph.deepagents_manager import PuddingClawRubricMiddleware
-
-    response = AIMessage(
-        content=(
-            "```json\n"
-            '{"result":"satisfied","explanation":"全部通过",'
-            '"criteria":[{"name":"task_fulfillment","passed":true}]}\n'
-            "```"
-        )
-    )
-
-    graded = PuddingClawRubricMiddleware._parse_grader_response(response)
-
-    assert graded.result == "satisfied"
-    assert graded.criteria[0]["name"] == "task_fulfillment"
-    assert graded.criteria[0]["passed"] is True
-
-
 def test_rubric_grader_payload_is_scoped_to_current_run():
-    from graph.deepagents_manager import PuddingClawRubricMiddleware
+    from graph.verification.transcript_projection import project_messages_for_grader
 
-    middleware = PuddingClawRubricMiddleware(
-        model=SimpleNamespace(),
-        max_iterations=2,
-    )
-    payload = middleware._build_grader_payload(
-        {
-            "messages": [
+    projected = project_messages_for_grader(
+            [
                 HumanMessage(content="上一轮：总结 AI 新闻"),
                 AIMessage(content="上一轮新闻回答"),
                 HumanMessage(
@@ -1034,11 +1018,9 @@ def test_rubric_grader_payload_is_scoped_to_current_run():
                 ),
                 AIMessage(content="本轮 L03 回答"),
             ],
-            "rubric": "完成本轮任务",
-            "_run_query_id": "query-current",
-        },
-        iteration=0,
+            run_query_id="query-current",
     )
+    payload = "\n".join(str(item.content) for item in projected)
 
     assert "本轮：总结小鹏 L03" in payload
     assert "本轮 L03 回答" in payload
@@ -1047,50 +1029,13 @@ def test_rubric_grader_payload_is_scoped_to_current_run():
 
 
 def test_deterministic_source_result_is_not_rejudged_by_llm_grader():
-    from graph.deepagents_manager import PuddingClawRubricMiddleware
     from harness.rubric_compiler import RubricBuildContext, RunRubricCompiler
 
     contract = RunRubricCompiler.compile(RubricBuildContext(user_message="搜索最近 AI 新闻并附来源"))
     assert contract is not None
-    middleware = PuddingClawRubricMiddleware(model=SimpleNamespace(), max_iterations=2)
-    graded = middleware._parse_grader_response(
-        AIMessage(
-            content=(
-                '{"result":"needs_revision","explanation":"对话里看不到来源",'
-                '"criteria":['
-                '{"name":"task_fulfillment","passed":true},'
-                '{"name":"web_evidence_traceability","passed":false,'
-                '"gap":"没有来源"},'
-                '{"name":"time_scope","passed":true}'
-                "]}"
-            )
-        )
-    )
-    state = {
-        "verification_contract": contract.model_dump(mode="json"),
-        "_deterministic_evaluations": [
-            {
-                "criterion_id": "web_evidence_traceability",
-                "passed": True,
-                "verifier": "deterministic",
-                "evidence": [{"kind": "source", "uri": "https://example.com/news"}],
-            },
-            {
-                "criterion_id": "time_scope",
-                "passed": True,
-                "verifier": "deterministic",
-                "evidence": [],
-            },
-        ],
-    }
-
-    reconciled = middleware._reconcile_deterministic_grader_response(state, graded)
-
-    assert reconciled.result == "satisfied"
-    by_name = {item["name"]: item for item in reconciled.criteria}
-    assert by_name["web_evidence_traceability"]["passed"] is True
-    assert by_name["time_scope"]["passed"] is True
-    assert "对话里看不到来源" not in reconciled.explanation
+    assert "task_fulfillment" in contract.rubric
+    assert "web_evidence_traceability" not in contract.rubric
+    assert "time_scope" not in contract.rubric
 
 
 def test_published_verification_summary_keeps_only_user_relevant_outcomes():
@@ -1505,16 +1450,9 @@ def test_goal_runtime_context_includes_only_authoritative_prior_verification_pro
     assert context["latest_goal_decision"]["criterion_provenance"][0]["passed"] is True
 
 
-def test_goal_rubric_payload_keeps_run_transcript_scoped_but_adds_authoritative_cross_run_evidence():
-    from graph.deepagents_manager import PuddingClawRubricMiddleware
-
-    middleware = PuddingClawRubricMiddleware(
-        model=SimpleNamespace(),
-        max_iterations=2,
-    )
-    payload = middleware._build_grader_payload(
-        {
-            "messages": [
+def test_goal_rubric_projection_is_run_scoped_and_excludes_cross_run_control_context():
+    payload = _projected_grader_text(
+            [
                 HumanMessage(content="上一轮自然语言过程，不应重放"),
                 AIMessage(content="上一轮口头声称完成"),
                 HumanMessage(
@@ -1523,37 +1461,19 @@ def test_goal_rubric_payload_keeps_run_transcript_scoped_but_adds_authoritative_
                 ),
                 AIMessage(content="本轮补齐趋势总结"),
             ],
-            "rubric": "刷新报告并完成验证",
-            "_run_query_id": "query-current",
-            "_goal_verification_context": {
-                "goal_id": "goal-1",
-                "objective_revision": 2,
-                "evidence_refs": [{"kind": "artifact", "path": "/workspace/report.html", "digest": "sha256:abc"}],
-                "todos": [{"id": "todo-chart", "status": "completed"}],
-                "known_gaps": ["趋势总结待补齐"],
-            },
-        },
-        iteration=0,
+            run_query_id="query-current",
     )
 
     assert "本轮补齐趋势总结" in payload
     assert "上一轮自然语言过程" not in payload
     assert "上一轮口头声称完成" not in payload
-    assert "goal_aggregate_verification_context" in payload
-    assert "/workspace/report.html" in payload
-    assert "todo-chart" in payload
+    assert "goal_aggregate_verification_context" not in payload
+    assert "/workspace/report.html" not in payload
 
 
 def test_rubric_grader_payload_falls_back_to_latest_external_user_turn():
-    from graph.deepagents_manager import PuddingClawRubricMiddleware
-
-    middleware = PuddingClawRubricMiddleware(
-        model=SimpleNamespace(),
-        max_iterations=2,
-    )
-    payload = middleware._build_grader_payload(
-        {
-            "messages": [
+    payload = _projected_grader_text(
+            [
                 HumanMessage(content="上一轮：重新安装 aihot"),
                 AIMessage(content="上一轮安装完成"),
                 HumanMessage(content="本轮：L6 年度改款多少钱？"),
@@ -1565,39 +1485,26 @@ def test_rubric_grader_payload_falls_back_to_latest_external_user_turn():
                 ),
                 AIMessage(content="L6 置换价 23.48 万元起"),
             ],
-            "rubric": "完成本轮任务",
-        },
-        iteration=1,
     )
 
     assert "本轮：L6 年度改款多少钱？" in payload
     assert "L6 置换价 23.48 万元起" in payload
-    assert "grader revision" in payload
+    assert "grader revision" not in payload
     assert "上一轮：重新安装 aihot" not in payload
     assert "上一轮安装完成" not in payload
 
 
 def test_rubric_grader_reconstructs_current_run_after_summarization():
-    from graph.deepagents_manager import PuddingClawRubricMiddleware
-
-    middleware = PuddingClawRubricMiddleware(
-        model=SimpleNamespace(),
-        max_iterations=2,
-    )
-    payload = middleware._build_grader_payload(
-        {
-            "messages": [
+    payload = _projected_grader_text(
+            [
                 HumanMessage(
                     content="摘要中包含旧任务：重新安装 aihot",
                     additional_kwargs={"lc_source": "summarization"},
                 ),
                 AIMessage(content="L6 售价 24.98 万元"),
             ],
-            "rubric": "完成本轮任务",
-            "_run_query_id": "query-current",
-            "_run_objective": "L6 年度改款多少钱？",
-        },
-        iteration=0,
+            run_query_id="query-current",
+            objective="L6 年度改款多少钱？",
     )
 
     assert "L6 年度改款多少钱？" in payload
@@ -1606,23 +1513,13 @@ def test_rubric_grader_reconstructs_current_run_after_summarization():
 
 
 def test_rubric_grader_fail_closed_without_any_message_boundary():
-    from graph.deepagents_manager import PuddingClawRubricMiddleware
-
-    middleware = PuddingClawRubricMiddleware(
-        model=SimpleNamespace(),
-        max_iterations=2,
-    )
-    payload = middleware._build_grader_payload(
-        {
-            "messages": [
+    payload = _projected_grader_text(
+            [
                 AIMessage(content="旧任务结果：aihot 安装完成"),
                 AIMessage(content="当前结果：L6 售价 24.98 万元"),
             ],
-            "rubric": "完成本轮任务",
-            "_run_query_id": "query-current",
-            "_run_objective": "L6 年度改款多少钱？",
-        },
-        iteration=0,
+            run_query_id="query-current",
+            objective="L6 年度改款多少钱？",
     )
 
     assert "L6 年度改款多少钱？" in payload
@@ -1631,15 +1528,8 @@ def test_rubric_grader_fail_closed_without_any_message_boundary():
 
 
 def test_rubric_query_marker_only_matches_external_user_messages():
-    from graph.deepagents_manager import PuddingClawRubricMiddleware
-
-    middleware = PuddingClawRubricMiddleware(
-        model=SimpleNamespace(),
-        max_iterations=2,
-    )
-    payload = middleware._build_grader_payload(
-        {
-            "messages": [
+    payload = _projected_grader_text(
+            [
                 AIMessage(
                     content="旧任务结果",
                     additional_kwargs={"puddingclaw_query_id": "query-current"},
@@ -1650,10 +1540,7 @@ def test_rubric_query_marker_only_matches_external_user_messages():
                 ),
                 AIMessage(content="L6 售价 24.98 万元"),
             ],
-            "rubric": "完成本轮任务",
-            "_run_query_id": "query-current",
-        },
-        iteration=0,
+            run_query_id="query-current",
     )
 
     assert "L6 年度改款多少钱？" in payload
@@ -1664,15 +1551,8 @@ def test_rubric_query_marker_only_matches_external_user_messages():
 def test_rubric_scope_understands_langchain_serialized_messages():
     from langchain_core.messages import message_to_dict
 
-    from graph.deepagents_manager import PuddingClawRubricMiddleware
-
-    middleware = PuddingClawRubricMiddleware(
-        model=SimpleNamespace(),
-        max_iterations=2,
-    )
-    payload = middleware._build_grader_payload(
-        {
-            "messages": [
+    payload = _projected_grader_text(
+            [
                 message_to_dict(HumanMessage(content="旧任务")),
                 message_to_dict(AIMessage(content="旧结果")),
                 message_to_dict(
@@ -1691,15 +1571,12 @@ def test_rubric_scope_understands_langchain_serialized_messages():
                 ),
                 message_to_dict(AIMessage(content="L6 置换 23.48 万元起")),
             ],
-            "rubric": "完成本轮任务",
-            "_run_query_id": "query-current",
-        },
-        iteration=1,
+            run_query_id="query-current",
     )
 
     assert "L6 年度改款多少钱？" in payload
     assert "L6 置换 23.48 万元起" in payload
-    assert "grader revision" in payload
+    assert "grader revision" not in payload
     assert "旧任务" not in payload
     assert "旧结果" not in payload
 
@@ -1715,13 +1592,6 @@ def test_build_messages_marks_current_user_with_query_id():
 
     assert messages[-1].additional_kwargs["puddingclaw_query_id"] == "query-current"
     assert not messages[0].additional_kwargs
-
-
-def test_rubric_grader_rejects_non_json_output():
-    from graph.deepagents_manager import PuddingClawRubricMiddleware
-
-    with pytest.raises(ValueError, match="JSON object"):
-        PuddingClawRubricMiddleware._parse_grader_response(AIMessage(content="任务看起来完成了"))
 
 
 def test_model_call_limit_emits_typed_budget_event():

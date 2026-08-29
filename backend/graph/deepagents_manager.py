@@ -32,6 +32,7 @@ from deepagents.middleware.memory import MemoryMiddleware
 from deepagents.middleware.rubric import RUBRIC_GRADER_MESSAGE_SOURCE, GraderResponse
 from deepagents.middleware.subagents import SubAgent
 from deepagents.middleware.summarization import SummarizationMiddleware as DeepAgentsSummarizationMiddleware
+from langchain.agents import AgentState
 from langchain.agents.middleware import (
     AgentMiddleware,
     ModelCallLimitMiddleware,
@@ -54,7 +55,6 @@ from langchain_core.messages import (
     HumanMessage,
     SystemMessage,
     ToolMessage,
-    convert_to_messages,
     message_to_dict,
     messages_from_dict,
 )
@@ -142,6 +142,15 @@ from graph.tool_result_adapter import tool_result_adapter
 from graph.trace_collector import TraceCollector, TraceSpan
 from graph.user_agents import build_user_agents_additions
 from graph.user_input_resume import user_input_resume_registry
+from graph.verification.environment import EnvironmentVerificationProfile
+from graph.verification.events import VerificationEvent, emit_verification_event
+from graph.verification.models import VerificationRecordStatus, stable_digest
+from graph.verification.orchestrator import OnlineVerificationOrchestrator
+from graph.verification.run_review import RunReviewOrchestrator
+from graph.verification.transcript_projection import (
+    candidate_from_projected_messages,
+    project_messages_for_grader,
+)
 from harness.artifact_paths import (
     extract_local_directory_paths,
     extract_local_resource_paths,
@@ -160,6 +169,7 @@ from harness.models import (
     RunKind,
     RunOutcome,
     RunRecord,
+    RunReviewPolicy,
     RunStatus,
     RunTaskProfile,
     RunVerificationContract,
@@ -169,7 +179,7 @@ from harness.models import (
     VerifierKind,
 )
 from harness.permission_reviewer import ModelPermissionReviewer, PermissionReviewer
-from harness.rubric_compiler import RunRubricCompiler
+from harness.rubric_compiler import RubricBuildContext, RunRubricCompiler
 from harness.task_profiles import (
     SemanticRubricProfileClassifier,
     TaskProfileClassifier,
@@ -1085,7 +1095,10 @@ class PuddingClawSummarizationMiddleware(DeepAgentsSummarizationMiddleware):
 register_harness_profile(
     "modelclientchatmodel",
     HarnessProfile(
-        excluded_middleware=frozenset({"SummarizationMiddleware", "TodoListMiddleware"}),
+        # DeepAgents 0.7.11 no longer assembles TodoListMiddleware in its base
+        # stack. Keep replacing summarization, and install HarnessTodo below,
+        # without declaring a stale exclusion that the SDK correctly rejects.
+        excluded_middleware=frozenset({"SummarizationMiddleware"}),
         extra_middleware=lambda: [HarnessTodoMiddleware()],
         tool_description_overrides={
             "edit_file": (
@@ -1224,6 +1237,9 @@ class PuddingClawAgentState(DeepAgentState):
     _completion_gate_failure_signature: NotRequired[Annotated[str, PrivateStateAttr]]
     _completion_gate_stagnation_count: NotRequired[Annotated[int, PrivateStateAttr]]
     _deterministic_evaluations: NotRequired[Annotated[list[dict[str, Any]], PrivateStateAttr]]
+    _evaluation_snapshot_id: NotRequired[Annotated[str, PrivateStateAttr]]
+    _verification_proposal_report: NotRequired[Annotated[dict[str, Any], PrivateStateAttr]]
+    _environment_observations: NotRequired[Annotated[list[dict[str, Any]], PrivateStateAttr]]
     _run_query_id: NotRequired[Annotated[str, PrivateStateAttr]]
     _run_objective: NotRequired[Annotated[str, PrivateStateAttr]]
     _active_analysis_template: NotRequired[Annotated[dict[str, Any] | None, PrivateStateAttr]]
@@ -1235,6 +1251,36 @@ class PuddingClawAgentState(DeepAgentState):
     _model_response_recovery_count: NotRequired[Annotated[int, PrivateStateAttr]]
     _model_response_termination: NotRequired[Annotated[dict[str, Any], PrivateStateAttr]]
     _model_response_incomplete: NotRequired[Annotated[dict[str, Any] | None, PrivateStateAttr]]
+
+
+class PuddingClawGraderState(AgentState[GraderResponse]):
+    """Attempt correlation exposed only inside the nested grader graph."""
+
+    evaluation_snapshot_id: NotRequired[str]
+    completion_request_id: NotRequired[str]
+    grader_attempt_id: NotRequired[str]
+
+
+def _prepare_rubric_grader_messages(messages: list[Any]) -> list[Any]:
+    return project_messages_for_grader(messages)
+
+
+def _build_rubric_grader_state(state: Any, iteration: int) -> dict[str, Any]:
+    snapshot_id = str(state.get("_evaluation_snapshot_id") or "")
+    goal_context = state.get("_goal_verification_context")
+    context = goal_context if isinstance(goal_context, dict) else {}
+    request_id = str(context.get("completion_request_id") or "")
+    grader_attempt_id = stable_digest(
+        {"snapshot_id": snapshot_id, "method": "semantic_rubric", "iteration": iteration}
+    )
+    return {
+        "evaluation_snapshot_id": snapshot_id,
+        "completion_request_id": request_id,
+        # This is a nested-agent trace correlation key, not the durable
+        # VerificationRecord operation_id (which additionally binds attempt
+        # number and verifier policy hash inside SessionManager).
+        "grader_attempt_id": grader_attempt_id,
+    }
 
 
 class RunScopeMiddleware(AgentMiddleware):
@@ -1426,13 +1472,28 @@ class PuddingClawRubricMiddleware(RubricMiddleware):
         max_iterations: int = 3,
         on_evaluation: Callable[[Any], None] | None = None,
         max_stagnant_repairs: int = 2,
+        grader_middleware: Sequence[Any] | None = None,
+        grader_context_schema: type[Any] | None = None,
+        grader_state_schema: type[Any] | None = None,
+        prepare_messages_for_grader: Callable[[list[Any]], list[Any]] | None = None,
+        build_grader_state: Callable[[Any, int], dict[str, Any]] | None = None,
     ) -> None:
+        if tools:
+            raise ValueError(
+                "PuddingClawRubricMiddleware does not permit grader tools; "
+                "environment observations must use the separate read-only verifier."
+            )
         super().__init__(
             model=model,
             system_prompt=system_prompt,
             tools=tools,
             max_iterations=max_iterations,
             on_evaluation=on_evaluation,
+            grader_middleware=grader_middleware,
+            grader_context_schema=grader_context_schema,
+            grader_state_schema=grader_state_schema,
+            prepare_messages_for_grader=prepare_messages_for_grader,
+            build_grader_state=build_grader_state,
         )
         if (
             not isinstance(max_stagnant_repairs, int)
@@ -1441,69 +1502,7 @@ class PuddingClawRubricMiddleware(RubricMiddleware):
         ):
             raise ValueError("PuddingClawRubricMiddleware: max_stagnant_repairs must be in [1, 20]")
         self.max_stagnant_repairs = max_stagnant_repairs
-
-    _JSON_GRADER_SUFFIX = """
-
-Return exactly one JSON object and no markdown. Do not call tools or functions.
-The object must follow this shape:
-{
-  "result": "satisfied" | "needs_revision" | "failed",
-  "explanation": "evidence-grounded user-facing verification summary",
-  "criteria": [
-    {"name": "criterion id or statement", "passed": true},
-    {"name": "criterion id or statement", "passed": false, "gap": "missing evidence"}
-  ]
-}
-Use "satisfied" only when every required criterion passes.
-Return one criteria item for every required rubric criterion. Write explanation
-and gaps in Chinese. Missing criteria are treated as failed by Harness.
-Criteria whose verifier is deterministic have already been checked by Harness.
-Treat the supplied deterministic evaluation context as authoritative: copy its
-verdict and do not independently fail it from the transcript.
-When result is "satisfied", explanation is published in the final answer.
-For a satisfied result, write only 1-2 short natural-language sentences (at most
-160 Chinese characters) and mention no more than three user-relevant outcomes,
-such as delivered content, test/build outcome, data scope, or usable source
-links. Do not merely say "验证通过" or "全部标准满足". Do not mention SKILL.md,
-tool names, execute, ToolMessage, Todo, reconciliation, source_id, internal
-criterion ids, grader rounds, Run ids, required rules, or Harness implementation
-details. Never invent evidence that is absent from the supplied context.
-""".strip()
-
-    @staticmethod
-    def _response_text(response: Any) -> str:
-        content = getattr(response, "content", response)
-        if isinstance(content, str):
-            return content
-        if isinstance(content, list):
-            return "\n".join(
-                str(item.get("text") or item.get("content") or "") if isinstance(item, dict) else str(item)
-                for item in content
-            )
-        return str(content or "")
-
-    @classmethod
-    def _parse_grader_response(cls, response: Any) -> GraderResponse:
-        text = cls._response_text(response).strip()
-        if text.startswith("```"):
-            text = re.sub(r"^```(?:json)?\s*", "", text, count=1)
-            text = re.sub(r"\s*```$", "", text, count=1)
-        start = text.find("{")
-        end = text.rfind("}")
-        if start < 0 or end < start:
-            raise ValueError("Rubric grader did not return a JSON object.")
-        payload = json.loads(text[start : end + 1])
-        return GraderResponse.model_validate(payload)
-
-    def _plain_grader_model(self) -> BaseChatModel:
-        model = getattr(self, "_pudding_plain_grader_model", None)
-        if model is not None:
-            return model
-        from deepagents._models import resolve_model
-
-        model = resolve_model(self._model)
-        self._pudding_plain_grader_model = model
-        return model
+        self._verification_orchestrator = OnlineVerificationOrchestrator(session_manager)
 
     @staticmethod
     def _runtime_run_scope_update(state: Any, runtime: Any) -> dict[str, Any]:
@@ -1721,277 +1720,6 @@ details. Never invent evidence that is absent from the supplied context.
         update = dict(await super().abefore_agent(state, runtime) or {})
         update.update(self._runtime_run_scope_update(state, runtime))
         return update or None
-
-    @staticmethod
-    def _is_external_user_message(message: Any) -> bool:
-        role, name, extra = _message_metadata(message)
-        if role not in {"human", "user"}:
-            return False
-        source = str(extra.get("lc_source") or "")
-        if source:
-            return False
-        return str(name or "") not in {
-            RUBRIC_GRADER_MESSAGE_SOURCE,
-            "puddingclaw_completion_gate",
-        }
-
-    @classmethod
-    def _run_message_start(cls, state: Any, messages: list[Any]) -> int | None:
-        run_query_id = state.get("_run_query_id")
-        if isinstance(run_query_id, str) and run_query_id:
-            for index in range(len(messages) - 1, -1, -1):
-                message = messages[index]
-                role, _, extra = _message_metadata(message)
-                if role not in {"human", "user"}:
-                    continue
-                if extra.get("puddingclaw_query_id") == run_query_id:
-                    return index
-        # Fail closed to the latest real user turn. Rubric revision prompts are
-        # HumanMessages too, while summaries carry an internal source marker.
-        for index in range(len(messages) - 1, -1, -1):
-            if cls._is_external_user_message(messages[index]):
-                return index
-        return None
-
-    @staticmethod
-    def _is_summary_message(message: Any) -> bool:
-        _, _, extra = _message_metadata(message)
-        return extra.get("lc_source") == "summarization"
-
-    @classmethod
-    def _scoped_run_messages(cls, state: Any, messages: list[Any]) -> list[Any]:
-        start = cls._run_message_start(state, messages)
-        if start is not None:
-            scoped = messages[start:]
-            _, _, first_extra = _message_metadata(scoped[0])
-            if first_extra.get("lc_source") == "puddingclaw_goal_continuation":
-                objective = state.get("_run_objective")
-                if isinstance(objective, str) and objective:
-                    return [
-                        HumanMessage(
-                            content=objective,
-                            name="puddingclaw_run_objective",
-                            additional_kwargs={"lc_source": "puddingclaw_run_objective"},
-                        ),
-                        *scoped[1:],
-                    ]
-            return scoped
-
-        # A long current Run can summarize away its opening user message. The
-        # objective is durable runtime metadata, so reconstruct the grader view
-        # from it and retain only messages after the latest summary boundary.
-        objective = state.get("_run_objective")
-        if isinstance(objective, str) and objective:
-            tail: list[Any] = []
-            for index in range(len(messages) - 1, -1, -1):
-                if cls._is_summary_message(messages[index]):
-                    tail = messages[index + 1 :]
-                    break
-            if not tail:
-                # With no trustworthy message boundary, do not re-admit the
-                # whole session. The last AI answer is enough for the LLM grader;
-                # deterministic checks own current-Run tool evidence.
-                tail = next(
-                    ([message] for message in reversed(messages) if isinstance(message, AIMessage)),
-                    [],
-                )
-            return [
-                HumanMessage(
-                    content=objective,
-                    name="puddingclaw_run_objective",
-                    additional_kwargs={"lc_source": "puddingclaw_run_objective"},
-                ),
-                *tail,
-            ]
-        return messages
-
-    def _build_grader_payload(self, state: Any, iteration: int) -> str:
-        """Grade only messages produced for the current Harness Run.
-
-        The main agent intentionally receives cross-Run session context, but a
-        completion verdict belongs to one Run.  DeepAgents' default rubric
-        payload grades the entire transcript, which can make an earlier user
-        request contaminate the current verdict. Run identity comes from trusted
-        runtime context and remains stable across revision and summary loops.
-        """
-
-        messages = list(state.get("messages") or [])
-        scoped_state = dict(state)
-        scoped_messages = self._scoped_run_messages(state, messages)
-        normalized_messages: list[Any] = []
-        for message in scoped_messages:
-            if not isinstance(message, dict):
-                normalized_messages.append(message)
-            elif isinstance(message.get("data"), dict) and message.get("type"):
-                normalized_messages.extend(messages_from_dict([message]))
-            else:
-                normalized_messages.extend(convert_to_messages([message]))
-        scoped_state["messages"] = normalized_messages
-        payload = super()._build_grader_payload(scoped_state, iteration)
-        deterministic = state.get("_deterministic_evaluations")
-        if isinstance(deterministic, list) and deterministic:
-            payload = (
-                f"{payload}\n\n"
-                "<authoritative_deterministic_evaluations>\n"
-                "以下逐项结果已由 Harness 从结构化证据完成检查。请直接采用，"
-                "不要根据对话文本再次判断或推翻。\n"
-                f"{json.dumps(deterministic, ensure_ascii=False, default=str)}\n"
-                "</authoritative_deterministic_evaluations>"
-            )
-        goal_context = state.get("_goal_verification_context")
-        if not isinstance(goal_context, dict) or not goal_context.get("goal_id"):
-            return payload
-        # Goal verification is not transcript replay.  Append a bounded,
-        # deterministic aggregate of authoritative cross-Run evidence while
-        # keeping the natural-language conversation scoped to this Run.
-        serialized = json.dumps(goal_context, ensure_ascii=False, default=str)
-        return (
-            f"{payload}\n\n"
-            "<goal_aggregate_verification_context>\n"
-            "以下内容来自 Session JSON 的当前 Goal 修订版，是跨 Run 验收证据索引，"
-            "不是新的用户消息，也不能替代缺失的证据。允许用它确认先前 Run 已完成且"
-            "仍属于当前 Goal 修订版的工作。\n"
-            f"{serialized}\n"
-            "</goal_aggregate_verification_context>"
-        )
-
-    @staticmethod
-    def _reconcile_deterministic_grader_response(
-        state: Any,
-        graded: GraderResponse,
-    ) -> GraderResponse:
-        """Make structured deterministic checks authoritative for their criteria."""
-
-        contract_payload = state.get("verification_contract")
-        deterministic_payload = state.get("_deterministic_evaluations")
-        if not isinstance(contract_payload, dict) or not isinstance(deterministic_payload, list):
-            return graded
-        contract = RunVerificationContract.model_validate(contract_payload)
-        deterministic_criteria = {
-            criterion.id: criterion
-            for criterion in contract.criteria
-            if criterion.verifier == VerifierKind.DETERMINISTIC
-        }
-        if not deterministic_criteria:
-            return graded
-        authoritative = {
-            str(item.get("criterion_id") or ""): item
-            for item in deterministic_payload
-            if isinstance(item, dict) and item.get("criterion_id") in deterministic_criteria
-        }
-        if not authoritative:
-            return graded
-
-        by_statement = {criterion.statement: criterion.id for criterion in deterministic_criteria.values()}
-        rebuilt: list[dict[str, Any]] = []
-        emitted: set[str] = set()
-        for raw_item in graded.criteria:
-            item = dict(raw_item)
-            name = str(item.get("name") or "")
-            criterion_id = name if name in deterministic_criteria else by_statement.get(name)
-            if criterion_id and criterion_id in authoritative:
-                if criterion_id in emitted:
-                    continue
-                verdict = authoritative[criterion_id]
-                normalized: dict[str, Any] = {
-                    "name": criterion_id,
-                    "passed": bool(verdict.get("passed")),
-                }
-                if not normalized["passed"]:
-                    normalized["gap"] = str(verdict.get("gap") or "缺少可验证证据")
-                rebuilt.append(normalized)
-                emitted.add(criterion_id)
-                continue
-            rebuilt.append(item)
-        for criterion_id, verdict in authoritative.items():
-            if criterion_id in emitted:
-                continue
-            normalized = {
-                "name": criterion_id,
-                "passed": bool(verdict.get("passed")),
-            }
-            if not normalized["passed"]:
-                normalized["gap"] = str(verdict.get("gap") or "缺少可验证证据")
-            rebuilt.append(normalized)
-
-        result = graded.result
-        has_failure = any(not bool(item.get("passed")) for item in rebuilt)
-        if result == "needs_revision" and not has_failure:
-            result = "satisfied"
-        elif result == "satisfied" and has_failure:
-            result = "needs_revision"
-        explanation = graded.explanation
-        if result == "satisfied" and graded.result != "satisfied":
-            explanation = "已核对最终交付与结构化证据，任务结果及必需的来源或产物均可验证。"
-        return GraderResponse.model_validate(
-            {
-                "result": result,
-                "explanation": explanation,
-                "criteria": rebuilt,
-            }
-        )
-
-    def _grade(self, state: Any, iteration: int) -> GraderResponse:
-        payload = self._build_grader_payload(state, iteration)
-        response = self._plain_grader_model().invoke(
-            [
-                SystemMessage(content=f"{self._system_prompt}\n\n{self._JSON_GRADER_SUFFIX}"),
-                HumanMessage(content=payload),
-            ]
-        )
-        return self._reconcile_deterministic_grader_response(
-            state,
-            self._parse_grader_response(response),
-        )
-
-    async def _agrade(self, state: Any, iteration: int) -> GraderResponse:
-        payload = self._build_grader_payload(state, iteration)
-        response = await self._plain_grader_model().ainvoke(
-            [
-                SystemMessage(content=f"{self._system_prompt}\n\n{self._JSON_GRADER_SUFFIX}"),
-                HumanMessage(content=payload),
-            ]
-        )
-        return self._reconcile_deterministic_grader_response(
-            state,
-            self._parse_grader_response(response),
-        )
-
-    def _compose_update(
-        self,
-        state: Any,
-        evaluation: Any,
-        graded_result: Any,
-    ) -> dict[str, Any]:
-        """Keep business revisions inside the current Harness Run.
-
-        DeepAgents' stock Rubric middleware treats ``max_iterations`` and a
-        grader ``failed`` verdict as agent termination.  In PuddingClaw those
-        are completion gaps, not Run-boundary decisions.  The model-call
-        limiter is the single execution budget and remains the only automatic
-        circuit breaker for repeated business revisions.
-        """
-
-        next_iteration = int(evaluation.get("iteration") or 0) + 1
-        evaluations = [*state.get("_rubric_evaluations", []), evaluation]
-        update: dict[str, Any] = {
-            "_rubric_evaluations": evaluations,
-            "_rubric_iterations": next_iteration,
-            "_rubric_status": evaluation.get("result"),
-        }
-        if graded_result == "satisfied":
-            return update
-        return {
-            **update,
-            "messages": [
-                HumanMessage(
-                    content=self._revision_prompt(evaluation),
-                    name=RUBRIC_GRADER_MESSAGE_SOURCE,
-                    additional_kwargs={"lc_source": RUBRIC_GRADER_MESSAGE_SOURCE},
-                )
-            ],
-            "jump_to": "model",
-        }
 
     @staticmethod
     def _last_ai_text(state: dict[str, Any]) -> str:
@@ -2330,6 +2058,170 @@ details. Never invent evidence that is absent from the supplied context.
             "rubric": effective.rubric,
         }
 
+    def _freeze_goal_snapshot_for_grading(
+        self,
+        *,
+        session_id: str,
+        run_id: str,
+        state: dict[str, Any],
+        context: dict[str, Any],
+    ) -> tuple[RunRecord, GoalRecord, Any, dict[str, Any]]:
+        """Freeze the exact candidate before any verifier observes it."""
+
+        raw_run = session_manager.get_run_state(session_id, run_id)
+        if not isinstance(raw_run, dict):
+            raise ValueError(f"Run {run_id} does not exist")
+        run = RunRecord.model_validate(raw_run)
+        if not run.goal_id:
+            raise ValueError("Goal Rubric verification requires a Goal-bound Run")
+        raw_goal = session_manager.get_goal_state(session_id, run.goal_id)
+        if not isinstance(raw_goal, dict):
+            raise ValueError(f"Goal {run.goal_id} does not exist")
+        goal = GoalRecord.model_validate(raw_goal)
+        projected = project_messages_for_grader(
+            state.get("messages") or [],
+            run_query_id=run.query_id,
+            objective=run.objective,
+        )
+        frozen_state = {**state, "messages": projected}
+        goal_context = frozen_state.get("_goal_verification_context")
+        frozen_state["_goal_verification_context"] = {
+            **(goal_context if isinstance(goal_context, dict) else {}),
+            "completion_request_id": run.completion_request_id or "",
+        }
+        workspace_fingerprint = stable_digest(
+            {
+                "workspace_path": str(context.get("workspace_path") or ""),
+                "execution": (
+                    run.config_snapshot.get("execution", {})
+                    if isinstance(run.config_snapshot, dict)
+                    else {}
+                ),
+            }
+        )
+        snapshot = self._verification_orchestrator.freeze_goal_snapshot(
+            run=run,
+            goal=goal,
+            final_state=frozen_state,
+            workspace_fingerprint=workspace_fingerprint,
+        )
+        frozen_state["_evaluation_snapshot_id"] = snapshot.snapshot_id
+        return run, goal, snapshot, frozen_state
+
+    def _proposal_update(
+        self,
+        *,
+        run: RunRecord,
+        goal: GoalRecord,
+        snapshot: Any,
+        gate_update: dict[str, Any] | None,
+        rubric_update: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        evaluations = (
+            rubric_update.get("_rubric_evaluations")
+            if isinstance(rubric_update, dict)
+            else None
+        )
+        semantic_evaluation = (
+            dict(evaluations[-1])
+            if isinstance(evaluations, list) and evaluations and isinstance(evaluations[-1], dict)
+            else None
+        )
+        if semantic_evaluation is None and any(
+            item.verifier == VerifierKind.LLM_GRADER
+            for item in (run.verification_contract.criteria if run.verification_contract else [])
+        ):
+            semantic_evaluation = {
+                "result": str((rubric_update or {}).get("_rubric_status") or "grader_error"),
+                "criteria": [],
+            }
+        report = self._verification_orchestrator.materialize_goal_proposal_from_verifiers(
+            run=run,
+            goal=goal,
+            snapshot=snapshot,
+            deterministic_evaluations=list(
+                (gate_update or {}).get("_deterministic_evaluations") or []
+            ),
+            semantic_evaluation=semantic_evaluation,
+        )
+        return {
+            "_evaluation_snapshot_id": snapshot.snapshot_id,
+            "_verification_proposal_report": report.model_dump(mode="json"),
+        }
+
+    def _run_environment_verification(
+        self,
+        *,
+        run: RunRecord,
+        snapshot: Any,
+        state: dict[str, Any],
+        runtime: Any,
+    ) -> None:
+        raw_config = (
+            run.config_snapshot.get("completion", {}).get("rubric", {})
+            if isinstance(run.config_snapshot, dict)
+            else {}
+        )
+        profile = EnvironmentVerificationProfile(
+            raw_config.get("environment_profile")
+            or EnvironmentVerificationProfile.NONE.value
+        )
+        if profile in {
+            EnvironmentVerificationProfile.NONE,
+            EnvironmentVerificationProfile.DETERMINISTIC_ONLY,
+        }:
+            return
+        self._emit_verification_lifecycle(
+            runtime,
+            "verification.environment.started",
+            run=run,
+            snapshot_id=snapshot.snapshot_id,
+            method="environment",
+        )
+        record = self._verification_orchestrator.run_environment_verifier(
+            run=run,
+            snapshot=snapshot,
+            observations=list(state.get("_environment_observations") or []),
+            profile=profile,
+        )
+        self._emit_verification_lifecycle(
+            runtime,
+            "verification.environment.completed",
+            run=run,
+            snapshot_id=snapshot.snapshot_id,
+            status=(record.status.value if record is not None else "not_evaluated"),
+            method="environment",
+            error_kind=(record.error_kind if record is not None else None),
+        )
+
+    @staticmethod
+    def _emit_verification_lifecycle(
+        runtime: Any,
+        event_type: str,
+        *,
+        run: RunRecord,
+        snapshot_id: str | None = None,
+        status: str = "",
+        method: str | None = None,
+        error_kind: str | None = None,
+    ) -> None:
+        emit_verification_event(
+            runtime,
+            VerificationEvent(
+                event_type=event_type,
+                session_id=run.session_id,
+                query_id=run.query_id,
+                run_id=run.run_id,
+                goal_id=run.goal_id,
+                goal_revision=run.goal_revision,
+                completion_request_id=run.completion_request_id,
+                snapshot_id=snapshot_id,
+                status=status,
+                method=method,
+                error_kind=error_kind,
+            ),
+        )
+
     @hook_config(can_jump_to=["model"])
     def after_agent(self, state: Any, runtime: Any) -> dict[str, Any] | None:
         runtime_context = getattr(runtime, "context", None)
@@ -2358,12 +2250,29 @@ details. Never invent evidence that is absent from the supplied context.
             if session_id and request_id
             else None
         )
-        if not isinstance(request, dict) or request.get("status") != "requested":
+        if not isinstance(request, dict) or request.get("status") not in {
+            "requested",
+            "evaluating",
+            "needs_revision",
+        }:
             return None
         effective_update = self._effective_contract_update(dict(state), runtime)
         effective_state = {**dict(state), **effective_update}
         if not isinstance(effective_state.get("verification_contract"), dict):
             return super().after_agent(effective_state, runtime)
+        run, goal, snapshot, effective_state = self._freeze_goal_snapshot_for_grading(
+            session_id=session_id,
+            run_id=run_id,
+            state=effective_state,
+            context=context,
+        )
+        self._emit_verification_lifecycle(
+            runtime,
+            "verification.snapshot.created",
+            run=run,
+            snapshot_id=snapshot.snapshot_id,
+            status="frozen",
+        )
         previous_attempts = max(
             int(effective_state.get("_verification_attempts") or 0),
             int(effective_state.get("_completion_gate_iterations") or 0),
@@ -2371,24 +2280,97 @@ details. Never invent evidence that is absent from the supplied context.
         )
         attempt = previous_attempts + 1
         effective_state["_rubric_iterations"] = previous_attempts
+        self._emit_verification_lifecycle(
+            runtime,
+            "verification.deterministic.started",
+            run=run,
+            snapshot_id=snapshot.snapshot_id,
+            method="deterministic",
+        )
         gate_update = self._completion_gate_update(
             effective_state,
             runtime,
             attempt=attempt,
         )
+        self._emit_verification_lifecycle(
+            runtime,
+            "verification.deterministic.completed",
+            run=run,
+            snapshot_id=snapshot.snapshot_id,
+            status=str((gate_update or {}).get("_completion_gate_status") or "satisfied"),
+            method="deterministic",
+        )
         if gate_update and gate_update.get("jump_to") == "model":
+            proposal_update = self._proposal_update(
+                run=run,
+                goal=goal,
+                snapshot=snapshot,
+                gate_update=gate_update,
+                rubric_update=None,
+            )
+            self._emit_verification_lifecycle(
+                runtime,
+                "verification.revision.requested",
+                run=run,
+                snapshot_id=snapshot.snapshot_id,
+                status="needs_revision",
+                method="deterministic",
+            )
             session_manager.update_goal_completion_request_status(
                 session_id, request_id, "needs_revision", reason="deterministic_revision_requested"
             )
-            return {**effective_update, **gate_update}
+            return {**effective_update, **gate_update, **proposal_update}
         if gate_update and gate_update.get("_completion_gate_status") in {
             VerificationStatus.FAILED.value,
             VerificationStatus.INFRASTRUCTURE_ERROR.value,
         }:
-            return {**effective_update, **gate_update}
+            proposal_update = self._proposal_update(
+                run=run,
+                goal=goal,
+                snapshot=snapshot,
+                gate_update=gate_update,
+                rubric_update=None,
+            )
+            return {**effective_update, **gate_update, **proposal_update}
+        self._run_environment_verification(
+            run=run,
+            snapshot=snapshot,
+            state=effective_state,
+            runtime=runtime,
+        )
         grading_state = {**effective_state, **(gate_update or {})}
+        self._emit_verification_lifecycle(
+            runtime,
+            "verification.grader.started",
+            run=run,
+            snapshot_id=snapshot.snapshot_id,
+            method="semantic_rubric",
+        )
         rubric_update = super().after_agent(grading_state, runtime)
+        self._emit_verification_lifecycle(
+            runtime,
+            "verification.grader.completed",
+            run=run,
+            snapshot_id=snapshot.snapshot_id,
+            status=str((rubric_update or {}).get("_rubric_status") or "not_evaluated"),
+            method="semantic_rubric",
+        )
+        proposal_update = self._proposal_update(
+            run=run,
+            goal=goal,
+            snapshot=snapshot,
+            gate_update=gate_update,
+            rubric_update=rubric_update,
+        )
         if rubric_update and rubric_update.get("jump_to") == "model":
+            self._emit_verification_lifecycle(
+                runtime,
+                "verification.revision.requested",
+                run=run,
+                snapshot_id=snapshot.snapshot_id,
+                status="needs_revision",
+                method="semantic_rubric",
+            )
             session_manager.update_goal_completion_request_status(
                 session_id, request_id, "needs_revision", reason="rubric_revision_requested"
             )
@@ -2396,6 +2378,7 @@ details. Never invent evidence that is absent from the supplied context.
             **effective_update,
             **(gate_update or {}),
             **(rubric_update or {}),
+            **proposal_update,
         } or None
 
     @hook_config(can_jump_to=["model"])
@@ -2436,12 +2419,34 @@ details. Never invent evidence that is absent from the supplied context.
             if session_id and request_id
             else None
         )
-        if not isinstance(request, dict) or request.get("status") != "requested":
+        if not isinstance(request, dict) or request.get("status") not in {
+            "requested",
+            "evaluating",
+            "needs_revision",
+        }:
             return None
-        effective_update = self._effective_contract_update(dict(state), runtime)
+        effective_update = await asyncio.to_thread(
+            self._effective_contract_update,
+            dict(state),
+            runtime,
+        )
         effective_state = {**dict(state), **effective_update}
         if not isinstance(effective_state.get("verification_contract"), dict):
             return await super().aafter_agent(effective_state, runtime)
+        run, goal, snapshot, effective_state = await asyncio.to_thread(
+            self._freeze_goal_snapshot_for_grading,
+            session_id=session_id,
+            run_id=run_id,
+            state=effective_state,
+            context=context,
+        )
+        self._emit_verification_lifecycle(
+            runtime,
+            "verification.snapshot.created",
+            run=run,
+            snapshot_id=snapshot.snapshot_id,
+            status="frozen",
+        )
         previous_attempts = max(
             int(effective_state.get("_verification_attempts") or 0),
             int(effective_state.get("_completion_gate_iterations") or 0),
@@ -2449,12 +2454,44 @@ details. Never invent evidence that is absent from the supplied context.
         )
         attempt = previous_attempts + 1
         effective_state["_rubric_iterations"] = previous_attempts
-        gate_update = self._completion_gate_update(
+        self._emit_verification_lifecycle(
+            runtime,
+            "verification.deterministic.started",
+            run=run,
+            snapshot_id=snapshot.snapshot_id,
+            method="deterministic",
+        )
+        gate_update = await asyncio.to_thread(
+            self._completion_gate_update,
             effective_state,
             runtime,
             attempt=attempt,
         )
+        self._emit_verification_lifecycle(
+            runtime,
+            "verification.deterministic.completed",
+            run=run,
+            snapshot_id=snapshot.snapshot_id,
+            status=str((gate_update or {}).get("_completion_gate_status") or "satisfied"),
+            method="deterministic",
+        )
         if gate_update and gate_update.get("jump_to") == "model":
+            proposal_update = await asyncio.to_thread(
+                self._proposal_update,
+                run=run,
+                goal=goal,
+                snapshot=snapshot,
+                gate_update=gate_update,
+                rubric_update=None,
+            )
+            self._emit_verification_lifecycle(
+                runtime,
+                "verification.revision.requested",
+                run=run,
+                snapshot_id=snapshot.snapshot_id,
+                status="needs_revision",
+                method="deterministic",
+            )
             await asyncio.to_thread(
                 session_manager.update_goal_completion_request_status,
                 session_id,
@@ -2462,15 +2499,61 @@ details. Never invent evidence that is absent from the supplied context.
                 "needs_revision",
                 reason="deterministic_revision_requested",
             )
-            return {**effective_update, **gate_update}
+            return {**effective_update, **gate_update, **proposal_update}
         if gate_update and gate_update.get("_completion_gate_status") in {
             VerificationStatus.FAILED.value,
             VerificationStatus.INFRASTRUCTURE_ERROR.value,
         }:
-            return {**effective_update, **gate_update}
+            proposal_update = await asyncio.to_thread(
+                self._proposal_update,
+                run=run,
+                goal=goal,
+                snapshot=snapshot,
+                gate_update=gate_update,
+                rubric_update=None,
+            )
+            return {**effective_update, **gate_update, **proposal_update}
+        await asyncio.to_thread(
+            self._run_environment_verification,
+            run=run,
+            snapshot=snapshot,
+            state=effective_state,
+            runtime=runtime,
+        )
         grading_state = {**effective_state, **(gate_update or {})}
+        self._emit_verification_lifecycle(
+            runtime,
+            "verification.grader.started",
+            run=run,
+            snapshot_id=snapshot.snapshot_id,
+            method="semantic_rubric",
+        )
         rubric_update = await super().aafter_agent(grading_state, runtime)
+        self._emit_verification_lifecycle(
+            runtime,
+            "verification.grader.completed",
+            run=run,
+            snapshot_id=snapshot.snapshot_id,
+            status=str((rubric_update or {}).get("_rubric_status") or "not_evaluated"),
+            method="semantic_rubric",
+        )
+        proposal_update = await asyncio.to_thread(
+            self._proposal_update,
+            run=run,
+            goal=goal,
+            snapshot=snapshot,
+            gate_update=gate_update,
+            rubric_update=rubric_update,
+        )
         if rubric_update and rubric_update.get("jump_to") == "model":
+            self._emit_verification_lifecycle(
+                runtime,
+                "verification.revision.requested",
+                run=run,
+                snapshot_id=snapshot.snapshot_id,
+                status="needs_revision",
+                method="semantic_rubric",
+            )
             await asyncio.to_thread(
                 session_manager.update_goal_completion_request_status,
                 session_id,
@@ -2482,6 +2565,7 @@ details. Never invent evidence that is absent from the supplied context.
             **effective_update,
             **(gate_update or {}),
             **(rubric_update or {}),
+            **proposal_update,
         } or None
 
 
@@ -2968,11 +3052,254 @@ class DeepAgentsAgentManager:
         self._checkpointer: Any | None = None
         self._checkpointer_info: dict[str, Any] | None = None
         self._run_coordinator = HarnessRunCoordinator(session_manager)
+        self._verification_orchestrator = OnlineVerificationOrchestrator(session_manager)
+        self._run_review_orchestrator = RunReviewOrchestrator(session_manager)
         self._active_goal_tasks: dict[tuple[str, str], asyncio.Task[Any]] = {}
+        self._run_review_tasks: dict[str, asyncio.Task[Any]] = {}
 
     def initialize(self, base_dir: Path, *, user_root: Path | None = None) -> None:
         self._base_dir = base_dir
         self._user_root = (user_root or PuddingClawPaths.from_environment().root).expanduser().resolve()
+
+    def _ordinary_run_review_state(
+        self,
+        run: RunRecord,
+        *,
+        workspace_path: Path,
+        final_state: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        state = dict(final_state or {})
+        if not isinstance(state.get("messages"), list):
+            state["messages"] = session_manager.load_session(run.session_id)
+        state["_harness_context"] = {
+            "todos": session_manager.get_todos(run.session_id, run_id=run.run_id),
+            "final_content": self._last_ai_content(state),
+            "workspace_path": str(workspace_path),
+            "run_id": run.run_id,
+            "declared_artifact_targets": list(run.declared_artifact_targets),
+            "verification_activations": [
+                item.model_dump(mode="json") if hasattr(item, "model_dump") else dict(item)
+                for item in run.verification_activations
+            ],
+        }
+        return state
+
+    async def begin_run_review(
+        self,
+        session_id: str,
+        run_id: str,
+        *,
+        manual: bool = True,
+        final_state: dict[str, Any] | None = None,
+        workspace_path: Path | None = None,
+        model: Any | None = None,
+        wait: bool = False,
+    ) -> dict[str, Any]:
+        """Durably prepare an ordinary Run review, then execute it asynchronously."""
+
+        raw_run = session_manager.get_run_state(session_id, run_id)
+        if not isinstance(raw_run, dict):
+            raise ValueError(f"Run {run_id} does not exist")
+        run = RunRecord.model_validate(raw_run)
+        if run.run_kind != RunKind.STANDALONE or run.goal_id is not None or not run.terminal:
+            raise ValueError("Run review is available only after an ordinary Run completes")
+        harness = session_manager.get_harness_state(session_id)
+        if run.run_review_report_id:
+            existing = (harness.get("run_review_reports") or {}).get(run.run_review_report_id)
+            if isinstance(existing, dict):
+                return {"status": "completed", "report": existing}
+        policy = run.run_review_policy
+        if manual and policy == RunReviewPolicy.OFF:
+            policy = RunReviewPolicy.SHADOW
+        if policy == RunReviewPolicy.OFF:
+            raise ValueError("Run review policy is off")
+        if run.verification_contract is None:
+            review_config = (
+                run.config_snapshot.get("completion", {}).get("rubric", {})
+                if isinstance(run.config_snapshot, dict)
+                else {}
+            )
+            contract = RunRubricCompiler.compile(
+                RubricBuildContext(
+                    user_message=run.objective,
+                    custom_rules=(
+                        list(review_config.get("custom_rules") or [])
+                        if review_config.get("custom_rules_enabled", False)
+                        else []
+                    ),
+                    force_required=True,
+                    task_profile=run.task_profile,
+                )
+            )
+            if contract is None:
+                raise ValueError("Run review contract could not be compiled")
+            raw_run = session_manager.attach_manual_run_review_contract(
+                session_id,
+                run_id,
+                contract.model_dump(mode="json"),
+            )
+            run = RunRecord.model_validate(raw_run)
+        effective_workspace = workspace_path
+        if effective_workspace is None:
+            effective_workspace, _ = self._resolve_workspace(
+                session_id=session_id,
+                project_id=run.project_id,
+            )
+        state = self._ordinary_run_review_state(
+            run,
+            workspace_path=effective_workspace,
+            final_state=final_state,
+        )
+        snapshot, operation = self._run_review_orchestrator.prepare(
+            run=run,
+            final_state=state,
+            workspace_fingerprint=stable_digest(
+                {
+                    "workspace_path": str(effective_workspace),
+                    "execution": run.config_snapshot.get("execution", {}),
+                }
+            ),
+            policy=policy,
+            manual=manual,
+        )
+        operation_id = str(operation["operation_id"])
+        active_task = self._run_review_tasks.get(operation_id)
+        if active_task is not None and not active_task.done():
+            return {
+                "status": "pending",
+                "operation_id": operation_id,
+                "snapshot_id": snapshot.snapshot_id,
+                "run_id": run.run_id,
+                "policy": policy.value,
+                "manual": manual,
+            }
+        review_owner = f"run-review:{os.getpid()}:{id(self)}"
+        claimed_operation = session_manager.claim_verification_operation(
+            session_id,
+            operation_id,
+            owner=review_owner,
+        )
+        if claimed_operation is None:
+            raise ValueError(f"Verification operation {operation_id} cannot be claimed")
+        # Another process may be grading this same frozen input.  Returning a
+        # durable pending response is important: callers may retry freely and
+        # no second model call is started.
+        if (
+            claimed_operation.get("status") == "running"
+            and claimed_operation.get("owner") != review_owner
+        ):
+            return {
+                "status": "pending",
+                "operation_id": operation_id,
+                "snapshot_id": snapshot.snapshot_id,
+                "run_id": run.run_id,
+                "policy": policy.value,
+                "manual": manual,
+            }
+        operation = claimed_operation
+        review_model = model
+        if review_model is None:
+            review_cfg = (
+                run.config_snapshot.get("completion", {}).get("run_review", {})
+                if isinstance(run.config_snapshot, dict)
+                else {}
+            )
+            rubric_cfg = (
+                run.config_snapshot.get("completion", {}).get("rubric", {})
+                if isinstance(run.config_snapshot, dict)
+                else {}
+            )
+            review_model_name = str(review_cfg.get("model") or rubric_cfg.get("model") or "").strip()
+            review_model = ModelClientChatModel(
+                role="rubric",
+                streaming=False,
+                thinking_enabled=False,
+                model_override=review_model_name or None,
+            )
+
+        async def execute_review() -> dict[str, Any]:
+            try:
+                report = await self._run_review_orchestrator.execute(
+                    run=run,
+                    snapshot=snapshot,
+                    operation=operation,
+                    final_state=state,
+                    model=review_model,
+                    policy=policy,
+                    manual=manual,
+                )
+                return report.model_dump(mode="json")
+            except asyncio.CancelledError:
+                session_manager.release_verification_operation(
+                    session_id,
+                    operation_id,
+                    owner=review_owner,
+                    error="review_cancelled",
+                )
+                raise
+            except Exception as exc:
+                # Keep the operation discoverable after a crash/model outage;
+                # a later process startup can claim and retry it.
+                session_manager.release_verification_operation(
+                    session_id,
+                    operation_id,
+                    owner=review_owner,
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+                raise
+            finally:
+                self._run_review_tasks.pop(operation_id, None)
+
+        if wait:
+            return {"status": "completed", "report": await execute_review()}
+        task = asyncio.create_task(
+            execute_review(),
+            name=f"run-review-{operation['operation_id']}",
+        )
+        def log_review_failure(completed: asyncio.Task[Any]) -> None:
+            if completed.cancelled():
+                return
+            error = completed.exception()
+            if error is not None:
+                logger.error(
+                    "Background Run review failed session=%s run=%s operation=%s",
+                    session_id,
+                    run_id,
+                    operation["operation_id"],
+                    exc_info=(type(error), error, error.__traceback__),
+                )
+
+        task.add_done_callback(log_review_failure)
+        self._run_review_tasks[operation_id] = task
+        return {
+            "status": "pending",
+            "operation_id": operation["operation_id"],
+            "snapshot_id": snapshot.snapshot_id,
+            "run_id": run.run_id,
+            "policy": policy.value,
+            "manual": manual,
+        }
+
+    async def recover_pending_run_reviews(self) -> list[dict[str, Any]]:
+        """Resume durable ordinary-Run review jobs after process startup."""
+
+        jobs = session_manager.list_pending_run_reviews()
+        for job in jobs:
+            try:
+                await self.begin_run_review(
+                    str(job["session_id"]),
+                    str(job["run_id"]),
+                    manual=bool((job.get("operation") or {}).get("manual", False)),
+                    wait=False,
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to recover Run review session=%s run=%s operation=%s",
+                    job.get("session_id"),
+                    job.get("run_id"),
+                    job.get("operation_id"),
+                )
+        return jobs
 
     def _skills_runtime_root(self) -> Path:
         assert self._base_dir is not None
@@ -3423,8 +3750,15 @@ class DeepAgentsAgentManager:
             middlewares.append(
                 PuddingClawRubricMiddleware(
                     model=rubric_model,
+                    # The semantic grader is a verifier, never an executor.
+                    # Keep this explicit so a DeepAgents default or config
+                    # expansion cannot silently grant it mutation tools.
+                    tools=[],
                     max_iterations=max_iterations,
                     max_stagnant_repairs=max_stagnant_repairs,
+                    grader_state_schema=PuddingClawGraderState,
+                    prepare_messages_for_grader=_prepare_rubric_grader_messages,
+                    build_grader_state=_build_rubric_grader_state,
                 )
             )
         model_call_limit_cfg = config.load_config().get("harness", {}).get("model_call_limit", {})
@@ -6790,6 +7124,7 @@ class DeepAgentsAgentManager:
         goal_id: str | None = None,
         context_goal_id: str | None = None,
         goal_control_action: str | None = None,
+        run_review_policy: str | None = None,
         interaction_mode: str = "interactive",
         authority_profile: str = "smart",
         filesystem_mode: str | None = None,
@@ -7066,6 +7401,7 @@ class DeepAgentsAgentManager:
                 context_goal_id=run_context_goal_id,
                 context_goal_revision=context_goal_revision,
                 goal_turn_decision=turn_decision,
+                run_review_policy=run_review_policy,
                 interaction_mode=interaction_mode,
                 authority_profile=authority_profile,
                 filesystem_mode=filesystem_mode,
@@ -7231,6 +7567,7 @@ class DeepAgentsAgentManager:
         context_goal_id: str | None = None,
         context_goal_revision: int | None = None,
         goal_turn_decision: GoalTurnDecision | None = None,
+        run_review_policy: str | None = None,
         interaction_mode: str = "interactive",
         authority_profile: str = "smart",
         filesystem_mode: str | None = None,
@@ -7351,6 +7688,19 @@ class DeepAgentsAgentManager:
             harness_config = config.load_config().get("harness", {})
             goals_config = harness_config.get("goals", {})
             rubric_config = harness_config.get("completion", {}).get("rubric", {})
+            run_review_config = harness_config.get("completion", {}).get("run_review", {})
+            configured_review_policy = RunReviewPolicy(
+                run_review_config.get("policy") or RunReviewPolicy.OFF.value
+            )
+            resolved_run_review_policy = (
+                RunReviewPolicy(run_review_policy)
+                if run_review_policy is not None
+                else (
+                    configured_review_policy
+                    if configured_review_policy != RunReviewPolicy.BLOCKING_ONE_SHOT
+                    else RunReviewPolicy.OFF
+                )
+            )
             effective_rubric_config = dict(rubric_config)
             completion_policy = "rubric" if rubric_config.get("enabled", False) else "standard"
             # Policy is frozen when a Goal is created; a later settings change
@@ -7521,6 +7871,7 @@ class DeepAgentsAgentManager:
                     "completion": {
                         **dict(harness_config.get("completion", {})),
                         "rubric": dict(effective_rubric_config),
+                        "run_review": dict(run_review_config),
                     },
                     "goals": goals_config,
                     "model_call_limit": harness_config.get("model_call_limit", {}),
@@ -7536,7 +7887,11 @@ class DeepAgentsAgentManager:
                 # Existing Goals freeze their completion policy. A later UI
                 # setting change must not silently disable the verifier for a
                 # Rubric Goal continuation or upgrade a Standard Goal.
-                verification_enabled=(completion_policy == GoalCompletionPolicy.RUBRIC.value),
+                verification_enabled=(
+                    completion_policy == GoalCompletionPolicy.RUBRIC.value
+                    or resolved_run_review_policy != RunReviewPolicy.OFF
+                ),
+                run_review_policy=resolved_run_review_policy,
                 completion_policy=completion_policy,
                 goal_max_rounds=goal_max_rounds,
                 custom_rubric_rules=(
@@ -8229,10 +8584,12 @@ class DeepAgentsAgentManager:
             received_context_usage_event = False
             last_fallback_context_usage = -1
             persisted_agent_context_fingerprint = _agent_context_fingerprint(saved_agent_context)
-            # A natural stop without a declaration is still allowed to publish
-            # this Run's progress response. The final transaction—not stream
-            # buffering—is the authority for Goal completion.
-            defer_final_publication = False
+            # Goal Rubric and explicit blocking review keep terminal candidate
+            # text private until their control-plane verdict is available.
+            defer_final_publication = bool(
+                run_record.requires_goal_verification
+                or run_record.run_review_policy == RunReviewPolicy.BLOCKING_ONE_SHOT
+            )
 
             def persist_assistant_snapshot(
                 *,
@@ -9312,6 +9669,43 @@ class DeepAgentsAgentManager:
             model_limit_detail = verification_state.get("_model_call_limit_exceeded")
             if not isinstance(model_limit_detail, dict) and model_call_limit_events:
                 model_limit_detail = model_call_limit_events[-1]
+            blocking_run_review_report = None
+            if (
+                run_record.run_kind == RunKind.STANDALONE
+                and run_record.run_review_policy == RunReviewPolicy.BLOCKING_ONE_SHOT
+                and incomplete_model_response is None
+                and not stream_context.get("_headless_needs_input")
+                and not isinstance(model_limit_detail, dict)
+            ):
+                if run_record.status == RunStatus.RUNNING:
+                    self._run_coordinator.transition(run_record, RunStatus.EVALUATING)
+                blocking_state = self._ordinary_run_review_state(
+                    run_record,
+                    workspace_path=workspace_path,
+                    final_state=verification_state,
+                )
+                snapshot, operation = self._run_review_orchestrator.prepare(
+                    run=run_record,
+                    final_state=blocking_state,
+                    workspace_fingerprint=stable_digest(
+                        {
+                            "workspace_path": str(workspace_path),
+                            "execution": run_record.config_snapshot.get("execution", {}),
+                        }
+                    ),
+                    policy=RunReviewPolicy.BLOCKING_ONE_SHOT,
+                    manual=False,
+                )
+                blocking_run_review_report = await self._run_review_orchestrator.execute(
+                    run=run_record,
+                    snapshot=snapshot,
+                    operation=operation,
+                    final_state=blocking_state,
+                    model=rubric_model,
+                    policy=RunReviewPolicy.BLOCKING_ONE_SHOT,
+                    manual=False,
+                )
+                run_record.run_review_report_id = blocking_run_review_report.report_id
             run_limit_payload: dict[str, Any] | None = None
             if isinstance(model_limit_detail, dict):
                 reason = str(model_limit_detail.get("reason") or "run_model_call_limit")
@@ -9407,7 +9801,10 @@ class DeepAgentsAgentManager:
                     goal_record is None
                     or goal_record.completion_policy == GoalCompletionPolicy.STANDARD
                     or verification_report is not None
-                    and verification_report.accepted_for_goal_revision is True
+                    and (
+                        verification_report.source_format == "verification_records_v1"
+                        or verification_report.accepted_for_goal_revision is True
+                    )
                 )
             )
 
@@ -9481,23 +9878,112 @@ class DeepAgentsAgentManager:
                 if not completion_accepted
                 else ""
             )
-            if completion_accepted:
-                session_manager.commit_accepted_completion(
-                    session_id,
-                    run=run_record.model_dump(mode="json"),
-                    goal=(goal_record.model_dump(mode="json") if goal_record is not None else None),
-                    query_id=query_id,
-                    content=full_content,
-                    tool_calls=all_tool_calls or None,
-                    sources=message_sources or None,
-                    citations=final_citations or None,
-                    reasoning_content=accumulated_reasoning or None,
-                    timeline=all_timeline or None,
-                    segments=segments or None,
-                    output_attachments=published_attachments or None,
-                    verification_summary=verification_summary or None,
-                    usage_summary=final_usage_summary,
+            if blocking_run_review_report is not None:
+                blocking_status = blocking_run_review_report.status
+                verification_summary = (
+                    "**质量复核 · 实验性：** 独立复核通过。"
+                    if blocking_status == VerificationRecordStatus.SATISFIED
+                    else "**质量复核 · 实验性：** "
+                    + (
+                        "复核基础设施未完成，本次已按降级策略发布。"
+                        if blocking_status
+                        in {
+                            VerificationRecordStatus.GRADER_ERROR,
+                            VerificationRecordStatus.INFRASTRUCTURE_ERROR,
+                        }
+                        else "独立复核发现潜在缺口，本次回答已在发布前完成标注。"
+                    )
                 )
+            run_review_start: dict[str, Any] | None = None
+            if completion_accepted:
+                verified_projection = project_messages_for_grader(
+                    verification_state.get("messages") or [],
+                    run_query_id=run_record.query_id,
+                    objective=run_record.objective,
+                )
+                verified_candidate_content, verified_candidate_tool_calls = (
+                    candidate_from_projected_messages(verified_projection)
+                )
+                settlement_event_base = {
+                    "session_id": session_id,
+                    "query_id": query_id,
+                    "run_id": run_record.run_id,
+                    "goal_id": run_record.goal_id,
+                    "goal_revision": run_record.goal_revision,
+                    "completion_request_id": run_record.completion_request_id,
+                    "snapshot_id": run_record.evaluation_snapshot_id,
+                }
+                if run_record.requires_goal_verification:
+                    started_event = VerificationEvent(
+                        event_type="verification.settlement.started",
+                        status="evaluating",
+                        **settlement_event_base,
+                    )
+                    yield self._sse(
+                        started_event.event_type,
+                        started_event.model_dump(mode="json"),
+                    )
+                try:
+                    session_manager.commit_accepted_completion(
+                        session_id,
+                        run=run_record.model_dump(mode="json"),
+                        goal=(goal_record.model_dump(mode="json") if goal_record is not None else None),
+                        query_id=query_id,
+                        content=full_content,
+                        verified_candidate_content=verified_candidate_content,
+                        verified_candidate_tool_calls=verified_candidate_tool_calls,
+                        tool_calls=all_tool_calls or None,
+                        sources=message_sources or None,
+                        citations=final_citations or None,
+                        reasoning_content=accumulated_reasoning or None,
+                        timeline=all_timeline or None,
+                        segments=segments or None,
+                        output_attachments=published_attachments or None,
+                        verification_summary=verification_summary or None,
+                        usage_summary=final_usage_summary,
+                    )
+                except Exception as exc:
+                    if run_record.requires_goal_verification:
+                        rejected_event = VerificationEvent(
+                            event_type="verification.settlement.rejected",
+                            status="rejected",
+                            error_kind=type(exc).__name__,
+                            **settlement_event_base,
+                        )
+                        yield self._sse(
+                            rejected_event.event_type,
+                            rejected_event.model_dump(mode="json"),
+                        )
+                    raise
+                if run_record.requires_goal_verification:
+                    committed_event = VerificationEvent(
+                        event_type="verification.settlement.committed",
+                        status="accepted",
+                        **settlement_event_base,
+                    )
+                    yield self._sse(
+                        committed_event.event_type,
+                        committed_event.model_dump(mode="json"),
+                    )
+                if (
+                    run_record.run_kind == RunKind.STANDALONE
+                    and run_record.run_review_policy == RunReviewPolicy.SHADOW
+                ):
+                    try:
+                        run_review_start = await self.begin_run_review(
+                            session_id,
+                            run_record.run_id,
+                            manual=False,
+                            final_state=verification_state,
+                            workspace_path=workspace_path,
+                            model=rubric_model,
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Failed to prepare shadow Run review session=%s run=%s",
+                            session_id,
+                            run_record.run_id,
+                        )
             elif (
                 self._segment_has_payload({"content": full_content, "tool_calls": all_tool_calls})
                 or published_attachments
@@ -9523,6 +10009,16 @@ class DeepAgentsAgentManager:
             terminal_authority_committed = True
 
             yield self._sse("usage_summary", final_usage_summary)
+
+            if run_review_start is not None:
+                yield self._sse(
+                    "run_review_started",
+                    {
+                        "session_id": session_id,
+                        "query_id": query_id,
+                        **run_review_start,
+                    },
+                )
 
             if run_record.run_kind != RunKind.GOAL_INSPECTION and verification_report is not None:
                 yield self._sse(
