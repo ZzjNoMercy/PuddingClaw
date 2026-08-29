@@ -103,6 +103,9 @@ export interface DatabaseSettings {
   database: string;
   username: string;
   password?: string;
+  password_configured?: boolean;
+  password_readable?: boolean;
+  password_error?: string;
   url: string;
   configured_url?: string;
   configured_by?: string;
@@ -237,6 +240,8 @@ export interface ProviderEndpoint {
   capabilities: ProviderCapability[];
   credential_configured: boolean;
   api_key_masked: string;
+  credential_readable?: boolean;
+  credential_error?: string;
   credential_source: "" | "environment" | "local_file";
 }
 
@@ -245,6 +250,8 @@ export interface ProviderApiKey {
   is_default: boolean;
   credential_configured: boolean;
   api_key_masked: string;
+  credential_readable?: boolean;
+  credential_error?: string;
   credential_source: "" | "environment" | "local_file";
 }
 
@@ -276,6 +283,10 @@ export interface ProviderRegistry {
   version: number;
   providers: ProviderService[];
   bindings: Record<string, string>;
+  credential_vault?: {
+    readable: boolean;
+    error: string;
+  };
 }
 
 export async function getSettings(): Promise<SystemSettings> {

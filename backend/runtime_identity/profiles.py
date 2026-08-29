@@ -19,6 +19,7 @@ from io import BytesIO
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from filelock import FileLock
 
@@ -27,6 +28,10 @@ from runtime_identity.paths import PuddingClawPaths, safe_identity_component
 
 MAX_CREDENTIAL_ARCHIVE_BYTES = 20 * 1024 * 1024
 MAX_CREDENTIAL_ARCHIVE_FILES = 2_000
+
+
+class CredentialEnvelopeDecryptionError(ValueError):
+    """Encrypted credential state exists but is not readable by this installation."""
 
 
 def validate_credential_archive(
@@ -135,6 +140,13 @@ class MasterKeyProvider:
             return self._get_or_create_locked()
 
     def _get_or_create_locked(self) -> bytes:
+        # Once the file fallback exists it is the durable key authority for
+        # this installation.  Choosing Keychain first on every startup made
+        # the active key depend on whether the login Keychain happened to be
+        # unlocked, which can make an otherwise valid vault undecryptable.
+        fallback = self._read_fallback_key()
+        if fallback is not None:
+            return fallback
         if sys.platform == "darwin":
             try:
                 return self._get_or_create_keychain_key()
@@ -143,20 +155,45 @@ class MasterKeyProvider:
                 # The local fallback remains private to this owner and never
                 # shares a directory with encrypted provider state.
                 pass
-        fallback = self.paths.root / ".vault-keys" / f"{self.owner_user_id}.key"
+        fallback = self._fallback_path()
         fallback.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(fallback.parent, 0o700)
+        value = secrets.token_bytes(32)
+        _atomic_write(fallback, value)
+        os.chmod(fallback, 0o600)
+        return value
+
+    def existing_keys(self) -> tuple[bytes, ...]:
+        """Return existing recovery candidates without creating a new key."""
+
+        candidates: list[bytes] = []
+        fallback = self._read_fallback_key()
+        if fallback is not None:
+            candidates.append(fallback)
+        if sys.platform == "darwin":
+            try:
+                keychain = self._read_keychain_key()
+            except (OSError, subprocess.TimeoutExpired):
+                keychain = None
+            if keychain is not None and keychain not in candidates:
+                candidates.append(keychain)
+        return tuple(candidates)
+
+    def _fallback_path(self) -> Path:
+        return self.paths.root / ".vault-keys" / f"{self.owner_user_id}.key"
+
+    def _read_fallback_key(self) -> bytes | None:
+        fallback = self._fallback_path()
         try:
             value = fallback.read_bytes()
         except FileNotFoundError:
-            value = secrets.token_bytes(32)
-            _atomic_write(fallback, value)
+            return None
         if len(value) != 32:
             raise ValueError("credential vault master key has an invalid length")
         os.chmod(fallback, 0o600)
         return value
 
-    def _get_or_create_keychain_key(self) -> bytes:
+    def _read_keychain_key(self) -> bytes | None:
         existing = subprocess.run(
             [
                 "security",
@@ -172,13 +209,18 @@ class MasterKeyProvider:
             text=True,
             timeout=10,
         )
-        if existing.returncode == 0 and existing.stdout.strip():
-            try:
-                value = base64.urlsafe_b64decode(existing.stdout.strip().encode("ascii"))
-            except (ValueError, UnicodeError):
-                value = b""
-            if len(value) == 32:
-                return value
+        if existing.returncode != 0 or not existing.stdout.strip():
+            return None
+        try:
+            value = base64.urlsafe_b64decode(existing.stdout.strip().encode("ascii"))
+        except (ValueError, UnicodeError):
+            return None
+        return value if len(value) == 32 else None
+
+    def _get_or_create_keychain_key(self) -> bytes:
+        existing = self._read_keychain_key()
+        if existing is not None:
+            return existing
         generated = secrets.token_bytes(32)
         encoded = base64.urlsafe_b64encode(generated).decode("ascii")
         stored = subprocess.run(
@@ -227,11 +269,16 @@ class CredentialVault:
         value = json.loads(envelope.decode("utf-8"))
         if value.get("version") != self.version or value.get("algorithm") != "AES-256-GCM":
             raise ValueError("unsupported credential vault envelope")
-        return self._cipher.decrypt(
-            base64.b64decode(value["nonce"], validate=True),
-            base64.b64decode(value["ciphertext"], validate=True),
-            self._aad(owner_user_id, provider, profile_id),
-        )
+        try:
+            return self._cipher.decrypt(
+                base64.b64decode(value["nonce"], validate=True),
+                base64.b64decode(value["ciphertext"], validate=True),
+                self._aad(owner_user_id, provider, profile_id),
+            )
+        except InvalidTag as exc:
+            raise CredentialEnvelopeDecryptionError(
+                "已保存的凭据无法解密；主密钥与密文不匹配，请重新授权或重新录入凭据。"
+            ) from exc
 
     def seal_flow(
         self,
@@ -276,11 +323,16 @@ class CredentialVault:
         value = json.loads(envelope.decode("utf-8"))
         if value.get("version") != self.version or value.get("algorithm") != "AES-256-GCM":
             raise ValueError("unsupported credential vault envelope")
-        return self._cipher.decrypt(
-            base64.b64decode(value["nonce"], validate=True),
-            base64.b64decode(value["ciphertext"], validate=True),
-            aad,
-        )
+        try:
+            return self._cipher.decrypt(
+                base64.b64decode(value["nonce"], validate=True),
+                base64.b64decode(value["ciphertext"], validate=True),
+                aad,
+            )
+        except InvalidTag as exc:
+            raise CredentialEnvelopeDecryptionError(
+                "已保存的授权状态无法解密；主密钥与密文不匹配，请重新发起授权。"
+            ) from exc
 
     @staticmethod
     def _aad(owner_user_id: str, provider: str, profile_id: str) -> bytes:
@@ -315,13 +367,41 @@ class CredentialProfileStore:
         self.registry_path = self.root / "credential-profiles.json"
         self.bindings_path = self.root / "project-bindings.json"
         self._registry_lock = FileLock(str(self.root / ".registry.lock"))
+        self.key_provider = MasterKeyProvider(self.paths, self.owner_user_id)
         self._vault = vault
 
     @property
     def vault(self) -> CredentialVault:
         if self._vault is None:
-            self._vault = CredentialVault(MasterKeyProvider(self.paths, self.owner_user_id).get_or_create())
+            self._vault = CredentialVault(self.key_provider.get_or_create())
         return self._vault
+
+    def _open_state_envelope(
+        self,
+        envelope: bytes,
+        *,
+        provider: str,
+        profile_id: str,
+    ) -> bytes:
+        candidates = [self.vault]
+        candidates.extend(
+            CredentialVault(key) for key in self.key_provider.existing_keys()
+        )
+        for candidate in candidates:
+            try:
+                plaintext = candidate.open(
+                    envelope,
+                    owner_user_id=self.owner_user_id,
+                    provider=provider,
+                    profile_id=profile_id,
+                )
+            except CredentialEnvelopeDecryptionError:
+                continue
+            self._vault = candidate
+            return plaintext
+        raise CredentialEnvelopeDecryptionError(
+            "已保存的凭据无法解密；主密钥与密文不匹配，请重新授权。"
+        )
 
     def resolve(
         self,
@@ -581,9 +661,8 @@ class CredentialProfileStore:
         if stored_fingerprint is not None and stored_fingerprint != credential_state.fingerprint:
             raise ValueError("credential profile state contract does not match the active Adapter")
         return validate_credential_archive(
-            self.vault.open(
+            self._open_state_envelope(
                 envelope,
-                owner_user_id=self.owner_user_id,
                 provider=provider,
                 profile_id=profile_id,
             ),

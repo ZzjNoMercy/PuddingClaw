@@ -211,6 +211,7 @@ export default function DocumentParserSettings() {
           const hasDraftConnection = hasDraftKey || hasDraftBaseUrl;
           const credentialState = hasDraftKey
             ? parser.credential_configured ? "已修改" : "待保存"
+            : parser.credential_readable === false ? "需重新录入"
             : parser.credential_configured ? "已保存" : "未配置";
           return (
             <div key={parser.id} className="rounded-xl border border-black/[0.07] bg-white/70 p-3">

@@ -206,7 +206,14 @@ def _is_postgres_url(url: str) -> bool:
 
 async def _check_postgres(url: str | None) -> CapabilityStatus:
     """Core Catalog 数据库探测（scope=core）：SQLite 直接可用，PostgreSQL 探测连通性。"""
-    target = _resolve_postgres_url(url)
+    try:
+        target = _resolve_postgres_url(url)
+    except ValueError as exc:
+        return CapabilityStatus(
+            available=False,
+            reason=str(exc),
+            details={"mode": "postgresql", "scope": "core", "credential_readable": False},
+        )
     if not _is_postgres_url(target):
         if get_database_config().get("mode") == "sqlite":
             return CapabilityStatus(
@@ -521,7 +528,14 @@ def _check_milvus_sync(url: str | None) -> CapabilityStatus:
 
 def _check_postgres_sync(url: str | None) -> CapabilityStatus:
     """同步路径只做 TCP 探测，避免在已有事件循环里阻塞 asyncpg。"""
-    target = _resolve_postgres_url(url)
+    try:
+        target = _resolve_postgres_url(url)
+    except ValueError as exc:
+        return CapabilityStatus(
+            available=False,
+            reason=str(exc),
+            details={"mode": "postgresql", "scope": "core", "credential_readable": False},
+        )
     if not _is_postgres_url(target):
         if get_database_config().get("mode") == "sqlite":
             return CapabilityStatus(

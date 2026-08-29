@@ -1024,6 +1024,8 @@ export interface KnowledgeDatabaseSource {
   username: string;
   password?: string;
   password_configured?: boolean;
+  password_readable?: boolean;
+  password_error?: string;
   selected_tables: string[];
   builtin?: boolean;
   configured_by?: string;
@@ -1738,6 +1740,8 @@ export interface DocumentParserStatus {
   requires_credential: boolean;
   credential_env?: string;
   credential_configured: boolean;
+  credential_readable?: boolean;
+  credential_error?: string;
   credential_source?: "environment" | "vault" | "none";
   cloud_data_notice?: string;
   version?: string;
@@ -4630,6 +4634,7 @@ export interface McpConfig {
 export interface McpConfigPayload {
   path: string;
   config: McpConfig;
+  credential_vault?: { readable: boolean; error: string };
 }
 
 export async function getMcpConfig(): Promise<McpConfigPayload> {

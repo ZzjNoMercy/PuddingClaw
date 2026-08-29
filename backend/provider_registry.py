@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+from cryptography.exceptions import InvalidTag
 
 from llm.thinking_mapping import thinking_profile
 from runtime_identity.paths import PuddingClawPaths, trusted_owner_user_id
@@ -76,6 +77,10 @@ DEFAULT_MODEL_CATEGORY = {
 }
 
 logger = logging.getLogger(__name__)
+
+
+class CredentialVaultDecryptionError(ValueError):
+    """The encrypted Provider registry cannot be opened by local keys."""
 
 
 def user_data_dir() -> Path:
@@ -159,17 +164,43 @@ class LocalCredentialStore:
         self.paths = PuddingClawPaths(home_root)
         self.path = self.paths.credentials_root(self.owner_user_id) / "provider-registry.enc"
         self.legacy_paths = (configured_root / "credentials.json", home_root / "credentials.json")
-        self.vault = CredentialVault(MasterKeyProvider(self.paths, self.owner_user_id).get_or_create())
+        self.key_provider = MasterKeyProvider(self.paths, self.owner_user_id)
+        self.vault = CredentialVault(self.key_provider.get_or_create())
+        self._unreadable_envelope: tuple[int, int, str] | None = None
+
+    def _open_payload(self) -> dict[str, Any]:
+        """Open the registry with existing keys, without destructive reset."""
+
+        stat = self.path.stat()
+        signature = (stat.st_mtime_ns, stat.st_size)
+        if self._unreadable_envelope and self._unreadable_envelope[:2] == signature:
+            raise CredentialVaultDecryptionError(self._unreadable_envelope[2]) from None
+        envelope = self.path.read_bytes()
+        vaults = [self.vault]
+        vaults.extend(CredentialVault(key) for key in self.key_provider.existing_keys())
+        for vault in vaults:
+            try:
+                raw = vault.open(
+                    envelope,
+                    owner_user_id=self.owner_user_id,
+                    provider="provider-registry",
+                    profile_id="default",
+                )
+            except (InvalidTag, ValueError, KeyError, TypeError, UnicodeDecodeError):
+                continue
+            self.vault = vault
+            self._unreadable_envelope = None
+            return _read_json_bytes(raw)
+        error = CredentialVaultDecryptionError(
+            "Credential Vault 无法解密已保存的 Provider API Key；主密钥与密文不匹配。"
+            "请在 Settings > 模型服务重新保存所有 Provider API Key。"
+        )
+        self._unreadable_envelope = (*signature, str(error))
+        raise error from None
 
     def _payload(self) -> dict[str, Any]:
         if self.path.is_file():
-            raw = self.vault.open(
-                self.path.read_bytes(),
-                owner_user_id=self.owner_user_id,
-                provider="provider-registry",
-                profile_id="default",
-            )
-            return _read_json_bytes(raw)
+            return self._open_payload()
         for legacy in self.legacy_paths:
             if not legacy.is_file():
                 continue
@@ -185,13 +216,7 @@ class LocalCredentialStore:
     def _payload_from_disk(self) -> dict[str, Any]:
         if not self.path.is_file():
             return {}
-        raw = self.vault.open(
-            self.path.read_bytes(),
-            owner_user_id=self.owner_user_id,
-            provider="provider-registry",
-            profile_id="default",
-        )
-        return _read_json_bytes(raw)
+        return self._open_payload()
 
     def _write_payload(self, payload: dict[str, Any]) -> None:
         encoded = (json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode()
@@ -203,11 +228,33 @@ class LocalCredentialStore:
         )
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         _atomic_bytes_write(self.path, envelope)
+        self._unreadable_envelope = None
+
+    def _quarantine_unreadable_payload(self) -> Path | None:
+        """Preserve unreadable ciphertext before an explicit credential save repairs the vault."""
+
+        if not self.path.is_file():
+            return None
+        backup = self.path.with_name(f"{self.path.name}.unreadable-{time.time_ns()}")
+        self.path.replace(backup)
+        logger.warning(
+            "Credential Vault key mismatch; preserved unreadable Provider registry at %s before re-keying",
+            backup,
+        )
+        return backup
 
     def put(self, ref: str, value: str) -> str:
         if not value:
             return ref
-        payload = self._payload()
+        try:
+            payload = self._payload()
+        except CredentialVaultDecryptionError:
+            # A credential save is an explicit repair action.  Keep the old
+            # ciphertext for forensic/manual recovery, then create a fresh
+            # registry with the installation's stable master key.  No read
+            # path is allowed to reset credentials implicitly.
+            self._quarantine_unreadable_payload()
+            payload = {"version": 1, "credentials": {}}
         credentials = payload.setdefault("credentials", {})
         credentials[ref] = {"value": value, "updated_at": int(time.time())}
         self._write_payload(payload)
@@ -225,14 +272,47 @@ class LocalCredentialStore:
 
     def delete(self, ref: str) -> None:
         key = ref.rsplit("/", 1)[-1]
-        payload = self._payload()
+        try:
+            payload = self._payload()
+        except CredentialVaultDecryptionError:
+            # Deleting/clearing a credential is also an explicit repair
+            # action.  Preserve the unreadable ciphertext and let the caller
+            # remove its non-secret reference instead of trapping the user on
+            # a settings page that cannot clear the broken configuration.
+            self._quarantine_unreadable_payload()
+            return
         credentials = payload.setdefault("credentials", {})
         if key in credentials:
             del credentials[key]
             self._write_payload(payload)
 
     def display(self, reference: str) -> str:
-        return _mask(self.get(reference))
+        return str(self.inspect(reference)["api_key_masked"])
+
+    def inspect(self, reference: str) -> dict[str, Any]:
+        """Return control-plane credential status without propagating vault failures.
+
+        Runtime callers must continue to use :meth:`get`.  Settings pages use
+        this method so an unreadable vault can be repaired from the UI instead
+        of making the repair screen itself unavailable.
+        """
+
+        try:
+            value = self.get(reference)
+        except CredentialVaultDecryptionError as exc:
+            configured = bool(reference.startswith("vault://") and self.path.is_file())
+            return {
+                "credential_configured": configured,
+                "credential_readable": False,
+                "api_key_masked": "••••••••" if configured else "",
+                "credential_error": str(exc),
+            }
+        return {
+            "credential_configured": bool(value),
+            "credential_readable": True,
+            "api_key_masked": _mask(value),
+            "credential_error": "",
+        }
 
     def updated_at(self, reference: str) -> int:
         if not reference.startswith("vault://"):
@@ -856,6 +936,18 @@ class ProviderRegistry:
     def display(self) -> dict[str, Any]:
         payload = self._payload()
         result = copy.deepcopy(payload)
+        vault_error = ""
+        inspections: dict[str, dict[str, Any]] = {}
+
+        def inspect(reference: str) -> dict[str, Any]:
+            nonlocal vault_error
+            if reference not in inspections:
+                inspections[reference] = self.credentials.inspect(reference)
+            status = inspections[reference]
+            if not status["credential_readable"] and not vault_error:
+                vault_error = str(status["credential_error"])
+            return status
+
         for provider in result["providers"]:
             raw_credentials = provider.pop("credentials", {})
             provider["default_credential_name"] = DEFAULT_CREDENTIAL_NAME
@@ -864,25 +956,24 @@ class ProviderRegistry:
             names.add(DEFAULT_CREDENTIAL_NAME)
             for name in sorted(names, key=lambda item: (item != DEFAULT_CREDENTIAL_NAME, item.lower())):
                 reference = str(raw_credentials.get(name) or "") if isinstance(raw_credentials, dict) else ""
+                status = inspect(reference)
                 provider["api_keys"].append({
                     "name": name,
                     "is_default": name == DEFAULT_CREDENTIAL_NAME,
-                    "credential_configured": bool(self.credentials.get(reference)),
-                    "api_key_masked": self.credentials.display(reference),
+                    **status,
                     "credential_source": (
                         "environment" if reference.startswith("env://")
-                        else "vault" if reference.startswith("vault://")
+                        else "local_file" if reference.startswith("vault://")
                         else "" if not reference else "legacy"
                     ),
                 })
             for endpoint in provider.get("endpoints", []):
                 reference = str(raw_credentials.get(DEFAULT_CREDENTIAL_NAME) or endpoint.pop("credential_ref", ""))
                 endpoint.pop("credential_ref", None)
-                endpoint["credential_configured"] = bool(self.credentials.get(reference))
-                endpoint["api_key_masked"] = self.credentials.display(reference)
+                endpoint.update(inspect(reference))
                 endpoint["credential_source"] = (
                     "environment" if reference.startswith("env://")
-                    else "vault" if reference.startswith("vault://")
+                    else "local_file" if reference.startswith("vault://")
                     else "" if not reference else "legacy"
                 )
             for model in provider.get("models", []):
@@ -891,6 +982,10 @@ class ProviderRegistry:
                     model_name=str(model.get("name") or ""),
                     endpoint_id=str(model.get("endpoint_id") or ""),
                 )
+        result["credential_vault"] = {
+            "readable": not vault_error,
+            "error": vault_error,
+        }
         return result
 
     def resolve_credential_for_runtime(

@@ -49,6 +49,34 @@ def _safe_mcp_config(config: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+def _mcp_credential_vault_status(config: dict[str, Any]) -> dict[str, Any]:
+    """Return one fail-soft status for Vault-backed MCP secrets."""
+
+    references: list[str] = []
+    servers = config.get("servers")
+    if isinstance(servers, dict):
+        for server in servers.values():
+            if not isinstance(server, dict):
+                continue
+            for location in ("headers", "env"):
+                values = server.get(location)
+                if isinstance(values, dict):
+                    references.extend(
+                        str(value) for value in values.values()
+                        if isinstance(value, str) and value.startswith("vault://")
+                    )
+    if not references:
+        return {"readable": True, "error": ""}
+    from provider_registry import LocalCredentialStore
+
+    store = LocalCredentialStore()
+    for reference in references:
+        status = store.inspect(reference)
+        if not status.get("credential_readable", True):
+            return {"readable": False, "error": str(status.get("credential_error") or "")}
+    return {"readable": True, "error": ""}
+
+
 class McpConfigRequest(BaseModel):
     config: dict[str, Any] = Field(default_factory=dict)
 
@@ -139,6 +167,9 @@ async def get_mcp_config():
     return {
         "path": str(_config_path()),
         "config": _safe_mcp_config(config if isinstance(config, dict) else {}),
+        "credential_vault": _mcp_credential_vault_status(
+            config if isinstance(config, dict) else {}
+        ),
     }
 
 
@@ -163,7 +194,12 @@ async def put_mcp_config(request: McpConfigRequest):
         invalidate_mcp_tool_cache()
     except Exception:
         pass
-    return {"path": str(_config_path()), "config": _safe_mcp_config(next_mcp), "status": "saved"}
+    return {
+        "path": str(_config_path()),
+        "config": _safe_mcp_config(next_mcp),
+        "credential_vault": _mcp_credential_vault_status(next_mcp),
+        "status": "saved",
+    }
 
 
 @router.get("/mcp/servers")
@@ -183,7 +219,9 @@ async def list_mcp_servers(probe: bool = Query(False)):
         enabled = effective_mcp_server_names(mcp_config.get("enabled", []))
         from mcp_clients.servers import _server_registry
 
-        registry_names = list(_server_registry(custom_servers).keys())
+        registry_names = list(
+            _server_registry(custom_servers, resolve_secrets=False).keys()
+        )
         servers = get_mcp_server_display_info(enabled, custom_servers)
         gbrain = gbrain_runtime_status()
         catalog_names = list(dict.fromkeys([*registry_names, *enabled]))

@@ -6,6 +6,7 @@ from typing import Any
 import pytest
 
 from graph.citations import format_sources_for_model, make_source_id, parse_tool_result
+from runtime_identity.profiles import CredentialVault
 from web_search.adapters.base import normalized_response_sources
 from web_search.adapters.grok import GrokSearchAdapter
 from web_search.models import AdapterResponse, SearchRequest, SearchResult, WebSearchError
@@ -79,6 +80,28 @@ def test_registry_masks_credentials_and_uses_confirmed_default_routes(tmp_path) 
     assert displayed["ready_providers"] == ["tavily", "grok"]
     assert all(item["dependencies"]["status"] == "already_satisfied" for item in displayed["providers"])
     assert registry.available() is True
+
+
+def test_web_search_settings_display_survives_unreadable_vault(tmp_path) -> None:
+    registry = WebSearchRegistry(tmp_path)
+    registry.save_credential("tavily", "tavily-secret-key")
+    original = CredentialVault(b"o" * 32).seal(
+        b'{"version":1,"credentials":{}}',
+        owner_user_id=registry.credentials.owner_user_id,
+        provider="provider-registry",
+        profile_id="default",
+    )
+    registry.credentials.path.write_bytes(original)
+
+    displayed = registry.display()
+
+    assert displayed["credential_vault"]["readable"] is False
+    tavily = next(item for item in displayed["providers"] if item["id"] == "tavily")
+    assert tavily["credential_configured"] is True
+    assert tavily["credential_readable"] is False
+    assert tavily["api_key_masked"] == "••••••••"
+    assert "重新保存所有 Provider API Key" in tavily["credential_error"]
+    assert registry.credentials.path.read_bytes() == original
 
 
 def test_legacy_global_switch_is_ignored_in_favor_of_provider_readiness(tmp_path) -> None:

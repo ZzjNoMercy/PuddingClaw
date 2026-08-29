@@ -349,7 +349,9 @@ export default function ChatInput() {
           return model.capability === "llm"
             && model.categories?.includes("llm")
             && Boolean(endpoint)
-            && provider.api_keys.some((credential) => credential.credential_configured);
+            && provider.api_keys.some(
+              (credential) => credential.credential_configured && credential.credential_readable !== false,
+            );
         })
         .map((model) => ({ provider, model }))
     );
@@ -370,7 +372,9 @@ export default function ChatInput() {
     ?? selectedThinkingProfile?.default_level
     ?? null;
   const selectedProviderCredentials = useMemo(
-    () => selectedConversationModel?.provider.api_keys.filter((item) => item.credential_configured) || [],
+    () => selectedConversationModel?.provider.api_keys.filter(
+      (item) => item.credential_configured && item.credential_readable !== false,
+    ) || [],
     [selectedConversationModel],
   );
   const effectiveCredentialName = credentialName || "default";

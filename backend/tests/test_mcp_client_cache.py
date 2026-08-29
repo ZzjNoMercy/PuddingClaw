@@ -4,6 +4,7 @@ import asyncio
 from types import SimpleNamespace
 
 import mcp_clients
+from mcp_clients import servers
 
 
 def _install_fake_discovery(monkeypatch, *, delay: float = 0) -> type:
@@ -133,3 +134,33 @@ def test_failed_mcp_discovery_is_not_cached(monkeypatch) -> None:
 
     asyncio.run(run())
     assert FlakyMCPClient.calls == 2
+
+
+def test_mcp_catalog_does_not_resolve_vault_references(monkeypatch) -> None:
+    monkeypatch.setattr(
+        servers,
+        "_resolve_environment_values",
+        lambda value: (_ for _ in ()).throw(
+            AssertionError("control-plane catalog must not resolve credentials")
+        ),
+    )
+    configured = {
+        "private": {
+            "transport": "streamable-http",
+            "url": "https://mcp.example.test",
+            "headers": {
+                "Authorization": "vault://users/local/credentials/private-mcp"
+            },
+        }
+    }
+
+    catalog = servers.get_mcp_server_display_info(["private"], configured)
+
+    assert catalog == [
+        {
+            "key": "private",
+            "name": "private",
+            "url": "https://mcp.example.test",
+            "transport": "streamable-http",
+        }
+    ]

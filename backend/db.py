@@ -174,14 +174,33 @@ async def init_database() -> bool:
 
 
 def get_database_status() -> dict[str, object]:
-    url = get_database_url()
-    config = get_database_config()
-    provider = "postgresql" if url.startswith("postgresql") else "sqlite" if url.startswith("sqlite") else "unknown"
-    configured = provider == "sqlite" or bool(config.get("url"))
-    safe_url = url
+    """Return secret-free control-plane status without decrypting credentials."""
+
+    config = get_database_config(resolve_password=False)
+    provider = str(config.get("provider") or "unknown")
+    credential_readable = bool(config.get("password_readable", True))
+    configured = provider == "sqlite" or bool(
+        config.get("configured_url")
+        or (
+            config.get("host")
+            and config.get("database")
+            and config.get("password_configured")
+        )
+    )
+    if provider == "sqlite":
+        safe_url = f"sqlite+aiosqlite:///{PuddingClawPaths.from_environment().databases() / 'catalog.sqlite3'}"
+    else:
+        safe_url = str(config.get("configured_url") or "")
+        if not safe_url and provider == "postgresql":
+            safe_url = (
+                "postgresql+asyncpg://***@"
+                f"{config.get('host') or '127.0.0.1'}:{config.get('port') or 5432}/"
+                f"{config.get('database') or 'puddingclaw'}"
+            )
     if "@" in safe_url and "://" in safe_url:
         scheme, rest = safe_url.split("://", 1)
         safe_url = f"{scheme}://***@{rest.split('@', 1)[1]}"
+    credential_error = str(config.get("password_error") or "")
     return {
         "configured": configured,
         "provider": provider,
@@ -189,14 +208,18 @@ def get_database_status() -> dict[str, object]:
         "configured_by": config.get("configured_by"),
         "environment_override": config.get("environment_override"),
         "mode": config.get("mode"),
+        "credential_readable": credential_readable,
+        "credential_error": credential_error,
         "schema_version": _last_schema_version,
         "configuration_hint": (
-            ""
+            credential_error
+            if not credential_readable
+            else ""
             if configured
             else "数据库未配置；请前往 Settings -> 数据库配置数据库连接。"
         ),
-        "last_error": _last_error,
-        "healthy": configured and _last_error is None,
+        "last_error": credential_error or _last_error,
+        "healthy": configured and credential_readable and _last_error is None,
     }
 
 

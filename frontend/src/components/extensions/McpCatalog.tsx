@@ -54,6 +54,7 @@ export default function McpCatalog() {
   const [data, setData] = useState<McpServersStatus | null>(null);
   const [config, setConfig] = useState<McpConfig | null>(null);
   const [configPath, setConfigPath] = useState("");
+  const [credentialVaultError, setCredentialVaultError] = useState("");
   const [loading, setLoading] = useState(true);
   const [probing, setProbing] = useState(false);
   const [error, setError] = useState("");
@@ -73,6 +74,11 @@ export default function McpCatalog() {
       setData(status);
       setConfig(normalizeConfig(savedConfig.config));
       setConfigPath(savedConfig.path);
+      setCredentialVaultError(
+        savedConfig.credential_vault?.readable === false
+          ? savedConfig.credential_vault.error || "MCP 凭证无法解密，请重新录入。"
+          : "",
+      );
       setProbing(true);
       void getMcpServersStatus(true)
         .then((probed) => {
@@ -109,6 +115,11 @@ export default function McpCatalog() {
       const saved = await updateMcpConfig(next);
       setConfig(normalizeConfig(saved.config));
       setConfigPath(saved.path);
+      setCredentialVaultError(
+        saved.credential_vault?.readable === false
+          ? saved.credential_vault.error || "MCP 凭证无法解密，请重新录入。"
+          : "",
+      );
       setShowConfig(false);
       setShowNewServer(false);
       await refresh();
@@ -144,6 +155,11 @@ export default function McpCatalog() {
         </div>
 
         {configPath ? <p className="mb-3 truncate font-mono text-[10px] text-gray-400" title={configPath}>当前配置：{configPath}</p> : null}
+        {credentialVaultError ? (
+          <div className="mb-3 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-xs text-amber-800">
+            已保存的 MCP 凭证当前不可读取。配置仍保留，请在编辑配置后重新录入相关 Header 或环境变量。{credentialVaultError ? ` ${credentialVaultError}` : ""}
+          </div>
+        ) : null}
         {error ? (
           <div className="mb-3 rounded-xl border border-red-100 bg-red-50 px-4 py-3 text-xs text-red-700">
             {error}<button type="button" onClick={() => void refresh()} className="ml-3 font-medium underline">重试</button>

@@ -112,8 +112,13 @@ export default function WebSearchSettingsPage() {
 
   const load = useCallback(async () => {
     setLoading(true);
+    setNotice(null);
     try {
-      setConfig(await getWebSearchConfig());
+      const fresh = await getWebSearchConfig();
+      setConfig(fresh);
+      if (fresh.credential_vault?.readable === false) {
+        setNotice({ tone: "error", text: fresh.credential_vault.error || "凭证存储不可读，请重新保存 API Key" });
+      }
     } catch (error) {
       setNotice({ tone: "error", text: error instanceof Error ? error.message : "无法加载联网搜索配置" });
     } finally {
@@ -412,7 +417,7 @@ function ProviderCard({
           {provider.credential_configured ? (
             <span className="flex min-w-0 items-center justify-end gap-1.5">
               <span className="truncate font-mono font-medium text-emerald-700">{provider.api_key_masked}</span>
-              <span className="shrink-0 rounded-md bg-emerald-50 px-1.5 py-0.5 font-medium text-emerald-700">{credentialSourceLabel(provider)}</span>
+              <span className={`shrink-0 rounded-md px-1.5 py-0.5 font-medium ${provider.credential_readable === false ? "bg-amber-50 text-amber-700" : "bg-emerald-50 text-emerald-700"}`}>{provider.credential_readable === false ? "需重新录入" : credentialSourceLabel(provider)}</span>
             </span>
           ) : <span className="text-amber-700">未配置</span>}
         </div>
@@ -453,7 +458,7 @@ function ProviderCard({
         )}
 
         <div className="mt-2 flex gap-2">
-          <button type="button" disabled={busy || !provider.credential_configured} onClick={onTest} className="inline-flex items-center justify-center gap-1.5 rounded-lg border border-gray-200 px-3 py-2 text-[10px] font-medium text-gray-600 transition hover:bg-gray-50 disabled:cursor-not-allowed disabled:opacity-45">{busy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}测试</button>
+          <button type="button" disabled={busy || !provider.credential_configured || provider.credential_readable === false} onClick={onTest} className="inline-flex items-center justify-center gap-1.5 rounded-lg border border-gray-200 px-3 py-2 text-[10px] font-medium text-gray-600 transition hover:bg-gray-50 disabled:cursor-not-allowed disabled:opacity-45">{busy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}测试</button>
           <button type="button" disabled={busy || (!provider.enabled && provider.state !== "ready")} onClick={onToggle} title={!provider.enabled && provider.state !== "ready" ? "请先通过连接测试" : undefined} className={`flex-1 rounded-lg px-3 py-2 text-[10px] font-semibold transition disabled:cursor-not-allowed disabled:opacity-45 ${provider.enabled ? "border border-gray-200 text-gray-600 hover:bg-gray-50" : "bg-[#002fa7] text-white hover:bg-[#001f7a]"}`}>{busy ? "处理中…" : provider.enabled ? "停用" : "启用"}</button>
           <a href={provider.docs} target="_blank" rel="noreferrer" title="查看官方文档" className="flex items-center justify-center rounded-lg border border-gray-200 px-2.5 text-gray-400 transition hover:bg-gray-50 hover:text-gray-700"><ExternalLink className="h-3.5 w-3.5" /></a>
         </div>

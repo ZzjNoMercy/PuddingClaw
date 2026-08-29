@@ -52,7 +52,7 @@ def test_sqlite_core_hides_stale_project_postgres_source(tmp_path, monkeypatch: 
             )
             await session.commit()
 
-            monkeypatch.setattr(database_sources, "get_database_config", lambda: {"provider": "sqlite"})
+            monkeypatch.setattr(database_sources, "get_database_config", lambda **_kwargs: {"provider": "sqlite"})
             sources = await database_sources.list_database_sources(session)
 
             assert [source["id"] for source in sources] == ["sales_postgres"]
@@ -83,7 +83,7 @@ def test_postgresql_core_still_exposes_project_default(tmp_path, monkeypatch: py
         monkeypatch.setattr(
             database_sources,
             "get_database_config",
-            lambda: {
+            lambda **_kwargs: {
                 "provider": "postgresql",
                 "host": "postgres.internal",
                 "port": 5433,

@@ -6,8 +6,7 @@ from types import SimpleNamespace
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from api.mcp import router
-from api.mcp import _validate_mcp_config
+from api.mcp import _validate_mcp_config, router
 from config import _DEFAULT_CONFIG
 from mcp_clients.servers import (
     allowed_mcp_tool_names,
@@ -82,6 +81,31 @@ def test_unready_gbrain_is_removed_even_when_explicitly_enabled(monkeypatch, tmp
     assert status["configured"] is False
     assert status["ready"] is False
     assert "尚未初始化" in status["reason"]
+
+
+def test_gbrain_vault_failure_disables_optional_server_without_raising(monkeypatch, tmp_path) -> None:
+    from provider_registry import CredentialVaultDecryptionError
+
+    knowledge_root = tmp_path / "knowledge"
+    runtime_home = knowledge_root / "llm-wiki" / ".puddingclaw" / "gbrain-home"
+    (runtime_home / ".gbrain" / "schema-packs" / "puddingclaw-wiki").mkdir(parents=True)
+    (runtime_home / ".gbrain" / "config.json").write_text("{}", encoding="utf-8")
+    (runtime_home / ".gbrain" / "schema-packs" / "puddingclaw-wiki" / "pack.yaml").write_text(
+        "api_version: gbrain-schema-pack-v1\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("PUDDINGCLAW_KNOWLEDGE_DIR", str(knowledge_root))
+    monkeypatch.setenv("PUDDINGCLAW_GBRAIN_BIN", sys.executable)
+    monkeypatch.setattr(
+        "mcp_clients.servers.resolve_gbrain_ai_runtime",
+        lambda: (_ for _ in ()).throw(CredentialVaultDecryptionError("请重新保存 API Key")),
+    )
+
+    status = gbrain_runtime_status()
+
+    assert status["ready"] is False
+    assert "重新保存 API Key" in status["reason"]
+    assert effective_mcp_server_names([]) == []
 
 
 def test_gbrain_home_is_always_derived_from_the_active_knowledge_base(monkeypatch, tmp_path) -> None:

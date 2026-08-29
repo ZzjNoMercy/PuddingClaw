@@ -18,7 +18,7 @@ from knowledge.parsers.mineru_cloud import MinerUCloudLightParser, MinerUCloudPr
 from knowledge.parsers.mineru_local import MinerULocalParser
 from knowledge.parsers.native_file import NativeFileImportParser
 from knowledge.parsers.unstructured_local import UnstructuredLocalParser
-from provider_registry import LocalCredentialStore
+from provider_registry import CredentialVaultDecryptionError, LocalCredentialStore
 
 DEFAULT_PARSERS: dict[str, dict[str, Any]] = {
     "mineru_local": {"enabled": True, "priority": 10},
@@ -56,6 +56,35 @@ def _resolve_credential(reference: str) -> str:
     if reference.startswith("env://"):
         return os.getenv(reference.removeprefix("env://"), "")
     return LocalCredentialStore().get(reference)
+
+
+def _credential_status(reference: str) -> dict[str, Any]:
+    """Inspect a parser credential without breaking the parser catalog."""
+
+    reference = str(reference or "")
+    if reference.startswith("env://"):
+        value = os.getenv(reference.removeprefix("env://"), "")
+        return {"configured": bool(value), "readable": True, "value": value, "error": ""}
+    if not reference:
+        return {"configured": False, "readable": True, "value": "", "error": ""}
+    store = LocalCredentialStore()
+    status = store.inspect(reference)
+    value = ""
+    if status.get("credential_readable"):
+        try:
+            value = store.get(reference)
+        except CredentialVaultDecryptionError as exc:
+            status = {
+                "credential_configured": True,
+                "credential_readable": False,
+                "credential_error": str(exc),
+            }
+    return {
+        "configured": bool(status.get("credential_configured")),
+        "readable": bool(status.get("credential_readable", True)),
+        "value": value,
+        "error": str(status.get("credential_error") or ""),
+    }
 
 
 class DocumentParserRegistry:
@@ -160,9 +189,14 @@ class DocumentParserRegistry:
         rows: list[dict[str, Any]] = []
         health_tasks: list[tuple[int, asyncio.Task[tuple[bool, str]]]] = []
         for parser_id, item in config.items():
-            parser = self._build(parser_id)
-            caps = parser.capabilities()
             credential_ref = str(item.get("credential_ref") or "")
+            credential = _credential_status(credential_ref)
+            parser = (
+                self._build(parser_id, api_key=str(credential["value"]))
+                if parser_id in {"mineru_cloud_precise", "llama_parse_cloud"}
+                else self._build(parser_id)
+            )
+            caps = parser.capabilities()
             row = {
                 "id": parser_id,
                 "name": caps.name,
@@ -178,9 +212,12 @@ class DocumentParserRegistry:
                 "implementation_available": True,
                 "enabled": bool(item.get("enabled", False)),
                 "priority": int(item.get("priority") or 100),
-                "credential_configured": bool(_resolve_credential(credential_ref))
-                if caps.requires_credential
-                else True,
+                "credential_configured": bool(credential["configured"])
+                if caps.requires_credential else True,
+                "credential_readable": bool(credential["readable"])
+                if caps.requires_credential else True,
+                "credential_error": str(credential["error"])
+                if caps.requires_credential else "",
                 "credential_source": "environment"
                 if credential_ref.startswith("env://")
                 else "vault"
@@ -195,7 +232,15 @@ class DocumentParserRegistry:
                 row["dependency_install"] = install_status(parser_id)
                 row["dependency_extra"] = "unstructured"
             rows.append(row)
-            if not suffix or suffix in caps.supported_extensions:
+            if caps.requires_credential and not credential["readable"]:
+                row["available"] = False
+                row["healthy"] = False
+                row["health_message"] = "凭证无法解密，请重新录入 API Key"
+            elif caps.requires_credential and not credential["configured"]:
+                row["available"] = False
+                row["healthy"] = False
+                row["health_message"] = "尚未配置 API Key"
+            elif not suffix or suffix in caps.supported_extensions:
                 health_tasks.append((len(rows) - 1, asyncio.create_task(self._health(parser))))
             else:
                 row["available"] = False

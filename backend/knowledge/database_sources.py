@@ -43,7 +43,7 @@ _SUPPORTED_TYPES = {"postgresql"}
 def _project_postgres_enabled() -> bool:
     """Return whether the Core Catalog is a real PostgreSQL connection."""
 
-    return str(get_database_config().get("provider") or "").lower() == "postgresql"
+    return str(get_database_config(resolve_password=False).get("provider") or "").lower() == "postgresql"
 
 
 def _assert_project_postgres_enabled() -> None:
@@ -91,7 +91,7 @@ def _sanitize_payload(raw: dict[str, Any], *, fallback_id: str | None = None) ->
 
 
 def _project_postgres_source(saved: KnowledgeDatabaseSource | None = None) -> dict[str, Any]:
-    db_config = get_database_config()
+    db_config = get_database_config(resolve_password=False)
     source = {
         "id": "project_postgres",
         "source_type": "postgresql",
@@ -150,12 +150,30 @@ def _public_source_dict(source: KnowledgeDatabaseSource | dict[str, Any]) -> dic
             "created_at": iso_utc(source.created_at),
             "updated_at": iso_utc(source.updated_at),
         }
-        payload["password_configured"] = bool(metadata.get("credential_ref") or source.password)
+        reference = str(metadata.get("credential_ref") or "")
+        credential_status = (
+            _credential_store().inspect(reference)
+            if reference
+            else {
+                "credential_configured": bool(source.password),
+                "credential_readable": True,
+                "credential_error": "",
+            }
+        )
+        payload["password_configured"] = bool(
+            credential_status.get("credential_configured") or source.password
+        )
+        payload["password_readable"] = bool(credential_status.get("credential_readable", True))
+        payload["password_error"] = str(credential_status.get("credential_error") or "")
     else:
         payload = dict(source)
     payload["type"] = payload.get("source_type") or payload.get("type") or "postgresql"
     payload["selected_tables"] = _normalize_tables(payload.get("selected_tables") if isinstance(payload.get("selected_tables"), list) else [])
-    payload["password_configured"] = bool(payload.get("password"))
+    payload["password_configured"] = bool(
+        payload.get("password_configured") or payload.get("password")
+    )
+    payload.setdefault("password_readable", True)
+    payload.setdefault("password_error", "")
     payload["password"] = ""
     return payload
 

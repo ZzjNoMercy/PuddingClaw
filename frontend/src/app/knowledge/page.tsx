@@ -783,7 +783,11 @@ export default function KnowledgePage() {
                           <p className="mt-1 truncate text-[11px] text-gray-400">
                             {source.host}:{source.port}/{source.database}
                           </p>
-                          <p className="mt-1 text-[10px] text-gray-400">已选 {source.selected_tables.length} 张表</p>
+                          <p className={`mt-1 text-[10px] ${source.password_readable === false ? "text-amber-600" : "text-gray-400"}`}>
+                            {source.password_readable === false
+                              ? "密码无法解密，需重新录入"
+                              : `已选 ${source.selected_tables.length} 张表`}
+                          </p>
                         </div>
                       </div>
                     </button>
@@ -1264,6 +1268,12 @@ export default function KnowledgePage() {
                     />
                   </label>
                 </div>
+
+                {databaseDraft.password_readable === false ? (
+                  <div className="mt-4 rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-xs text-amber-800">
+                    已保存的数据库密码无法解密。请重新输入密码并保存；原密文不会在读取时被自动删除。
+                  </div>
+                ) : null}
 
                 {databaseModalStatus ? (
                   <div

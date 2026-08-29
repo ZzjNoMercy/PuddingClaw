@@ -1115,8 +1115,14 @@ def get_knowledge_mineru_config() -> dict[str, Any]:
     }
 
 
-def get_vanna_config() -> dict[str, Any]:
-    """Read global Vanna NL2SQL runtime settings from config.json."""
+def get_vanna_config(*, resolve_models: bool = True) -> dict[str, Any]:
+    """Read global Vanna NL2SQL settings.
+
+    Runtime callers keep the strict default and receive resolved model
+    credentials.  Settings/control-plane callers pass ``resolve_models=False``
+    so the configuration page remains available when Credential Vault needs
+    repair.
+    """
 
     config = load_config()
     vanna = config.get("vanna", {})
@@ -1126,8 +1132,8 @@ def get_vanna_config() -> dict[str, Any]:
     training = vanna.get("training", {})
     query = vanna.get("query", {})
     knowledge_index = config.get("knowledge", {}).get("multimodal_index", {})
-    agent_llm = get_fallback_llm_config()
-    text_embedding = get_fallback_embedding_config()
+    agent_llm = get_fallback_llm_config() if resolve_models else {}
+    text_embedding = get_fallback_embedding_config() if resolve_models else {}
 
     def _positive_int(value: Any, default: int) -> int:
         try:
@@ -1267,7 +1273,7 @@ def _raw_database_overrides() -> dict[str, Any]:
     return database if isinstance(database, dict) else {}
 
 
-def get_database_config() -> dict[str, Any]:
+def get_database_config(*, resolve_password: bool = True) -> dict[str, Any]:
     """Read catalog database connection config.
 
     Settings page / config.json is the normal desktop source of truth. CLI
@@ -1322,10 +1328,23 @@ def get_database_config() -> dict[str, Any]:
 
     raw_password = str(database.get("password") or "")
     password_ref = str(database.get("password_ref") or "")
-    if raw_password and not password_ref:
+    if resolve_password and raw_password and not password_ref:
         password_ref = LocalCredentialStore().put("database-config", raw_password)
-    password = LocalCredentialStore().get(password_ref) if password_ref else ""
-    if not password:
+    credential_status = (
+        LocalCredentialStore().inspect(password_ref)
+        if password_ref
+        else {
+            "credential_configured": bool(raw_password),
+            "credential_readable": True,
+            "credential_error": "",
+        }
+    )
+    password = (
+        LocalCredentialStore().get(password_ref)
+        if resolve_password and password_ref
+        else raw_password if resolve_password else ""
+    )
+    if resolve_password and not password:
         password = os.getenv("PUDDINGCLAW_DATABASE_PASSWORD", "")
     if env_mode == "sqlite" or env_provider == "sqlite":
         provider = "sqlite"
@@ -1374,6 +1393,14 @@ def get_database_config() -> dict[str, Any]:
         "username": username,
         "password": password,
         "password_ref": password_ref,
+        "password_configured": bool(
+            credential_status.get("credential_configured")
+            or raw_password
+            or os.getenv("PUDDINGCLAW_DATABASE_PASSWORD")
+            or env_url
+        ),
+        "password_readable": bool(credential_status.get("credential_readable", True)),
+        "password_error": str(credential_status.get("credential_error") or ""),
         "url": "" if provider == "sqlite" else env_url or effective_config_url,
         "configured_url": configured_url,
         "configured_by": (
@@ -1441,8 +1468,8 @@ def get_settings_for_display() -> dict[str, Any]:
     effective_knowledge_index = get_knowledge_multimodal_index_config()
     effective_knowledge_root = get_knowledge_root_config()
     effective_knowledge_mineru = get_knowledge_mineru_config()
-    effective_database = get_database_config()
-    effective_vanna = get_vanna_config()
+    effective_database = get_database_config(resolve_password=False)
+    effective_vanna = get_vanna_config(resolve_models=False)
     effective_database_qa = get_database_qa_config()
     raw_vanna = config.get("vanna", {})
     provider_registry = get_provider_registry().display()
@@ -1635,7 +1662,7 @@ def update_settings(updates: dict[str, Any]) -> dict[str, Any] | None:
         if "database" not in config:
             config["database"] = {}
         if isinstance(database_update, dict):
-            previous_provider = get_database_config().get("provider")
+            previous_provider = get_database_config(resolve_password=False).get("provider")
             requested_provider = ""
             requested_source = ""
             # Legacy GUI contract: mode sqlite | bundled | external. New

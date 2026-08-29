@@ -16,6 +16,8 @@ export interface WebSearchProvider {
   credential_configured: boolean;
   api_key_masked: string;
   credential_source: "" | "web_search" | "provider_registry" | "environment";
+  credential_readable?: boolean;
+  credential_error?: string;
   options: {
     max_results: number;
     search_depth?: "basic" | "advanced" | "fast" | "ultra-fast";
@@ -46,6 +48,10 @@ export interface WebSearchConfig {
   };
   providers: WebSearchProvider[];
   ready_providers: WebSearchProviderId[];
+  credential_vault?: {
+    readable: boolean;
+    error: string;
+  };
 }
 
 export interface WebSearchTestResult {

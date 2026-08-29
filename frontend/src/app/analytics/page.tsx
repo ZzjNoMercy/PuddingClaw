@@ -6065,7 +6065,9 @@ function DatabaseSourceCard({
           </p>
           <div className="mt-3 flex flex-wrap gap-2 text-xs text-gray-500">
             <span>{tableCount > 0 ? `${tableCount} 张已选择表` : "未选择表"}</span>
-            {source.password_configured ? <span>密码已配置</span> : <span>密码未保存</span>}
+            {source.password_readable === false ? (
+              <span className="text-amber-600">密码需重新录入</span>
+            ) : source.password_configured ? <span>密码已配置</span> : <span>密码未保存</span>}
             {source.description ? <span className="max-w-[520px] truncate">{source.description}</span> : null}
           </div>
         </div>
@@ -7572,6 +7574,12 @@ function DatabaseSourceModal({
               />
             </label>
           </div>
+
+          {draft.password_readable === false ? (
+            <div className="mt-4 rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-xs text-amber-800">
+              已保存的数据库密码无法解密。请重新输入密码并保存；配置列表仍会保留。
+            </div>
+          ) : null}
 
           {status ? (
             <div

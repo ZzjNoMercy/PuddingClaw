@@ -70,8 +70,12 @@ class EvaluationSettingsStore:
             reference = f"vault://users/{trusted_owner_user_id()}/credentials/{self._CREDENTIAL_ID}"
         legacy_key = str(payload.pop("api_key", "") or "")
         if legacy_key:
-            reference = credential_store.put(self._CREDENTIAL_ID, legacy_key)
-        stored_key = credential_store.get(reference)
+            # Reading legacy settings must not mutate or repair the shared
+            # Provider vault.  A later explicit settings save performs the
+            # migration safely.
+            stored_key = legacy_key
+        else:
+            stored_key = credential_store.get(reference)
         if stored_key:
             payload["api_key"] = stored_key
         env_endpoint = os.getenv("LANGSMITH_ENDPOINT")
@@ -87,17 +91,33 @@ class EvaluationSettingsStore:
         return LangSmithSettings.model_validate(payload)
 
     def public(self) -> dict[str, Any]:
-        settings = self.load()
+        from provider_registry import LocalCredentialStore
+        from runtime_identity.paths import trusted_owner_user_id
+
+        payload = self._load_file()
+        reference = str(payload.pop("api_key_ref", "") or "")
+        legacy_key = str(payload.pop("api_key", "") or "")
+        if not reference.startswith("vault://"):
+            reference = f"vault://users/{trusted_owner_user_id()}/credentials/{self._CREDENTIAL_ID}"
+        settings = LangSmithSettings.model_validate(payload)
+        status = LocalCredentialStore().inspect(reference)
+        configured = bool(status.get("credential_configured") or legacy_key)
         data = settings.model_dump(exclude={"api_key"})
-        data["api_key_configured"] = bool(settings.api_key)
-        data["api_key_masked"] = f"••••{settings.api_key[-4:]}" if settings.api_key else None
+        data["api_key_configured"] = configured
+        data["api_key_readable"] = bool(status.get("credential_readable", True))
+        data["api_key_masked"] = (
+            f"••••{legacy_key[-4:]}"
+            if legacy_key
+            else status.get("api_key_masked") or None
+        )
+        data["api_key_error"] = str(status.get("credential_error") or "")
         return data
 
     def update(self, updates: dict[str, Any], *, clear_api_key: bool = False) -> dict[str, Any]:
         from provider_registry import LocalCredentialStore
 
         raw = self._load_file()
-        raw.pop("api_key_ref", None)
+        existing_reference = str(raw.pop("api_key_ref", "") or "")
         raw.pop("api_key", None)
         current = LangSmithSettings.model_validate(raw).model_dump()
         api_key = updates.pop("api_key", None)
@@ -108,7 +128,7 @@ class EvaluationSettingsStore:
             credential_store.delete(self._CREDENTIAL_ID)
         elif api_key:
             current["api_key"] = api_key
-            credential_store.put(self._CREDENTIAL_ID, api_key)
+            existing_reference = credential_store.put(self._CREDENTIAL_ID, api_key)
         validated = LangSmithSettings.model_validate(current)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         fd, temp_name = tempfile.mkstemp(prefix="eval-settings-", suffix=".json", dir=self.path.parent)
@@ -116,7 +136,9 @@ class EvaluationSettingsStore:
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
                 payload = validated.model_dump(exclude={"api_key"})
                 if validated.api_key:
-                    payload["api_key_ref"] = credential_store.put(self._CREDENTIAL_ID, validated.api_key)
+                    existing_reference = credential_store.put(self._CREDENTIAL_ID, validated.api_key)
+                if existing_reference and not clear_api_key:
+                    payload["api_key_ref"] = existing_reference
                 json.dump(payload, handle, ensure_ascii=False, indent=2)
                 handle.flush()
                 os.fsync(handle.fileno())

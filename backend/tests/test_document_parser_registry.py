@@ -89,6 +89,40 @@ async def test_light_cloud_parser_is_rejected_before_upload_when_source_exceeds_
     assert eligible[0]["reason"] == "当前首选的可用解析器"
 
 
+@pytest.mark.asyncio
+async def test_parser_catalog_survives_unreadable_vault_credential(monkeypatch):
+    registry = DocumentParserRegistry()
+    monkeypatch.setattr(
+        registry,
+        "configuration",
+        lambda: {
+            "llama_parse_cloud": {
+                "enabled": True,
+                "priority": 10,
+                "base_url": "https://api.cloud.llamaindex.ai",
+                "credential_ref": "vault://users/local/credentials/parser-llama",
+            }
+        },
+    )
+    monkeypatch.setattr(
+        "knowledge.parsers.registry._credential_status",
+        lambda _reference: {
+            "configured": True,
+            "readable": False,
+            "value": "",
+            "error": "vault mismatch",
+        },
+    )
+
+    rows = await registry.catalog(filename="report.pdf")
+
+    assert rows[0]["credential_configured"] is True
+    assert rows[0]["credential_readable"] is False
+    assert rows[0]["available"] is False
+    assert rows[0]["selectable"] is False
+    assert "重新录入" in rows[0]["health_message"]
+
+
 class _Registry:
     async def catalog(self, *, filename: str = "", file_size: int | None = None, page_count: int | None = None):
         return [

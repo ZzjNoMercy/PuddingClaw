@@ -10,8 +10,12 @@ import time
 from pathlib import Path
 from typing import Any
 
-from provider_registry import LocalCredentialStore, get_provider_registry, user_data_dir
-from runtime_identity.paths import PuddingClawPaths
+from provider_registry import (
+    CredentialVaultDecryptionError,
+    LocalCredentialStore,
+    get_provider_registry,
+    user_data_dir,
+)
 
 PROVIDER_IDS = ("tavily", "deepseek", "grok")
 PROVIDER_MANIFEST: dict[str, dict[str, Any]] = {
@@ -177,6 +181,8 @@ class WebSearchRegistry:
                 value = get_provider_registry().resolve_credential_for_runtime(
                     "deepseek", "default"
                 )
+            except CredentialVaultDecryptionError:
+                raise
             except ValueError:
                 value = ""
             if value:
@@ -189,13 +195,31 @@ class WebSearchRegistry:
         rendered: list[dict[str, Any]] = []
         for provider_id in PROVIDER_IDS:
             provider = result["providers"][provider_id]
-            secret, source = self.credential(provider_id)
+            credential_error = ""
+            configured_but_unreadable = False
+            try:
+                secret, source = self.credential(provider_id)
+            except CredentialVaultDecryptionError as exc:
+                secret = ""
+                configured_but_unreadable = True
+                source = (
+                    "web_search"
+                    if provider.get("credential_ref")
+                    else "provider_registry"
+                    if provider_id == "deepseek"
+                    else ""
+                )
+                credential_error = str(exc)
             provider.pop("credential_ref", None)
             provider.update(PROVIDER_MANIFEST[provider_id])
             provider["id"] = provider_id
-            provider["credential_configured"] = bool(secret)
-            provider["api_key_masked"] = _mask(secret)
+            provider["credential_configured"] = bool(secret) or configured_but_unreadable
+            provider["api_key_masked"] = _mask(secret) or (
+                "••••••••" if configured_but_unreadable else ""
+            )
             provider["credential_source"] = source
+            provider["credential_readable"] = not credential_error
+            provider["credential_error"] = credential_error
             provider["dependencies"] = {
                 "status": "already_satisfied",
                 "packages": PROVIDER_MANIFEST[provider_id]["required_packages"],
@@ -205,6 +229,15 @@ class WebSearchRegistry:
         result["ready_providers"] = [
             item["id"] for item in rendered if item.get("enabled") and item.get("state") == "ready"
         ]
+        vault_errors = [
+            str(item.get("credential_error") or "")
+            for item in rendered
+            if item.get("credential_error")
+        ]
+        result["credential_vault"] = {
+            "readable": not vault_errors,
+            "error": vault_errors[0] if vault_errors else "",
+        }
         return result
 
     def save_credential(self, provider_id: str, api_key: str) -> dict[str, Any]:

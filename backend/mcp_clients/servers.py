@@ -99,8 +99,18 @@ def _configured_servers() -> dict[str, Any]:
     return servers if isinstance(servers, dict) else {}
 
 
-def _server_registry(custom_servers: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Combine code-owned built-ins with user-defined MCP servers."""
+def _server_registry(
+    custom_servers: dict[str, Any] | None = None,
+    *,
+    resolve_secrets: bool = True,
+) -> dict[str, Any]:
+    """Combine code-owned built-ins with user-defined MCP servers.
+
+    Catalog and settings callers must pass ``resolve_secrets=False``.  Merely
+    listing configured servers is a control-plane operation and must remain
+    available when Credential Vault is unreadable.  Runtime construction keeps
+    the strict default and resolves credentials immediately before use.
+    """
 
     registry = copy.deepcopy(_REGISTRY)
     for name, value in (custom_servers if custom_servers is not None else _configured_servers()).items():
@@ -112,7 +122,11 @@ def _server_registry(custom_servers: dict[str, Any] | None = None) -> dict[str, 
             continue
         if value.get("transport") == "stdio" and not str(value.get("command") or "").strip():
             continue
-        registry[name] = _resolve_environment_values(copy.deepcopy(value))
+        registry[name] = (
+            _resolve_environment_values(copy.deepcopy(value))
+            if resolve_secrets
+            else copy.deepcopy(value)
+        )
     return registry
 
 
@@ -138,7 +152,7 @@ def get_mcp_server_display_info(
 ) -> list[dict[str, str]]:
     """返回供前端展示的 MCP 服务器信息（不含敏感 headers）."""
     result = []
-    registry = _server_registry(custom_servers)
+    registry = _server_registry(custom_servers, resolve_secrets=False)
     for name in enabled_names:
         cfg = registry.get(name)
         if not cfg:

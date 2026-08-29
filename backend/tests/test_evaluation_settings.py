@@ -45,3 +45,30 @@ def test_cleared_explicit_key_does_not_fall_back_to_environment(tmp_path: Path, 
 
     assert store.load().api_key == ""
     assert store.public()["api_key_configured"] is False
+
+
+def test_langsmith_public_settings_survive_unreadable_vault(tmp_path: Path, monkeypatch):
+    credential_root = tmp_path / "user-data"
+    monkeypatch.setattr(provider_registry, "user_data_dir", lambda: credential_root)
+    settings_path = tmp_path / "evaluation-settings.json"
+    settings_path.write_text(
+        json.dumps({"enabled": True, "api_key_ref": "vault://users/local/credentials/puddingclaw-langsmith"}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        provider_registry.LocalCredentialStore,
+        "inspect",
+        lambda _self, _reference: {
+            "credential_configured": True,
+            "credential_readable": False,
+            "api_key_masked": "••••••••",
+            "credential_error": "vault mismatch",
+        },
+    )
+
+    public = EvaluationSettingsStore(settings_path).public()
+
+    assert public["enabled"] is True
+    assert public["api_key_configured"] is True
+    assert public["api_key_readable"] is False
+    assert public["api_key_error"] == "vault mismatch"

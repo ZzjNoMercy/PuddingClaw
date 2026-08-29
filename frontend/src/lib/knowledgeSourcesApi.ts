@@ -93,6 +93,8 @@ export interface FeishuAppCredential {
   tenant_key: string;
   status: string;
   credential_configured: boolean;
+  credential_readable?: boolean;
+  credential_error?: string;
   validated_at: string | null;
   rotated_at: string | null;
   created_at: string | null;

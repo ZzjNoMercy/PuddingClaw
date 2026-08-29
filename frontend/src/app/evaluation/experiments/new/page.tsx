@@ -53,12 +53,16 @@ export default function NewExperimentPage() {
     provider.models
       .filter((item) => item.capability === "llm"
         && item.categories?.includes("llm")
-        && provider.api_keys.some((key) => key.is_default && key.credential_configured))
+        && provider.api_keys.some(
+          (key) => key.is_default && key.credential_configured && key.credential_readable !== false,
+        ))
       .map((item) => ({ provider, model: item }))
   )) || [], [providerRegistry]);
   const selectedModel = models.find((item) => item.model.id === model) || null;
   const selectableKeys = useMemo(
-    () => selectedModel?.provider.api_keys.filter((item) => item.credential_configured) || [],
+    () => selectedModel?.provider.api_keys.filter(
+      (item) => item.credential_configured && item.credential_readable !== false,
+    ) || [],
     [selectedModel],
   );
 

@@ -7,13 +7,18 @@ import json
 import os
 import re
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
 from filelock import FileLock
 
 from runtime_identity.paths import PuddingClawPaths, safe_identity_component
-from runtime_identity.profiles import CredentialVault, MasterKeyProvider
+from runtime_identity.profiles import (
+    CredentialEnvelopeDecryptionError,
+    CredentialVault,
+    MasterKeyProvider,
+)
 
 _ENV_NAME = re.compile(r"[A-Z_][A-Z0-9_]{0,127}")
 _DENIED_EXACT = frozenset(
@@ -89,12 +94,13 @@ class SkillSecretStore:
         self.owner_user_id = safe_identity_component(owner_user_id, field="owner_user_id")
         self.path = paths.skill_secret_registry(self.owner_user_id)
         self.lock = FileLock(str(self.path.parent / ".registry.lock"), thread_local=False)
+        self.key_provider = MasterKeyProvider(self.paths, self.owner_user_id)
         self._vault: CredentialVault | None = None
 
     @property
     def vault(self) -> CredentialVault:
         if self._vault is None:
-            key = MasterKeyProvider(self.paths, self.owner_user_id).get_or_create()
+            key = self.key_provider.get_or_create()
             self._vault = CredentialVault(key)
         return self._vault
 
@@ -107,12 +113,25 @@ class SkillSecretStore:
             envelope = self.path.read_bytes()
         except FileNotFoundError:
             return self._empty(), "missing"
-        plaintext = self.vault.open(
-            envelope,
-            owner_user_id=self.owner_user_id,
-            provider=self.provider,
-            profile_id=self.profile_id,
-        )
+        plaintext = None
+        candidates = [self.vault]
+        candidates.extend(CredentialVault(key) for key in self.key_provider.existing_keys())
+        for candidate in candidates:
+            try:
+                plaintext = candidate.open(
+                    envelope,
+                    owner_user_id=self.owner_user_id,
+                    provider=self.provider,
+                    profile_id=self.profile_id,
+                )
+            except CredentialEnvelopeDecryptionError:
+                continue
+            self._vault = candidate
+            break
+        if plaintext is None:
+            raise CredentialEnvelopeDecryptionError(
+                "Skill Secret 无法解密，请重新录入该 Skill 所需的密钥。"
+            )
         value = json.loads(plaintext.decode("utf-8"))
         if (
             not isinstance(value, dict)
@@ -138,13 +157,21 @@ class SkillSecretStore:
             raise RuntimeError("Skill Secret registry write was not durable")
         return revision
 
+    def _quarantine_unreadable_registry(self) -> None:
+        if not self.path.is_file():
+            return
+        self.path.replace(self.path.with_name(f"{self.path.name}.unreadable-{time.time_ns()}"))
+
     def status(self, *, skill_id: str, skill_version: str, env_name: str) -> str:
         skill = safe_identity_component(skill_id, field="skill_id")
         name = validate_skill_secret_name(env_name)
         if not self.path.exists():
             return "missing"
         with self.lock.acquire(timeout=30):
-            value, _revision = self._read()
+            try:
+                value, _revision = self._read()
+            except CredentialEnvelopeDecryptionError:
+                return "unreadable"
         secrets = value["secrets"]
         bindings = value["bindings"]
         binding = bindings.get(skill) if isinstance(bindings, dict) else None
@@ -169,7 +196,11 @@ class SkillSecretStore:
         if len(secret_value.encode("utf-8")) > 64 * 1024:
             raise ValueError("Skill Secret value exceeds the size limit")
         with self.lock.acquire(timeout=30):
-            value, _revision = self._read()
+            try:
+                value, _revision = self._read()
+            except CredentialEnvelopeDecryptionError:
+                self._quarantine_unreadable_registry()
+                value = self._empty()
             secrets = dict(value["secrets"])
             bindings = dict(value["bindings"])
             secrets[name] = secret_value

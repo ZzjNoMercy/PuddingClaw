@@ -418,6 +418,56 @@ def test_database_settings_live_in_config_json(tmp_path, monkeypatch):
     assert saved["database"]["url"].startswith("postgresql+asyncpg://puddingclaw:")
 
 
+def test_settings_display_survives_unreadable_database_credential(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "database": {
+                    "provider": "postgresql",
+                    "source": "external",
+                    "host": "db.example.test",
+                    "port": 5432,
+                    "database": "puddingclaw",
+                    "username": "alice",
+                    "password_ref": "vault://users/local/credentials/database-config",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(config, "CONFIG_FILE", config_path)
+    monkeypatch.setattr(
+        provider_registry,
+        "get_provider_registry",
+        lambda: SimpleNamespace(display=lambda: {"providers": [], "bindings": {}}),
+    )
+    monkeypatch.setattr(
+        provider_registry.LocalCredentialStore,
+        "inspect",
+        lambda self, reference: {
+            "credential_configured": bool(reference),
+            "credential_readable": False,
+            "api_key_masked": "••••••••",
+            "credential_error": "vault key mismatch",
+        },
+    )
+    monkeypatch.setattr(
+        provider_registry.LocalCredentialStore,
+        "get",
+        lambda self, reference: (_ for _ in ()).throw(
+            AssertionError("settings display must not decrypt the database password")
+        ),
+    )
+
+    displayed = config.get_settings_for_display()
+
+    assert displayed["database"]["password_configured"] is True
+    assert displayed["database"]["password_readable"] is False
+    assert displayed["database"]["password_error"] == "vault key mismatch"
+    assert displayed["database"].get("password", "") == ""
+
+
 def test_plaintext_database_password_fails_fast(tmp_path, monkeypatch):
     config_path = tmp_path / "config.json"
     config_path.write_text(

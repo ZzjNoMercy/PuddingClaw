@@ -94,7 +94,12 @@ class FeishuAppSecret:
 
 
 def _read_app_secret(app: FeishuAppCredential) -> FeishuAppSecret:
-    raw = _credential_store().get(app.credential_ref)
+    from provider_registry import CredentialVaultDecryptionError
+
+    try:
+        raw = _credential_store().get(app.credential_ref)
+    except CredentialVaultDecryptionError as exc:
+        raise FeishuConnectorError("飞书应用凭据无法解密，请重新配置 App ID / App Secret。") from exc
     try:
         payload = json.loads(raw)
     except (TypeError, json.JSONDecodeError) as exc:
@@ -176,6 +181,7 @@ def delete_feishu_app_secret(app: FeishuAppCredential) -> None:
 
 
 def feishu_app_to_dict(app: FeishuAppCredential) -> dict[str, Any]:
+    credential = _credential_store().inspect(app.credential_ref)
     return {
         "id": app.id,
         "app_id_masked": app.app_id_masked,
@@ -183,7 +189,9 @@ def feishu_app_to_dict(app: FeishuAppCredential) -> dict[str, Any]:
         "api_base_url": app.api_base_url,
         "tenant_key": app.tenant_key,
         "status": app.status,
-        "credential_configured": bool(app.credential_ref),
+        "credential_configured": bool(credential.get("credential_configured")),
+        "credential_readable": bool(credential.get("credential_readable", True)),
+        "credential_error": str(credential.get("credential_error") or ""),
         "validated_at": iso_utc(app.validated_at),
         "rotated_at": iso_utc(app.rotated_at),
         "created_at": iso_utc(app.created_at),
@@ -486,7 +494,12 @@ async def complete_user_oauth(
     source = await session.get(KnowledgeSourceConnection, oauth_session.source_connection_id)
     if app is None or source is None:
         raise FeishuConnectorError("OAuth 绑定的飞书应用或 Source 已不存在。")
-    verifier = _credential_store().get(oauth_session.verifier_credential_ref)
+    from provider_registry import CredentialVaultDecryptionError
+
+    try:
+        verifier = _credential_store().get(oauth_session.verifier_credential_ref)
+    except CredentialVaultDecryptionError as exc:
+        raise FeishuConnectorError("飞书 OAuth 临时凭据无法解密，请重新发起授权。") from exc
     if not verifier:
         raise FeishuConnectorError("OAuth PKCE verifier 已失效，请重新发起授权。")
     secret = _read_app_secret(app)
@@ -668,7 +681,12 @@ class UserTokenBroker:
 
     @staticmethod
     def _read_tokens(grant: FeishuUserGrant) -> dict[str, str]:
-        raw = _credential_store().get(grant.token_credential_ref)
+        from provider_registry import CredentialVaultDecryptionError
+
+        try:
+            raw = _credential_store().get(grant.token_credential_ref)
+        except CredentialVaultDecryptionError as exc:
+            raise FeishuConnectorError("飞书用户授权凭据无法解密，请重新授权。") from exc
         try:
             payload = json.loads(raw)
         except (TypeError, json.JSONDecodeError) as exc:

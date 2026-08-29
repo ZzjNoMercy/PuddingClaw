@@ -100,7 +100,9 @@ export interface LangSmithSettings {
   trace_finalize_timeout_seconds: number;
   projection_timeout_seconds: number;
   api_key_configured: boolean;
+  api_key_readable?: boolean;
   api_key_masked?: string | null;
+  api_key_error?: string;
 }
 export interface EvalExperiment {
   experiment_id: string;

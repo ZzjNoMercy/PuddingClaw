@@ -5,7 +5,7 @@ import json
 import pytest
 
 from runtime_identity.paths import PuddingClawPaths
-from runtime_identity.profiles import CredentialVault
+from runtime_identity.profiles import CredentialEnvelopeDecryptionError, CredentialVault
 from runtime_identity.skill_runtimes import SkillRuntimeBindingStore
 from runtime_identity.skill_secrets import SkillSecretStore, validate_skill_secret_name
 
@@ -102,6 +102,37 @@ def test_registry_revision_detects_stale_execution_projection(tmp_path):
     )
 
     assert not store.revision_is_current(first)
+
+
+def test_unreadable_skill_secret_can_be_repaired_by_explicit_entry(tmp_path):
+    store = _store(tmp_path)
+    store.set_and_bind(
+        skill_id="demo",
+        skill_version="sha256-v1",
+        env_name="DEMO_TOKEN",
+        secret_value="old",
+    )
+    damaged = SkillSecretStore(PuddingClawPaths(tmp_path / ".puddingclaw"), "local")
+    damaged._vault = CredentialVault(b"x" * 32)
+    damaged.key_provider.existing_keys = lambda: ()
+
+    assert damaged.status(
+        skill_id="demo", skill_version="sha256-v1", env_name="DEMO_TOKEN"
+    ) == "unreadable"
+    with pytest.raises(CredentialEnvelopeDecryptionError):
+        damaged.projection(skill_id="demo", skill_version="sha256-v1")
+
+    damaged.set_and_bind(
+        skill_id="demo",
+        skill_version="sha256-v1",
+        env_name="DEMO_TOKEN",
+        secret_value="new",
+    )
+
+    assert damaged.projection(skill_id="demo", skill_version="sha256-v1").environment == {
+        "DEMO_TOKEN": "new"
+    }
+    assert list(damaged.path.parent.glob("registry.enc.unreadable-*"))
 
 
 def test_explicit_skill_runtime_binding_is_scoped_to_content_version(tmp_path):

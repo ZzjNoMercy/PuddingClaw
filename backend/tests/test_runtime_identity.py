@@ -14,7 +14,6 @@ from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
-from cryptography.exceptions import InvalidTag
 from langchain.agents.middleware.types import ToolCallRequest
 from langchain_core.messages import AIMessage, ToolMessage
 
@@ -60,8 +59,10 @@ from runtime_identity.paths import (
     trusted_owner_user_id,
 )
 from runtime_identity.profiles import (
+    CredentialEnvelopeDecryptionError,
     CredentialProfileStore,
     CredentialVault,
+    MasterKeyProvider,
     validate_credential_archive,
 )
 from runtime_identity.service import (
@@ -639,11 +640,11 @@ def test_vault_rejects_tamper_and_cross_profile_replay():
     sealed = vault.seal(archive, owner_user_id="owner", provider="lark", profile_id="one")
     assert vault.open(sealed, owner_user_id="owner", provider="lark", profile_id="one") == archive
 
-    with pytest.raises(InvalidTag):
+    with pytest.raises(CredentialEnvelopeDecryptionError):
         vault.open(sealed, owner_user_id="owner", provider="lark", profile_id="two")
     envelope = json.loads(sealed)
     envelope["ciphertext"] = envelope["ciphertext"][:-2] + "AA"
-    with pytest.raises((InvalidTag, ValueError)):
+    with pytest.raises((CredentialEnvelopeDecryptionError, ValueError)):
         vault.open(
             json.dumps(envelope).encode(),
             owner_user_id="owner",
@@ -658,7 +659,7 @@ def test_vault_rejects_tamper_and_cross_profile_replay():
         profile_id="one",
         flow_id="auth-one",
     )
-    with pytest.raises(InvalidTag):
+    with pytest.raises(CredentialEnvelopeDecryptionError):
         vault.open_flow(
             continuation,
             owner_user_id="owner",
@@ -667,6 +668,20 @@ def test_vault_rejects_tamper_and_cross_profile_replay():
             flow_id="auth-two",
         )
 
+
+def test_master_key_provider_keeps_existing_fallback_authoritative(tmp_path, monkeypatch):
+    paths = PuddingClawPaths(tmp_path)
+    provider = MasterKeyProvider(paths, "owner")
+    fallback = tmp_path / ".vault-keys" / "owner.key"
+    fallback.parent.mkdir(parents=True)
+    fallback.write_bytes(b"f" * 32)
+    monkeypatch.setattr(
+        provider,
+        "_get_or_create_keychain_key",
+        lambda: (_ for _ in ()).throw(AssertionError("must not switch key backends")),
+    )
+
+    assert provider.get_or_create() == b"f" * 32
 
 def test_credential_archive_rejects_links_and_traversal():
     output = io.BytesIO()
@@ -795,6 +810,82 @@ def test_profile_vault_freezes_credential_state_fingerprint(tmp_path):
             profile["profile_id"],
             credential_state=changed,
         )
+
+
+def test_profile_vault_recovers_with_an_existing_master_key(tmp_path, monkeypatch):
+    paths = PuddingClawPaths(tmp_path / ".puddingclaw")
+    original_key = b"a" * 32
+    writer = CredentialProfileStore(
+        paths,
+        "owner",
+        vault=CredentialVault(original_key),
+    )
+    profile = writer.resolve("fixture")
+    archive = _credential_archive()
+    writer.write_state(
+        "fixture",
+        profile["profile_id"],
+        archive,
+        credential_state=_LARK_STATE,
+    )
+
+    reader = CredentialProfileStore(
+        paths,
+        "owner",
+        vault=CredentialVault(b"b" * 32),
+    )
+    monkeypatch.setattr(reader.key_provider, "existing_keys", lambda: (original_key,))
+
+    assert (
+        reader.read_state(
+            "fixture",
+            profile["profile_id"],
+            credential_state=_LARK_STATE,
+        )
+        == archive
+    )
+
+
+def test_authorization_flow_recovers_with_an_existing_master_key(tmp_path, monkeypatch):
+    paths = PuddingClawPaths(tmp_path / ".puddingclaw")
+    original_key = b"a" * 32
+    writer = AuthorizationFlowStore(
+        paths,
+        "owner",
+        vault=CredentialVault(original_key),
+    )
+    phase = AuthorizationPhaseSpec(
+        phase_id="consent",
+        step=1,
+        total=1,
+        title="Authorize",
+        description="Authorize fixture",
+        completion_hint="Continue",
+        recovery_evidence=AuthorizationRecoveryEvidence.STAGING_AND_CONTINUATION,
+        missing_evidence_action=AuthorizationMissingEvidenceAction.RESET_ATTEMPT,
+    )
+    flow = writer.begin_or_advance(
+        provider="fixture",
+        adapter_id="fixture-cli",
+        profile_id="fixture_default",
+        purpose="connect",
+        phase=phase,
+        profile_revision=1.0,
+        base_state_revision="missing",
+        adapter_contract_fingerprint="a" * 64,
+        public={},
+        secret={"device_code": "secret"},
+        expires_at=time.time() + 600,
+    )
+
+    reader = AuthorizationFlowStore(
+        paths,
+        "owner",
+        vault=CredentialVault(b"b" * 32),
+    )
+    monkeypatch.setattr(reader.key_provider, "existing_keys", lambda: (original_key,))
+
+    assert reader.read_secret(flow)["device_code"] == "secret"
 
 
 def test_profile_vault_writeback_uses_state_revision_cas(tmp_path):

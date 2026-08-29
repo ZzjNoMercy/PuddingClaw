@@ -83,6 +83,37 @@ def test_init_database_fails_closed_when_sqlite_is_too_old(isolated_db_singleton
     asyncio.run(run())
 
 
+def test_database_status_reports_unreadable_credential_without_runtime_resolution(monkeypatch) -> None:
+    monkeypatch.setattr(
+        db,
+        "get_database_config",
+        lambda **kwargs: {
+            "provider": "postgresql",
+            "mode": "external",
+            "configured_url": "",
+            "host": "db.example.test",
+            "port": 5432,
+            "database": "puddingclaw",
+            "password_configured": True,
+            "password_readable": False,
+            "password_error": "vault key mismatch",
+            "configured_by": "config.json",
+            "environment_override": False,
+        }
+        if kwargs == {"resolve_password": False}
+        else (_ for _ in ()).throw(
+            AssertionError("status must not resolve the database credential")
+        ),
+    )
+
+    status = db.get_database_status()
+
+    assert status["configured"] is True
+    assert status["credential_readable"] is False
+    assert status["healthy"] is False
+    assert status["last_error"] == "vault key mismatch"
+
+
 def test_foreign_key_violations_are_rejected(isolated_db_singleton) -> None:
     async def run() -> None:
         ready = await db.init_database()

@@ -8,9 +8,12 @@ import pytest
 from provider_registry import (
     DASHSCOPE_NATIVE_MODEL_CATALOG,
     DEFAULT_AGENT_MODEL,
+    CredentialVaultDecryptionError,
+    LocalCredentialStore,
     ProviderRegistry,
     _default_registry,
 )
+from runtime_identity.profiles import CredentialVault
 
 
 def _configured_registry(tmp_path) -> ProviderRegistry:
@@ -42,6 +45,107 @@ def test_fresh_registry_has_canonical_models_and_bindings(tmp_path):
     multimodal = registry.resolve_binding("multimodal_embedding")
     assert multimodal["api_key"] == "dashscope-text-secret"
     assert multimodal["protocol"] == "dashscope_multimodal_embedding"
+
+
+def test_local_credential_store_recovers_with_existing_secondary_key(tmp_path, monkeypatch):
+    store = LocalCredentialStore(tmp_path)
+    secondary_key = b"s" * 32
+    payload = b'{"version":1,"credentials":{"api":{"value":"secret"}}}'
+    store.path.parent.mkdir(parents=True, exist_ok=True)
+    store.path.write_bytes(
+        CredentialVault(secondary_key).seal(
+            payload,
+            owner_user_id=store.owner_user_id,
+            provider="provider-registry",
+            profile_id="default",
+        )
+    )
+    monkeypatch.setattr(store.key_provider, "existing_keys", lambda: (secondary_key,))
+
+    assert store.get(f"vault://users/{store.owner_user_id}/credentials/api") == "secret"
+
+
+def test_local_credential_store_reports_key_mismatch_without_reset(tmp_path, monkeypatch):
+    store = LocalCredentialStore(tmp_path)
+    store.path.parent.mkdir(parents=True, exist_ok=True)
+    original = CredentialVault(b"o" * 32).seal(
+        b'{"version":1,"credentials":{}}',
+        owner_user_id=store.owner_user_id,
+        provider="provider-registry",
+        profile_id="default",
+    )
+    store.path.write_bytes(original)
+    store.vault = CredentialVault(b"x" * 32)
+    monkeypatch.setattr(store.key_provider, "existing_keys", lambda: ())
+
+    with pytest.raises(CredentialVaultDecryptionError, match="重新保存"):
+        store.get(f"vault://users/{store.owner_user_id}/credentials/api")
+
+    assert store.path.read_bytes() == original
+
+
+def test_explicit_credential_save_backs_up_unreadable_vault_and_rekeys(tmp_path, monkeypatch):
+    store = LocalCredentialStore(tmp_path)
+    store.path.parent.mkdir(parents=True, exist_ok=True)
+    original = CredentialVault(b"o" * 32).seal(
+        b'{"version":1,"credentials":{"lost":{"value":"old"}}}',
+        owner_user_id=store.owner_user_id,
+        provider="provider-registry",
+        profile_id="default",
+    )
+    store.path.write_bytes(original)
+    store.vault = CredentialVault(b"x" * 32)
+    monkeypatch.setattr(store.key_provider, "existing_keys", lambda: ())
+
+    reference = store.put("replacement", "new-secret")
+
+    assert reference == f"vault://users/{store.owner_user_id}/credentials/replacement"
+    assert store.get(reference) == "new-secret"
+    backups = list(store.path.parent.glob("provider-registry.enc.unreadable-*"))
+    assert len(backups) == 1
+    assert backups[0].read_bytes() == original
+
+
+def test_explicit_credential_delete_can_clear_an_unreadable_vault(tmp_path, monkeypatch):
+    store = LocalCredentialStore(tmp_path)
+    store.path.parent.mkdir(parents=True, exist_ok=True)
+    original = CredentialVault(b"o" * 32).seal(
+        b'{"version":1,"credentials":{"lost":{"value":"old"}}}',
+        owner_user_id=store.owner_user_id,
+        provider="provider-registry",
+        profile_id="default",
+    )
+    store.path.write_bytes(original)
+    store.vault = CredentialVault(b"x" * 32)
+    monkeypatch.setattr(store.key_provider, "existing_keys", lambda: ())
+
+    store.delete(f"vault://users/{store.owner_user_id}/credentials/lost")
+
+    assert not store.path.exists()
+    backups = list(store.path.parent.glob("provider-registry.enc.unreadable-*"))
+    assert len(backups) == 1
+    assert backups[0].read_bytes() == original
+
+
+def test_provider_settings_display_survives_unreadable_vault(tmp_path):
+    registry = _configured_registry(tmp_path)
+    original = CredentialVault(b"o" * 32).seal(
+        b'{"version":1,"credentials":{}}',
+        owner_user_id=registry.credentials.owner_user_id,
+        provider="provider-registry",
+        profile_id="default",
+    )
+    registry.credentials.path.write_bytes(original)
+
+    displayed = registry.display()
+
+    assert displayed["credential_vault"]["readable"] is False
+    assert "重新保存所有 Provider API Key" in displayed["credential_vault"]["error"]
+    deepseek = next(item for item in displayed["providers"] if item["id"] == "deepseek")
+    assert deepseek["api_keys"][0]["credential_configured"] is True
+    assert deepseek["api_keys"][0]["credential_readable"] is False
+    assert deepseek["api_keys"][0]["api_key_masked"] == "••••••••"
+    assert registry.credentials.path.read_bytes() == original
 
 
 def test_legacy_init_provider_is_merged_into_builtin_provider(tmp_path, monkeypatch):
@@ -361,7 +465,7 @@ def test_provider_update_persists_api_key_and_reports_masked_status(tmp_path):
 
     endpoint = displayed["providers"][0]["endpoints"][0]
     assert endpoint["credential_configured"] is True
-    assert endpoint["credential_source"] == "vault"
+    assert endpoint["credential_source"] == "local_file"
     assert endpoint["api_key_masked"].endswith("cret")
     assert "saved-provider-secret" not in json.dumps(displayed)
 

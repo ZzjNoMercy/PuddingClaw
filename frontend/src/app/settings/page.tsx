@@ -500,6 +500,7 @@ export default function SettingsPage() {
   const [databaseName, setDatabaseName] = useState("puddingclaw");
   const [databaseUsername, setDatabaseUsername] = useState("pet");
   const [databasePassword, setDatabasePassword] = useState("");
+  const [databasePasswordError, setDatabasePasswordError] = useState("");
   const [databaseConfiguredBy, setDatabaseConfiguredBy] = useState("default");
   const [databaseSource, setDatabaseSource] = useState("config");
   const [databaseCatalogPath, setDatabaseCatalogPath] = useState("$PUDDINGCLAW_HOME/db/catalog.sqlite3");
@@ -616,6 +617,13 @@ export default function SettingsPage() {
       .then(setCapabilities)
       .catch(() => {});
 
+    // Provider metadata has its own control-plane endpoint.  Load it
+    // independently so an unrelated settings section cannot blank the model
+    // service navigation.
+    getProviders()
+      .then(setProviderRegistry)
+      .catch(() => {});
+
     getSettings()
       .then((s) => {
         setProviderRegistry(s.provider_registry || null);
@@ -671,6 +679,11 @@ export default function SettingsPage() {
         // Passwords are write-only. An empty field means "keep the stored
         // credential" when the rest of the settings form is saved.
         setDatabasePassword("");
+        setDatabasePasswordError(
+          s.database?.password_readable === false
+            ? s.database.password_error || "数据库密码无法解密，请重新录入。"
+            : "",
+        );
         setDatabaseConfiguredBy(s.database?.configured_by || "default");
         setDatabaseSource(s.database?.source || "config");
         setDatabaseCatalogPath(s.database?.catalog_path || "$PUDDINGCLAW_HOME/db/catalog.sqlite3");
@@ -1751,6 +1764,17 @@ export default function SettingsPage() {
                   .provider-light :global(.provider-primary-action) { background-color: #002fa7 !important; border: 1px solid #001f7a !important; color: #ffffff !important; }
                   .provider-light :global(.provider-primary-action:hover) { background-color: #001f7a !important; }
                 `}</style>
+                {providerRegistry?.credential_vault?.readable === false && (
+                  <div className="mx-5 mt-5 flex items-start gap-3 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-amber-900">
+                    <KeyRound className="mt-0.5 h-4 w-4 shrink-0" />
+                    <div>
+                      <p className="text-[12px] font-semibold">本地凭证存储无法解密</p>
+                      <p className="mt-1 text-[11px] leading-5 text-amber-800">
+                        {providerRegistry.credential_vault.error || "请重新保存所有 Provider API Key。"}
+                      </p>
+                    </div>
+                  </div>
+                )}
                 <div className="grid min-h-[calc(100vh-96px)] grid-cols-1 lg:grid-cols-[300px_minmax(0,1fr)]">
                   <aside className="border-b border-white/[0.1] bg-[#171717] lg:border-b-0 lg:border-r">
                     <div className="border-b border-white/[0.1] px-5 py-5">
@@ -1786,10 +1810,11 @@ export default function SettingsPage() {
                         {filteredProviders.map((provider) => {
                           const selected = selectedProviderId === provider.id;
                           const configured = provider.api_keys.some((item) => item.credential_configured);
+                          const credentialUnreadable = provider.api_keys.some((item) => item.credential_readable === false);
                           const hasDefaultModel = providerHasDefaultModel(provider);
                           return <button type="button" key={provider.id} onClick={() => setSelectedProviderId(provider.id)} className={`group flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left transition-all ${selected ? "bg-white/[0.1] text-white shadow-sm ring-1 ring-white/[0.12]" : "text-white/65 hover:bg-white/[0.055] hover:text-white"}`}>
                             <ProviderLogo provider={provider} />
-                            <span className="min-w-0 flex-1"><span className="block truncate text-[13px] font-semibold">{provider.name}</span><span className="mt-0.5 block text-[10px] text-white/40">{configured ? "已配置" : "待配置"}</span></span>
+                            <span className="min-w-0 flex-1"><span className="block truncate text-[13px] font-semibold">{provider.name}</span><span className={`mt-0.5 block text-[10px] ${credentialUnreadable ? "text-amber-500" : "text-white/40"}`}>{credentialUnreadable ? "凭证需重录" : configured ? "已配置" : "待配置"}</span></span>
                             {hasDefaultModel && <span className="h-2.5 w-2.5 rounded-full bg-emerald-400" title="包含默认模型" aria-label="包含默认模型" />}
                           </button>;
                         })}
@@ -1863,10 +1888,11 @@ export default function SettingsPage() {
                             <div className="flex overflow-hidden rounded-xl border border-white/[0.13] bg-[#1a1a1a] transition-colors focus-within:border-[#8d9cff]">
                               <input value={activeProviderCredentialName} readOnly={!isAddingProviderCredential} onChange={(event) => setProviderCredentialNames((current) => ({ ...current, [activeProvider.id]: event.target.value }))} className={`w-36 border-r border-white/[0.13] px-4 py-3 font-mono text-[13px] text-white outline-none placeholder:text-white/25 ${isAddingProviderCredential ? "bg-transparent" : "cursor-default bg-white/[0.025] text-white/55"}`} placeholder="Key 名称" aria-label={`${activeProvider.name} Key 名称`} />
                               <input ref={providerKeyInputRef} type={showProviderKey ? "text" : "password"} name={`provider-api-key-${activeProvider.id}`} autoComplete="new-password" data-1p-ignore="true" data-lpignore="true" spellCheck={false} value={providerKeys[activeProviderCredentialKey] || ""} onChange={(event) => { setProviderKeys((current) => ({ ...current, [activeProviderCredentialKey]: event.target.value })); setProviderRevealedKeys((current) => { const next = { ...current }; delete next[activeProviderCredentialKey]; return next; }); }} placeholder={activeProviderCredential?.api_key_masked || "输入 API 密钥"} className="min-w-0 flex-1 bg-transparent px-4 py-3 text-[14px] text-white outline-none placeholder:text-white/25" aria-label={`${activeProvider.name} API Key`} />
-                              <button type="button" disabled={providerBusy === `${activeProviderCredentialKey}:reveal`} onClick={() => handleProviderKeyVisibility(activeProvider, activeProviderCredentialName, Boolean(activeProviderCredential?.credential_configured))} className="px-3 text-white/45 transition hover:bg-white/[0.07] hover:text-white disabled:opacity-45" title={showProviderKey ? "隐藏密钥" : "显示密钥"}>{providerBusy === `${activeProviderCredentialKey}:reveal` ? <Loader2 className="h-4 w-4 animate-spin" /> : showProviderKey ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}</button>
-                              {activeEndpoint.protocol !== "dashscope_multimodal_embedding" && <button type="button" disabled={providerBusy === `${activeEndpointKey}:test`} onClick={() => handleTestProviderConnection(activeProvider, activeEndpoint.id)} className="border-l border-white/[0.13] px-4 text-[12px] font-semibold text-white transition hover:bg-white/[0.07] disabled:opacity-45">{providerBusy === `${activeEndpointKey}:test` ? "检测中…" : "检测"}</button>}
+                              <button type="button" disabled={providerBusy === `${activeProviderCredentialKey}:reveal` || activeProviderCredential?.credential_readable === false} onClick={() => handleProviderKeyVisibility(activeProvider, activeProviderCredentialName, Boolean(activeProviderCredential?.credential_configured))} className="px-3 text-white/45 transition hover:bg-white/[0.07] hover:text-white disabled:cursor-not-allowed disabled:opacity-45" title={activeProviderCredential?.credential_readable === false ? "密钥无法解密，请重新录入" : showProviderKey ? "隐藏密钥" : "显示密钥"}>{providerBusy === `${activeProviderCredentialKey}:reveal` ? <Loader2 className="h-4 w-4 animate-spin" /> : showProviderKey ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}</button>
+                              {activeEndpoint.protocol !== "dashscope_multimodal_embedding" && <button type="button" disabled={providerBusy === `${activeEndpointKey}:test` || activeProviderCredential?.credential_readable === false} onClick={() => handleTestProviderConnection(activeProvider, activeEndpoint.id)} className="border-l border-white/[0.13] px-4 text-[12px] font-semibold text-white transition hover:bg-white/[0.07] disabled:cursor-not-allowed disabled:opacity-45" title={activeProviderCredential?.credential_readable === false ? "密钥无法解密，请重新录入后检测" : undefined}>{providerBusy === `${activeEndpointKey}:test` ? "检测中…" : "检测"}</button>}
                               <button type="button" disabled={providerBusy === activeEndpointKey} onClick={() => handleProviderSave(activeProvider, activeEndpoint.id, undefined, providerKeyInputRef.current?.value || providerKeys[activeProviderCredentialKey] || "", activeProviderCredentialName)} className="provider-primary-action border-l border-white/[0.13] px-4 text-[12px] font-semibold transition disabled:opacity-45">{providerBusy === activeEndpointKey ? "保存中…" : "保存"}</button>
                             </div>
+                            {activeProviderCredential?.credential_readable === false && <p className="mt-2 text-[11px] text-amber-400">已保存的密钥无法解密。配置仍保留，请在上方重新输入并保存。</p>}
                             {providerConnectionResults[activeEndpointKey] && <p className={`mt-2 text-[11px] ${providerConnectionResults[activeEndpointKey].ok ? "text-emerald-600" : "text-rose-600"}`}>{providerConnectionResults[activeEndpointKey].message}</p>}
                             {activeProvider.website && <a href={activeProvider.website} target="_blank" rel="noreferrer" className="mt-3 inline-flex items-center gap-1.5 text-[11px] text-[#8d9cff] transition hover:text-[#b1b8ff]"><KeyRound className="h-3.5 w-3.5" /> 前往 {activeProvider.name} 获取密钥</a>}
                           </section>
@@ -2320,6 +2346,12 @@ export default function SettingsPage() {
                         <Copy className="h-3.5 w-3.5" />
                         puddingclaw database configure
                       </button>
+                    </div>
+                  ) : null}
+
+                  {databasePasswordError ? (
+                    <div className="rounded-xl border border-amber-200 bg-amber-50 px-3.5 py-3 text-[11px] leading-relaxed text-amber-800">
+                      已保存的数据库连接信息仍在，但密码当前无法读取。请重新输入密码并保存；其他设置可继续查看和编辑。
                     </div>
                   ) : null}
 
