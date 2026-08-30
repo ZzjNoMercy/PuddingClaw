@@ -1926,8 +1926,6 @@ function RunReviewControl({ message, isStreaming }: { message: ChatMessageType; 
   };
   const terminal = status && status !== "pending" && status !== "running";
   const canRequestReview = !status
-    || status === "stale"
-    || status === "failed"
     || status === "grader_error"
     || status === "infrastructure_error";
   const actionLabel = status ? "重新验证此回答" : "验证此回答";

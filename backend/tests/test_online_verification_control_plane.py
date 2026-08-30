@@ -532,6 +532,31 @@ def test_goal_adapter_rejects_unknown_or_duplicate_criterion_identity(tmp_path, 
     assert semantic["error_kind"].startswith("criterion_identity:")
 
 
+def test_goal_adapter_preserves_grader_runtime_error(tmp_path) -> None:
+    sessions, orchestrator, run, goal, snapshot, _request = _goal_verification_fixture(
+        tmp_path,
+        [{"id": "quality", "statement": "clear", "verifier": "llm_grader"}],
+    )
+
+    report = orchestrator.materialize_goal_proposal_from_verifiers(
+        run=run,
+        goal=goal,
+        snapshot=snapshot,
+        deterministic_evaluations=_deterministic_passes(run),
+        semantic_evaluation={
+            "result": "grader_error",
+            "explanation": "Grader raised APIConnectionError: Connection error.",
+            "criteria": [],
+        },
+    )
+
+    assert report.status == VerificationRecordStatus.GRADER_ERROR
+    assert report.explanation == "语义 grader 调用失败，未形成业务裁决。"
+    records = sessions.list_verification_records("session-1", snapshot_id=snapshot.snapshot_id)
+    semantic = next(item for item in records if item["method"] == "semantic_rubric")
+    assert semantic["error_kind"] == "grader_runtime:APIConnectionError"
+
+
 def test_goal_adapter_never_fakes_environment_pass_without_read_only_observation(tmp_path) -> None:
     sessions, orchestrator, run, goal, snapshot, _request = _goal_verification_fixture(
         tmp_path,
@@ -709,6 +734,74 @@ def test_shadow_run_review_persists_report_without_changing_run_outcome(tmp_path
     assert persisted["outcome"] == RunOutcome.COMPLETED.value
     assert persisted["run_review_report_id"] == report.report_id
     assert sessions.get_harness_state("session-1").get("completion_requests", {}) == {}
+
+
+def test_manual_review_runtime_error_is_retryable_without_becoming_protocol_error(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    sessions = _sessions(tmp_path)
+    run = _completed_review_run(sessions)
+    state = {
+        "messages": [HumanMessage(content=run.objective), AIMessage(content="done")],
+        "_harness_context": {"todos": [], "final_content": "done"},
+    }
+    reviewer = RunReviewOrchestrator(sessions)
+    snapshot, operation = reviewer.prepare(
+        run=run,
+        final_state=state,
+        workspace_fingerprint="workspace-runtime-error",
+        policy=RunReviewPolicy.SHADOW,
+        manual=True,
+    )
+
+    async def fake_after_agent(self, _state, _runtime):
+        return {
+            "_rubric_evaluations": [
+                {
+                    "result": "grader_error",
+                    "explanation": "Grader raised APIConnectionError: Connection error.",
+                    "criteria": [],
+                }
+            ]
+        }
+
+    monkeypatch.setattr(RubricMiddleware, "aafter_agent", fake_after_agent)
+    report = asyncio.run(
+        reviewer.execute(
+            run=run,
+            snapshot=snapshot,
+            operation=operation,
+            final_state=state,
+            model=object(),
+            policy=RunReviewPolicy.SHADOW,
+            manual=True,
+        )
+    )
+
+    assert report.status == VerificationRecordStatus.GRADER_ERROR
+    assert report.summary == "语义 grader 调用失败，未形成业务裁决。"
+    semantic = next(
+        item
+        for item in sessions.list_verification_records(
+            "session-1", snapshot_id=snapshot.snapshot_id
+        )
+        if item["method"] == VerificationMethod.SEMANTIC_RUBRIC.value
+    )
+    assert semantic["error_kind"] == "grader_runtime:APIConnectionError"
+
+    refreshed = RunRecord.model_validate(sessions.get_run_state("session-1", run.run_id))
+    retry_snapshot, retry_operation = reviewer.prepare(
+        run=refreshed,
+        final_state=state,
+        workspace_fingerprint="workspace-runtime-error",
+        policy=RunReviewPolicy.SHADOW,
+        manual=True,
+        force_new_attempt=True,
+    )
+    assert retry_snapshot.snapshot_id == snapshot.snapshot_id
+    assert retry_operation["operation_id"] != operation["operation_id"]
+    assert retry_operation["attempt_no"] == operation["attempt_no"] + 1
 
 
 def _completed_review_run(sessions: SessionManager):

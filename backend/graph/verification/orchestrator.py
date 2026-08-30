@@ -358,7 +358,14 @@ class OnlineVerificationOrchestrator:
             missing = [item.id for item in semantic_contract if item.id not in seen]
             protocol_errors.extend(f"missing:{item}" for item in missing)
             raw_result = str(semantic_evaluation.get("result") or "")
-            if protocol_errors:
+            if raw_result == "grader_error":
+                status = VerificationRecordStatus.GRADER_ERROR
+                explanation = str(semantic_evaluation.get("explanation") or "")
+                raised_detail = explanation.partition("Grader raised ")[2].split(maxsplit=1)
+                raised_type = raised_detail[0].rstrip(":") if raised_detail else "unknown"
+                error_kind = f"grader_runtime:{raised_type or 'unknown'}"
+                semantic_results = []
+            elif protocol_errors:
                 status = VerificationRecordStatus.GRADER_ERROR
                 error_kind = "criterion_identity:" + ",".join(protocol_errors)
             elif raw_result == "satisfied" and all(item.passed is True for item in semantic_results):

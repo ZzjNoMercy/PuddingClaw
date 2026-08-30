@@ -131,7 +131,14 @@ def merge_verification_records(
         explanation = "验收基础设施异常，未将其解释为任务不合格。"
     elif any(item.status == VerificationRecordStatus.GRADER_ERROR for item in control_errors) or foreign_ids:
         status = VerificationRecordStatus.GRADER_ERROR
-        explanation = "语义 grader 协议异常，未形成业务裁决。"
+        explanation = (
+            "语义 grader 调用失败，未形成业务裁决。"
+            if any(
+                str(item.error_kind or "").startswith("grader_runtime:")
+                for item in control_errors
+            )
+            else "语义 grader 协议异常，未形成业务裁决。"
+        )
     elif gaps:
         status = VerificationRecordStatus.NEEDS_REVISION
         explanation = "验收未通过：" + "；".join(dict.fromkeys(gaps))

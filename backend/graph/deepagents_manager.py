@@ -3104,10 +3104,17 @@ class DeepAgentsAgentManager:
         if run.run_kind != RunKind.STANDALONE or run.goal_id is not None or not run.terminal:
             raise ValueError("Run review is available only after an ordinary Run completes")
         harness = session_manager.get_harness_state(session_id)
+        force_new_attempt = False
         if run.run_review_report_id:
             existing = (harness.get("run_review_reports") or {}).get(run.run_review_report_id)
             if isinstance(existing, dict):
-                return {"status": "completed", "report": existing}
+                if manual and str(existing.get("status") or "") in {
+                    VerificationRecordStatus.GRADER_ERROR.value,
+                    VerificationRecordStatus.INFRASTRUCTURE_ERROR.value,
+                }:
+                    force_new_attempt = True
+                else:
+                    return {"status": "completed", "report": existing}
         policy = run.run_review_policy
         if manual and policy == RunReviewPolicy.OFF:
             policy = RunReviewPolicy.SHADOW
@@ -3161,6 +3168,7 @@ class DeepAgentsAgentManager:
             ),
             policy=policy,
             manual=manual,
+            force_new_attempt=force_new_attempt,
         )
         operation_id = str(operation["operation_id"])
         active_task = self._run_review_tasks.get(operation_id)

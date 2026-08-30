@@ -64,6 +64,7 @@ class RunReviewOrchestrator:
         workspace_fingerprint: str | None,
         policy: RunReviewPolicy,
         manual: bool = False,
+        force_new_attempt: bool = False,
     ) -> tuple[EvaluationInputSnapshot, dict[str, Any]]:
         if policy == RunReviewPolicy.OFF or (run.run_review_policy != policy and not manual):
             raise ValueError("Run review policy is not enabled for this immutable Run")
@@ -100,7 +101,7 @@ class RunReviewOrchestrator:
                         and item.get("verifier_policy_hash") == stable_digest(grader_policy)
                         and item.get("status") in {"pending", "running", "completed"}
                     ] if isinstance(operations, dict) else []
-                    if live_or_recoverable:
+                    if live_or_recoverable and not force_new_attempt:
                         return parsed, max(
                             live_or_recoverable,
                             key=lambda item: int(item.get("attempt_no") or 0),
@@ -347,9 +348,16 @@ class RunReviewOrchestrator:
                         gap=str(item.get("gap") or "") or None,
                     )
                 )
-            protocol_errors.extend(f"missing:{item.id}" for item in criteria if item.id not in seen)
             raw_result = str(evaluation.get("result") or "")
-            if protocol_errors:
+            protocol_errors.extend(f"missing:{item.id}" for item in criteria if item.id not in seen)
+            if raw_result == "grader_error":
+                status = VerificationRecordStatus.GRADER_ERROR
+                explanation = str(evaluation.get("explanation") or "")
+                raised_detail = explanation.partition("Grader raised ")[2].split(maxsplit=1)
+                raised_type = raised_detail[0].rstrip(":") if raised_detail else "unknown"
+                error_kind = f"grader_runtime:{raised_type or 'unknown'}"
+                results = []
+            elif protocol_errors:
                 status = VerificationRecordStatus.GRADER_ERROR
                 error_kind = "criterion_identity:" + ",".join(protocol_errors)
             elif raw_result == "satisfied" and all(item.passed is True for item in results):
