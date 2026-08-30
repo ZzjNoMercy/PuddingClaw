@@ -179,9 +179,9 @@ export default function ChatInput() {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const attachmentInputRef = useRef<HTMLInputElement>(null);
   const runReviewPolicyLabel: Record<RunReviewPolicy, string> = {
-    off: "关闭复核",
-    shadow: "后台复核",
-    blocking_one_shot: "发布前复核",
+    off: "关闭",
+    shadow: "后台",
+    blocking_one_shot: "发布前",
   };
   const selectedRunReviewPolicyLabel = runReviewPolicy === null
     ? "跟随设置"
