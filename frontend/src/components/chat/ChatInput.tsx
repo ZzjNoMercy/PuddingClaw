@@ -178,6 +178,14 @@ export default function ChatInput() {
   const [text, setText] = useState(() => getInputDraft(sessionId));
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const attachmentInputRef = useRef<HTMLInputElement>(null);
+  const runReviewPolicyLabel: Record<RunReviewPolicy, string> = {
+    off: "关闭复核",
+    shadow: "后台复核",
+    blocking_one_shot: "发布前复核",
+  };
+  const selectedRunReviewPolicyLabel = runReviewPolicy === null
+    ? "跟随设置"
+    : runReviewPolicyLabel[runReviewPolicy];
   const controlsMenuRef = useRef<HTMLDivElement>(null);
   const submitInFlightSessionsRef = useRef<Set<string>>(new Set());
   const currentSessionIdRef = useRef(sessionId);
@@ -1012,7 +1020,7 @@ export default function ChatInput() {
                   title={goalModeEnabled ? "Goal Run 不使用普通 Run 复核" : "普通 Run 质量复核"}
                 >
                   <ShieldCheck className="h-3.5 w-3.5" />
-                  <span className="hidden sm:inline">复核</span>
+                  <span className="hidden sm:inline">{selectedRunReviewPolicyLabel}</span>
                   <ChevronDown className="h-3.5 w-3.5" />
                 </button>
                 {openPopover === "review-policy" && !goalModeEnabled && (
