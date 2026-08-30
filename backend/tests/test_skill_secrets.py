@@ -114,7 +114,6 @@ def test_unreadable_skill_secret_can_be_repaired_by_explicit_entry(tmp_path):
     )
     damaged = SkillSecretStore(PuddingClawPaths(tmp_path / ".puddingclaw"), "local")
     damaged._vault = CredentialVault(b"x" * 32)
-    damaged.key_provider.existing_keys = lambda: ()
 
     assert damaged.status(
         skill_id="demo", skill_version="sha256-v1", env_name="DEMO_TOKEN"

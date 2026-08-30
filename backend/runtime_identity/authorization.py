@@ -21,7 +21,6 @@ from filelock import FileLock
 
 from runtime_identity.paths import PuddingClawPaths, safe_identity_component
 from runtime_identity.profiles import (
-    CredentialEnvelopeDecryptionError,
     CredentialVault,
     MasterKeyProvider,
     _atomic_write,
@@ -153,25 +152,12 @@ class AuthorizationFlowStore:
         profile_id: str,
         flow_id: str,
     ) -> bytes:
-        candidates = [self.vault]
-        candidates.extend(
-            CredentialVault(key) for key in self.key_provider.existing_keys()
-        )
-        for candidate in candidates:
-            try:
-                plaintext = candidate.open_flow(
-                    envelope,
-                    owner_user_id=self.owner_user_id,
-                    provider=provider,
-                    profile_id=profile_id,
-                    flow_id=flow_id,
-                )
-            except CredentialEnvelopeDecryptionError:
-                continue
-            self._vault = candidate
-            return plaintext
-        raise CredentialEnvelopeDecryptionError(
-            "已保存的授权状态无法解密；主密钥与密文不匹配，请重新发起授权。"
+        return self.vault.open_flow(
+            envelope,
+            owner_user_id=self.owner_user_id,
+            provider=provider,
+            profile_id=profile_id,
+            flow_id=flow_id,
         )
 
     def active(self, provider: str, profile_id: str) -> dict[str, Any] | None:

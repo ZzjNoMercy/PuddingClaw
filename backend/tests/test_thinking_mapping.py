@@ -70,6 +70,26 @@ def test_direct_kimi_k3_defaults_to_low_strength() -> None:
     assert mapped["reasoning_effort"] == "low"
 
 
+@pytest.mark.parametrize("model_name", ["glm-5.3", "glm-5.3-flash"])
+@pytest.mark.parametrize("level", ["low", "high", "max"])
+def test_zhipu_glm_53_exposes_documented_reasoning_strengths(
+    model_name: str,
+    level: str,
+) -> None:
+    profile = thinking_profile(
+        provider_id="zhipu",
+        model_name=model_name,
+        endpoint_id="zhipu-openai",
+    )
+
+    mapped = map_thinking_request(profile, level)
+
+    assert profile["levels"] == ["low", "high", "max"]
+    assert profile["default_level"] == "max"
+    assert mapped["reasoning_effort"] == level
+    assert mapped["extra_body"] == {"thinking": {"type": "enabled"}}
+
+
 def test_bailian_kimi_k3_is_fixed_to_max() -> None:
     profile = thinking_profile(
         provider_id="dashscope",

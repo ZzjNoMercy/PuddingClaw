@@ -16,6 +16,7 @@ from provider_registry import (
     get_provider_registry,
     user_data_dir,
 )
+from runtime_identity.profiles import CredentialAuthorityLockedError
 
 PROVIDER_IDS = ("tavily", "deepseek", "grok")
 PROVIDER_MANIFEST: dict[str, dict[str, Any]] = {
@@ -62,6 +63,8 @@ def _default_provider(provider_id: str) -> dict[str, Any]:
                 "x_video_understanding_enabled": False,
             }
         )
+    if provider_id == "deepseek":
+        options["proxy_mode"] = "direct"
     return {
         "enabled": False,
         "state": "disabled",
@@ -141,9 +144,16 @@ class WebSearchRegistry:
             routing.setdefault(key, copy.deepcopy(value))
         providers = payload.setdefault("providers", {})
         for provider_id in PROVIDER_IDS:
-            current = providers.setdefault(provider_id, _default_provider(provider_id))
-            for key, value in _default_provider(provider_id).items():
+            provider_defaults = _default_provider(provider_id)
+            current = providers.setdefault(provider_id, provider_defaults)
+            for key, value in provider_defaults.items():
                 current.setdefault(key, copy.deepcopy(value))
+            options = current.get("options")
+            if not isinstance(options, dict):
+                options = {}
+                current["options"] = options
+            for key, value in provider_defaults["options"].items():
+                options.setdefault(key, copy.deepcopy(value))
         return payload
 
     def _save(self, payload: dict[str, Any]) -> None:
@@ -181,7 +191,7 @@ class WebSearchRegistry:
                 value = get_provider_registry().resolve_credential_for_runtime(
                     "deepseek", "default"
                 )
-            except CredentialVaultDecryptionError:
+            except (CredentialVaultDecryptionError, CredentialAuthorityLockedError):
                 raise
             except ValueError:
                 value = ""
@@ -199,7 +209,7 @@ class WebSearchRegistry:
             configured_but_unreadable = False
             try:
                 secret, source = self.credential(provider_id)
-            except CredentialVaultDecryptionError as exc:
+            except (CredentialVaultDecryptionError, CredentialAuthorityLockedError) as exc:
                 secret = ""
                 configured_but_unreadable = True
                 source = (

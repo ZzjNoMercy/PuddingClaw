@@ -110,9 +110,9 @@ export default function WebSearchSettingsPage() {
   const [notice, setNotice] = useState<{ tone: "success" | "error"; text: string } | null>(null);
   const runtimeExtensions = useRuntimeProfile();
 
-  const load = useCallback(async () => {
+  const load = useCallback(async ({ preserveNotice = false }: { preserveNotice?: boolean } = {}) => {
     setLoading(true);
-    setNotice(null);
+    if (!preserveNotice) setNotice(null);
     try {
       const fresh = await getWebSearchConfig();
       setConfig(fresh);
@@ -197,7 +197,12 @@ export default function WebSearchSettingsPage() {
 
   const testProvider = useCallback(async (providerId: WebSearchProviderId) => {
     const result = await runAction(`test:${providerId}`, () => testWebSearchProvider(providerId), "连接和搜索能力验证通过");
-    if (result) await load();
+    if (!result) return;
+    await load({ preserveNotice: true });
+    setNotice({
+      tone: "success",
+      text: `连接和搜索能力验证通过 · ${result.latency_ms}ms · 返回 ${result.source_count} 条来源`,
+    });
   }, [load, runAction]);
 
   const toggleProvider = useCallback(async (provider: WebSearchProvider) => {

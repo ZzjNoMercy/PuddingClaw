@@ -73,6 +73,7 @@ import deepseekLogo from "@lobehub/icons-static-svg/icons/deepseek-color.svg";
 import bailianLogo from "@lobehub/icons-static-svg/icons/bailian-color.svg";
 import moonshotLogo from "@lobehub/icons-static-svg/icons/moonshot.svg";
 import siliconFlowLogo from "@lobehub/icons-static-svg/icons/siliconcloud-color.svg";
+import zhipuLogo from "@lobehub/icons-static-svg/icons/zhipu-color.svg";
 
 type SubAgentConfigMap = Record<string, Omit<SubAgentItem, "name">>;
 type PendingModelCategoryEdit = {
@@ -139,6 +140,7 @@ const PROVIDER_LOGOS: Record<string, string | { src: string }> = {
   dashscope: bailianLogo,
   kimi: moonshotLogo,
   siliconflow: siliconFlowLogo,
+  zhipu: zhipuLogo,
 };
 
 const PROVIDER_ACCENTS: Record<string, string> = {
@@ -146,6 +148,7 @@ const PROVIDER_ACCENTS: Record<string, string> = {
   dashscope: "#6757ff",
   kimi: "#e8e8e8",
   siliconflow: "#6e29f6",
+  zhipu: "#3858e9",
 };
 
 const PROTOCOL_LABELS: Record<string, string> = {

@@ -351,11 +351,25 @@ Operator 锁定项和安全约束不采用简单的“后写覆盖”：监听�
 
 `settings.json` 只保存用户明确修改过的字段，不复制 `_DEFAULT_CONFIG` 的完整展开结果。升级时先用新版本 defaults 合并旧用户 overrides，再执行按 `schema_version` 注册的纯迁移函数；未知字段要么由对应扩展 Schema 接管，要么进入诊断，不能静默丢失。
 
-Credential 读取优先级：
+Credential 不再采用运行时读取优先级或失败兜底。每个安装/owner 通过
+`$PUDDINGCLAW_HOME/.vault-keys/<owner>.provider.json` 固定一个主密钥
+Provider；Desktop、后台服务和 Headless Worker 共用该权威。所选 Provider
+不可用时进入 locked，不改用另一来源，也不生成第二把密钥。
 
-1. 部署环境提供的 `env://<NAME>`、K8s Secret 或外部 Secret Manager 引用；默认不复制到本地文件。
-2. 桌面平台安全存储中的 Secret 或 Vault 主密钥：macOS Keychain、Windows Credential Manager/DPAPI，Linux 可接 Secret Service。
-3. 平台安全存储不可用时，使用 `$PUDDINGCLAW_HOME/users/<owner>/credentials/` 下的加密 Vault；主密钥必须与密文分离，文件权限只作为补充保护。
+权威清单保存 `provider`、`owner_user_id`、schema version 与非敏感的
+`key_id`（主密钥 SHA-256 标识）。新密文使用 envelope v2 并携带相同的
+`key_id`，因此选错主密钥会在 AES-GCM 解密前被识别，不再笼统表现为
+`InvalidTag`。Provider 只在首次初始化时选择：macOS 默认 Keychain，当前
+Linux/Windows 默认权限受限的安装级文件密钥；独立 Headless/Server 部署可在
+首次初始化前显式选择 `environment`，并用 `PUDDINGCLAW_MASTER_KEY` 注入
+32 字节 hex/base64url 密钥。清单生成后，更改运行模式或环境变量不能切换
+Provider。
+
+无清单的旧 macOS 安装只执行一次迁移判定：只有一类旧密钥时选择该
+Provider；Keychain 与文件密钥同时存在时，用 canonical Provider Registry
+密文唯一判断实际权威；没有历史密文时选择 Keychain；无法唯一判断则锁定。
+清单写入后不再扫描候选密钥。未来若要更换 Provider，必须实现显式、可审计
+的“解密全部旧密文 → 原子重加密 → 更新清单”事务。
 
 Provider Registry 只保存类似以下的非敏感记录：
 
@@ -369,7 +383,10 @@ Provider Registry 只保存类似以下的非敏感记录：
 }
 ```
 
-原生 Windows 需要补齐 Credential Manager 或 DPAPI Provider。现有 `MasterKeyProvider` 在 macOS 优先使用 Keychain，但 Windows 会退回本地 key 文件；在完成 Windows 安全存储接入前，这只能作为受限兼容模式并在 Doctor 中明确警告，不能宣称等同于系统 Credential Manager。
+原生 Windows 仍需补齐 Credential Manager 或 DPAPI Provider。当前 Windows/Linux
+新安装会把 `file` 明确写成安装级 Provider；它不是 Keychain 失败后的运行时
+fallback。在完成系统安全存储接入前，这只能作为受限兼容模式并在 Doctor 中
+明确警告，不能宣称等同于系统安全存储。
 
 ### 4.5 模型 Credential 迁移
 

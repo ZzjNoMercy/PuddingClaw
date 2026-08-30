@@ -28,14 +28,34 @@ def resolved_https_proxy() -> str:
     return _configured_https_proxy_url()
 
 
-def openai_compatible_http_client(*, timeout: float) -> Any | None:
-    """Build an httpx.Client bound to the shared HTTPS proxy, or None for SDK defaults."""
+def openai_compatible_http_client(
+    *,
+    timeout: float,
+    proxy_mode: str = "auto",
+) -> Any | None:
+    """Build one destination-aware HTTP client for an OpenAI-compatible API.
 
-    proxy_url = resolved_https_proxy()
-    if not proxy_url:
-        return None
+    ``direct`` explicitly disables process proxy variables. ``auto`` preserves
+    the shared PuddingClaw/system proxy behavior. Provider adapters select the
+    mode once from their endpoint contract; failed POST requests are never
+    replayed through a second route.
+    """
+
+    if proxy_mode not in {"auto", "direct", "proxy"}:
+        raise ValueError("proxy_mode must be auto, direct, or proxy")
     import httpx
 
+    if proxy_mode == "direct":
+        return httpx.Client(
+            timeout=timeout,
+            follow_redirects=True,
+            trust_env=False,
+        )
+    proxy_url = resolved_https_proxy()
+    if not proxy_url and proxy_mode == "proxy":
+        raise ValueError("proxy_mode=proxy requires a configured HTTPS proxy")
+    if not proxy_url:
+        return None
     return httpx.Client(proxy=proxy_url, timeout=timeout, follow_redirects=True)
 
 

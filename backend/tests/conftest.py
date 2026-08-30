@@ -16,6 +16,7 @@ def isolate_puddingclaw_home(tmp_path, monkeypatch):
     """Never let unit tests read or mutate the developer's real Home state."""
 
     monkeypatch.setenv("PUDDINGCLAW_HOME", str(tmp_path / "puddingclaw-home"))
+    monkeypatch.setenv("PUDDINGCLAW_CREDENTIAL_KEY_PROVIDER", "file")
     import provider_registry
     from web_search import registry as web_search_registry
 

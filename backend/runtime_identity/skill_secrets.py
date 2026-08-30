@@ -15,6 +15,7 @@ from filelock import FileLock
 
 from runtime_identity.paths import PuddingClawPaths, safe_identity_component
 from runtime_identity.profiles import (
+    CredentialAuthorityLockedError,
     CredentialEnvelopeDecryptionError,
     CredentialVault,
     MasterKeyProvider,
@@ -113,25 +114,12 @@ class SkillSecretStore:
             envelope = self.path.read_bytes()
         except FileNotFoundError:
             return self._empty(), "missing"
-        plaintext = None
-        candidates = [self.vault]
-        candidates.extend(CredentialVault(key) for key in self.key_provider.existing_keys())
-        for candidate in candidates:
-            try:
-                plaintext = candidate.open(
-                    envelope,
-                    owner_user_id=self.owner_user_id,
-                    provider=self.provider,
-                    profile_id=self.profile_id,
-                )
-            except CredentialEnvelopeDecryptionError:
-                continue
-            self._vault = candidate
-            break
-        if plaintext is None:
-            raise CredentialEnvelopeDecryptionError(
-                "Skill Secret 无法解密，请重新录入该 Skill 所需的密钥。"
-            )
+        plaintext = self.vault.open(
+            envelope,
+            owner_user_id=self.owner_user_id,
+            provider=self.provider,
+            profile_id=self.profile_id,
+        )
         value = json.loads(plaintext.decode("utf-8"))
         if (
             not isinstance(value, dict)
@@ -170,7 +158,7 @@ class SkillSecretStore:
         with self.lock.acquire(timeout=30):
             try:
                 value, _revision = self._read()
-            except CredentialEnvelopeDecryptionError:
+            except (CredentialEnvelopeDecryptionError, CredentialAuthorityLockedError):
                 return "unreadable"
         secrets = value["secrets"]
         bindings = value["bindings"]

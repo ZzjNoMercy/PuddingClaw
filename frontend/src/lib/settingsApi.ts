@@ -230,7 +230,7 @@ export type ProviderModelCategory = "llm" | "multimodal_llm" | "text_embedding" 
 export type ThinkingLevel = "low" | "high" | "max";
 
 export interface ThinkingProfile {
-  kind: "qwen_fixed" | "kimi_bailian_fixed" | "kimi_levels" | "deepseek_levels" | "none";
+  kind: "qwen_fixed" | "kimi_bailian_fixed" | "kimi_levels" | "zhipu_levels" | "deepseek_levels" | "none";
   thinking_enabled: boolean;
   strength_control: "levels" | "disabled" | "hidden";
   levels: ThinkingLevel[];

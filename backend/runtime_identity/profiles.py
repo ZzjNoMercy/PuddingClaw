@@ -15,6 +15,7 @@ import tempfile
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -32,6 +33,17 @@ MAX_CREDENTIAL_ARCHIVE_FILES = 2_000
 
 class CredentialEnvelopeDecryptionError(ValueError):
     """Encrypted credential state exists but is not readable by this installation."""
+
+
+class CredentialAuthorityLockedError(ValueError):
+    """The installation's selected credential authority cannot supply its key."""
+
+
+@dataclass(frozen=True)
+class CredentialAuthority:
+    provider: str
+    key_id: str
+    key: bytes
 
 
 def validate_credential_archive(
@@ -123,74 +135,251 @@ def _atomic_write(path: Path, payload: bytes, *, mode: int = 0o600) -> None:
 
 
 class MasterKeyProvider:
-    """Load a per-user vault key from Keychain, with a 0600 fallback."""
+    """Resolve the one credential authority selected for this installation.
+
+    Runtime mode never participates in selection.  A persisted manifest pins
+    one provider; if that provider is unavailable the Vault is locked rather
+    than silently switching keys.  Provider discovery only happens once while
+    migrating an installation that predates the manifest.
+    """
 
     service = "PuddingClaw Credential Vault"
+    manifest_version = 1
+    provider_environment_variable = "PUDDINGCLAW_CREDENTIAL_KEY_PROVIDER"
+    master_key_environment_variable = "PUDDINGCLAW_MASTER_KEY"
 
     def __init__(self, paths: PuddingClawPaths, owner_user_id: str) -> None:
         self.paths = paths
         self.owner_user_id = safe_identity_component(owner_user_id, field="owner_user_id")
+        self._authority: CredentialAuthority | None = None
 
     def get_or_create(self) -> bytes:
+        return self.authority().key
+
+    def authority(self) -> CredentialAuthority:
+        if self._authority is not None:
+            return self._authority
         lock_root = self.paths.root / ".vault-keys"
         lock_root.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(lock_root, 0o700)
         lock = FileLock(str(lock_root / f".{self.owner_user_id}.master-key.lock"), thread_local=False)
         with lock.acquire(timeout=30):
-            return self._get_or_create_locked()
+            self._authority = self._resolve_locked()
+            return self._authority
 
-    def _get_or_create_locked(self) -> bytes:
-        # Once the file fallback exists it is the durable key authority for
-        # this installation.  Choosing Keychain first on every startup made
-        # the active key depend on whether the login Keychain happened to be
-        # unlocked, which can make an otherwise valid vault undecryptable.
-        fallback = self._read_fallback_key()
-        if fallback is not None:
-            return fallback
+    def _resolve_locked(self) -> CredentialAuthority:
+        manifest = self._read_manifest()
+        if manifest is None:
+            return self._bootstrap_authority()
+        provider = str(manifest.get("provider") or "")
+        expected_key_id = str(manifest.get("key_id") or "")
+        if manifest.get("schema_version") != self.manifest_version or provider not in {
+            "keychain", "file", "environment"
+        } or manifest.get("owner_user_id") != self.owner_user_id or not expected_key_id:
+            raise CredentialAuthorityLockedError(
+                "Credential Vault 的安装级密钥权威清单无效；请修复清单后再启动。"
+            )
+        key = self._read_provider_key(provider)
+        actual_key_id = self.key_id(key)
+        if actual_key_id != expected_key_id:
+            raise CredentialAuthorityLockedError(
+                "Credential Vault 已锁定：当前密钥与安装级权威清单不匹配。"
+            )
+        return CredentialAuthority(provider=provider, key_id=actual_key_id, key=key)
+
+    def _bootstrap_authority(self) -> CredentialAuthority:
+        requested = os.environ.get(self.provider_environment_variable, "").strip().lower()
+        if requested and requested not in {"keychain", "file", "environment"}:
+            raise CredentialAuthorityLockedError(
+                f"{self.provider_environment_variable} 只支持 keychain、file 或 environment。"
+            )
+        provider = requested or self._legacy_or_platform_provider()
+        if provider == "keychain" and sys.platform != "darwin":
+            raise CredentialAuthorityLockedError("keychain 凭证权威只支持 macOS。")
+        key = self._create_or_read_bootstrap_key(provider)
+        authority = CredentialAuthority(provider=provider, key_id=self.key_id(key), key=key)
+        manifest = {
+            "schema_version": self.manifest_version,
+            "owner_user_id": self.owner_user_id,
+            "provider": authority.provider,
+            "key_id": authority.key_id,
+            "created_at": int(time.time()),
+        }
+        _atomic_write(
+            self.paths.credential_authority_manifest(self.owner_user_id),
+            (json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8"),
+        )
+        return authority
+
+    def _legacy_or_platform_provider(self) -> str:
         if sys.platform == "darwin":
+            try:
+                keychain_key = self._read_keychain_key()
+            except (OSError, subprocess.TimeoutExpired):
+                # An existing macOS installation still owns a Keychain
+                # authority even when this process cannot currently open it.
+                # Do not reinterpret that temporary failure as permission to
+                # switch to a file key.
+                raise CredentialAuthorityLockedError(
+                    "Credential Vault 已锁定：macOS Keychain 当前不可用。"
+                ) from None
+            file_key = self._read_file_key()
+            if keychain_key is not None and file_key is not None:
+                return self._select_legacy_provider_from_ciphertext(
+                    keychain_key=keychain_key,
+                    file_key=file_key,
+                )
+            if keychain_key is not None:
+                return "keychain"
+            if file_key is not None:
+                return "file"
+            return "keychain"
+        return "file"
+
+    def _select_legacy_provider_from_ciphertext(
+        self,
+        *,
+        keychain_key: bytes,
+        file_key: bytes,
+    ) -> str:
+        """Resolve an old dual-key installation once from its canonical Vault.
+
+        This is migration, not a runtime recovery path.  Once the result is
+        persisted in the authority manifest no ciphertext is probed again.
+        """
+
+        if keychain_key == file_key:
+            return "keychain"
+        registry = self.paths.credentials_root(self.owner_user_id) / "provider-registry.enc"
+        try:
+            envelope = registry.read_bytes()
+        except FileNotFoundError:
+            return "keychain"
+        except OSError as exc:
+            raise CredentialAuthorityLockedError(
+                "Credential Vault 已锁定：无法读取旧 Provider 密文以确定唯一密钥权威。"
+            ) from exc
+        matches: list[str] = []
+        for provider, key in (("keychain", keychain_key), ("file", file_key)):
+            try:
+                CredentialVault(key).open(
+                    envelope,
+                    owner_user_id=self.owner_user_id,
+                    provider="provider-registry",
+                    profile_id="default",
+                )
+            except (CredentialEnvelopeDecryptionError, ValueError, KeyError, TypeError, UnicodeDecodeError):
+                continue
+            matches.append(provider)
+        if len(matches) == 1:
+            return matches[0]
+        raise CredentialAuthorityLockedError(
+            "Credential Vault 已锁定：旧安装同时存在多把主密钥，且无法从 Provider 密文确定唯一权威。"
+        )
+
+    def _create_or_read_bootstrap_key(self, provider: str) -> bytes:
+        if provider == "keychain":
             try:
                 return self._get_or_create_keychain_key()
-            except (OSError, subprocess.TimeoutExpired):
-                # Headless macOS services may not have an unlocked Keychain.
-                # The local fallback remains private to this owner and never
-                # shares a directory with encrypted provider state.
-                pass
-        fallback = self._fallback_path()
-        fallback.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        os.chmod(fallback.parent, 0o700)
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                raise CredentialAuthorityLockedError(
+                    "Credential Vault 已锁定：无法初始化 macOS Keychain。"
+                ) from exc
+        if provider == "environment":
+            return self._read_environment_key()
+        existing = self._read_file_key()
+        if existing is not None:
+            return existing
+        path = self._file_key_path()
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(path.parent, 0o700)
         value = secrets.token_bytes(32)
-        _atomic_write(fallback, value)
-        os.chmod(fallback, 0o600)
+        _atomic_write(path, value)
+        os.chmod(path, 0o600)
         return value
 
-    def existing_keys(self) -> tuple[bytes, ...]:
-        """Return existing recovery candidates without creating a new key."""
-
-        candidates: list[bytes] = []
-        fallback = self._read_fallback_key()
-        if fallback is not None:
-            candidates.append(fallback)
-        if sys.platform == "darwin":
-            try:
-                keychain = self._read_keychain_key()
-            except (OSError, subprocess.TimeoutExpired):
-                keychain = None
-            if keychain is not None and keychain not in candidates:
-                candidates.append(keychain)
-        return tuple(candidates)
-
-    def _fallback_path(self) -> Path:
-        return self.paths.root / ".vault-keys" / f"{self.owner_user_id}.key"
-
-    def _read_fallback_key(self) -> bytes | None:
-        fallback = self._fallback_path()
+    def _read_manifest(self) -> dict[str, Any] | None:
+        path = self.paths.credential_authority_manifest(self.owner_user_id)
         try:
-            value = fallback.read_bytes()
+            value = json.loads(path.read_text(encoding="utf-8"))
         except FileNotFoundError:
             return None
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            raise CredentialAuthorityLockedError(
+                "Credential Vault 的安装级密钥权威清单无法读取。"
+            ) from exc
+        if not isinstance(value, dict):
+            raise CredentialAuthorityLockedError(
+                "Credential Vault 的安装级密钥权威清单格式无效。"
+            )
+        return value
+
+    def _read_provider_key(self, provider: str) -> bytes:
+        if provider == "environment":
+            return self._read_environment_key()
+        if provider == "file":
+            key = self._read_file_key()
+            if key is None:
+                raise CredentialAuthorityLockedError(
+                    "Credential Vault 已锁定：安装级文件密钥不存在。"
+                )
+            return key
+        if sys.platform != "darwin":
+            raise CredentialAuthorityLockedError("Credential Vault 已锁定：当前平台不支持 Keychain。")
+        try:
+            key = self._read_keychain_key()
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise CredentialAuthorityLockedError(
+                "Credential Vault 已锁定：macOS Keychain 当前不可用。"
+            ) from exc
+        if key is None:
+            raise CredentialAuthorityLockedError(
+                "Credential Vault 已锁定：macOS Keychain 中的安装级密钥不存在。"
+            )
+        return key
+
+    def _read_environment_key(self) -> bytes:
+        encoded = os.environ.get(self.master_key_environment_variable, "").strip()
+        if not encoded:
+            raise CredentialAuthorityLockedError(
+                f"Credential Vault 已锁定：缺少 {self.master_key_environment_variable}。"
+            )
+        try:
+            value = bytes.fromhex(encoded) if re.fullmatch(r"[0-9a-fA-F]{64}", encoded) else base64.urlsafe_b64decode(
+                encoded + "=" * (-len(encoded) % 4)
+            )
+        except (ValueError, UnicodeError) as exc:
+            raise CredentialAuthorityLockedError(
+                f"{self.master_key_environment_variable} 必须是 32 字节密钥的 hex 或 base64url 编码。"
+            ) from exc
         if len(value) != 32:
-            raise ValueError("credential vault master key has an invalid length")
-        os.chmod(fallback, 0o600)
+            raise CredentialAuthorityLockedError(
+                f"{self.master_key_environment_variable} 必须解码为 32 字节。"
+            )
+        return value
+
+    @staticmethod
+    def key_id(key: bytes) -> str:
+        return f"sha256:{hashlib.sha256(key).hexdigest()[:32]}"
+
+    def _file_key_path(self) -> Path:
+        return self.paths.credential_file_key(self.owner_user_id)
+
+    def _read_file_key(self) -> bytes | None:
+        path = self._file_key_path()
+        try:
+            value = path.read_bytes()
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise CredentialAuthorityLockedError(
+                "Credential Vault 已锁定：安装级文件密钥不可读。"
+            ) from exc
+        if len(value) != 32:
+            raise CredentialAuthorityLockedError(
+                "Credential Vault 已锁定：安装级文件密钥长度无效。"
+            )
+        os.chmod(path, 0o600)
         return value
 
     def _read_keychain_key(self) -> bytes | None:
@@ -209,8 +398,13 @@ class MasterKeyProvider:
             text=True,
             timeout=10,
         )
-        if existing.returncode != 0 or not existing.stdout.strip():
-            return None
+        if existing.returncode != 0:
+            diagnostic = f"{existing.stderr}\n{existing.stdout}".lower()
+            if existing.returncode == 44 or "could not be found" in diagnostic:
+                return None
+            raise OSError("macOS Keychain lookup failed")
+        if not existing.stdout.strip():
+            raise OSError("macOS Keychain returned an empty credential")
         try:
             value = base64.urlsafe_b64decode(existing.stdout.strip().encode("ascii"))
         except (ValueError, UnicodeError):
@@ -246,12 +440,13 @@ class MasterKeyProvider:
 
 
 class CredentialVault:
-    version = 1
+    version = 2
 
     def __init__(self, key: bytes) -> None:
         if len(key) != 32:
             raise ValueError("AES-256-GCM requires a 32-byte key")
         self._cipher = AESGCM(key)
+        self.key_id = MasterKeyProvider.key_id(key)
 
     def seal(self, plaintext: bytes, *, owner_user_id: str, provider: str, profile_id: str) -> bytes:
         nonce = secrets.token_bytes(12)
@@ -260,6 +455,7 @@ class CredentialVault:
         envelope = {
             "version": self.version,
             "algorithm": "AES-256-GCM",
+            "key_id": self.key_id,
             "nonce": base64.b64encode(nonce).decode("ascii"),
             "ciphertext": base64.b64encode(ciphertext).decode("ascii"),
         }
@@ -267,8 +463,12 @@ class CredentialVault:
 
     def open(self, envelope: bytes, *, owner_user_id: str, provider: str, profile_id: str) -> bytes:
         value = json.loads(envelope.decode("utf-8"))
-        if value.get("version") != self.version or value.get("algorithm") != "AES-256-GCM":
+        if value.get("version") not in {1, self.version} or value.get("algorithm") != "AES-256-GCM":
             raise ValueError("unsupported credential vault envelope")
+        if value.get("version") == self.version and value.get("key_id") != self.key_id:
+            raise CredentialEnvelopeDecryptionError(
+                "已保存的凭据属于另一安装级密钥权威，当前 Vault 已锁定。"
+            )
         try:
             return self._cipher.decrypt(
                 base64.b64decode(value["nonce"], validate=True),
@@ -314,6 +514,7 @@ class CredentialVault:
         envelope = {
             "version": self.version,
             "algorithm": "AES-256-GCM",
+            "key_id": self.key_id,
             "nonce": base64.b64encode(nonce).decode("ascii"),
             "ciphertext": base64.b64encode(ciphertext).decode("ascii"),
         }
@@ -321,8 +522,12 @@ class CredentialVault:
 
     def _open_with_aad(self, envelope: bytes, aad: bytes) -> bytes:
         value = json.loads(envelope.decode("utf-8"))
-        if value.get("version") != self.version or value.get("algorithm") != "AES-256-GCM":
+        if value.get("version") not in {1, self.version} or value.get("algorithm") != "AES-256-GCM":
             raise ValueError("unsupported credential vault envelope")
+        if value.get("version") == self.version and value.get("key_id") != self.key_id:
+            raise CredentialEnvelopeDecryptionError(
+                "已保存的授权状态属于另一安装级密钥权威，当前 Vault 已锁定。"
+            )
         try:
             return self._cipher.decrypt(
                 base64.b64decode(value["nonce"], validate=True),
@@ -383,24 +588,11 @@ class CredentialProfileStore:
         provider: str,
         profile_id: str,
     ) -> bytes:
-        candidates = [self.vault]
-        candidates.extend(
-            CredentialVault(key) for key in self.key_provider.existing_keys()
-        )
-        for candidate in candidates:
-            try:
-                plaintext = candidate.open(
-                    envelope,
-                    owner_user_id=self.owner_user_id,
-                    provider=provider,
-                    profile_id=profile_id,
-                )
-            except CredentialEnvelopeDecryptionError:
-                continue
-            self._vault = candidate
-            return plaintext
-        raise CredentialEnvelopeDecryptionError(
-            "已保存的凭据无法解密；主密钥与密文不匹配，请重新授权。"
+        return self.vault.open(
+            envelope,
+            owner_user_id=self.owner_user_id,
+            provider=provider,
+            profile_id=profile_id,
         )
 
     def resolve(

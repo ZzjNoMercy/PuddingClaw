@@ -70,6 +70,16 @@ def thinking_profile(*, provider_id: str, model_name: str, endpoint_id: str = ""
             "disabled_label": "",
         }
 
+    if provider in {"zhipu", "zai"} and model in {"glm-5.3", "glm-5.3-flash"}:
+        return {
+            "kind": "zhipu_levels",
+            "thinking_enabled": True,
+            "strength_control": "levels",
+            "levels": ["low", "high", "max"],
+            "default_level": "max",
+            "disabled_label": "",
+        }
+
     if provider == "deepseek" or model.startswith("deepseek-"):
         return {
             "kind": "deepseek_levels",
@@ -123,6 +133,15 @@ def map_thinking_request(profile: dict[str, Any], level: str | None) -> dict[str
             "thinking_level": normalized,
             "reasoning_effort": normalized,
             "extra_body": None,
+        }
+    if kind == "zhipu_levels":
+        if normalized not in {"low", "high", "max"}:
+            raise ValueError("智谱 GLM-5.3 推理强度仅支持：低、高、最大")
+        return {
+            "thinking_enabled": True,
+            "thinking_level": normalized,
+            "reasoning_effort": normalized,
+            "extra_body": {"thinking": {"type": "enabled"}},
         }
     if kind == "deepseek_levels":
         if normalized not in {"high", "max"}:

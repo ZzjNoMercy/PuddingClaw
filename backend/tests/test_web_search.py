@@ -6,7 +6,7 @@ from typing import Any
 import pytest
 
 from graph.citations import format_sources_for_model, make_source_id, parse_tool_result
-from runtime_identity.profiles import CredentialVault
+from runtime_identity.profiles import CredentialAuthorityLockedError, CredentialVault
 from web_search.adapters.base import normalized_response_sources
 from web_search.adapters.grok import GrokSearchAdapter
 from web_search.models import AdapterResponse, SearchRequest, SearchResult, WebSearchError
@@ -104,6 +104,42 @@ def test_web_search_settings_display_survives_unreadable_vault(tmp_path) -> None
     assert registry.credentials.path.read_bytes() == original
 
 
+def test_web_search_settings_report_locked_authority_instead_of_missing_key(
+    tmp_path, monkeypatch
+) -> None:
+    registry = WebSearchRegistry(tmp_path)
+    registry.save_credential("tavily", "tavily-secret-key")
+    locked = CredentialAuthorityLockedError("Credential Vault 已锁定：Keychain 不可用")
+    monkeypatch.setattr(registry.credentials, "get", lambda _reference: (_ for _ in ()).throw(locked))
+
+    displayed = registry.display()
+
+    assert displayed["credential_vault"]["readable"] is False
+    tavily = next(item for item in displayed["providers"] if item["id"] == "tavily")
+    assert tavily["credential_configured"] is True
+    assert tavily["credential_readable"] is False
+    assert "已锁定" in tavily["credential_error"]
+
+
+def test_deepseek_inherited_credential_does_not_swallow_locked_authority(
+    tmp_path, monkeypatch
+) -> None:
+    registry = WebSearchRegistry(tmp_path)
+    monkeypatch.setattr(registry, "_own_credential", lambda _provider, _payload: "")
+
+    class _LockedProviderRegistry:
+        @staticmethod
+        def resolve_credential_for_runtime(_provider: str, _name: str) -> str:
+            raise CredentialAuthorityLockedError("Credential Vault 已锁定")
+
+    monkeypatch.setattr(
+        "web_search.registry.get_provider_registry", lambda: _LockedProviderRegistry()
+    )
+
+    with pytest.raises(CredentialAuthorityLockedError, match="已锁定"):
+        registry.credential("deepseek")
+
+
 def test_legacy_global_switch_is_ignored_in_favor_of_provider_readiness(tmp_path) -> None:
     registry = _ready_registry(tmp_path, "grok")
     payload = json.loads(registry.path.read_text(encoding="utf-8"))
@@ -112,6 +148,18 @@ def test_legacy_global_switch_is_ignored_in_favor_of_provider_readiness(tmp_path
 
     assert registry.available() is True
     assert "enabled" not in registry.raw()
+
+
+def test_existing_deepseek_config_receives_direct_proxy_policy_default(tmp_path) -> None:
+    registry = WebSearchRegistry(tmp_path)
+    payload = registry.raw()
+    payload["providers"]["deepseek"]["options"] = {"max_results": 7}
+    registry.path.parent.mkdir(parents=True, exist_ok=True)
+    registry.path.write_text(json.dumps(payload), encoding="utf-8")
+
+    options = registry.raw()["providers"]["deepseek"]["options"]
+
+    assert options == {"max_results": 7, "proxy_mode": "direct"}
 
 
 def test_disable_preserves_ready_state_and_reenable_does_not_probe(tmp_path) -> None:
@@ -285,6 +333,54 @@ def test_openai_compatible_http_client_follows_shared_proxy(monkeypatch) -> None
 
     monkeypatch.setattr(base, "resolved_https_proxy", lambda: "")
     assert base.openai_compatible_http_client(timeout=1.0) is None
+
+    direct = base.openai_compatible_http_client(timeout=1.0, proxy_mode="direct")
+    assert isinstance(direct, httpx.Client)
+    assert direct.trust_env is False
+    direct.close()
+
+
+def test_deepseek_search_uses_direct_route_by_default(monkeypatch) -> None:
+    import httpx
+    from openai import APIConnectionError
+
+    from web_search.adapters import deepseek
+
+    captured: dict[str, Any] = {}
+    sentinel = httpx.Client(trust_env=False)
+
+    class _FakeResponses:
+        @staticmethod
+        def create(**_kwargs: Any) -> Any:
+            raise APIConnectionError(
+                request=httpx.Request("POST", "https://api.deepseek.com/responses")
+            )
+
+    class _FakeOpenAI:
+        def __init__(self, **kwargs: Any) -> None:
+            captured["openai"] = kwargs
+
+        @property
+        def responses(self) -> _FakeResponses:
+            return _FakeResponses()
+
+    def _client(**kwargs: Any) -> httpx.Client:
+        captured["client"] = kwargs
+        return sentinel
+
+    monkeypatch.setattr("openai.OpenAI", _FakeOpenAI)
+    monkeypatch.setattr(deepseek, "openai_compatible_http_client", _client)
+
+    with pytest.raises(WebSearchError):
+        deepseek.DeepSeekSearchAdapter().search(
+            SearchRequest(query="ping", source="web", provider="deepseek"),
+            "deepseek-test-key",
+            {},
+        )
+
+    assert captured["client"] == {"timeout": 30.0, "proxy_mode": "direct"}
+    assert captured["openai"]["http_client"] is sentinel
+    sentinel.close()
 
 
 def test_grok_search_routes_openai_client_through_shared_proxy(monkeypatch) -> None:

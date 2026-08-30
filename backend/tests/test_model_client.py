@@ -56,6 +56,22 @@ def test_model_client_direct_openai(mock_config):
     assert llm.__class__.__name__ == "ChatOpenAI"
 
 
+def test_model_client_direct_zhipu_uses_openai_compatible_transport(mock_config):
+    mock_config.update(
+        {
+            "provider": "zhipu",
+            "protocol": "openai_compatible",
+            "model": "glm-5.3",
+            "base_url": "https://open.bigmodel.cn/api/paas/v4",
+        }
+    )
+
+    llm = ModelClient(role="agent", force_direct=True).get_chat_model()
+
+    assert llm.__class__.__name__ == "ChatOpenAI"
+    assert str(llm.openai_api_base).rstrip("/") == "https://open.bigmodel.cn/api/paas/v4"
+
+
 def test_direct_models_disable_hidden_sdk_retries(mock_config):
     deepseek = ModelClient(role="agent", force_direct=True).get_chat_model()
     assert deepseek.root_client.max_retries == 0

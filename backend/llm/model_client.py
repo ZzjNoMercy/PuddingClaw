@@ -399,7 +399,7 @@ class ModelClient:
         """构造思考模式参数（reasoning_effort / extra_body.thinking）。
 
         当会话/调用方显式选择推理强度时，统一传递给底层模型。
-        DeepSeek 官方 API 以及 Higress 透传场景均支持这些参数。
+        Provider 官方 API 以及兼容网关透传场景均支持这些参数。
         """
         kwargs: dict[str, Any] = {}
         reasoning_effort = cfg.get("reasoning_effort")

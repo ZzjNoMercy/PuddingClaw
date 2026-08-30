@@ -13,7 +13,7 @@ from provider_registry import (
     ProviderRegistry,
     _default_registry,
 )
-from runtime_identity.profiles import CredentialVault
+from runtime_identity.profiles import CredentialAuthorityLockedError, CredentialVault
 
 
 def _configured_registry(tmp_path) -> ProviderRegistry:
@@ -46,8 +46,37 @@ def test_fresh_registry_has_canonical_models_and_bindings(tmp_path):
     assert multimodal["api_key"] == "dashscope-text-secret"
     assert multimodal["protocol"] == "dashscope_multimodal_embedding"
 
+    zhipu = next(provider for provider in registry._payload()["providers"] if provider["id"] == "zhipu")
+    assert zhipu["endpoints"] == [
+        {
+            "id": "zhipu-openai",
+            "protocol": "openai_compatible",
+            "base_url": "https://open.bigmodel.cn/api/paas/v4",
+            "credential_ref": "env://ZAI_API_KEY",
+            "capabilities": ["llm", "text_embedding"],
+        }
+    ]
+    assert {model["name"] for model in zhipu["models"]} == {
+        "glm-5.3",
+        "glm-5.3-flash",
+        "embedding-3",
+    }
 
-def test_local_credential_store_recovers_with_existing_secondary_key(tmp_path, monkeypatch):
+
+def test_existing_registry_backfills_new_provider_presets(tmp_path, monkeypatch):
+    monkeypatch.delenv("PUDDINGCLAW_INITIAL_PROVIDER", raising=False)
+    payload = _default_registry()
+    payload["providers"] = [provider for provider in payload["providers"] if provider["id"] != "zhipu"]
+    (tmp_path / "providers.json").write_text(json.dumps(payload), encoding="utf-8")
+
+    registry = ProviderRegistry(tmp_path)
+    loaded = registry._payload()
+
+    assert [provider["id"] for provider in loaded["providers"]].count("zhipu") == 1
+    assert json.loads((tmp_path / "providers.json").read_text(encoding="utf-8")) == loaded
+
+
+def test_local_credential_store_does_not_probe_secondary_keys(tmp_path):
     store = LocalCredentialStore(tmp_path)
     secondary_key = b"s" * 32
     payload = b'{"version":1,"credentials":{"api":{"value":"secret"}}}'
@@ -60,9 +89,8 @@ def test_local_credential_store_recovers_with_existing_secondary_key(tmp_path, m
             profile_id="default",
         )
     )
-    monkeypatch.setattr(store.key_provider, "existing_keys", lambda: (secondary_key,))
-
-    assert store.get(f"vault://users/{store.owner_user_id}/credentials/api") == "secret"
+    with pytest.raises(CredentialVaultDecryptionError):
+        store.get(f"vault://users/{store.owner_user_id}/credentials/api")
 
 
 def test_local_credential_store_reports_key_mismatch_without_reset(tmp_path, monkeypatch):
@@ -76,8 +104,6 @@ def test_local_credential_store_reports_key_mismatch_without_reset(tmp_path, mon
     )
     store.path.write_bytes(original)
     store.vault = CredentialVault(b"x" * 32)
-    monkeypatch.setattr(store.key_provider, "existing_keys", lambda: ())
-
     with pytest.raises(CredentialVaultDecryptionError, match="重新保存"):
         store.get(f"vault://users/{store.owner_user_id}/credentials/api")
 
@@ -95,8 +121,6 @@ def test_explicit_credential_save_backs_up_unreadable_vault_and_rekeys(tmp_path,
     )
     store.path.write_bytes(original)
     store.vault = CredentialVault(b"x" * 32)
-    monkeypatch.setattr(store.key_provider, "existing_keys", lambda: ())
-
     reference = store.put("replacement", "new-secret")
 
     assert reference == f"vault://users/{store.owner_user_id}/credentials/replacement"
@@ -117,8 +141,6 @@ def test_explicit_credential_delete_can_clear_an_unreadable_vault(tmp_path, monk
     )
     store.path.write_bytes(original)
     store.vault = CredentialVault(b"x" * 32)
-    monkeypatch.setattr(store.key_provider, "existing_keys", lambda: ())
-
     store.delete(f"vault://users/{store.owner_user_id}/credentials/lost")
 
     assert not store.path.exists()
@@ -146,6 +168,20 @@ def test_provider_settings_display_survives_unreadable_vault(tmp_path):
     assert deepseek["api_keys"][0]["credential_readable"] is False
     assert deepseek["api_keys"][0]["api_key_masked"] == "••••••••"
     assert registry.credentials.path.read_bytes() == original
+
+
+def test_provider_settings_preserve_configuration_when_authority_is_locked(tmp_path):
+    configured = _configured_registry(tmp_path)
+    configured.credentials.paths.credential_file_key(configured.credentials.owner_user_id).unlink()
+    registry = ProviderRegistry(tmp_path)
+
+    displayed = registry.display()
+
+    assert displayed["credential_vault"]["readable"] is False
+    assert "已锁定" in displayed["credential_vault"]["error"]
+    assert any(provider["id"] == "deepseek" for provider in displayed["providers"])
+    with pytest.raises(CredentialAuthorityLockedError, match="已锁定"):
+        registry.resolve_binding("agent")
 
 
 def test_legacy_init_provider_is_merged_into_builtin_provider(tmp_path, monkeypatch):

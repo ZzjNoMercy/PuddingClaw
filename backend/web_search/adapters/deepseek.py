@@ -47,7 +47,14 @@ class DeepSeekSearchAdapter(WebSearchAdapter):
             base_url="https://api.deepseek.com",
             timeout=30.0,
             max_retries=0,
-            http_client=openai_compatible_http_client(timeout=30.0),
+            # api.deepseek.com is directly reachable on the primary domestic
+            # deployment path, while routing it through a local global proxy
+            # can terminate TLS with UNEXPECTED_EOF. Select one route before
+            # the POST instead of retrying a potentially billable request.
+            http_client=openai_compatible_http_client(
+                timeout=30.0,
+                proxy_mode=str(options.get("proxy_mode") or "direct"),
+            ),
         )
         domain_note = ""
         if request.include_domains:

@@ -59,6 +59,7 @@ from runtime_identity.paths import (
     trusted_owner_user_id,
 )
 from runtime_identity.profiles import (
+    CredentialAuthorityLockedError,
     CredentialEnvelopeDecryptionError,
     CredentialProfileStore,
     CredentialVault,
@@ -669,7 +670,7 @@ def test_vault_rejects_tamper_and_cross_profile_replay():
         )
 
 
-def test_master_key_provider_keeps_existing_fallback_authoritative(tmp_path, monkeypatch):
+def test_master_key_provider_pins_file_authority_in_manifest(tmp_path, monkeypatch):
     paths = PuddingClawPaths(tmp_path)
     provider = MasterKeyProvider(paths, "owner")
     fallback = tmp_path / ".vault-keys" / "owner.key"
@@ -682,6 +683,141 @@ def test_master_key_provider_keeps_existing_fallback_authoritative(tmp_path, mon
     )
 
     assert provider.get_or_create() == b"f" * 32
+    manifest = json.loads(paths.credential_authority_manifest("owner").read_text())
+    assert manifest["provider"] == "file"
+    assert manifest["key_id"] == MasterKeyProvider.key_id(b"f" * 32)
+
+
+def test_master_key_provider_does_not_replace_missing_pinned_key(tmp_path, monkeypatch):
+    paths = PuddingClawPaths(tmp_path)
+    first = MasterKeyProvider(paths, "owner")
+    original = first.get_or_create()
+    paths.credential_file_key("owner").unlink()
+
+    with pytest.raises(CredentialAuthorityLockedError, match="已锁定"):
+        MasterKeyProvider(paths, "owner").get_or_create()
+
+    assert len(original) == 32
+    assert not paths.credential_file_key("owner").exists()
+
+
+def test_master_key_provider_runtime_env_cannot_switch_pinned_provider(tmp_path, monkeypatch):
+    paths = PuddingClawPaths(tmp_path)
+    original = MasterKeyProvider(paths, "owner").get_or_create()
+    monkeypatch.setenv("PUDDINGCLAW_CREDENTIAL_KEY_PROVIDER", "environment")
+    monkeypatch.setenv("PUDDINGCLAW_MASTER_KEY", (b"e" * 32).hex())
+
+    assert MasterKeyProvider(paths, "owner").get_or_create() == original
+
+
+def test_headless_environment_authority_is_pinned_and_never_materialized(tmp_path, monkeypatch):
+    paths = PuddingClawPaths(tmp_path)
+    key = b"e" * 32
+    monkeypatch.setenv("PUDDINGCLAW_CREDENTIAL_KEY_PROVIDER", "environment")
+    monkeypatch.setenv("PUDDINGCLAW_MASTER_KEY", key.hex())
+
+    authority = MasterKeyProvider(paths, "owner").authority()
+
+    assert authority.provider == "environment"
+    assert authority.key == key
+    assert not paths.credential_file_key("owner").exists()
+    monkeypatch.delenv("PUDDINGCLAW_MASTER_KEY")
+    with pytest.raises(CredentialAuthorityLockedError, match="PUDDINGCLAW_MASTER_KEY"):
+        MasterKeyProvider(paths, "owner").get_or_create()
+
+
+def test_legacy_macos_keychain_failure_never_switches_to_file(tmp_path, monkeypatch):
+    paths = PuddingClawPaths(tmp_path)
+    paths.credential_file_key("owner").parent.mkdir(parents=True)
+    paths.credential_file_key("owner").write_bytes(b"f" * 32)
+    monkeypatch.delenv("PUDDINGCLAW_CREDENTIAL_KEY_PROVIDER", raising=False)
+    monkeypatch.setattr("runtime_identity.profiles.sys.platform", "darwin")
+    provider = MasterKeyProvider(paths, "owner")
+    monkeypatch.setattr(
+        provider,
+        "_read_keychain_key",
+        lambda: (_ for _ in ()).throw(OSError("keychain unavailable")),
+    )
+
+    with pytest.raises(CredentialAuthorityLockedError, match="Keychain"):
+        provider.get_or_create()
+    assert not paths.credential_authority_manifest("owner").exists()
+
+
+def test_legacy_macos_installation_selects_keychain_once_when_both_keys_exist(
+    tmp_path, monkeypatch
+):
+    paths = PuddingClawPaths(tmp_path)
+    paths.credential_file_key("owner").parent.mkdir(parents=True)
+    paths.credential_file_key("owner").write_bytes(b"f" * 32)
+    monkeypatch.delenv("PUDDINGCLAW_CREDENTIAL_KEY_PROVIDER", raising=False)
+    monkeypatch.setattr("runtime_identity.profiles.sys.platform", "darwin")
+    provider = MasterKeyProvider(paths, "owner")
+    monkeypatch.setattr(provider, "_read_keychain_key", lambda: b"k" * 32)
+
+    assert provider.get_or_create() == b"k" * 32
+    manifest = json.loads(paths.credential_authority_manifest("owner").read_text())
+    assert manifest["provider"] == "keychain"
+
+
+def test_legacy_macos_installation_uses_ciphertext_to_select_file_authority(
+    tmp_path, monkeypatch
+):
+    paths = PuddingClawPaths(tmp_path)
+    file_key = b"f" * 32
+    paths.credential_file_key("owner").parent.mkdir(parents=True)
+    paths.credential_file_key("owner").write_bytes(file_key)
+    registry = paths.credentials_root("owner") / "provider-registry.enc"
+    registry.parent.mkdir(parents=True)
+    registry.write_bytes(
+        CredentialVault(file_key).seal(
+            b'{"version":1,"credentials":{}}',
+            owner_user_id="owner",
+            provider="provider-registry",
+            profile_id="default",
+        )
+    )
+    monkeypatch.delenv("PUDDINGCLAW_CREDENTIAL_KEY_PROVIDER", raising=False)
+    monkeypatch.setattr("runtime_identity.profiles.sys.platform", "darwin")
+    provider = MasterKeyProvider(paths, "owner")
+    monkeypatch.setattr(provider, "_read_keychain_key", lambda: b"k" * 32)
+
+    assert provider.get_or_create() == file_key
+    manifest = json.loads(paths.credential_authority_manifest("owner").read_text())
+    assert manifest["provider"] == "file"
+
+
+def test_vault_envelope_binds_ciphertext_to_key_id():
+    vault = CredentialVault(b"k" * 32)
+    sealed = vault.seal(b"secret", owner_user_id="owner", provider="demo", profile_id="one")
+    envelope = json.loads(sealed)
+
+    assert envelope["version"] == 2
+    assert envelope["key_id"] == vault.key_id
+    envelope["key_id"] = MasterKeyProvider.key_id(b"x" * 32)
+    with pytest.raises(CredentialEnvelopeDecryptionError, match="另一安装级密钥权威"):
+        vault.open(
+            json.dumps(envelope).encode(),
+            owner_user_id="owner",
+            provider="demo",
+            profile_id="one",
+        )
+
+
+def test_vault_reads_legacy_v1_envelope_with_the_pinned_key():
+    vault = CredentialVault(b"k" * 32)
+    envelope = json.loads(
+        vault.seal(b"legacy", owner_user_id="owner", provider="demo", profile_id="one")
+    )
+    envelope["version"] = 1
+    envelope.pop("key_id")
+
+    assert vault.open(
+        json.dumps(envelope).encode(),
+        owner_user_id="owner",
+        provider="demo",
+        profile_id="one",
+    ) == b"legacy"
 
 def test_credential_archive_rejects_links_and_traversal():
     output = io.BytesIO()
@@ -812,7 +948,7 @@ def test_profile_vault_freezes_credential_state_fingerprint(tmp_path):
         )
 
 
-def test_profile_vault_recovers_with_an_existing_master_key(tmp_path, monkeypatch):
+def test_profile_vault_rejects_a_different_master_key(tmp_path):
     paths = PuddingClawPaths(tmp_path / ".puddingclaw")
     original_key = b"a" * 32
     writer = CredentialProfileStore(
@@ -834,19 +970,15 @@ def test_profile_vault_recovers_with_an_existing_master_key(tmp_path, monkeypatc
         "owner",
         vault=CredentialVault(b"b" * 32),
     )
-    monkeypatch.setattr(reader.key_provider, "existing_keys", lambda: (original_key,))
-
-    assert (
+    with pytest.raises(CredentialEnvelopeDecryptionError):
         reader.read_state(
             "fixture",
             profile["profile_id"],
             credential_state=_LARK_STATE,
         )
-        == archive
-    )
 
 
-def test_authorization_flow_recovers_with_an_existing_master_key(tmp_path, monkeypatch):
+def test_authorization_flow_rejects_a_different_master_key(tmp_path):
     paths = PuddingClawPaths(tmp_path / ".puddingclaw")
     original_key = b"a" * 32
     writer = AuthorizationFlowStore(
@@ -883,9 +1015,8 @@ def test_authorization_flow_recovers_with_an_existing_master_key(tmp_path, monke
         "owner",
         vault=CredentialVault(b"b" * 32),
     )
-    monkeypatch.setattr(reader.key_provider, "existing_keys", lambda: (original_key,))
-
-    assert reader.read_secret(flow)["device_code"] == "secret"
+    with pytest.raises(CredentialEnvelopeDecryptionError):
+        reader.read_secret(flow)
 
 
 def test_profile_vault_writeback_uses_state_revision_cas(tmp_path):

@@ -19,11 +19,15 @@ from pathlib import Path
 from typing import Any
 
 import httpx
-from cryptography.exceptions import InvalidTag
 
 from llm.thinking_mapping import thinking_profile
 from runtime_identity.paths import PuddingClawPaths, trusted_owner_user_id
-from runtime_identity.profiles import CredentialVault, MasterKeyProvider
+from runtime_identity.profiles import (
+    CredentialAuthorityLockedError,
+    CredentialEnvelopeDecryptionError,
+    CredentialVault,
+    MasterKeyProvider,
+)
 
 REGISTRY_VERSION = 2
 DEFAULT_CREDENTIAL_NAME = "default"
@@ -165,30 +169,39 @@ class LocalCredentialStore:
         self.path = self.paths.credentials_root(self.owner_user_id) / "provider-registry.enc"
         self.legacy_paths = (configured_root / "credentials.json", home_root / "credentials.json")
         self.key_provider = MasterKeyProvider(self.paths, self.owner_user_id)
-        self.vault = CredentialVault(self.key_provider.get_or_create())
+        self._vault: CredentialVault | None = None
         self._unreadable_envelope: tuple[int, int, str] | None = None
 
+    @property
+    def vault(self) -> CredentialVault:
+        if self._vault is None:
+            self._vault = CredentialVault(self.key_provider.get_or_create())
+        return self._vault
+
+    @vault.setter
+    def vault(self, value: CredentialVault) -> None:
+        self._vault = value
+
     def _open_payload(self) -> dict[str, Any]:
-        """Open the registry with existing keys, without destructive reset."""
+        """Open the registry with the installation's sole credential authority."""
 
         stat = self.path.stat()
         signature = (stat.st_mtime_ns, stat.st_size)
         if self._unreadable_envelope and self._unreadable_envelope[:2] == signature:
             raise CredentialVaultDecryptionError(self._unreadable_envelope[2]) from None
         envelope = self.path.read_bytes()
-        vaults = [self.vault]
-        vaults.extend(CredentialVault(key) for key in self.key_provider.existing_keys())
-        for vault in vaults:
-            try:
-                raw = vault.open(
-                    envelope,
-                    owner_user_id=self.owner_user_id,
-                    provider="provider-registry",
-                    profile_id="default",
-                )
-            except (InvalidTag, ValueError, KeyError, TypeError, UnicodeDecodeError):
-                continue
-            self.vault = vault
+        try:
+            raw = self.vault.open(
+                envelope,
+                owner_user_id=self.owner_user_id,
+                provider="provider-registry",
+                profile_id="default",
+            )
+        except CredentialAuthorityLockedError:
+            raise
+        except (CredentialEnvelopeDecryptionError, ValueError, KeyError, TypeError, UnicodeDecodeError):
+            pass
+        else:
             self._unreadable_envelope = None
             return _read_json_bytes(raw)
         error = CredentialVaultDecryptionError(
@@ -299,7 +312,7 @@ class LocalCredentialStore:
 
         try:
             value = self.get(reference)
-        except CredentialVaultDecryptionError as exc:
+        except (CredentialVaultDecryptionError, CredentialAuthorityLockedError) as exc:
             configured = bool(reference.startswith("vault://") and self.path.is_file())
             return {
                 "credential_configured": configured,
@@ -377,9 +390,80 @@ def _provider_presets() -> list[dict[str, Any]]:
                 {"id": "dashscope:dashscope-compatible:qwen3-7-plus:llm", "name": "qwen3.7-plus", "endpoint_id": "dashscope-compatible", "capability": "llm", "categories": ["llm", "multimodal_llm"]},
             ],
         },
+        {
+            "id": "zhipu",
+            "name": "智谱 AI",
+            "enabled": False,
+            "website": "https://open.bigmodel.cn",
+            "credential_scope": "provider",
+            "credentials": {DEFAULT_CREDENTIAL_NAME: "env://ZAI_API_KEY"},
+            "endpoints": [
+                {
+                    "id": "zhipu-openai",
+                    "protocol": "openai_compatible",
+                    "base_url": "https://open.bigmodel.cn/api/paas/v4",
+                    "credential_ref": "env://ZAI_API_KEY",
+                    "capabilities": ["llm", "text_embedding"],
+                }
+            ],
+            "models": [
+                {
+                    "id": "zhipu:zhipu-openai:glm-5-3:llm",
+                    "name": "glm-5.3",
+                    "endpoint_id": "zhipu-openai",
+                    "capability": "llm",
+                    "categories": ["llm"],
+                    "temperature": 1.0,
+                    "max_tokens": 131072,
+                    "context_window": 1000000,
+                },
+                {
+                    "id": "zhipu:zhipu-openai:glm-5-3-flash:llm",
+                    "name": "glm-5.3-flash",
+                    "endpoint_id": "zhipu-openai",
+                    "capability": "llm",
+                    "categories": ["llm", "multimodal_llm"],
+                    "temperature": 1.0,
+                    "max_tokens": 131072,
+                    "context_window": 1000000,
+                },
+                {
+                    "id": "zhipu:zhipu-openai:embedding-3:text_embedding",
+                    "name": "embedding-3",
+                    "endpoint_id": "zhipu-openai",
+                    "capability": "text_embedding",
+                    "categories": ["text_embedding"],
+                    "dimension": 2048,
+                    "batch_size": 64,
+                    "context_window": 8192,
+                },
+            ],
+        },
         {"id": "kimi", "name": "Kimi", "enabled": False, "website": "https://platform.moonshot.cn", "credentials": {}, "endpoints": [{"id": "kimi-openai", "protocol": "openai_compatible", "base_url": "https://api.moonshot.cn/v1", "credential_ref": "", "capabilities": ["llm"]}], "models": []},
         {"id": "siliconflow", "name": "硅基流动", "enabled": False, "website": "https://siliconflow.cn", "credentials": {}, "endpoints": [{"id": "siliconflow-openai", "protocol": "openai_compatible", "base_url": "https://api.siliconflow.cn/v1", "credential_ref": "", "capabilities": ["llm", "text_embedding"]}], "models": []},
     ]
+
+
+def _backfill_missing_provider_presets(payload: dict[str, Any]) -> bool:
+    """Add newly shipped Provider presets without disturbing user edits."""
+
+    providers = payload.get("providers", [])
+    if not isinstance(providers, list):
+        return False
+    existing_ids = {
+        str(provider.get("id") or "")
+        for provider in providers
+        if isinstance(provider, dict)
+    }
+    missing = [
+        copy.deepcopy(provider)
+        for provider in _provider_presets()
+        if str(provider.get("id") or "") not in existing_ids
+    ]
+    if not missing:
+        return False
+    providers.extend(missing)
+    return True
 
 
 def _bootstrap_provider_binding(
@@ -741,6 +825,7 @@ class ProviderRegistry:
         if not isinstance(payload.get("providers"), list) or not isinstance(payload.get("bindings"), dict):
             raise ValueError("Provider Registry requires providers and bindings")
         migrated = _migrate_legacy_initial_provider(payload)
+        presets_backfilled = _backfill_missing_provider_presets(payload)
         bootstrapped = self._apply_environment_bootstrap_once(payload)
         model_ids = {
             str(model.get("id") or "")
@@ -760,7 +845,7 @@ class ProviderRegistry:
         )
         if dangling_bindings:
             raise ValueError(f"Provider Registry has unknown bound models: {', '.join(dangling_bindings)}")
-        if migrated or bootstrapped:
+        if migrated or presets_backfilled or bootstrapped:
             self._save(payload)
         if bootstrapped:
             self._mark_environment_bootstrap()

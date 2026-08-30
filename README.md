@@ -211,7 +211,7 @@ analysis-project/
 | 高级设置 | 兼容性压缩参数等低频运行选项 |
 | 系统状态 | Catalog 数据库（默认 SQLite，可选 PostgreSQL）、pgvector、Milvus、MinerU、模型接入等能力探测与降级状态 |
 
-正常桌面使用以代码 defaults 与 `~/.puddingclaw/config.json` 的稀疏用户覆盖合并结果为事实源；环境变量仅用于部署覆盖。Provider 凭据和数据库密码进入 Credential Vault，不写入配置文件。
+正常桌面使用以代码 defaults 与 `~/.puddingclaw/config.json` 的稀疏用户覆盖合并结果为事实源；环境变量仅用于部署覆盖。Provider 凭据和数据库密码进入 Credential Vault，不写入配置文件。Vault 主密钥采用[安装级唯一密钥权威](docs/plans/2026-08-11-user-home-sessions-and-skills-migration.md)，Desktop 与 Headless 不会各自选钥。
 
 知识库现已提供 Schema Studio：可查看 gbrain 内置 Schema、选择父 pack、结构化编辑完整官方 manifest，并预览 custom/parent/resolved YAML。当前还缺少可视化 diff、官方 YAML CST 导入/注释保留、Ingest / Query / Lint 运维页、raw/Wiki drift 看板、Embedding 绑定与托管式重建入口。
 

@@ -173,6 +173,14 @@ class PuddingClawPaths:
         owner = safe_identity_component(owner_user_id, field="owner_user_id")
         return self.root / "users" / owner / "credentials"
 
+    def credential_authority_manifest(self, owner_user_id: str) -> Path:
+        owner = safe_identity_component(owner_user_id, field="owner_user_id")
+        return self.root / ".vault-keys" / f"{owner}.provider.json"
+
+    def credential_file_key(self, owner_user_id: str) -> Path:
+        owner = safe_identity_component(owner_user_id, field="owner_user_id")
+        return self.root / ".vault-keys" / f"{owner}.key"
+
     def integration_root(self, owner_user_id: str, integration: str) -> Path:
         """Return persistent host state for one user-owned CLI integration.
 
