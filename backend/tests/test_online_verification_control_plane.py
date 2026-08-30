@@ -9,7 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 from deepagents import RubricMiddleware
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
 
 from graph.deepagents_manager import (
     DeepAgentsAgentManager,
@@ -743,7 +743,22 @@ def test_manual_review_runtime_error_is_retryable_without_becoming_protocol_erro
     sessions = _sessions(tmp_path)
     run = _completed_review_run(sessions)
     state = {
-        "messages": [HumanMessage(content=run.objective), AIMessage(content="done")],
+        "messages": [
+            {"role": "user", "content": run.objective},
+            {
+                "role": "assistant",
+                "content": "done",
+                "tool_calls": [
+                    {
+                        "tool": "read_file",
+                        "input": {"file_path": "/workspace/result.txt"},
+                        "id": "call-review-result",
+                        "output": "verified output",
+                        "status": "success",
+                    }
+                ],
+            },
+        ],
         "_harness_context": {"todos": [], "final_content": "done"},
     }
     reviewer = RunReviewOrchestrator(sessions)
@@ -755,7 +770,10 @@ def test_manual_review_runtime_error_is_retryable_without_becoming_protocol_erro
         manual=True,
     )
 
-    async def fake_after_agent(self, _state, _runtime):
+    async def fake_after_agent(self, grader_state, _runtime):
+        grader_messages = grader_state["messages"]
+        assert all(isinstance(item, BaseMessage) for item in grader_messages)
+        assert any(isinstance(item, ToolMessage) for item in grader_messages)
         return {
             "_rubric_evaluations": [
                 {

@@ -27,7 +27,10 @@ from graph.verification.models import (
 from graph.verification.orchestrator import OnlineVerificationOrchestrator
 from graph.verification.records import build_verification_record
 from graph.verification.report_merger import merge_verification_records
-from graph.verification.transcript_projection import project_messages_for_grader
+from graph.verification.transcript_projection import (
+    materialize_grader_messages,
+    project_messages_for_grader,
+)
 from harness.deterministic_checks import evaluate_deterministic_criteria
 from harness.models import RunRecord, RunReviewPolicy, VerificationFailureKind, VerifierKind
 from observability import emit_harness_metric
@@ -297,22 +300,23 @@ class RunReviewOrchestrator:
             run_query_id=run.query_id,
             objective=run.objective,
         )
-        middleware = RubricMiddleware(
-            model=model,
-            tools=[],
-            max_iterations=1,
-            grader_middleware=[],
-            grader_state_schema=RunReviewGraderState,
-            prepare_messages_for_grader=lambda messages: list(messages),
-            build_grader_state=lambda _state, _iteration: {
-                "evaluation_snapshot_id": snapshot.snapshot_id,
-                "verification_operation_id": str(operation["operation_id"]),
-            },
-        )
         started = time.time()
         try:
+            grader_messages = materialize_grader_messages(projected)
+            middleware = RubricMiddleware(
+                model=model,
+                tools=[],
+                max_iterations=1,
+                grader_middleware=[],
+                grader_state_schema=RunReviewGraderState,
+                prepare_messages_for_grader=lambda messages: list(messages),
+                build_grader_state=lambda _state, _iteration: {
+                    "evaluation_snapshot_id": snapshot.snapshot_id,
+                    "verification_operation_id": str(operation["operation_id"]),
+                },
+            )
             update = await middleware.aafter_agent(
-                {"messages": projected, "rubric": run.verification_contract.rubric},
+                {"messages": grader_messages, "rubric": run.verification_contract.rubric},
                 SimpleNamespace(context={"run_id": run.run_id}, stream_writer=None),
             )
             evaluations = update.get("_rubric_evaluations") if isinstance(update, dict) else None

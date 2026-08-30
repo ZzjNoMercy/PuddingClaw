@@ -5,7 +5,14 @@ from __future__ import annotations
 from collections.abc import Iterable
 from typing import Any
 
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.messages import (
+    AIMessage,
+    BaseMessage,
+    HumanMessage,
+    SystemMessage,
+    ToolMessage,
+    messages_from_dict,
+)
 
 INTERNAL_GRADER_MESSAGE_SOURCES = frozenset(
     {
@@ -86,6 +93,97 @@ def project_messages_for_grader(
     ):
         filtered.insert(0, HumanMessage(content=objective, name="puddingclaw_run_objective"))
     return filtered
+
+
+def materialize_grader_messages(messages: Iterable[Any]) -> list[BaseMessage]:
+    """Convert a JSON-safe transcript projection into SDK-native messages."""
+
+    materialized: list[BaseMessage] = []
+    for message_index, message in enumerate(messages):
+        if isinstance(message, BaseMessage):
+            materialized.append(message)
+            continue
+        if not isinstance(message, dict):
+            raise TypeError(f"Unsupported grader message type: {type(message).__name__}")
+        if isinstance(message.get("data"), dict) and message.get("type"):
+            materialized.extend(messages_from_dict([message]))
+            continue
+
+        role, name, additional = message_metadata(message)
+        content = message.get("content", "")
+        query_id = str(message.get("query_id") or "")
+        if query_id:
+            additional.setdefault("puddingclaw_query_id", query_id)
+        message_name = name or None
+        if role in {"human", "user"}:
+            materialized.append(
+                HumanMessage(content=content, name=message_name, additional_kwargs=additional)
+            )
+            continue
+        if role == "system":
+            materialized.append(
+                SystemMessage(content=content, name=message_name, additional_kwargs=additional)
+            )
+            continue
+        if role in {"ai", "assistant"}:
+            raw_calls = [item for item in message.get("tool_calls") or [] if isinstance(item, dict)]
+            tool_calls: list[dict[str, Any]] = []
+            tool_results: list[ToolMessage] = []
+            for call_index, raw_call in enumerate(raw_calls):
+                call_id = str(
+                    raw_call.get("id")
+                    or f"grader_projection_{message_index}_{call_index}"
+                )
+                raw_args = raw_call.get("args", raw_call.get("input", {}))
+                args = dict(raw_args) if isinstance(raw_args, dict) else {"input": raw_args}
+                tool_name = str(raw_call.get("name") or raw_call.get("tool") or "unknown_tool")
+                tool_calls.append({"id": call_id, "name": tool_name, "args": args})
+                raw_output = raw_call.get("output", raw_call.get("raw_output", ""))
+                output = (
+                    raw_output
+                    if isinstance(raw_output, (str, list))
+                    else str(raw_output or "")
+                )
+                tool_results.append(
+                    ToolMessage(
+                        content=output,
+                        tool_call_id=call_id,
+                        name=tool_name,
+                        status=(
+                            "error"
+                            if raw_call.get("is_error")
+                            or raw_call.get("status") in {"error", "failed", "interrupted"}
+                            else "success"
+                        ),
+                    )
+                )
+            if tool_calls:
+                materialized.append(
+                    AIMessage(
+                        content="",
+                        tool_calls=tool_calls,
+                        name=message_name,
+                        additional_kwargs=additional,
+                    )
+                )
+                materialized.extend(tool_results)
+            if content or not tool_calls:
+                materialized.append(
+                    AIMessage(content=content, name=message_name, additional_kwargs=additional)
+                )
+            continue
+        if role == "tool":
+            materialized.append(
+                ToolMessage(
+                    content=content,
+                    tool_call_id=str(message.get("tool_call_id") or message.get("id") or "unknown"),
+                    name=message_name,
+                    additional_kwargs=additional,
+                )
+            )
+            continue
+        raise ValueError(f"Unsupported grader message role: {role or '<empty>'}")
+    return materialized
 
 
 def serialize_projected_messages(messages: Iterable[Any]) -> list[dict[str, Any]]:
