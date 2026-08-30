@@ -25,6 +25,67 @@ def test_run_review_policy_is_request_scoped_and_goal_safe():
         AgentRequest(message="未知策略", run_review_policy="always")
 
 
+def test_run_review_status_exposes_only_owned_public_records(monkeypatch):
+    from api import agent as agent_api
+
+    report = {
+        "report_id": "report-1",
+        "run_id": "run-1",
+        "snapshot_id": "snapshot-1",
+        "status": "satisfied",
+        "verification_record_ids": ["record-deterministic", "record-semantic"],
+        "summary": "全部通过",
+    }
+    records = {
+        "record-deterministic": {
+            "verification_id": "record-deterministic",
+            "snapshot_id": "snapshot-1",
+            "method": "deterministic",
+            "status": "satisfied",
+            "criteria": [{"criterion_id": "todo_reconciliation", "passed": True}],
+        },
+        "record-semantic": {
+            "verification_id": "record-semantic",
+            "snapshot_id": "snapshot-1",
+            "method": "semantic_rubric",
+            "status": "satisfied",
+            "criteria": [{"criterion_id": "task_fulfillment", "passed": True}],
+        },
+        "record-other-attempt": {
+            "verification_id": "record-other-attempt",
+            "snapshot_id": "snapshot-1",
+            "method": "semantic_rubric",
+            "status": "grader_error",
+            "criteria": [],
+        },
+    }
+    monkeypatch.setattr(
+        agent_api.session_manager,
+        "get_run_state",
+        lambda session_id, run_id: {"run_review_report_id": "report-1"},
+    )
+    monkeypatch.setattr(
+        agent_api.session_manager,
+        "get_harness_state",
+        lambda session_id: {
+            "run_review_reports": {"report-1": report},
+            "verification_records": records,
+        },
+    )
+
+    app = FastAPI()
+    app.include_router(agent_api.router, prefix="/api")
+    response = TestClient(app).get("/api/agent/sessions/session-1/runs/run-1/review")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "satisfied"
+    assert payload["run_id"] == "run-1"
+    assert [
+        item["verification_id"] for item in payload["report"]["verification_records"]
+    ] == ["record-deterministic", "record-semantic"]
+
+
 def test_stream_agent_persists_user_message_before_stream(monkeypatch, tmp_path):
     from api import agent as agent_api
     from graph.session_manager import session_manager

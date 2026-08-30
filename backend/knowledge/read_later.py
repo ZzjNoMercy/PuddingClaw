@@ -672,6 +672,7 @@ async def list_read_later_items(
     knowledge_base_id: str = DEFAULT_KNOWLEDGE_BASE_ID,
     reading_status: str = "all",
     parse_status: str = "all",
+    source: str = "",
     search: str = "",
     limit: int = 200,
 ) -> list[ReadLaterItem]:
@@ -681,12 +682,23 @@ async def list_read_later_items(
     if parse_status != "all":
         stmt = stmt.where(ReadLaterItem.parse_status == parse_status)
     result_limit = max(1, min(limit, 500))
-    candidate_limit = 500 if search.strip() else result_limit
+    candidate_limit = 500 if search.strip() or source.strip() else result_limit
     result = await session.execute(stmt.order_by(ReadLaterItem.created_at.desc()).limit(candidate_limit))
     items = list(result.scalars())
+    source_needle = source.strip().casefold()
+    if source_needle:
+        items = [
+            item
+            for item in items
+            if (
+                item.site_name.strip()
+                or (urlsplit(item.original_url).hostname or "").removeprefix("www.")
+            ).casefold()
+            == source_needle
+        ]
     needle = search.strip().casefold()
     if not needle:
-        return items
+        return items[:result_limit]
 
     knowledge_root = KnowledgeService(base_dir).knowledge_dir.resolve()
 

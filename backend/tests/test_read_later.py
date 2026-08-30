@@ -308,15 +308,33 @@ def test_read_later_searches_title_platform_and_markdown_content(tmp_path: Path,
                 virtual_path="/knowledge/imported/article.md",
             )
             session.add(item)
+            other = ReadLaterItem(
+                knowledge_base_id=knowledge_base.id,
+                original_url="https://example.org/claude-in-the-body",
+                canonical_url="https://example.org/claude-in-the-body",
+                title="A Claude comparison from another source",
+                site_name="Example News",
+                parse_status="ready",
+            )
+            session.add(other)
             await session.commit()
 
             by_title = await list_read_later_items(session, base_dir=tmp_path, search="reliable agent")
             by_platform = await list_read_later_items(session, base_dir=tmp_path, search="dev community")
             by_content = await list_read_later_items(session, base_dir=tmp_path, search="deterministic fixtures")
+            by_source = await list_read_later_items(session, base_dir=tmp_path, source="dev community")
+            combined = await list_read_later_items(
+                session,
+                base_dir=tmp_path,
+                source="DEV Community",
+                search="reliable agent",
+            )
 
         assert [entry.id for entry in by_title] == [item.id]
         assert [entry.id for entry in by_platform] == [item.id]
         assert [entry.id for entry in by_content] == [item.id]
+        assert [entry.id for entry in by_source] == [item.id]
+        assert [entry.id for entry in combined] == [item.id]
         await engine.dispose()
 
     asyncio.run(run())

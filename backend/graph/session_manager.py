@@ -386,6 +386,7 @@ class SessionManager:
             "llm_model_id",
             "thinking_level",
             "credential_name",
+            "run_review_policy",
             "headless_enabled",
             "session_source",
             "worker_key_id",
@@ -499,6 +500,7 @@ class SessionManager:
             "llm_model_id",
             "thinking_level",
             "credential_name",
+            "run_review_policy",
             "headless_enabled",
             "session_source",
             "worker_key_id",
@@ -5679,6 +5681,7 @@ class SessionManager:
                     "llm_model_id",
                     "thinking_level",
                     "credential_name",
+                    "run_review_policy",
                 ):
                     if key in raw:
                         meta[key] = raw.get(key)

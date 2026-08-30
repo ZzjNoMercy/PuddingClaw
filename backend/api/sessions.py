@@ -45,11 +45,16 @@ class SessionLlmSelectionRequest(BaseModel):
     credential_name: str | None = None
 
 
+class SessionRunReviewPolicyRequest(BaseModel):
+    run_review_policy: Literal["off", "shadow", "blocking_one_shot"] | None = None
+
+
 class SessionCreateRequest(BaseModel):
     analytics_model_id: str | None = None
     llm_model_id: str | None = None
     thinking_level: Literal["low", "high", "max"] | None = None
     credential_name: str | None = None
+    run_review_policy: Literal["off", "shadow", "blocking_one_shot"] | None = None
     approval_mode: Literal["strict", "smart"] = "smart"
     runtime_mode: Literal["chat", "agent"] = "agent"
     project_id: str | None = None
@@ -99,6 +104,7 @@ async def create_session(req: SessionCreateRequest | None = None):
         # immediately, instead of only after the first Run flips them.
         metadata: dict[str, Any] = {
             "analytics_model_id": payload.analytics_model_id,
+            "run_review_policy": payload.run_review_policy,
             "runtime_mode": payload.runtime_mode,
         }
         if payload.llm_model_id:
@@ -173,6 +179,22 @@ async def update_session_llm_selection(
         raise HTTPException(status_code=404, detail="Session not found") from exc
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@router.patch("/sessions/{session_id}/run-review-policy")
+async def update_session_run_review_policy(
+    session_id: str,
+    req: SessionRunReviewPolicyRequest,
+):
+    """Persist the ordinary-Run review preference selected for one Session."""
+
+    try:
+        return session_manager.update_metadata(
+            session_id,
+            {"run_review_policy": req.run_review_policy},
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Session not found") from exc
 
 
 @router.delete("/sessions/{session_id}")

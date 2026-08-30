@@ -80,6 +80,7 @@ async def save_read_later(request: ReadLaterCreateRequest, session: AsyncSession
 async def get_read_later_items(
     reading_status: str = "all",
     parse_status: str = "all",
+    source: str = "",
     search: str = "",
     limit: int = 200,
     knowledge_base_id: str = DEFAULT_KNOWLEDGE_BASE_ID,
@@ -91,6 +92,7 @@ async def get_read_later_items(
         knowledge_base_id=knowledge_base_id,
         reading_status=reading_status,
         parse_status=parse_status,
+        source=source,
         search=search,
         limit=limit,
     )

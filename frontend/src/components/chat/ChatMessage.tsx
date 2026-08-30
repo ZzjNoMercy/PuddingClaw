@@ -3,7 +3,7 @@
 import { Children, isValidElement, useEffect, useRef, useState, type ReactNode } from "react";
 import ReactMarkdown from "react-markdown";
 import type { Components } from "react-markdown";
-import { AlertTriangle, CheckCircle2, ChevronDown, ChevronRight, Database, Download, FileSpreadsheet, FileText, FolderOpen, Globe2, HelpCircle, ImageIcon, Key, KeyRound, Layers3, Loader2, Maximize2, PauseCircle, Plus, ShieldCheck, Sparkles, SquareTerminal, Trash2, XCircle } from "lucide-react";
+import { AlertTriangle, CheckCircle2, ChevronDown, ChevronRight, Copy, Database, Download, FileSpreadsheet, FileText, FolderOpen, Globe2, HelpCircle, ImageIcon, Key, KeyRound, Layers3, Loader2, Maximize2, PauseCircle, Plus, ShieldCheck, Sparkles, SquareTerminal, Trash2, XCircle } from "lucide-react";
 import { denyPermissionRequest, grantExternalFilePermission, grantShellDirectoryPermission, grantToolActionPermission, resolveDatabaseSqlRevisionRequest, resolveDimensionBuildRuleRequest, resolveKernelFallbackRequest, resolveLogicalDatasetRuleRequest, resolveSkillSecretRequest, resolveUserInputRequest, type AgentAttachment, type DatabaseSqlRevisionRequest, type DimensionBuildRuleRequest, type KernelFallbackRequest, type LogicalDatasetRuleRequest, type PermissionRequest, type SkillSecretRequest, type UserInputAnswer, type UserInputRequest } from "@/lib/api";
 import { markdownRemarkPlugins, markdownUrlTransform, normalizeLooseStrongMarkdown } from "@/lib/markdown";
 import { useApp, type ChatMessage as ChatMessageType, type SourceRecord, type TimelineItem, type ToolCall } from "@/lib/store";
@@ -58,6 +58,24 @@ function stripModelCallLimitNotice(content: string): string {
       ""
     )
     .trimEnd();
+}
+
+async function writeTextToClipboard(text: string): Promise<void> {
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(text);
+    return;
+  }
+
+  const textarea = document.createElement("textarea");
+  textarea.value = text;
+  textarea.setAttribute("readonly", "");
+  textarea.style.position = "fixed";
+  textarea.style.opacity = "0";
+  document.body.appendChild(textarea);
+  textarea.select();
+  const copied = document.execCommand("copy");
+  textarea.remove();
+  if (!copied) throw new Error("Clipboard copy failed");
 }
 
 const ScrollableMarkdownTable: Components["table"] = ({ node: _node, ...props }) => (
@@ -399,7 +417,7 @@ export default function ChatMessage({ message, sessionSources = [], isStreaming 
                 <ErrorNotice text={message.errorNotice} />
               ) : null}
 
-              <RunReviewControl message={message} isStreaming={isStreaming} />
+              <AssistantMessageActions message={message} isStreaming={isStreaming} />
 
               {/* Typing indicator — only when nothing else is visible yet */}
               {isStreaming && !message.content && !message.reasoning && !message.timeline?.length ? (
@@ -1891,7 +1909,15 @@ function TimelineWithManagedAuthorization({
 
 function VerificationSummaryText({ text }: { text?: string }) {
   const summary = String(text || "").trim();
-  if (!summary || /^验证通过[。.!！]?$/.test(summary)) return null;
+  const plainSummary = summary.replace(/\*\*/g, "").trim();
+  if (
+    !summary
+    || /^验证通过[。.!！]?$/.test(summary)
+    // Ordinary Run review has a dedicated status row and details panel below
+    // the answer. Keep review state out of the answer body, including for old
+    // persisted messages that still carry this compatibility annotation.
+    || /^质量复核\s*·\s*实验性[：:]/.test(plainSummary)
+  ) return null;
   return (
     <div className="mt-5 text-slate-700">
       <ReactMarkdown
@@ -1905,32 +1931,333 @@ function VerificationSummaryText({ text }: { text?: string }) {
   );
 }
 
-function RunReviewControl({ message, isStreaming }: { message: ChatMessageType; isStreaming?: boolean }) {
+const RUN_REVIEW_CRITERIA: Record<string, { title: string; description: string }> = {
+  task_fulfillment: {
+    title: "任务完成度",
+    description: "是否真正完成本轮要求，而不是只给计划或口头声明。",
+  },
+  todo_reconciliation: {
+    title: "待办收口",
+    description: "本轮产生的待办是否全部完成或已明确取消。",
+  },
+  tool_protocol_integrity: {
+    title: "工具调用完整性",
+    description: "每个工具调用是否都有唯一、完整的返回结果。",
+  },
+  artifact_delivery: {
+    title: "产物交付",
+    description: "要求生成或更新的文件是否真实存在并可定位。",
+  },
+  code_validation: {
+    title: "代码验证",
+    description: "是否执行并通过与代码改动相称的测试或静态检查。",
+  },
+  web_evidence_traceability: {
+    title: "网页来源可追溯",
+    description: "网页结论是否关联本轮真实检索得到的来源。",
+  },
+  analytics_evidence_traceability: {
+    title: "分析证据可追溯",
+    description: "关键数据是否关联本轮查询结果、数据源或查询轨迹。",
+  },
+  metric_consistency: {
+    title: "指标口径一致性",
+    description: "指标名称、计算口径、维度和结论是否前后一致。",
+  },
+  time_scope: {
+    title: "数据时间范围",
+    description: "是否明确并遵守用户指定的数据期间。",
+  },
+  report_integrity: {
+    title: "报告完整性",
+    description: "报告结构、标题、图表和正文是否完整。",
+  },
+};
+
+function runReviewCriterionPresentation(criterionId: string, rawName: string) {
+  const known = RUN_REVIEW_CRITERIA[criterionId];
+  if (known) return known;
+  const technicalName = /^[a-z0-9_:-]+$/i.test(rawName);
+  return {
+    title: technicalName ? "自定义验收规则" : rawName,
+    description: technicalName ? `规则标识：${criterionId}` : rawName,
+  };
+}
+
+function runReviewMethodLabel(method: string): string {
+  return ({
+    deterministic: "系统核验",
+    environment: "环境核验",
+    semantic_rubric: "模型复核",
+  } as Record<string, string>)[method] || "验收检查";
+}
+
+function runReviewEvidenceSummary(
+  evidence: Array<Record<string, unknown>> | undefined,
+  method: string,
+  passed: boolean | null,
+): string {
+  for (const item of evidence || []) {
+    if (item.kind === "todo_state") {
+      const total = Number(item.total || 0);
+      const incomplete = Number(item.incomplete || 0);
+      return incomplete > 0
+        ? `${incomplete} 项待办尚未收口（共 ${total} 项）。`
+        : total > 0
+          ? `${total} 项待办均已完成或明确取消。`
+          : "本轮没有未收口的待办。";
+    }
+    if (item.kind === "tool_protocol") {
+      const requested = Array.isArray(item.requested_call_ids) ? item.requested_call_ids.length : 0;
+      const missing = Array.isArray(item.missing_call_ids) ? item.missing_call_ids.length : 0;
+      const duplicate = Array.isArray(item.duplicate_call_ids) ? item.duplicate_call_ids.length : 0;
+      return missing || duplicate
+        ? `发现 ${missing} 个缺失结果、${duplicate} 个重复结果。`
+        : requested > 0
+          ? `${requested} 个工具调用均有唯一且完整的结果。`
+          : "本轮没有需要配对的工具调用。";
+    }
+  }
+  if (passed === null) return "该项没有形成有效裁决。";
+  if (method === "semantic_rubric") {
+    return passed
+      ? "模型根据当前回答与验收规则判定通过。"
+      : "模型根据当前回答与验收规则发现缺口。";
+  }
+  return passed ? "结构化检查未发现问题。" : "结构化检查发现未满足项。";
+}
+
+function formatReviewDuration(milliseconds: number): string {
+  if (milliseconds < 1000) return `${Math.max(1, Math.round(milliseconds))} ms`;
+  return `${(milliseconds / 1000).toFixed(milliseconds < 10000 ? 1 : 0)} 秒`;
+}
+
+function runReviewOutcomeSummary(
+  status: string,
+  criteria: Array<{ passed: boolean | null }>,
+): string {
+  const failed = criteria.filter((criterion) => criterion.passed === false).length;
+  const unavailable = criteria.filter((criterion) => criterion.passed === null).length;
+  if (status === "satisfied") return `${criteria.length} 项验收均已通过。`;
+  if (status === "needs_revision") {
+    return failed > 0 ? `${criteria.length} 项已检查，${failed} 项未通过。` : "验收发现待修正项。";
+  }
+  if (status === "failed") return "验收规则无法完成有效判定。";
+  if (status === "grader_error") return "模型验收未形成有效裁决，可重新验收。";
+  if (status === "infrastructure_error") return "验收基础设施异常，可重新验收。";
+  if (status === "stale") return "回答或证据已变化，需要重新验收。";
+  if (unavailable > 0) return `${unavailable} 项验收未执行。`;
+  return "验收尚未形成最终结论。";
+}
+
+function localizedRunReviewGap(
+  criterionId: string,
+  gap: string | null | undefined,
+): string {
+  const normalized = String(gap || "").trim();
+  if (normalized && /[\u3400-\u9fff]/.test(normalized)) return normalized;
+  return ({
+    task_fulfillment: "本轮回答未完成用户要求的最终交付。",
+    todo_reconciliation: "本轮仍有待办未完成或未明确取消。",
+    tool_protocol_integrity: "本轮工具调用缺少唯一、完整的返回结果。",
+    artifact_delivery: "要求交付的产物未能确认存在或无法定位。",
+    code_validation: "代码改动缺少相应的测试或静态检查证据。",
+    web_evidence_traceability: "网页结论缺少可追溯的本轮检索来源。",
+    analytics_evidence_traceability: "关键数据缺少可追溯的数据源或查询记录。",
+    metric_consistency: "指标名称、口径、维度或结论存在不一致。",
+    time_scope: "结果未明确遵守用户指定的数据时间范围。",
+    report_integrity: "报告结构或内容不完整。",
+  } as Record<string, string>)[criterionId] || "该项未达到验收标准。";
+}
+
+function RunReviewDetailsPanel({
+  report,
+  panelId,
+}: {
+  report: NonNullable<ChatMessageType["runReviewReport"]>;
+  panelId: string;
+}) {
+  const records = report.verification_records || [];
+  const criteria = records.flatMap((record) => record.criteria.map((criterion) => ({
+    ...criterion,
+    method: record.method,
+  })));
+  const emptyRecords = records.filter((record) => record.criteria.length === 0);
+  const latency = records.reduce((total, record) => total + Math.max(0, Number(record.latency_ms || 0)), 0);
+  const passed = report.status === "satisfied";
+  const outcomeSummary = runReviewOutcomeSummary(report.status, criteria);
+
+  return (
+    <section
+      id={panelId}
+      className="mt-2 max-w-2xl overflow-hidden rounded-2xl border border-black/[0.08] bg-white shadow-[0_10px_30px_rgba(15,23,42,0.06)]"
+      aria-label="质量复核详情"
+    >
+      <div className={`border-b px-4 py-3 ${passed ? "border-emerald-100 bg-emerald-50/70" : "border-amber-100 bg-amber-50/70"}`}>
+        <div className="flex items-start gap-2.5">
+          {passed
+            ? <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0 text-emerald-600" />
+            : <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-600" />}
+          <div className="min-w-0 flex-1">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <h3 className="text-xs font-semibold text-slate-800">验收详情</h3>
+              <div className="flex flex-wrap items-center gap-1.5 text-[10px] text-slate-500">
+                <span>{report.manual ? "手动验收" : "后台质量复核"}</span>
+                <span className="text-slate-300">·</span>
+                <span>第 {Math.max(1, Number(report.attempt_no || 0) + 1)} 次</span>
+                {latency > 0 ? (
+                  <>
+                    <span className="text-slate-300">·</span>
+                    <span>用时 {formatReviewDuration(latency)}</span>
+                  </>
+                ) : null}
+              </div>
+            </div>
+            <p className="mt-1 text-[11px] leading-5 text-slate-600">
+              {outcomeSummary}
+            </p>
+          </div>
+        </div>
+      </div>
+
+      <div className="space-y-2 p-3">
+        {criteria.map((criterion) => {
+          const presentation = runReviewCriterionPresentation(criterion.criterion_id, criterion.name);
+          const notEvaluated = criterion.passed === null;
+          const criterionPassed = criterion.passed === true;
+          return (
+            <div
+              key={`${criterion.method}-${criterion.criterion_id}`}
+              className={`rounded-xl border px-3 py-2.5 ${
+                criterionPassed
+                  ? "border-emerald-100 bg-emerald-50/45"
+                  : notEvaluated
+                    ? "border-slate-200 bg-slate-50"
+                    : "border-amber-200 bg-amber-50/70"
+              }`}
+            >
+              <div className="flex items-start gap-2.5">
+                {criterionPassed
+                  ? <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0 text-emerald-600" />
+                  : notEvaluated
+                    ? <HelpCircle className="mt-0.5 h-4 w-4 shrink-0 text-slate-400" />
+                    : <XCircle className="mt-0.5 h-4 w-4 shrink-0 text-amber-600" />}
+                <div className="min-w-0 flex-1">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <p className="text-[12px] font-semibold text-slate-800">{presentation.title}</p>
+                    <div className="flex items-center gap-1.5">
+                      <span className="rounded-full bg-white/80 px-2 py-0.5 text-[10px] font-medium text-slate-500">
+                        {runReviewMethodLabel(criterion.method)}
+                      </span>
+                      <span className={`text-[10px] font-semibold ${
+                        criterionPassed ? "text-emerald-700" : notEvaluated ? "text-slate-500" : "text-amber-700"
+                      }`}>
+                        {criterionPassed ? "通过" : notEvaluated ? "未执行" : "未通过"}
+                      </span>
+                    </div>
+                  </div>
+                  <p className="mt-1 text-[11px] leading-4 text-slate-500">{presentation.description}</p>
+                  <p className={`mt-2 text-[11px] leading-5 ${criterionPassed ? "text-slate-600" : "text-amber-800"}`}>
+                    {criterionPassed || notEvaluated
+                      ? runReviewEvidenceSummary(criterion.evidence, criterion.method, criterion.passed)
+                      : localizedRunReviewGap(criterion.criterion_id, criterion.gap)}
+                  </p>
+                </div>
+              </div>
+            </div>
+          );
+        })}
+
+        {emptyRecords.map((record) => (
+          <div key={record.verification_id} className="rounded-xl border border-amber-200 bg-amber-50 px-3 py-2.5">
+            <div className="flex items-start gap-2.5">
+              <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-600" />
+              <div>
+                <p className="text-[12px] font-semibold text-slate-800">{runReviewMethodLabel(record.method)}未完成</p>
+                <p className="mt-1 text-[11px] leading-5 text-amber-800">
+                  {record.status === "not_evaluated"
+                    ? "该验收器本次未执行，因此没有形成业务裁决。"
+                    : "验收器执行异常；这不等同于回答质量未通过，可稍后重新验收。"}
+                </p>
+              </div>
+            </div>
+          </div>
+        ))}
+
+        {records.length === 0 ? (
+          <div className="rounded-xl bg-slate-50 px-3 py-3 text-[11px] leading-5 text-slate-500">
+            这份旧报告没有附带逐项验收记录；重新验收后可查看完整明细。
+          </div>
+        ) : null}
+
+      </div>
+    </section>
+  );
+}
+
+function AssistantMessageActions({ message, isStreaming }: { message: ChatMessageType; isStreaming?: boolean }) {
   const { reviewRun } = useApp();
   const [pending, setPending] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const [detailsOpen, setDetailsOpen] = useState(false);
+  const copyResetTimer = useRef<number | null>(null);
+  const detailsContainerRef = useRef<HTMLDivElement | null>(null);
   const runId = message.runId || message.segments?.findLast((segment) => segment.runId)?.runId;
   const isGoalRun = Boolean(message.segments?.some((segment) => segment.goalId));
-  if (!runId || isGoalRun || isStreaming) return null;
+  const supportsReview = Boolean(runId && !isGoalRun);
+  const copyText = stripModelCallLimitNotice(
+    message.content.trim()
+      || message.segments?.map((segment) => segment.content.trim()).filter(Boolean).join("\n\n")
+      || "",
+  );
 
-  const status = message.runReviewStatus;
-  const report = message.runReviewReport;
+  useEffect(() => () => {
+    if (copyResetTimer.current !== null) window.clearTimeout(copyResetTimer.current);
+  }, []);
+
+  useEffect(() => {
+    if (!detailsOpen) return;
+    const frame = window.requestAnimationFrame(() => {
+      detailsContainerRef.current?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [detailsOpen]);
+
+  if (isStreaming || (!copyText && !supportsReview)) return null;
+
+  const status = supportsReview ? message.runReviewStatus : undefined;
+  const report = supportsReview ? message.runReviewReport : undefined;
   const statusLabel: Record<string, string> = {
     pending: "质量复核排队中",
     running: "质量复核进行中",
     satisfied: "质量复核通过",
-    needs_revision: "复核发现潜在缺口",
+    needs_revision: "质量复核未通过",
     failed: "复核未通过",
     grader_error: "复核未完成",
     infrastructure_error: "复核未完成",
     stale: "复核已失效",
   };
   const terminal = status && status !== "pending" && status !== "running";
-  const canRequestReview = !status
+  const canRequestReview = supportsReview && (
+    !status
     || status === "grader_error"
-    || status === "infrastructure_error";
+    || status === "infrastructure_error"
+  );
   const actionLabel = status ? "重新验证此回答" : "验证此回答";
+  const detailsPanelId = `run-review-details-${runId || message.id}`;
+  const handleCopy = async () => {
+    if (!copyText) return;
+    try {
+      await writeTextToClipboard(copyText);
+      setCopied(true);
+      if (copyResetTimer.current !== null) window.clearTimeout(copyResetTimer.current);
+      copyResetTimer.current = window.setTimeout(() => setCopied(false), 1600);
+    } catch {
+      setCopied(false);
+    }
+  };
   const handleReview = async () => {
-    if (pending) return;
+    if (pending || !runId) return;
     setPending(true);
     try {
       await reviewRun(runId);
@@ -1942,36 +2269,61 @@ function RunReviewControl({ message, isStreaming }: { message: ChatMessageType; 
   };
 
   return (
-    <div className="mt-2 flex min-h-8 flex-wrap items-center gap-2 pl-1 text-[11px]" data-testid="run-review-control">
-      {status ? (
-        <span className={`inline-flex items-center gap-1 rounded-full border px-2.5 py-1 ${
-          terminal && status === "satisfied"
-            ? "border-emerald-200 bg-emerald-50 text-emerald-700"
-            : terminal
-              ? "border-amber-200 bg-amber-50 text-amber-700"
-              : "border-blue-200 bg-blue-50 text-blue-700"
-        }`}>
-          {!terminal && <Loader2 className="h-3 w-3 animate-spin" />}
-          {statusLabel[status] || "质量复核"}
-        </span>
-      ) : null}
-      {report?.summary ? (
-        <span className="max-w-xl text-gray-500" title={report.summary}>
-          {report.summary.length > 140 ? `${report.summary.slice(0, 140)}…` : report.summary}
-        </span>
+    <div className="mt-1 pl-1 text-[11px]" data-testid="assistant-message-actions">
+      <div className="flex min-h-8 flex-wrap items-center gap-1">
+      {copyText ? (
+        <button
+          type="button"
+          onClick={() => void handleCopy()}
+          className={`inline-flex h-8 w-8 items-center justify-center rounded-lg transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#002fa7]/30 ${
+            copied
+              ? "bg-emerald-50 text-emerald-600"
+              : "text-gray-400 hover:bg-black/[0.05] hover:text-gray-700"
+          }`}
+          aria-label={copied ? "已复制回答" : "复制回答"}
+          title={copied ? "已复制" : "复制"}
+        >
+          {copied ? <CheckCircle2 className="h-4 w-4" /> : <Copy className="h-4 w-4" />}
+          <span className="sr-only" aria-live="polite">{copied ? "已复制" : "复制回答"}</span>
+        </button>
       ) : null}
       {canRequestReview ? (
         <button
           type="button"
           onClick={handleReview}
           disabled={pending}
-          className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-gray-400 transition hover:bg-black/[0.05] hover:text-gray-700 disabled:cursor-wait disabled:opacity-50"
+          className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-gray-400 transition hover:bg-black/[0.05] hover:text-gray-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#002fa7]/30 disabled:cursor-wait disabled:opacity-50"
           aria-label={actionLabel}
           title={actionLabel}
         >
           {pending ? <Loader2 className="h-4 w-4 animate-spin" /> : <ShieldCheck className="h-4 w-4" />}
           <span className="sr-only">{pending ? "正在验证" : actionLabel}</span>
         </button>
+      ) : null}
+      {status ? (
+        <button
+          type="button"
+          onClick={() => report && setDetailsOpen((open) => !open)}
+          disabled={!report}
+          aria-expanded={report ? detailsOpen : undefined}
+          aria-controls={report ? detailsPanelId : undefined}
+          className={`ml-1 inline-flex items-center gap-1 rounded-full border px-2.5 py-1 transition disabled:cursor-default ${
+          terminal && status === "satisfied"
+            ? "border-emerald-200 bg-emerald-50 text-emerald-700"
+            : terminal
+              ? "border-amber-200 bg-amber-50 text-amber-700"
+              : "border-blue-200 bg-blue-50 text-blue-700"
+        } ${report ? "hover:brightness-[0.98] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#002fa7]/25" : ""}`}>
+          {!terminal && <Loader2 className="h-3 w-3 animate-spin" />}
+          {statusLabel[status] || "质量复核"}
+          {report ? <ChevronDown className={`h-3 w-3 transition-transform ${detailsOpen ? "rotate-180" : ""}`} /> : null}
+        </button>
+      ) : null}
+      </div>
+      {detailsOpen && report ? (
+        <div ref={detailsContainerRef} className="scroll-mb-44">
+          <RunReviewDetailsPanel report={report} panelId={detailsPanelId} />
+        </div>
       ) : null}
     </div>
   );

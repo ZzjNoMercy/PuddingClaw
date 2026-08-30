@@ -33,6 +33,7 @@ import {
   removeProject as apiRemoveProject,
   updateSessionAnalyticsModel as apiUpdateSessionAnalyticsModel,
   updateSessionLlmSelection as apiUpdateSessionLlmSelection,
+  updateSessionRunReviewPolicy as apiUpdateSessionRunReviewPolicy,
   getSessionApprovalMode as apiGetSessionApprovalMode,
   updateSessionApprovalMode as apiUpdateSessionApprovalMode,
   getSessionHarnessState as apiGetSessionHarnessState,
@@ -64,6 +65,7 @@ import {
   RunReviewPolicy,
   RunReviewReport,
   RunReviewStatusResponse,
+  SessionHarnessState,
   ApprovalMode,
   AgentCompactResult,
 } from "./api";
@@ -317,6 +319,7 @@ export interface SessionMeta {
   llm_model_id?: string | null;
   thinking_level?: "low" | "high" | "max" | null;
   credential_name?: string | null;
+  run_review_policy?: RunReviewPolicy | null;
   approval_mode?: ApprovalMode;
   policy_epoch?: number;
   policy_version?: string;
@@ -730,24 +733,66 @@ function decorateRunReviews(
   runs: Record<string, HarnessRun> | undefined,
   reports: Record<string, RunReviewReport> | undefined,
 ): ChatMessage[] {
-  if (!reports) return messages;
-  return messages.map((message) => {
+  const availableReports = reports || {};
+  const decorated = messages.map((message) => {
     const run = runs ? Object.values(runs).find((candidate) =>
       (message.runId && candidate.run_id === message.runId)
       || (message.queryId && candidate.query_id === message.queryId)
       || message.segments?.some((segment) => segment.runId === candidate.run_id)
     ) : undefined;
     const report = run?.run_review_report_id
-      ? reports[run.run_review_report_id]
-      : Object.values(reports).find((candidate) => candidate.run_id === message.runId);
+      ? availableReports[run.run_review_report_id]
+      : Object.values(availableReports).find((candidate) => candidate.run_id === message.runId);
     if (!run && !report) return message;
+    const reviewExpected = Boolean(
+      run?.run_kind === "standalone"
+      && run.run_review_policy
+      && run.run_review_policy !== "off"
+    );
+    const nextRunId = message.runId || run?.run_id || report?.run_id;
+    const nextStatus = report?.status
+      || (reviewExpected ? message.runReviewStatus || "pending" : message.runReviewStatus);
+    const nextReport = report?.report_id === message.runReviewReport?.report_id
+      ? message.runReviewReport
+      : report || message.runReviewReport;
+    if (
+      nextRunId === message.runId
+      && nextStatus === message.runReviewStatus
+      && nextReport === message.runReviewReport
+    ) {
+      return message;
+    }
     return {
       ...message,
-      runId: message.runId || run?.run_id || report?.run_id,
-      runReviewStatus: report?.status,
-      runReviewReport: report,
+      runId: nextRunId,
+      // A shadow review starts after the Run is already terminal. Harness may
+      // therefore be read before its report is persisted; keep the pending
+      // state instead of making the action row look as if review were off.
+      runReviewStatus: nextStatus,
+      runReviewReport: nextReport,
     };
   });
+  return decorated.every((message, index) => message === messages[index])
+    ? messages
+    : decorated;
+}
+
+function hydrateRunReviewReports(
+  reports: Record<string, RunReviewReport> | undefined,
+  records: SessionHarnessState["verification_records"],
+): Record<string, RunReviewReport> {
+  if (!reports) return {};
+  return Object.fromEntries(Object.entries(reports).map(([reportId, report]) => [
+    reportId,
+    report.verification_records
+      ? report
+      : {
+          ...report,
+          verification_records: (report.verification_record_ids || [])
+            .map((recordId) => records?.[recordId])
+            .filter((record): record is NonNullable<typeof record> => Boolean(record)),
+        },
+  ]));
 }
 
 // ── Timeline helpers ───────────────────────────────────────
@@ -1030,6 +1075,8 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const approvalModesMapRef = useRef<Record<string, ApprovalMode>>({ default: "smart" });
   const approvalPolicyEpochsMapRef = useRef<Record<string, number>>({ default: 1 });
   const nextRunGoalModeMapRef = useRef<Record<string, boolean>>({ default: false });
+  const runReviewPoliciesMapRef = useRef<Record<string, RunReviewPolicy | null>>({ default: null });
+  const runReviewPolicySaveChainsRef = useRef<Record<string, Promise<void>>>({});
   const createSessionPromisesRef = useRef<Map<string, Promise<string | null>>>(new Map());
   const sendReservationsRef = useRef<Set<string>>(new Set());
   const approvalModeSavingSessionsRef = useRef<Set<string>>(new Set());
@@ -1039,6 +1086,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const goalRunsMapRef = useRef<Record<string, HarnessRun[]>>({});
   const verificationReportsMapRef = useRef<Record<string, RubricEvaluationReport | null>>({});
   const runReviewReportsMapRef = useRef<Record<string, Record<string, RunReviewReport>>>({});
+  const runReviewPollsRef = useRef<Map<string, Promise<RunReviewStatusResponse>>>(new Map());
   const runActivityStatusesMapRef = useRef<Record<string, RunActivityStatus | null>>({});
   const abortControllersRef = useRef<Map<string, AbortController>>(new Map());
   const assistantIdsRef = useRef<Map<string, string>>(new Map());
@@ -1118,7 +1166,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const [goalModeEnabled, setGoalModeEnabledRaw] = useState(false);
   // null means inherit the server-side Harness default; a concrete value is
   // frozen into the next ordinary Run request by sendMessage.
-  const [runReviewPolicy, setRunReviewPolicy] = useState<RunReviewPolicy | null>(null);
+  const [runReviewPolicy, setRunReviewPolicyRaw] = useState<RunReviewPolicy | null>(null);
   const [approvalMode, setApprovalModeRaw] = useState<ApprovalMode>("smart");
   const [approvalModeSaving, setApprovalModeSaving] = useState(false);
   const [approvalModeError, setApprovalModeError] = useState<string | null>(null);
@@ -1368,6 +1416,32 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     setGoalModeEnabledRaw(enabled);
   }, []);
 
+  const setRunReviewPolicy = useCallback((policy: RunReviewPolicy | null) => {
+    const sid = sessionIdRef.current;
+    runReviewPoliciesMapRef.current[sid] = policy;
+    setRunReviewPolicyRaw(policy);
+    if (sid === "default") return;
+
+    setSessions((current) => current.map((session) =>
+      session.id === sid ? { ...session, run_review_policy: policy } : session
+    ));
+    const previousSave = runReviewPolicySaveChainsRef.current[sid] || Promise.resolve();
+    const nextSave = previousSave
+      .catch(() => undefined)
+      .then(() => apiUpdateSessionRunReviewPolicy(sid, policy))
+      .then(() => undefined)
+      .catch(() => {
+        // The in-memory preference remains active for this tab. A later user
+        // selection retries persistence without disrupting the current Run.
+      });
+    runReviewPolicySaveChainsRef.current[sid] = nextSave;
+    void nextSave.finally(() => {
+      if (runReviewPolicySaveChainsRef.current[sid] === nextSave) {
+        delete runReviewPolicySaveChainsRef.current[sid];
+      }
+    });
+  }, []);
+
   const setApprovalMode = useCallback(async (mode: ApprovalMode): Promise<boolean> => {
     const sid = sessionIdRef.current;
     approvalModeErrorsMapRef.current[sid] = null;
@@ -1490,52 +1564,103 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     []
   );
 
-  const reviewRun = useCallback(async (runId: string): Promise<RunReviewStatusResponse> => {
-    const sid = sessionIdRef.current;
+  const applyRunReviewStatus = useCallback((
+    sid: string,
+    runId: string,
+    latest: RunReviewStatusResponse,
+  ): RunReviewStatusResponse => {
+    const effectiveStatus = latest.report?.status || latest.status;
     const matchesRun = (message: ChatMessage) =>
       message.runId === runId || message.segments?.some((segment) => segment.runId === runId);
-    updateSessionMessages(sid, (prev) => prev.map((message) =>
-      matchesRun(message) ? { ...message, runReviewStatus: "pending" } : message
-    ));
-    try {
-      let latest = await apiRequestRunReview(sid, runId);
-      updateSessionMessages(sid, (prev) => prev.map((message) =>
+    updateSessionMessages(sid, (prev) => {
+      const updated = prev.map((message) =>
         matchesRun(message)
-          ? { ...message, runReviewStatus: latest.status, runReviewReport: latest.report }
+          ? (() => {
+              const nextReport = latest.report || (
+                effectiveStatus === "pending" || effectiveStatus === "running"
+                  ? undefined
+                  : message.runReviewReport
+              );
+              if (
+                message.runReviewStatus === effectiveStatus
+                && message.runReviewReport === nextReport
+              ) {
+                return message;
+              }
+              return {
+                ...message,
+                runReviewStatus: effectiveStatus,
+                runReviewReport: nextReport,
+              };
+            })()
           : message
-      ));
-      if (latest.report?.report_id) {
-        runReviewReportsMapRef.current[sid] = {
-          ...(runReviewReportsMapRef.current[sid] || {}),
-          [latest.report.report_id]: latest.report,
-        };
-      }
-      // Manual review is asynchronous. Keep the action useful after the POST
-      // returns 202, while bounding browser-side polling; the server remains
-      // authoritative and the report can be fetched again after refresh.
-      for (let attempt = 0; attempt < 20 && (latest.status === "pending" || latest.status === "running"); attempt += 1) {
+      );
+      return updated.every((message, index) => message === prev[index]) ? prev : updated;
+    });
+    if (latest.report?.report_id) {
+      runReviewReportsMapRef.current[sid] = {
+        ...(runReviewReportsMapRef.current[sid] || {}),
+        [latest.report.report_id]: latest.report,
+      };
+    }
+    return { ...latest, status: effectiveStatus };
+  }, [updateSessionMessages]);
+
+  const pollRunReviewUntilSettled = useCallback((
+    sid: string,
+    runId: string,
+    initial?: RunReviewStatusResponse,
+  ): Promise<RunReviewStatusResponse> => {
+    const key = `${sid}:${runId}`;
+    const existing = runReviewPollsRef.current.get(key);
+    if (existing) return existing;
+    const task = (async () => {
+      let latest = applyRunReviewStatus(
+        sid,
+        runId,
+        initial || { status: "pending", run_id: runId },
+      );
+      // Shadow review runs after publication and outlives the answer SSE.
+      // Keep polling the durable status independently for up to two minutes.
+      for (
+        let attempt = 0;
+        attempt < 160 && (latest.status === "pending" || latest.status === "running");
+        attempt += 1
+      ) {
         await new Promise((resolve) => window.setTimeout(resolve, 750));
-        latest = await apiGetRunReviewStatus(sid, runId);
-        updateSessionMessages(sid, (prev) => prev.map((message) =>
-          matchesRun(message)
-            ? { ...message, runReviewStatus: latest.status, runReviewReport: latest.report }
-            : message
-        ));
-        if (latest.report?.report_id) {
-          runReviewReportsMapRef.current[sid] = {
-            ...(runReviewReportsMapRef.current[sid] || {}),
-            [latest.report.report_id]: latest.report,
-          };
+        try {
+          latest = applyRunReviewStatus(
+            sid,
+            runId,
+            await apiGetRunReviewStatus(sid, runId),
+          );
+        } catch {
+          // A transient fetch failure must not erase the visible pending state.
         }
       }
       return latest;
+    })().finally(() => {
+      runReviewPollsRef.current.delete(key);
+    });
+    runReviewPollsRef.current.set(key, task);
+    return task;
+  }, [applyRunReviewStatus]);
+
+  const reviewRun = useCallback(async (runId: string): Promise<RunReviewStatusResponse> => {
+    const sid = sessionIdRef.current;
+    applyRunReviewStatus(sid, runId, { status: "pending", run_id: runId });
+    try {
+      const started = await apiRequestRunReview(sid, runId);
+      return await pollRunReviewUntilSettled(sid, runId, started);
     } catch (error) {
+      const matchesRun = (message: ChatMessage) =>
+        message.runId === runId || message.segments?.some((segment) => segment.runId === runId);
       updateSessionMessages(sid, (prev) => prev.map((message) =>
         matchesRun(message) ? { ...message, runReviewStatus: "failed" } : message
       ));
       throw error;
     }
-  }, [updateSessionMessages]);
+  }, [applyRunReviewStatus, pollRunReviewUntilSettled, updateSessionMessages]);
 
   // ── Helper: update Agent white-box state for a session ──────────────
   const updateSessionTodos = useCallback((
@@ -1834,6 +1959,9 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
               credentialName: session.credential_name ?? null,
             };
           }
+          if (!Object.prototype.hasOwnProperty.call(runReviewPoliciesMapRef.current, session.id)) {
+            runReviewPoliciesMapRef.current[session.id] = session.run_review_policy ?? null;
+          }
           approvalModesMapRef.current[session.id] = session.approval_mode || "smart";
           if (session.policy_epoch) {
             approvalPolicyEpochsMapRef.current[session.id] = session.policy_epoch;
@@ -1964,6 +2092,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         setThinkingLevelRaw(llmSelectionsMapRef.current.default?.thinkingLevel ?? null);
         setCredentialNameRaw(llmSelectionsMapRef.current.default?.credentialName ?? null);
         setGoalModeEnabledRaw(nextRunGoalModeMapRef.current.default ?? false);
+        setRunReviewPolicyRaw(runReviewPoliciesMapRef.current.default ?? null);
         setApprovalModeRaw(approvalModesMapRef.current.default || "smart");
         setApprovalModeSaving(approvalModeSavingSessionsRef.current.has("default"));
         setApprovalModeError(approvalModeErrorsMapRef.current.default ?? null);
@@ -1976,6 +2105,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         setLlmModelIdRaw(llmSelectionsMapRef.current[id]?.modelId ?? null);
         setThinkingLevelRaw(llmSelectionsMapRef.current[id]?.thinkingLevel ?? null);
         setCredentialNameRaw(llmSelectionsMapRef.current[id]?.credentialName ?? null);
+        setRunReviewPolicyRaw(runReviewPoliciesMapRef.current[id] ?? null);
         setApprovalModeRaw(approvalModesMapRef.current[id] || "smart");
         setApprovalModeSaving(approvalModeSavingSessionsRef.current.has(id));
         setApprovalModeError(approvalModeErrorsMapRef.current[id] ?? null);
@@ -2001,10 +2131,14 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
                   .map((runId) => data.runs[runId])
                   .filter((candidate): candidate is HarnessRun => Boolean(candidate))
               : [];
-            runReviewReportsMapRef.current[id] = data.run_review_reports || {};
+            const hydratedRunReviewReports = hydrateRunReviewReports(
+              data.run_review_reports,
+              data.verification_records,
+            );
+            runReviewReportsMapRef.current[id] = hydratedRunReviewReports;
             const cachedHistory = messagesMapRef.current[id];
             if (cachedHistory) {
-              const decorated = decorateRunReviews(cachedHistory, data.runs, data.run_review_reports);
+              const decorated = decorateRunReviews(cachedHistory, data.runs, hydratedRunReviewReports);
               messagesMapRef.current[id] = decorated;
               if (sessionIdRef.current === id) setMessages(decorated);
             }
@@ -2181,6 +2315,20 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         const latestRun = data.latest_run_id && data.runs[data.latest_run_id]
           ? data.runs[data.latest_run_id]
           : null;
+        const hydratedRunReviewReports = hydrateRunReviewReports(
+          data.run_review_reports,
+          data.verification_records,
+        );
+        const mergedRunReviewReports = {
+          ...(runReviewReportsMapRef.current[sessionId] || {}),
+          ...hydratedRunReviewReports,
+        };
+        runReviewReportsMapRef.current[sessionId] = mergedRunReviewReports;
+        updateSessionMessages(sessionId, (previous) => decorateRunReviews(
+          previous,
+          data.runs,
+          mergedRunReviewReports,
+        ));
         const active = runIsActive(latestRun);
         const nextRemote = new Set(remoteRunningSessionsRef.current);
         if (active) nextRemote.add(sessionId);
@@ -2211,7 +2359,11 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           // transition so the answer appears without a page reload.
           const history = await apiGetSessionHistory(sessionId);
           if (stopped) return;
-          const loaded = history.messages?.length ? parseHistoryMessages(history.messages) : [];
+          const loaded = decorateRunReviews(
+            history.messages?.length ? parseHistoryMessages(history.messages) : [],
+            data.runs,
+            mergedRunReviewReports,
+          );
           messagesMapRef.current[sessionId] = loaded;
           if (sessionIdRef.current === sessionId) setMessages(loaded);
         }
@@ -2228,7 +2380,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       stopped = true;
       window.clearInterval(timer);
     };
-  }, [sessionId, updateSessionRunActivity]);
+  }, [sessionId, updateSessionMessages, updateSessionRunActivity]);
 
   const selectedSessionHasRemoteRun = remoteRunningSessions.has(sessionId);
 
@@ -2642,6 +2794,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       },
       approvalMode: (approvalModesMapRef.current[originSessionId] || "smart") as ApprovalMode,
       goalModeEnabled: nextRunGoalModeMapRef.current[originSessionId] ?? false,
+      runReviewPolicy: runReviewPoliciesMapRef.current[originSessionId] ?? null,
       runtimeMode,
       projectId: currentProjectId,
     };
@@ -2652,6 +2805,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           llm_model_id: snapshot.llmSelection.modelId,
           thinking_level: snapshot.llmSelection.thinkingLevel,
           credential_name: snapshot.llmSelection.credentialName,
+          run_review_policy: snapshot.runReviewPolicy,
           approval_mode: snapshot.approvalMode,
           runtime_mode: snapshot.runtimeMode,
           project_id: snapshot.projectId,
@@ -2661,6 +2815,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         approvalModesMapRef.current[meta.id] = meta.approval_mode;
         approvalPolicyEpochsMapRef.current[meta.id] = meta.policy_epoch;
         nextRunGoalModeMapRef.current[meta.id] = snapshot.goalModeEnabled;
+        runReviewPoliciesMapRef.current[meta.id] = snapshot.runReviewPolicy;
         setSessions((prev) => {
           const next = [
             {
@@ -2673,6 +2828,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
               llm_model_id: snapshot.llmSelection.modelId,
               thinking_level: snapshot.llmSelection.thinkingLevel,
               credential_name: snapshot.llmSelection.credentialName,
+              run_review_policy: snapshot.runReviewPolicy,
               approval_mode: meta.approval_mode,
               policy_epoch: meta.policy_epoch,
               policy_version: meta.policy_version,
@@ -2695,6 +2851,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           approvalModesMapRef.current.default = "smart";
           approvalPolicyEpochsMapRef.current.default = 1;
           nextRunGoalModeMapRef.current.default = false;
+          runReviewPoliciesMapRef.current.default = null;
         }
         return meta.id;
       } catch {
@@ -3973,6 +4130,19 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
                 ? { ...message, runReviewStatus: "pending" }
                 : message
             ));
+            if (runId) {
+              // A shadow review continues after the answer stream has closed.
+              // Follow its durable status so the action row updates without a
+              // second click on the manual review control.
+              void pollRunReviewUntilSettled(sendSessionId, runId, {
+                status: "pending",
+                run_id: runId,
+                operation_id: operationId || undefined,
+              }).catch(() => {
+                // Keep the visible pending state. Harness reconciliation will
+                // retry and remains the source of truth after reconnects.
+              });
+            }
             continue;
           }
 
@@ -5140,6 +5310,20 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             const latestRun = state.latest_run_id
               ? state.runs[state.latest_run_id] || null
               : null;
+            const hydratedRunReviewReports = hydrateRunReviewReports(
+              state.run_review_reports,
+              state.verification_records,
+            );
+            const mergedRunReviewReports = {
+              ...(runReviewReportsMapRef.current[sendSessionId] || {}),
+              ...hydratedRunReviewReports,
+            };
+            runReviewReportsMapRef.current[sendSessionId] = mergedRunReviewReports;
+            updateSessionMessages(sendSessionId, (previous) => decorateRunReviews(
+              previous,
+              state.runs,
+              mergedRunReviewReports,
+            ));
             currentRunsMapRef.current[sendSessionId] = latestRun;
             if (reconciledGoal) {
               nextRunGoalModeMapRef.current[sendSessionId] = false;
@@ -5187,6 +5371,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       goalModeEnabled,
       runReviewPolicy,
       activeGoal,
+      pollRunReviewUntilSettled,
       updateSessionRunActivity,
       updateStreamingSessions,
     ]

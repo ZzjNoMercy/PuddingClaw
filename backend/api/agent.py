@@ -189,6 +189,28 @@ class RunReviewRequest(BaseModel):
     pass
 
 
+def _public_run_review_report(
+    harness: dict[str, Any],
+    report: dict[str, Any],
+) -> dict[str, Any]:
+    """Attach only the immutable records owned by this review attempt.
+
+    The stored report remains compact.  The API view carries the criterion
+    verdicts needed by the transcript UI without exposing the frozen prompt or
+    transcript snapshot.
+    """
+
+    records = harness.get("verification_records")
+    records_by_id = records if isinstance(records, dict) else {}
+    report_view = dict(report)
+    report_view["verification_records"] = [
+        dict(record)
+        for record_id in report.get("verification_record_ids") or []
+        if isinstance((record := records_by_id.get(record_id)), dict)
+    ]
+    return report_view
+
+
 @router.post("/agent/sessions/{session_id}/runs/{run_id}/review", status_code=202)
 async def review_agent_run(
     session_id: str,
@@ -199,11 +221,21 @@ async def review_agent_run(
     if not bool(review_config.get("manual_enabled", True)):
         raise HTTPException(status_code=403, detail="Manual Run review is disabled")
     try:
-        return await deepagents_agent_manager.begin_run_review(
+        result = await deepagents_agent_manager.begin_run_review(
             session_id,
             run_id,
             manual=True,
         )
+        report = result.get("report") if isinstance(result, dict) else None
+        if isinstance(report, dict):
+            harness = session_manager.get_harness_state(session_id)
+            public_report = _public_run_review_report(harness, report)
+            return {
+                **result,
+                "status": str(public_report.get("status") or result.get("status") or "completed"),
+                "report": public_report,
+            }
+        return result
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except (PermissionError, ValueError) as exc:
@@ -219,7 +251,12 @@ async def agent_run_review_status(session_id: str, run_id: str) -> dict[str, Any
     report_id = str(raw_run.get("run_review_report_id") or "")
     report = (harness.get("run_review_reports") or {}).get(report_id)
     if isinstance(report, dict):
-        return {"status": "completed", "report": report}
+        public_report = _public_run_review_report(harness, report)
+        return {
+            "status": str(public_report.get("status") or "completed"),
+            "run_id": run_id,
+            "report": public_report,
+        }
     snapshot_id = str(raw_run.get("evaluation_snapshot_id") or "")
     operations = [
         item

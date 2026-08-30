@@ -96,6 +96,8 @@ export default function ReadLaterPage() {
   const [detail, setDetail] = useState<ReadLaterItem | null>(null);
   const [filter, setFilter] = useState<Filter>("all");
   const [query, setQuery] = useState("");
+  const [source, setSource] = useState("");
+  const [sourceOptions, setSourceOptions] = useState<string[]>([]);
   const [url, setUrl] = useState("");
   const [checked, setChecked] = useState<Set<string>>(new Set());
   const [importGbrain, setImportGbrain] = useState(false);
@@ -111,9 +113,14 @@ export default function ReadLaterPage() {
   const refresh = useCallback(async () => {
     const version = ++refreshVersion.current;
     try {
-      const result = await listReadLaterItems({ search: query.trim() });
+      const result = await listReadLaterItems({ source, search: query.trim() });
       if (version !== refreshVersion.current) return;
       setItems(result);
+      if (!source && !query.trim()) {
+        setSourceOptions(Array.from(new Set(
+          result.map((item) => item.site_name || hostname(item.original_url)).filter(Boolean),
+        )).sort((left, right) => left.localeCompare(right, "zh-CN")));
+      }
       setSelectedId((current) => result.some((item) => item.id === current) ? current : result[0]?.id || "");
     } catch (error) {
       if (version !== refreshVersion.current) return;
@@ -121,7 +128,7 @@ export default function ReadLaterPage() {
     } finally {
       if (version === refreshVersion.current) setLoading(false);
     }
-  }, [query]);
+  }, [query, source]);
 
   useEffect(() => {
     setMounted(true);
@@ -129,12 +136,12 @@ export default function ReadLaterPage() {
 
   useEffect(() => {
     const debounce = window.setTimeout(() => void refresh(), query.trim() ? 250 : 0);
-    const timer = query.trim() ? null : window.setInterval(() => void refresh(), 4000);
+    const timer = query.trim() || source ? null : window.setInterval(() => void refresh(), 4000);
     return () => {
       window.clearTimeout(debounce);
       if (timer !== null) window.clearInterval(timer);
     };
-  }, [query, refresh]);
+  }, [query, source, refresh]);
 
   useEffect(() => {
     if (!selectedId) {
@@ -308,6 +315,15 @@ export default function ReadLaterPage() {
 
           <section className="border-b border-black/[0.06] lg:border-b-0 lg:border-r">
             <div className="flex h-16 items-center gap-2 border-b border-black/[0.06] px-4">
+              <select
+                value={source}
+                onChange={(event) => setSource(event.target.value)}
+                aria-label="按来源过滤"
+                className="h-10 max-w-32 rounded-xl border border-black/[0.06] bg-white px-2.5 text-xs font-medium text-gray-600 outline-none focus:border-[#002fa7]/30"
+              >
+                <option value="">全部来源</option>
+                {sourceOptions.map((value) => <option key={value} value={value}>{value}</option>)}
+              </select>
               <div className="flex min-w-0 flex-1 items-center gap-2 rounded-xl bg-black/[0.035] px-3">
                 <Search className="h-4 w-4 text-gray-400" />
                 <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索标题、平台或正文" className="h-10 min-w-0 flex-1 bg-transparent text-sm outline-none" />

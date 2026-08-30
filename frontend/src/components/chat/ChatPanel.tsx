@@ -20,7 +20,9 @@ export default function ChatPanel() {
     hasActiveRun,
     activeGoal,
   } = useApp();
+  const scrollContainerRef = useRef<HTMLDivElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
+  const shouldStickToBottomRef = useRef(true);
   const previousSessionIdRef = useRef(sessionId);
   const previousHistoryLoadingRef = useRef(sessionHistoryLoading);
   const hasMountedRef = useRef(false);
@@ -66,10 +68,14 @@ export default function ChatPanel() {
     const initialHistoryRender = !hasMountedRef.current;
     const sessionChanged = previousSessionIdRef.current !== sessionId;
     const historyJustLoaded = previousHistoryLoadingRef.current && !sessionHistoryLoading;
-    bottomRef.current?.scrollIntoView({
-      behavior: initialHistoryRender || sessionChanged || historyJustLoaded ? "auto" : "smooth",
-      block: "end",
-    });
+    const forceScroll = initialHistoryRender || sessionChanged || historyJustLoaded;
+    if (forceScroll || shouldStickToBottomRef.current) {
+      bottomRef.current?.scrollIntoView({
+        behavior: forceScroll ? "auto" : "smooth",
+        block: "end",
+      });
+      shouldStickToBottomRef.current = true;
+    }
     hasMountedRef.current = true;
     previousSessionIdRef.current = sessionId;
     previousHistoryLoadingRef.current = sessionHistoryLoading;
@@ -91,7 +97,17 @@ export default function ChatPanel() {
 
   return (
     <div className="flex flex-col h-full">
-      <div className="flex-1 overflow-y-auto">
+      <div
+        ref={scrollContainerRef}
+        className="flex-1 overflow-y-auto"
+        onScroll={() => {
+          const container = scrollContainerRef.current;
+          if (!container) return;
+          shouldStickToBottomRef.current = (
+            container.scrollHeight - container.scrollTop - container.clientHeight <= 96
+          );
+        }}
+      >
         {sessionHistoryLoading ? (
           <div
             className="flex h-full flex-col items-center justify-center gap-3 px-6 pb-16 text-gray-400"

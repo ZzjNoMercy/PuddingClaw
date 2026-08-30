@@ -95,6 +95,25 @@ def test_analytics_model_id_round_trips_in_session_metadata(tmp_path):
     assert session_manager.get_metadata("analytics-model-session")["analytics_model_id"] is None
 
 
+def test_run_review_policy_round_trips_in_session_metadata(tmp_path):
+    session_manager.initialize(tmp_path)
+    session_manager.create_session(
+        "run-review-policy-session",
+        metadata={"run_review_policy": "shadow"},
+    )
+
+    assert session_manager.get_metadata("run-review-policy-session")["run_review_policy"] == "shadow"
+    listed = {item["id"]: item for item in session_manager.list_sessions()}
+    assert listed["run-review-policy-session"]["run_review_policy"] == "shadow"
+
+    inherited = session_manager.update_metadata(
+        "run-review-policy-session",
+        {"run_review_policy": None},
+    )
+    assert "run_review_policy" in inherited
+    assert inherited["run_review_policy"] is None
+
+
 def test_background_job_execution_context_is_not_listed_as_conversation(tmp_path):
     session_manager.initialize(tmp_path)
     session_manager.create_session("visible-session", metadata={"runtime_mode": "agent"})

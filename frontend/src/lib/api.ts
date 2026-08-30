@@ -258,6 +258,28 @@ export type RunReviewStatus =
   | "infrastructure_error"
   | "stale";
 
+export interface RunReviewCriterionResult {
+  criterion_id: string;
+  name: string;
+  passed: boolean | null;
+  evidence_refs?: Array<Record<string, unknown>>;
+  evidence?: Array<Record<string, unknown>>;
+  gap?: string | null;
+  failure_kind?: string | null;
+}
+
+export interface RunReviewVerificationRecord {
+  verification_id: string;
+  snapshot_id: string;
+  method: "deterministic" | "environment" | "semantic_rubric";
+  status: RunReviewStatus | "not_evaluated";
+  criteria: RunReviewCriterionResult[];
+  latency_ms?: number | null;
+  verifier_model?: string | null;
+  error_kind?: string | null;
+  stale_reason?: string | null;
+}
+
 export interface RunReviewReport {
   report_id: string;
   run_id: string;
@@ -273,6 +295,8 @@ export interface RunReviewReport {
   created_at?: number;
   completed_at?: number | null;
   error_kind?: string | null;
+  /** Public criterion results attached by the API; not part of the compact stored report. */
+  verification_records?: RunReviewVerificationRecord[];
 }
 
 export interface RunReviewStatusResponse {
@@ -379,6 +403,7 @@ export interface SessionHarnessState {
   goal_order: string[];
   active_goal_id?: string | null;
   run_review_reports?: Record<string, RunReviewReport>;
+  verification_records?: Record<string, RunReviewVerificationRecord>;
 }
 
 export interface ToolContextJobStatus {
@@ -1980,11 +2005,13 @@ export async function saveReadLaterUrl(input: {
 export async function listReadLaterItems(options: {
   readingStatus?: string;
   parseStatus?: string;
+  source?: string;
   search?: string;
 } = {}): Promise<ReadLaterItem[]> {
   const params = new URLSearchParams();
   if (options.readingStatus) params.set("reading_status", options.readingStatus);
   if (options.parseStatus) params.set("parse_status", options.parseStatus);
+  if (options.source) params.set("source", options.source);
   if (options.search) params.set("search", options.search);
   const response = await fetch(`${API_BASE}/read-later?${params.toString()}`, { cache: "no-store" });
   const text = await response.text();
@@ -4196,6 +4223,7 @@ export async function listSessions(): Promise<
     llm_model_id?: string | null;
     thinking_level?: "low" | "high" | "max" | null;
     credential_name?: string | null;
+    run_review_policy?: RunReviewPolicy | null;
     approval_mode?: ApprovalMode;
     policy_epoch?: number;
     policy_version?: string;
@@ -4433,6 +4461,7 @@ export interface CreateSessionOptions {
   llm_model_id?: string | null;
   thinking_level?: "low" | "high" | "max" | null;
   credential_name?: string | null;
+  run_review_policy?: RunReviewPolicy | null;
   approval_mode?: ApprovalMode;
   runtime_mode?: "agent" | "chat";
   project_id?: string | null;
@@ -4456,6 +4485,7 @@ export async function createSession(options: CreateSessionOptions = {}): Promise
   llm_model_id?: string | null;
   thinking_level?: "low" | "high" | "max" | null;
   credential_name?: string | null;
+  run_review_policy?: RunReviewPolicy | null;
   approval_mode: ApprovalMode;
   policy_epoch: number;
   policy_version: string;
@@ -4495,6 +4525,28 @@ export async function updateSessionLlmSelection(
   if (!resp.ok) {
     const data = await resp.json().catch(() => ({}));
     throw new Error(data.detail || `Failed to update conversation model: ${resp.status}`);
+  }
+  return resp.json();
+}
+
+export async function updateSessionRunReviewPolicy(
+  sessionId: string,
+  runReviewPolicy: RunReviewPolicy | null,
+): Promise<{
+  id: string;
+  run_review_policy?: RunReviewPolicy | null;
+}> {
+  const resp = await fetch(
+    `${API_BASE}/sessions/${encodeURIComponent(sessionId)}/run-review-policy`,
+    {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ run_review_policy: runReviewPolicy }),
+    },
+  );
+  if (!resp.ok) {
+    const data = await resp.json().catch(() => ({}));
+    throw new Error(data.detail || `Failed to update Run review policy: ${resp.status}`);
   }
   return resp.json();
 }

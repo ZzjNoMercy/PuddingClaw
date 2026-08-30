@@ -708,6 +708,8 @@ def test_shadow_run_review_persists_report_without_changing_run_outcome(tmp_path
 
     async def fake_after_agent(self, _state, _runtime):
         assert _state["_rubric_criteria"] == ["task_fulfillment"]
+        assert "必须使用简体中文" in self._system_prompt
+        assert "不超过 80 个汉字" in self._system_prompt
         return {
             "_rubric_evaluations": [
                 {
@@ -735,6 +737,137 @@ def test_shadow_run_review_persists_report_without_changing_run_outcome(tmp_path
     assert persisted["outcome"] == RunOutcome.COMPLETED.value
     assert persisted["run_review_report_id"] == report.report_id
     assert sessions.get_harness_state("session-1").get("completion_requests", {}) == {}
+
+
+def test_one_shot_review_recovers_complete_max_iteration_failure_as_needs_revision(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    sessions = _sessions(tmp_path)
+    run = _completed_review_run(sessions)
+    state = {
+        "messages": [HumanMessage(content=run.objective), AIMessage(content="not completed")],
+        "_harness_context": {"todos": [], "final_content": "not completed"},
+    }
+    reviewer = RunReviewOrchestrator(sessions)
+    snapshot, operation = reviewer.prepare(
+        run=run,
+        final_state=state,
+        workspace_fingerprint="workspace-one-shot-gap",
+        policy=RunReviewPolicy.SHADOW,
+    )
+
+    async def fake_after_agent(self, _state, _runtime):
+        return {
+            "_rubric_status": "max_iterations_reached",
+            "_rubric_evaluations": [
+                {
+                    "result": "max_iterations_reached",
+                    "explanation": "The answer did not complete the task.",
+                    "criteria": [
+                        {
+                            "name": "task_fulfillment",
+                            "passed": False,
+                            "gap": "Required output is missing.",
+                        }
+                    ],
+                    "unverified": False,
+                }
+            ],
+        }
+
+    monkeypatch.setattr(RubricMiddleware, "aafter_agent", fake_after_agent)
+    report = asyncio.run(
+        reviewer.execute(
+            run=run,
+            snapshot=snapshot,
+            operation=operation,
+            final_state=state,
+            model=object(),
+            policy=RunReviewPolicy.SHADOW,
+        )
+    )
+
+    assert report.status == VerificationRecordStatus.NEEDS_REVISION
+    assert report.error_kind is None
+    assert report.summary == "验收未通过：本轮回答未完成用户要求的最终交付。"
+    assert "Required output" not in report.summary
+    semantic = next(
+        item
+        for item in sessions.list_verification_records(
+            "session-1", snapshot_id=snapshot.snapshot_id
+        )
+        if item["method"] == VerificationMethod.SEMANTIC_RUBRIC.value
+    )
+    assert semantic["status"] == VerificationRecordStatus.NEEDS_REVISION.value
+    assert semantic["error_kind"] is None
+    assert semantic["criteria"] == [
+        {
+            "criterion_id": "task_fulfillment",
+            "name": "task_fulfillment",
+            "passed": False,
+            "evidence_refs": [],
+            "evidence": [],
+            "gap": "本轮回答未完成用户要求的最终交付。",
+            "failure_kind": None,
+        }
+    ]
+
+
+def test_one_shot_review_does_not_promote_unverified_max_iteration_result(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    sessions = _sessions(tmp_path)
+    run = _completed_review_run(sessions)
+    state = {"messages": [HumanMessage(content=run.objective), AIMessage(content="draft")]}
+    reviewer = RunReviewOrchestrator(sessions)
+    snapshot, operation = reviewer.prepare(
+        run=run,
+        final_state=state,
+        workspace_fingerprint="workspace-one-shot-unverified",
+        policy=RunReviewPolicy.SHADOW,
+    )
+
+    async def fake_after_agent(self, _state, _runtime):
+        return {
+            "_rubric_evaluations": [
+                {
+                    "result": "max_iterations_reached",
+                    "explanation": "Coverage could not be verified.",
+                    "criteria": [
+                        {
+                            "name": "task_fulfillment",
+                            "passed": False,
+                            "gap": "Untrusted partial verdict.",
+                        }
+                    ],
+                    "unverified": True,
+                }
+            ]
+        }
+
+    monkeypatch.setattr(RubricMiddleware, "aafter_agent", fake_after_agent)
+    report = asyncio.run(
+        reviewer.execute(
+            run=run,
+            snapshot=snapshot,
+            operation=operation,
+            final_state=state,
+            model=object(),
+            policy=RunReviewPolicy.SHADOW,
+        )
+    )
+
+    assert report.status == VerificationRecordStatus.GRADER_ERROR
+    semantic = next(
+        item
+        for item in sessions.list_verification_records(
+            "session-1", snapshot_id=snapshot.snapshot_id
+        )
+        if item["method"] == VerificationMethod.SEMANTIC_RUBRIC.value
+    )
+    assert semantic["error_kind"] == "unverified_grader_result"
 
 
 def test_manual_review_runtime_error_is_retryable_without_becoming_protocol_error(
@@ -924,11 +1057,13 @@ def test_completed_review_operation_can_replay_report_without_second_grader(tmp_
         policy=RunReviewPolicy.SHADOW,
     )
     policy = {
-        "version": "ordinary-run-review-deepagents-0.7.11-v1",
+        "version": "ordinary-run-review-deepagents-0.7.11-v2",
         "policy": "shadow",
         "tools": [],
         "max_iterations": 1,
         "manual": False,
+        "output_language": "zh-CN",
+        "gap_style": "single_sentence",
     }
     record = build_verification_record(
         snapshot_id=snapshot.snapshot_id,
