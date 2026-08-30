@@ -1020,12 +1020,15 @@ export default function ChatInput() {
                   title={goalModeEnabled ? "Goal Run 不使用普通 Run 复核" : "普通 Run 质量复核"}
                 >
                   <ShieldCheck className="h-3.5 w-3.5" />
-                  <span className="hidden sm:inline">{selectedRunReviewPolicyLabel}</span>
+                  <span className="hidden sm:inline">复核 · {selectedRunReviewPolicyLabel}</span>
                   <ChevronDown className="h-3.5 w-3.5" />
                 </button>
                 {openPopover === "review-policy" && !goalModeEnabled && (
                   <div role="menu" className="absolute bottom-full left-0 z-50 mb-2 w-64 rounded-2xl border border-black/[0.10] bg-white p-2 shadow-2xl shadow-slate-900/15 animate-fade-in-scale">
-                    <p className="px-3 py-2 text-[11px] text-gray-400">仅对下次普通 Run 生效</p>
+                    <div className="px-3 pb-2 pt-1.5">
+                      <p className="text-[12px] font-semibold text-gray-700">普通 Run 质量复核</p>
+                      <p className="mt-0.5 text-[11px] text-gray-400">仅对下次普通 Run 生效</p>
+                    </div>
                     {([
                       [null, "跟随设置", "使用设置页中的默认策略"],
                       ["off", "关闭复核", "不进行独立质量复核"],
