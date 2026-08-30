@@ -652,6 +652,22 @@ def test_default_agent_thinking_and_rubric_use_flash(tmp_path, monkeypatch):
     assert loaded["harness"]["completion"]["rubric"]["model"] == "deepseek-v4-flash"
 
 
+def test_internal_deepseek_v4_call_explicitly_disables_provider_thinking(
+    tmp_path,
+    monkeypatch,
+):
+    config_path = tmp_path / "config.json"
+    config_path.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(config, "CONFIG_FILE", config_path)
+
+    internal = config.get_fallback_llm_config(thinking_enabled_override=False)
+
+    assert internal["model"] == "deepseek-v4-flash"
+    assert internal["thinking_enabled"] is False
+    assert internal["reasoning_effort"] is None
+    assert internal["extra_body"] == {"thinking": {"type": "disabled"}}
+
+
 def test_empty_llm_wiki_model_overrides_are_not_persisted(tmp_path, monkeypatch):
     config_path = tmp_path / "config.json"
     config_path.write_text("{}", encoding="utf-8")

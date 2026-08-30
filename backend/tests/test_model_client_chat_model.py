@@ -219,7 +219,7 @@ def test_bind_tools_preserves_explicit_non_thinking_mode():
     assert wrapped._client.cfg.get("model") == "deepseek-v4-flash"
     assert wrapped.disable_streaming is True
     assert wrapped._client.cfg.get("reasoning_effort") is None
-    assert wrapped._client.cfg.get("extra_body") is None
+    assert wrapped._client.cfg.get("extra_body") == {"thinking": {"type": "disabled"}}
 
 
 def test_bind_tools_preserves_conversation_model_route_and_thinking_level():

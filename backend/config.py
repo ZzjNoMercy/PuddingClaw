@@ -849,19 +849,27 @@ def get_fallback_llm_config(
     # Conversation models follow their Provider Profile by default. Internal
     # callers such as summaries, titles and rubric checks can still explicitly
     # force reasoning off without reintroducing a global thinking_mode switch.
-    mapped_thinking = (
-        {
+    if thinking_enabled_override is False:
+        resolved_provider = str(resolved.get("provider_id") or "").strip().lower()
+        resolved_model = str(resolved.get("name") or "").strip().lower()
+        mapped_thinking = {
             "thinking_enabled": False,
             "thinking_level": None,
             "reasoning_effort": None,
-            "extra_body": None,
+            # DeepSeek V4 defaults to thinking mode. Omitting the toggle does
+            # not disable it, and thinking mode rejects the tool_choice used
+            # by structured-output graders.
+            "extra_body": (
+                {"thinking": {"type": "disabled"}}
+                if resolved_provider == "deepseek" and resolved_model.startswith("deepseek-v4-")
+                else None
+            ),
         }
-        if thinking_enabled_override is False
-        else map_thinking_request(
+    else:
+        mapped_thinking = map_thinking_request(
             resolved.get("thinking_profile", {}),
             thinking_level,
         )
-    )
     return {
         "provider": resolved.get("provider_id", "deepseek"),
         "model": resolved.get("name") or "deepseek-chat",
