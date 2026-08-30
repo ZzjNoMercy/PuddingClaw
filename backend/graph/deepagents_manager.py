@@ -2339,6 +2339,11 @@ class PuddingClawRubricMiddleware(RubricMiddleware):
             runtime=runtime,
         )
         grading_state = {**effective_state, **(gate_update or {})}
+        grading_state["_rubric_criteria"] = [
+            item.id
+            for item in run.verification_contract.criteria
+            if item.verifier == VerifierKind.LLM_GRADER
+        ]
         self._emit_verification_lifecycle(
             runtime,
             "verification.grader.started",
@@ -2521,6 +2526,11 @@ class PuddingClawRubricMiddleware(RubricMiddleware):
             runtime=runtime,
         )
         grading_state = {**effective_state, **(gate_update or {})}
+        grading_state["_rubric_criteria"] = [
+            item.id
+            for item in run.verification_contract.criteria
+            if item.verifier == VerifierKind.LLM_GRADER
+        ]
         self._emit_verification_lifecycle(
             runtime,
             "verification.grader.started",

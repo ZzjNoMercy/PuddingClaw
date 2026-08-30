@@ -425,10 +425,10 @@ class ModelClient:
 
         thinking_kwargs = self._thinking_kwargs(self.cfg)
         logger.info(
-            "[ModelClient] using direct DeepSeek: role=%s model=%s thinking=%s",
+            "[ModelClient] using direct DeepSeek: role=%s model=%s thinking_enabled=%s",
             self.role,
             self.cfg["model"],
-            bool(thinking_kwargs),
+            bool(self.cfg.get("thinking_enabled", False)),
         )
         if thinking_kwargs:
             logger.info("[ModelClient] thinking kwargs: %s", thinking_kwargs)
@@ -450,11 +450,12 @@ class ModelClient:
 
         thinking_kwargs = self._thinking_kwargs(self.cfg)
         logger.info(
-            "[ModelClient] using direct OpenAI-compatible: role=%s provider=%s model=%s thinking=%s",
+            "[ModelClient] using direct OpenAI-compatible: "
+            "role=%s provider=%s model=%s thinking_enabled=%s",
             self.role,
             self.cfg.get("provider", "openai"),
             self.cfg["model"],
-            bool(thinking_kwargs),
+            bool(self.cfg.get("thinking_enabled", False)),
         )
         if thinking_kwargs:
             logger.info("[ModelClient] thinking kwargs: %s", thinking_kwargs)

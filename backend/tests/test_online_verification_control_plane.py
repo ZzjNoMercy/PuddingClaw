@@ -707,6 +707,7 @@ def test_shadow_run_review_persists_report_without_changing_run_outcome(tmp_path
     )
 
     async def fake_after_agent(self, _state, _runtime):
+        assert _state["_rubric_criteria"] == ["task_fulfillment"]
         return {
             "_rubric_evaluations": [
                 {
@@ -774,6 +775,7 @@ def test_manual_review_runtime_error_is_retryable_without_becoming_protocol_erro
         grader_messages = grader_state["messages"]
         assert all(isinstance(item, BaseMessage) for item in grader_messages)
         assert any(isinstance(item, ToolMessage) for item in grader_messages)
+        assert grader_state["_rubric_criteria"] == ["task_fulfillment"]
         return {
             "_rubric_evaluations": [
                 {
@@ -1027,6 +1029,7 @@ def test_goal_hook_freezes_snapshot_before_sdk_grader_and_persists_proposal(
     def fake_sdk_after_agent(self, state, _runtime):
         snapshot_id = str(state.get("_evaluation_snapshot_id") or "")
         assert sessions.get_evaluation_snapshot("session-1", snapshot_id) is not None
+        assert state["_rubric_criteria"] == ["task_fulfillment"]
         observed["snapshot_id"] = snapshot_id
         return {
             "_rubric_status": "satisfied",

@@ -316,7 +316,14 @@ class RunReviewOrchestrator:
                 },
             )
             update = await middleware.aafter_agent(
-                {"messages": grader_messages, "rubric": run.verification_contract.rubric},
+                {
+                    "messages": grader_messages,
+                    "rubric": run.verification_contract.rubric,
+                    # DeepAgents otherwise invents descriptive names on the
+                    # first pass. Seed the frozen canonical IDs so its public
+                    # payload asks the grader to reuse them verbatim.
+                    "_rubric_criteria": [item.id for item in criteria],
+                },
                 SimpleNamespace(context={"run_id": run.run_id}, stream_writer=None),
             )
             evaluations = update.get("_rubric_evaluations") if isinstance(update, dict) else None
