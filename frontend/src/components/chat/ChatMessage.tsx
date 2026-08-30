@@ -232,7 +232,6 @@ export default function ChatMessage({ message, sessionSources = [], isStreaming 
         ) : (
           /* Assistant message — left-aligned */
           <div>
-            <RunReviewControl message={message} isStreaming={isStreaming} />
             <div className="min-w-0">
               <details open>
                   <summary className="hidden" />
@@ -399,6 +398,8 @@ export default function ChatMessage({ message, sessionSources = [], isStreaming 
               {message.errorNotice ? (
                 <ErrorNotice text={message.errorNotice} />
               ) : null}
+
+              <RunReviewControl message={message} isStreaming={isStreaming} />
 
               {/* Typing indicator — only when nothing else is visible yet */}
               {isStreaming && !message.content && !message.reasoning && !message.timeline?.length ? (
@@ -1924,6 +1925,12 @@ function RunReviewControl({ message, isStreaming }: { message: ChatMessageType; 
     stale: "复核已失效",
   };
   const terminal = status && status !== "pending" && status !== "running";
+  const canRequestReview = !status
+    || status === "stale"
+    || status === "failed"
+    || status === "grader_error"
+    || status === "infrastructure_error";
+  const actionLabel = status ? "重新验证此回答" : "验证此回答";
   const handleReview = async () => {
     if (pending) return;
     setPending(true);
@@ -1937,7 +1944,7 @@ function RunReviewControl({ message, isStreaming }: { message: ChatMessageType; 
   };
 
   return (
-    <div className="mb-2 flex flex-wrap items-center gap-2 pl-1 text-[11px]" data-testid="run-review-control">
+    <div className="mt-2 flex min-h-8 flex-wrap items-center gap-2 pl-1 text-[11px]" data-testid="run-review-control">
       {status ? (
         <span className={`inline-flex items-center gap-1 rounded-full border px-2.5 py-1 ${
           terminal && status === "satisfied"
@@ -1955,16 +1962,17 @@ function RunReviewControl({ message, isStreaming }: { message: ChatMessageType; 
           {report.summary.length > 140 ? `${report.summary.slice(0, 140)}…` : report.summary}
         </span>
       ) : null}
-      {!status || status === "stale" || status === "failed" || status === "grader_error" || status === "infrastructure_error" ? (
+      {canRequestReview ? (
         <button
           type="button"
           onClick={handleReview}
           disabled={pending}
-          className="inline-flex items-center gap-1 rounded-full border border-black/[0.08] bg-white/70 px-2.5 py-1 text-gray-600 transition hover:border-[#002fa7]/20 hover:bg-[#e8edff] hover:text-[#002fa7] disabled:cursor-wait disabled:opacity-60"
-          aria-label="验证此回答"
+          className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-gray-400 transition hover:bg-black/[0.05] hover:text-gray-700 disabled:cursor-wait disabled:opacity-50"
+          aria-label={actionLabel}
+          title={actionLabel}
         >
-          {pending ? <Loader2 className="h-3 w-3 animate-spin" /> : <ShieldCheck className="h-3 w-3" />}
-          {pending ? "正在验证…" : "验证此回答"}
+          {pending ? <Loader2 className="h-4 w-4 animate-spin" /> : <ShieldCheck className="h-4 w-4" />}
+          <span className="sr-only">{pending ? "正在验证" : actionLabel}</span>
         </button>
       ) : null}
     </div>
