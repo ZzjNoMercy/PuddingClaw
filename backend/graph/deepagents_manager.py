@@ -3111,8 +3111,15 @@ class DeepAgentsAgentManager:
         if not isinstance(raw_run, dict):
             raise ValueError(f"Run {run_id} does not exist")
         run = RunRecord.model_validate(raw_run)
-        if run.run_kind != RunKind.STANDALONE or run.goal_id is not None or not run.terminal:
-            raise ValueError("Run review is available only after an ordinary Run completes")
+        if (
+            run.run_kind != RunKind.STANDALONE
+            or run.goal_id is not None
+            or not run.terminal
+            or run.outcome != RunOutcome.COMPLETED
+        ):
+            raise ValueError(
+                "Run review is available only after an ordinary Run completes successfully"
+            )
         harness = session_manager.get_harness_state(session_id)
         force_new_attempt = False
         if run.run_review_report_id:
@@ -9652,9 +9659,10 @@ class DeepAgentsAgentManager:
                     },
                 )
             verification_state = dict(final_state or {})
+            observed_usage_summary = current_usage_summary()
             run_record.model_call_count = max(
                 int(verification_state.get("run_model_call_count") or 0),
-                model_call_index,
+                int(observed_usage_summary.get("rounds") or 0),
             )
             run_record.model_termination = termination_summary or None
             final_usage_summary = current_usage_summary(final_rounds=run_record.model_call_count)

@@ -306,6 +306,68 @@ class FeishuHttpClient:
         except (httpx.HTTPError, ValueError) as exc:
             raise FeishuConnectorError("飞书素材下载失败。") from exc
 
+    async def request_bytes(
+        self,
+        *,
+        api_base_url: str,
+        path: str,
+        headers: dict[str, str] | None = None,
+        max_bytes: int,
+    ) -> tuple[bytes, str, str]:
+        """Download an authenticated OpenAPI binary response with a hard size cap."""
+
+        base = normalize_api_base(api_base_url)
+        if not path.startswith("/open-apis/drive/v1/files/") or not path.endswith("/download"):
+            raise FeishuConnectorError("飞书文件下载路径不受支持。")
+        try:
+            async with httpx.AsyncClient(
+                timeout=self.timeout_seconds,
+                follow_redirects=False,
+                transport=self.transport,
+            ) as client:
+                for attempt in range(3):
+                    retry_delay: float | None = None
+                    async with client.stream("GET", f"{base}{path}", headers=headers or {}) as response:
+                        retryable = response.status_code == 429 or response.status_code >= 500
+                        if retryable and attempt < 2:
+                            try:
+                                retry_delay = min(2.0, max(0.05, float(response.headers.get("retry-after", ""))))
+                            except (TypeError, ValueError):
+                                retry_delay = 0.2 * (2**attempt)
+                            await response.aread()
+                        elif response.status_code >= 400:
+                            message = "飞书云盘文件下载失败。"
+                            try:
+                                payload = json.loads((await response.aread()).decode("utf-8"))
+                                if isinstance(payload, dict):
+                                    message = str(payload.get("msg") or payload.get("error_description") or message)
+                            except (UnicodeDecodeError, ValueError):
+                                pass
+                            raise FeishuConnectorError(message, status_code=response.status_code)
+                        else:
+                            length = response.headers.get("content-length")
+                            if length and int(length) > max_bytes:
+                                raise FeishuConnectorError("飞书云盘文件超过允许的大小上限。")
+                            chunks: list[bytes] = []
+                            size = 0
+                            async for chunk in response.aiter_bytes():
+                                size += len(chunk)
+                                if size > max_bytes:
+                                    raise FeishuConnectorError("飞书云盘文件超过允许的大小上限。")
+                                chunks.append(chunk)
+                            return (
+                                b"".join(chunks),
+                                response.headers.get("content-type", "application/octet-stream").split(";", 1)[0],
+                                response.headers.get("content-disposition", ""),
+                            )
+                    if retry_delay is not None:
+                        await asyncio.sleep(retry_delay)
+        except FeishuConnectorError:
+            raise
+        except (httpx.HTTPError, ValueError) as exc:
+            raise FeishuConnectorError("飞书云盘文件下载失败。") from exc
+        raise FeishuConnectorError("飞书云盘文件下载失败。")
+
 
 @dataclass(frozen=True)
 class _CachedTenantToken:
@@ -806,6 +868,58 @@ class FeishuOpenApi:
             extra_params=extra,
         )
 
+    async def list_drive_files(
+        self,
+        session: AsyncSession,
+        source: KnowledgeSourceConnection,
+        *,
+        folder_token: str = "",
+    ) -> list[dict[str, Any]]:
+        # Empty is an intentional, documented root-directory lookup.
+        extra = {"folder_token": folder_token}
+        return await self._paginate(
+            session,
+            source,
+            "/open-apis/drive/v1/files",
+            item_key="files",
+            page_size=200,
+            extra_params=extra,
+        )
+
+    async def download_drive_file(
+        self,
+        session: AsyncSession,
+        source: KnowledgeSourceConnection,
+        *,
+        file_token: str,
+        max_bytes: int = 200 * 1024 * 1024,
+    ) -> tuple[bytes, str, str]:
+        if not re.fullmatch(r"[A-Za-z0-9_-]{4,220}", file_token):
+            raise FeishuConnectorError("飞书云盘文件标识格式不正确。")
+        app, grant = await self._binding(session, source)
+        token = await self._token(session, app, grant, force_refresh=False)
+        path = f"/open-apis/drive/v1/files/{file_token}/download"
+        for attempt in range(2):
+            try:
+                return await self.http_client.request_bytes(
+                    api_base_url=app.api_base_url,
+                    path=path,
+                    headers={"Authorization": f"Bearer {token}"},
+                    max_bytes=max_bytes,
+                )
+            except FeishuConnectorError as exc:
+                invalid_token = exc.status_code == 401 or exc.code in self._INVALID_TOKEN_CODES
+                if not invalid_token:
+                    raise
+                if attempt:
+                    if grant is not None:
+                        grant.status = "needs_reauth"
+                    source.status = "needs_reauth"
+                    await session.commit()
+                    raise
+                token = await self._token(session, app, grant, force_refresh=True)
+        raise FeishuConnectorError("飞书身份凭据不可用。")
+
     async def get_node(
         self,
         session: AsyncSession,
@@ -1047,7 +1161,9 @@ class FeishuOpenApi:
             items.extend(item for item in page_items if isinstance(item, dict))
             if not data.get("has_more"):
                 return items
-            next_token = str(data.get("page_token") or "")
+            # Most Feishu list APIs return ``page_token`` while Drive files.list
+            # documents the continuation field as ``next_page_token``.
+            next_token = str(data.get("page_token") or data.get("next_page_token") or "")
             if not next_token or next_token in seen_tokens:
                 raise FeishuConnectorError("飞书分页游标异常，同步已停止以避免无限循环。")
             seen_tokens.add(next_token)

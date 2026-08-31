@@ -84,3 +84,14 @@ def test_run_usage_accepts_langchain_message_metadata_directly():
     assert summary["cache_hit_rate"] == 75.0
     assert summary["reasoning_tokens"] == 25
     assert summary["last_model_tokens_per_second"] == 400.0
+
+
+def test_default_rounds_count_only_main_agent_provider_calls():
+    usage = RunUsageAccumulator()
+    usage.add_model_event({"call_id": "agent-1", "role": "agent", "measured": False})
+    usage.add_model_event({"call_id": "grader-1", "role": "rubric", "measured": False})
+
+    summary = usage.summary(run_id="run-1", query_id="query-1")
+
+    assert summary["rounds"] == 1
+    assert summary["observed_calls"] == 2

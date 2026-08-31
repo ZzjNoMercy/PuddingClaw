@@ -26,7 +26,7 @@ test("normalizes and formats the provider-backed footer without cost", () => {
   assert.ok(summary);
   assert.equal(
     formatUsageSummary(summary),
-    "2 轮 · 8 步  |  上轮 1.6s · 361 tok/s  |  缓存命中 80%  |  输入 48.1K · 输出 2.7K",
+    "2 次模型调用 · 8 步  |  上轮 1.6s · 361 tok/s  |  缓存命中 80%  |  输入 48.1K · 输出 2.7K",
   );
   assert.equal(formatUsageSummary(summary).includes("$"), false);
 });
@@ -58,4 +58,17 @@ test("merges multiple Runs that the Goal history renders as one assistant turn",
   assert.equal(merged.rounds, 3);
   assert.equal(merged.steps, 6);
   assert.equal(merged.cacheHitRate, 50);
+});
+
+test("formats observed calls instead of an internal Goal retry ceiling", () => {
+  const summary = normalizeUsageSummary({
+    rounds: 20,
+    tool_calls: 19,
+    steps: 39,
+    observed_calls: 11,
+    measured: false,
+  });
+
+  assert.ok(summary);
+  assert.equal(formatUsageSummary(summary), "11 次模型调用 · 30 步");
 });

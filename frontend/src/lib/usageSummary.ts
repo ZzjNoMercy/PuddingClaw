@@ -120,7 +120,14 @@ function durationSeconds(milliseconds: number): string {
 
 export function formatUsageSummary(summary: UsageSummary): string {
   const groups: string[] = [];
-  groups.push(`${compactNumber(summary.rounds)} 轮 · ${compactNumber(summary.steps)} 步`);
+  // `rounds` can contain an internal Goal retry ceiling.  The footer reports
+  // observed model calls and actual tool work instead of surfacing that limit
+  // as if it were executed work.
+  const modelCalls = summary.observedCalls || summary.rounds;
+  const observedSteps = modelCalls + summary.toolCalls;
+  groups.push(
+    `${compactNumber(modelCalls)} 次模型调用 · ${compactNumber(observedSteps)} 步`,
+  );
   if (summary.lastModelDurationMs !== undefined) {
     let lastModel = `上轮 ${durationSeconds(summary.lastModelDurationMs)}`;
     if (summary.lastModelTokensPerSecond !== undefined) {

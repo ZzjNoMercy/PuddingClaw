@@ -117,6 +117,16 @@ export interface FeishuWikiNode {
   has_child?: boolean;
 }
 
+export interface FeishuDriveItem {
+  token: string;
+  name: string;
+  type: string;
+  parent_token?: string;
+  url?: string;
+  created_time?: string;
+  modified_time?: string;
+}
+
 export interface FeishuBitableReference {
   original_url: string;
   entry_kind: "direct_bitable" | "wiki_bitable";
@@ -343,6 +353,32 @@ export async function configureFeishuScope(sourceId: string, input: {
 }): Promise<KnowledgeSource> {
   return (await requestJson<{ source: KnowledgeSource }>(
     `/feishu/sources/${encodeURIComponent(sourceId)}/scope`,
+    { method: "PUT", body: JSON.stringify(input) },
+  )).source;
+}
+
+export async function listFeishuDriveFiles(
+  sourceId: string,
+  folderToken = "",
+): Promise<FeishuDriveItem[]> {
+  const params = new URLSearchParams();
+  if (folderToken) params.set("folder_token", folderToken);
+  const suffix = params.size ? `?${params.toString()}` : "";
+  return (await requestJson<{ items: FeishuDriveItem[] }>(
+    `/feishu/sources/${encodeURIComponent(sourceId)}/drive/files${suffix}`,
+  )).items;
+}
+
+export async function configureFeishuDriveScope(sourceId: string, input: {
+  folder_token?: string;
+  folder_name?: string;
+  source_url?: string;
+  publish_vector?: boolean;
+  interval_minutes?: number;
+  parser_id?: string;
+}): Promise<KnowledgeSource> {
+  return (await requestJson<{ source: KnowledgeSource }>(
+    `/feishu/sources/${encodeURIComponent(sourceId)}/drive/scope`,
     { method: "PUT", body: JSON.stringify(input) },
   )).source;
 }

@@ -309,6 +309,14 @@ export interface RunReviewStatusResponse {
   report?: RunReviewReport;
 }
 
+export interface RunReviewVerificationOperation {
+  operation_id: string;
+  snapshot_id: string;
+  method: "deterministic" | "environment" | "semantic_rubric";
+  status: "pending" | "running" | "completed";
+  attempt_no?: number;
+}
+
 export interface HarnessRun {
   run_id: string;
   query_id: string;
@@ -404,6 +412,7 @@ export interface SessionHarnessState {
   active_goal_id?: string | null;
   run_review_reports?: Record<string, RunReviewReport>;
   verification_records?: Record<string, RunReviewVerificationRecord>;
+  verification_operations?: Record<string, RunReviewVerificationOperation>;
 }
 
 export interface ToolContextJobStatus {
@@ -1084,8 +1093,8 @@ export interface TableAssetProfileJob {
 
 export interface KnowledgeDatabaseSource {
   id: string;
-  type: "postgresql" | string;
-  source_type?: "postgresql" | string;
+  type: "postgresql" | "mysql" | string;
+  source_type?: "postgresql" | "mysql" | string;
   name: string;
   description?: string;
   host: string;

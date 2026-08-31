@@ -6042,6 +6042,7 @@ function DatabaseSourceCard({
   onRemove: (source: KnowledgeDatabaseSource) => void;
 }) {
   const tableCount = source.selected_tables?.length ?? 0;
+  const isMySql = (source.source_type || source.type) === "mysql";
   return (
     <article className="rounded-3xl border border-black/[0.06] bg-white px-4 py-4 shadow-sm transition hover:border-[#002fa7]/20 hover:bg-[#002fa7]/[0.015]">
       <div className="flex items-start justify-between gap-4">
@@ -6052,7 +6053,7 @@ function DatabaseSourceCard({
               {source.name}
             </h3>
             <span className="rounded-full bg-[#002fa7]/10 px-2.5 py-1 text-xs font-medium text-[#002fa7]">
-              PostgreSQL
+              {(source.source_type || source.type) === "mysql" ? "MySQL" : "PostgreSQL"}
             </span>
             {source.builtin ? (
               <span className="rounded-full bg-emerald-50 px-2.5 py-1 text-xs font-medium text-emerald-700">
@@ -6096,19 +6097,20 @@ function DatabaseSourceCard({
         <div className="mt-4 rounded-2xl bg-gray-50 p-2">
           <div className="mb-2 flex items-center justify-between px-1">
             <p className="text-[11px] font-semibold uppercase tracking-wide text-gray-400">已选数据库表</p>
-            <span className="text-[11px] text-gray-400">Vanna 按表训练</span>
+            <span className="text-[11px] text-gray-400">{isMySql ? "实时只读" : "Vanna 按表训练"}</span>
           </div>
           <div className="grid gap-2 sm:grid-cols-2">
             {(source.selected_tables ?? []).map((table) => (
               <button
                 key={table}
                 type="button"
-                onClick={() => onTrainTable(source, table)}
-                className="flex min-w-0 items-center justify-between gap-3 rounded-xl bg-white px-3 py-2 text-left text-xs shadow-sm ring-1 ring-black/[0.04] transition hover:bg-[#002fa7]/[0.035] hover:ring-[#002fa7]/15"
+                onClick={() => !isMySql && onTrainTable(source, table)}
+                disabled={isMySql}
+                className="flex min-w-0 items-center justify-between gap-3 rounded-xl bg-white px-3 py-2 text-left text-xs shadow-sm ring-1 ring-black/[0.04] transition hover:bg-[#002fa7]/[0.035] hover:ring-[#002fa7]/15 disabled:cursor-default"
                 title={table}
               >
                 <span className="min-w-0 truncate font-medium text-gray-800">{table}</span>
-                <span className="shrink-0 rounded-full bg-[#002fa7]/10 px-2 py-0.5 font-semibold text-[#002fa7]">训练</span>
+                <span className="shrink-0 rounded-full bg-[#002fa7]/10 px-2 py-0.5 font-semibold text-[#002fa7]">{isMySql ? "可查询" : "训练"}</span>
               </button>
             ))}
           </div>
@@ -7478,6 +7480,7 @@ function DatabaseSourceModal({
   onSave: () => void;
 }) {
   const isProjectDefault = draft.id === "project_postgres";
+  const databaseType = (draft.source_type || draft.type) === "mysql" ? "mysql" : "postgresql";
 
   return (
     <div className="fixed inset-0 z-[120] flex items-center justify-center bg-black/35 px-4 py-6 backdrop-blur-sm">
@@ -7501,11 +7504,18 @@ function DatabaseSourceModal({
           <div className="grid gap-4 md:grid-cols-2">
             <label className="space-y-1.5">
               <span className="text-xs font-semibold text-gray-500">类型</span>
-              <input
-                value="PostgreSQL"
-                readOnly
-                className="h-11 w-full rounded-2xl border border-black/[0.08] bg-gray-50 px-4 text-sm text-gray-500 outline-none"
-              />
+              <select
+                value={databaseType}
+                disabled={isProjectDefault || Boolean(draft.id)}
+                onChange={(event) => {
+                  const nextType = event.target.value === "mysql" ? "mysql" : "postgresql";
+                  onUpdate({ type: nextType, source_type: nextType, port: nextType === "mysql" ? 3306 : 5432 });
+                }}
+                className="h-11 w-full rounded-2xl border border-black/[0.08] bg-white px-4 text-sm outline-none disabled:bg-gray-50 disabled:text-gray-500"
+              >
+                <option value="postgresql">PostgreSQL</option>
+                <option value="mysql">MySQL</option>
+              </select>
             </label>
             <label className="space-y-1.5">
               <span className="text-xs font-semibold text-gray-500">显示名称</span>
@@ -7540,7 +7550,7 @@ function DatabaseSourceModal({
                 type="number"
                 value={draft.port}
                 disabled={isProjectDefault}
-                onChange={(event) => onUpdate({ port: Number(event.target.value) || 5432 })}
+                onChange={(event) => onUpdate({ port: Number(event.target.value) || (databaseType === "mysql" ? 3306 : 5432) })}
                 className="h-11 w-full rounded-2xl border border-black/[0.08] bg-white px-4 text-sm outline-none transition disabled:bg-gray-50 disabled:text-gray-400 focus:border-[#002fa7]/40 focus:ring-4 focus:ring-[#002fa7]/[0.08]"
               />
             </label>

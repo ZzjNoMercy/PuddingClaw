@@ -16,12 +16,14 @@ import {
   RotateCcw,
   Search,
   Settings2,
+  Trash2,
   Unplug,
   X,
 } from "lucide-react";
 
 import FeishuConnectionWizard from "@/components/knowledge/FeishuConnectionWizard";
 import FeishuBitableDetailModal from "@/components/knowledge/FeishuBitableDetailModal";
+import DatabaseConnectionWizard, { type DatabaseConnectorType } from "@/components/knowledge/DatabaseConnectionWizard";
 import DocumentDetailModal, { type SourceKind } from "@/components/knowledge/DocumentDetailModal";
 import KnowledgeWorkspaceHeader from "@/components/knowledge/KnowledgeWorkspaceHeader";
 import KnowledgeWorkspaceNav from "@/components/knowledge/KnowledgeWorkspaceNav";
@@ -30,12 +32,15 @@ import ResizeHandle from "@/components/layout/ResizeHandle";
 import Sidebar from "@/components/layout/Sidebar";
 import {
   commitKnowledgeImportSource,
+  deleteKnowledgeDatabaseSource,
+  listKnowledgeDatabaseSources,
   listKnowledgeDocuments,
   listReadLaterItems,
   saveReadLaterUrl,
   stageKnowledgeImportSource,
   type DocumentParserStatus,
   type KnowledgeDocument,
+  type KnowledgeDatabaseSource,
   type ReadLaterItem,
   type StagedKnowledgeSource,
 } from "@/lib/api";
@@ -102,22 +107,34 @@ function SourceMark({ kind }: { kind: KnowledgeSource["connector_key"] }) {
   return <img src={src} alt={alt} className="h-11 w-11 rounded-2xl border border-black/[0.06] bg-white object-cover shadow-sm" />;
 }
 
-function SourceList({ sources, selectedId, onSelect, onAdd }: {
+function DatabaseSourceMark({ sourceType }: { sourceType: string }) {
+  return (
+    <span className="grid h-11 w-11 shrink-0 place-items-center rounded-2xl border border-black/[0.06] bg-white text-[#002fa7] shadow-sm">
+      <span className="text-[10px] font-extrabold tracking-tight">{sourceType === "mysql" ? "MY" : "PG"}</span>
+    </span>
+  );
+}
+
+function SourceList({ sources, databaseSources, selectedId, selectedDatabaseId, onSelect, onSelectDatabase, onAdd }: {
   sources: KnowledgeSource[];
+  databaseSources: KnowledgeDatabaseSource[];
   selectedId: string;
+  selectedDatabaseId: string;
   onSelect: (id: string) => void;
+  onSelectDatabase: (id: string) => void;
   onAdd: () => void;
 }) {
+  const total = sources.length + databaseSources.length;
   return (
     <section className="overflow-hidden rounded-3xl border border-black/[0.06] bg-white shadow-sm">
       <div className="flex h-[72px] items-center justify-between border-b border-black/[0.055] px-5">
-        <div><h2 className="text-sm font-semibold text-gray-950">已连接来源</h2><p className="mt-0.5 text-[11px] text-gray-400">{sources.length} 个来源</p></div>
+        <div><h2 className="text-sm font-semibold text-gray-950">已连接来源</h2><p className="mt-0.5 text-[11px] text-gray-400">{total} 个来源</p></div>
         <button type="button" onClick={onAdd} className="grid h-8 w-8 place-items-center rounded-xl bg-[#002fa7]/[0.06] text-[#002fa7] hover:bg-[#002fa7]/10" aria-label="添加来源"><Plus className="h-4 w-4" /></button>
       </div>
       <div className="space-y-1 p-2">
         {sources.map((source) => {
           const status = statusView(source.status);
-          const subtitle = source.connector_key === "local_upload" ? "PDF、Markdown 与 Office 文件" : source.connector_key === "web_capture" ? "稍后读与网页正文" : `${source.auth_type === "user" ? "用户身份" : "应用身份"} · ${source.item_count || 0} 项`;
+          const subtitle = source.connector_key === "local_upload" ? "PDF、Markdown 与 Office 文件" : source.connector_key === "web_capture" ? "稍后读与网页正文" : `飞书 · ${source.auth_type === "user" ? "用户身份" : "应用身份"} · ${source.item_count || 0} 项`;
           return (
             <button type="button" key={source.id} onClick={() => onSelect(source.id)} className={`flex w-full items-center gap-3 rounded-2xl border px-3 py-3 text-left transition ${selectedId === source.id ? "border-[#002fa7]/15 bg-[#002fa7]/[0.055]" : "border-transparent hover:bg-gray-50"}`}>
               <SourceMark kind={source.connector_key} />
@@ -126,12 +143,22 @@ function SourceList({ sources, selectedId, onSelect, onAdd }: {
             </button>
           );
         })}
+        {databaseSources.map((source) => {
+          const sourceType = source.source_type || source.type;
+          return (
+            <button type="button" key={`database:${source.id}`} onClick={() => onSelectDatabase(source.id)} className={`flex w-full items-center gap-3 rounded-2xl border px-3 py-3 text-left transition ${selectedDatabaseId === source.id ? "border-[#002fa7]/15 bg-[#002fa7]/[0.055]" : "border-transparent hover:bg-gray-50"}`}>
+              <DatabaseSourceMark sourceType={sourceType} />
+              <span className="min-w-0 flex-1"><span className="block truncate text-sm font-semibold text-gray-900">{source.name}</span><span className="mt-0.5 block truncate text-[11px] text-gray-400">{sourceType === "mysql" ? "MySQL" : "PostgreSQL"} · {source.selected_tables.length} 张表</span></span>
+              <span className={`h-2.5 w-2.5 shrink-0 rounded-full ${source.password_readable === false ? "bg-amber-500" : "bg-emerald-500"}`} />
+            </button>
+          );
+        })}
       </div>
     </section>
   );
 }
 
-function ConnectorPicker({ open, onClose, onPickFeishu }: { open: boolean; onClose: () => void; onPickFeishu: () => void }) {
+function ConnectorPicker({ open, onClose, onPickFeishu, onPickDatabase }: { open: boolean; onClose: () => void; onPickFeishu: () => void; onPickDatabase: (sourceType: DatabaseConnectorType) => void }) {
   if (!open) return null;
   return (
     <div className="fixed inset-0 z-[110] grid place-items-center bg-slate-950/30 p-4 backdrop-blur-[2px]" role="dialog" aria-modal="true" aria-label="添加资料来源">
@@ -144,11 +171,17 @@ function ConnectorPicker({ open, onClose, onPickFeishu }: { open: boolean; onClo
           <button type="button" onClick={onPickFeishu} className="flex w-full items-center gap-4 rounded-2xl border border-black/[0.07] p-4 text-left transition hover:border-[#002fa7]/25 hover:bg-[#002fa7]/[0.03]">
             <img src="/brands/feishu-logo.svg" alt="飞书" className="h-11 w-11 shrink-0 rounded-2xl border border-black/[0.06] object-cover" />
             <span className="min-w-0 flex-1">
-              <span className="block text-sm font-semibold text-gray-900">飞书 Wiki / 多维表格</span>
-              <span className="mt-0.5 block text-xs leading-5 text-gray-500">同步 Wiki 文档，或登记 Bitable 供 Agent 实时只读查询。</span>
+              <span className="block text-sm font-semibold text-gray-900">飞书 Wiki / 云盘 / 多维表格</span>
+              <span className="mt-0.5 block text-xs leading-5 text-gray-500">同步 Wiki 或云盘文件夹，或登记 Bitable 供 Agent 实时只读查询。</span>
             </span>
             <ChevronRight className="h-4 w-4 shrink-0 text-gray-300" />
           </button>
+          <div className="grid gap-3 sm:grid-cols-2">
+            {(["postgresql", "mysql"] as DatabaseConnectorType[]).map((sourceType) => {
+              const label = sourceType === "mysql" ? "MySQL" : "PostgreSQL";
+              return <button type="button" key={sourceType} onClick={() => onPickDatabase(sourceType)} className="flex items-center gap-3 rounded-2xl border border-black/[0.07] p-4 text-left transition hover:border-[#002fa7]/25 hover:bg-[#002fa7]/[0.03]"><DatabaseSourceMark sourceType={sourceType} /><span><span className="block text-sm font-semibold text-gray-900">{label}</span><span className="mt-0.5 block text-xs text-gray-500">实时只读数据库</span></span></button>;
+            })}
+          </div>
           <div className="rounded-2xl border border-dashed border-black/[0.08] px-4 py-5 text-center text-xs text-gray-400">更多 Connector（Notion、语雀等）即将上线</div>
         </div>
       </div>
@@ -379,6 +412,7 @@ function FeishuPanel({ source, items, runs, onChanged, onReconnect, onOpenDoc, o
   const [notice, setNotice] = useState("");
   const status = statusView(source.status);
   const isBitable = source.config.source_mode === "bitable";
+  const isDrive = source.config.source_mode === "drive";
 
   async function sync(mode: "incremental" | "full_scan" | "reindex") {
     setBusyMode(mode);
@@ -412,7 +446,9 @@ function FeishuPanel({ source, items, runs, onChanged, onReconnect, onOpenDoc, o
   const lastRun = runs[0];
   const scopeLabel = isBitable
     ? `多维表格实时读取 · ${String(source.config.table_name || source.config.table_id || "尚未选择数据表")}`
-    : typeof source.config.space_id === "string" ? `${source.config.space_id}${source.config.root_node_token ? " / 指定根节点" : " / 整个空间"}` : "尚未选择同步范围";
+    : isDrive
+      ? `云盘范围 · ${String(source.config.folder_name || source.config.folder_token || "我的云盘")}`
+      : typeof source.config.space_id === "string" ? `${source.config.space_id}${source.config.root_node_token ? " / 指定根节点" : " / 整个空间"}` : "尚未选择同步范围";
   return (
     <div className="space-y-5">
       <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between"><div><div className="flex items-center gap-2"><span className={`h-2.5 w-2.5 rounded-full ${status.className}`} /><span className="text-xs font-semibold text-gray-600">{status.label}</span><span className="rounded-full bg-blue-50 px-2 py-1 text-[10px] font-semibold text-blue-700">{source.auth_type === "user" ? "用户身份" : "应用身份"}</span>{isBitable ? <span className="rounded-full bg-violet-50 px-2 py-1 text-[10px] font-semibold text-violet-700">不保存行数据</span> : null}</div><p className="mt-2 text-xs leading-5 text-gray-400">{scopeLabel}</p></div><div className="flex flex-wrap gap-2"><button type="button" onClick={onReconnect} className="inline-flex h-9 items-center gap-2 rounded-xl border border-black/10 px-3 text-xs font-semibold text-gray-700"><Settings2 className="h-3.5 w-3.5" />编辑连接</button>{lastRun && ["queued", "running"].includes(lastRun.status) ? <button type="button" disabled={!!busyMode} onClick={() => void cancel()} className="inline-flex h-9 items-center gap-2 rounded-xl border border-red-200 px-3 text-xs font-semibold text-red-600 disabled:opacity-40">取消同步</button> : isBitable ? <button type="button" disabled={!!busyMode || !["ready", "error"].includes(source.status)} onClick={() => void sync("incremental")} className="inline-flex h-9 items-center gap-2 rounded-xl bg-[#002fa7] px-3.5 text-xs font-semibold text-white disabled:opacity-40"><RefreshCw className={`h-3.5 w-3.5 ${busyMode === "incremental" ? "animate-spin" : ""}`} />刷新字段 Schema</button> : <><button type="button" disabled={!!busyMode || !["ready", "error"].includes(source.status)} onClick={() => void sync("reindex")} className="inline-flex h-9 items-center gap-2 rounded-xl border border-black/10 px-3 text-xs font-semibold text-gray-700 disabled:opacity-40">重建索引</button><button type="button" disabled={!!busyMode || !["ready", "error"].includes(source.status)} onClick={() => void sync("full_scan")} className="inline-flex h-9 items-center gap-2 rounded-xl border border-black/10 px-3 text-xs font-semibold text-gray-700 disabled:opacity-40"><RotateCcw className={`h-3.5 w-3.5 ${busyMode === "full_scan" ? "animate-spin" : ""}`} />完整扫描</button><button type="button" disabled={!!busyMode || !["ready", "error"].includes(source.status)} onClick={() => void sync("incremental")} className="inline-flex h-9 items-center gap-2 rounded-xl bg-[#002fa7] px-3.5 text-xs font-semibold text-white disabled:opacity-40"><RefreshCw className={`h-3.5 w-3.5 ${busyMode === "incremental" ? "animate-spin" : ""}`} />立即同步</button></>}</div></div>
@@ -420,7 +456,26 @@ function FeishuPanel({ source, items, runs, onChanged, onReconnect, onOpenDoc, o
       <div className="grid grid-cols-2 gap-3 lg:grid-cols-4"><Metric label={isBitable ? "已登记数据表" : "内容条目"} value={source.item_count || items.length} /><Metric label={isBitable ? "Schema 状态" : "同步状态"} value={lastRun ? statusView(lastRun.status).label : "尚未运行"} hint={lastRun?.current_step} /><Metric label={isBitable ? "上次探测" : "上次同步"} value={relativeTime(source.last_synced_at)} /><Metric label="失败条目" value={lastRun?.stats.failed || 0} /></div>
       {lastRun ? <div className="grid grid-cols-2 gap-px overflow-hidden rounded-2xl border border-black/[0.06] bg-black/[0.06] sm:grid-cols-5">{(isBitable ? [["数据表", lastRun.stats.discovered || 0], ["实时关联", lastRun.stats.linked || 0], ["Schema 更新", lastRun.stats.schema_changed || 0], ["行数据落库", 0], ["失败", lastRun.stats.failed || 0]] : [["发现", lastRun.stats.discovered || 0], ["更新", lastRun.stats.changed || 0], ["跳过", lastRun.stats.unchanged || 0], ["删除", lastRun.stats.deleted || 0], ["失败", lastRun.stats.failed || 0]]).map(([label, value]) => <div key={String(label)} className="bg-white px-4 py-3"><div className="text-[10px] text-gray-400">{label}</div><div className="mt-1 text-base font-semibold text-gray-900">{value}</div></div>)}</div> : null}
       {source.last_error && Object.keys(source.last_error).length ? <div className="flex gap-3 rounded-2xl bg-red-50 p-4 text-xs leading-5 text-red-700"><AlertCircle className="mt-0.5 h-4 w-4 shrink-0" /><span>{String(source.last_error.message || source.last_error.detail || "最近一次同步出现错误。")}</span></div> : null}
-      <RecentItems items={items} empty={isBitable ? "保存连接后会登记数据表与字段 Schema，不会复制记录正文。" : "完成首次同步后，飞书文档会出现在这里。"} onOpen={onOpenDoc} onOpenBitable={onOpenBitable} />
+      <RecentItems items={items} empty={isBitable ? "保存连接后会登记数据表与字段 Schema，不会复制记录正文。" : isDrive ? "完成首次同步后，云盘文件会出现在这里。" : "完成首次同步后，飞书文档会出现在这里。"} onOpen={onOpenDoc} onOpenBitable={onOpenBitable} />
+    </div>
+  );
+}
+
+function DatabaseSourcePanel({ source, onEdit, onDelete }: { source: KnowledgeDatabaseSource; onEdit: () => void; onDelete: () => void }) {
+  const sourceType = source.source_type || source.type;
+  const label = sourceType === "mysql" ? "MySQL" : "PostgreSQL";
+  return (
+    <div className="space-y-5">
+      <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
+        <div>
+          <div className="flex items-center gap-2"><span className={`h-2.5 w-2.5 rounded-full ${source.password_readable === false ? "bg-amber-500" : "bg-emerald-500"}`} /><span className="text-xs font-semibold text-gray-600">{source.password_readable === false ? "凭据需更新" : "实时连接"}</span><span className="rounded-full bg-blue-50 px-2 py-1 text-[10px] font-semibold text-blue-700">{label}</span>{source.builtin ? <span className="rounded-full bg-emerald-50 px-2 py-1 text-[10px] font-semibold text-emerald-700">项目默认</span> : null}</div>
+          <p className="mt-2 break-all text-xs leading-5 text-gray-400">{source.username}@{source.host}:{source.port}/{source.database}</p>
+        </div>
+        <div className="flex gap-2"><button type="button" onClick={onEdit} className="inline-flex h-9 items-center gap-2 rounded-xl border border-black/10 px-3 text-xs font-semibold text-gray-700"><Settings2 className="h-3.5 w-3.5" />编辑连接</button>{!source.builtin ? <button type="button" onClick={onDelete} className="inline-flex h-9 items-center gap-2 rounded-xl border border-red-100 px-3 text-xs font-semibold text-red-600"><Trash2 className="h-3.5 w-3.5" />移除</button> : null}</div>
+      </div>
+      <div className="grid grid-cols-2 gap-3 lg:grid-cols-4"><Metric label="Connector" value={label} /><Metric label="授权数据表" value={source.selected_tables.length} /><Metric label="行数据" value="不落库" hint="查询时实时读取" /><Metric label="凭据" value={source.password_configured || source.builtin ? "已托管" : "未配置"} hint="Owner-scoped Vault" /></div>
+      <div className="rounded-2xl border border-black/[0.06] bg-gray-50/60 p-4"><h3 className="text-sm font-semibold text-gray-900">数据访问边界</h3><p className="mt-1 text-xs leading-5 text-gray-500">只有下列已授权表会暴露给智能问数。删除此连接只移除平台配置，不会修改外部数据库。</p><div className="mt-3 flex flex-wrap gap-2">{source.selected_tables.length ? source.selected_tables.map((table) => <span key={table} className="rounded-lg bg-white px-2.5 py-1.5 font-mono text-[11px] text-gray-600 ring-1 ring-black/[0.05]">{table}</span>) : <span className="text-xs text-amber-700">尚未选择数据表，请编辑连接并读取表目录。</span>}</div></div>
+      {source.description ? <div className="rounded-2xl bg-blue-50/60 px-4 py-3 text-xs leading-5 text-blue-800">{source.description}</div> : null}
     </div>
   );
 }
@@ -429,20 +484,26 @@ export default function KnowledgeSourcesPage() {
   const { sidebarOpen, toggleSidebar, sidebarWidth, setSidebarWidth } = useApp();
   const [mounted, setMounted] = useState(false);
   const [sources, setSources] = useState<KnowledgeSource[]>([]);
+  const [databaseSources, setDatabaseSources] = useState<KnowledgeDatabaseSource[]>([]);
   const [documents, setDocuments] = useState<KnowledgeDocument[]>([]);
   const [selectedId, setSelectedId] = useState("");
+  const [selectedDatabaseId, setSelectedDatabaseId] = useState("");
   const [items, setItems] = useState<KnowledgeSourceItem[]>([]);
   const [runs, setRuns] = useState<KnowledgeSyncRun[]>([]);
   const [loading, setLoading] = useState(true);
   const [wizardOpen, setWizardOpen] = useState(false);
   const [pickerOpen, setPickerOpen] = useState(false);
   const [reconnectSource, setReconnectSource] = useState<KnowledgeSource | null>(null);
+  const [databaseWizardOpen, setDatabaseWizardOpen] = useState(false);
+  const [databaseConnectorType, setDatabaseConnectorType] = useState<DatabaseConnectorType>("postgresql");
+  const [editingDatabaseSource, setEditingDatabaseSource] = useState<KnowledgeDatabaseSource | null>(null);
   const [notice, setNotice] = useState("");
   const [detail, setDetail] = useState<{ doc: KnowledgeDocument; kind: SourceKind; sourceName: string } | null>(null);
   const [bitableDetail, setBitableDetail] = useState<{ item: KnowledgeSourceItem; source: KnowledgeSource } | null>(null);
 
   useEffect(() => setMounted(true), []);
   const selected = useMemo(() => sources.find((source) => source.id === selectedId) || sources[0] || null, [selectedId, sources]);
+  const selectedDatabase = useMemo(() => databaseSources.find((source) => source.id === selectedDatabaseId) || null, [databaseSources, selectedDatabaseId]);
   const docById = useMemo(() => new Map(documents.map((doc) => [doc.id, doc])), [documents]);
 
   const openDocument = useCallback((source: KnowledgeSource, documentId: string | null) => {
@@ -455,17 +516,19 @@ export default function KnowledgeSourcesPage() {
 
   const refreshSources = useCallback(async () => {
     try {
-      const [next, nextDocuments] = await Promise.all([listKnowledgeSources(), listKnowledgeDocuments()]);
+      const [next, nextDocuments, nextDatabaseSources] = await Promise.all([listKnowledgeSources(), listKnowledgeDocuments(), listKnowledgeDatabaseSources()]);
       setSources(next);
       setDocuments(nextDocuments);
-      setSelectedId((current) => next.some((source) => source.id === current) ? current : next[0]?.id || "");
+      setDatabaseSources(nextDatabaseSources);
+      setSelectedDatabaseId((current) => nextDatabaseSources.some((source) => source.id === current) ? current : "");
+      setSelectedId((current) => current && next.some((source) => source.id === current) ? current : (selectedDatabaseId ? "" : next[0]?.id || ""));
       setNotice("");
     } catch (error) {
       setNotice(messageOf(error));
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [selectedDatabaseId]);
 
   const refreshSelected = useCallback(async () => {
     if (!selectedId) return;
@@ -488,12 +551,40 @@ export default function KnowledgeSourcesPage() {
     return () => window.clearInterval(timer);
   }, [refreshSelected, refreshSources]);
 
-  const readyCount = sources.filter((source) => source.status === "ready").length;
+  const readyCount = sources.filter((source) => source.status === "ready").length + databaseSources.filter((source) => source.password_readable !== false).length;
   const totalItems = sources.reduce((sum, source) => sum + (source.item_count || 0), 0);
   const lastSynced = sources.map((source) => source.last_synced_at).filter(Boolean).sort().at(-1) || null;
 
   async function changed() {
     await Promise.all([refreshSources(), refreshSelected()]);
+  }
+
+  function selectConnectorSource(id: string) {
+    setSelectedDatabaseId("");
+    setSelectedId(id);
+  }
+
+  function selectDatabaseSource(id: string) {
+    setSelectedId("");
+    setSelectedDatabaseId(id);
+  }
+
+  function openDatabaseWizard(sourceType: DatabaseConnectorType, source: KnowledgeDatabaseSource | null = null) {
+    setPickerOpen(false);
+    setDatabaseConnectorType(sourceType);
+    setEditingDatabaseSource(source);
+    setDatabaseWizardOpen(true);
+  }
+
+  async function removeDatabaseSource(source: KnowledgeDatabaseSource) {
+    if (!window.confirm(`移除数据源“${source.name}”？外部数据库不会被修改。`)) return;
+    try {
+      await deleteKnowledgeDatabaseSource(source.id);
+      setSelectedDatabaseId("");
+      await refreshSources();
+    } catch (error) {
+      setNotice(messageOf(error));
+    }
   }
 
   return (
@@ -506,15 +597,15 @@ export default function KnowledgeSourcesPage() {
           <div className="workspace-page-container flex flex-col gap-5">
             <KnowledgeWorkspaceHeader section="sources" actions={<button type="button" onClick={() => setPickerOpen(true)} className="inline-flex h-10 items-center gap-2 rounded-xl bg-[#002fa7] px-4 text-xs font-semibold text-white shadow-sm shadow-[#002fa7]/15"><Plus className="h-4 w-4" />添加来源</button>} />
             <KnowledgeWorkspaceNav />
-            <section className="grid grid-cols-2 gap-3 lg:grid-cols-4"><Metric label="资料来源" value={sources.length} hint={`${readyCount} 个可用`} /><Metric label="知识条目" value={totalItems} hint="跨来源统一计数" /><Metric label="内置来源" value={2} hint="本地上传与网页收藏" /><Metric label="最近同步" value={relativeTime(lastSynced)} /></section>
+            <section className="grid grid-cols-2 gap-3 lg:grid-cols-4"><Metric label="资料来源" value={sources.length + databaseSources.length} hint={`${readyCount} 个可用`} /><Metric label="知识条目" value={totalItems} hint="文档与实时数据源" /><Metric label="数据库连接" value={databaseSources.length} hint="不复制外部行数据" /><Metric label="最近同步" value={relativeTime(lastSynced)} /></section>
             {notice ? <div className="rounded-xl bg-red-50 px-4 py-3 text-xs text-red-700">{notice}</div> : null}
             {loading ? <div className="grid min-h-[360px] place-items-center"><Loader2 className="h-6 w-6 animate-spin text-[#002fa7]" /></div> : (
               <section className="grid min-w-0 gap-5 lg:grid-cols-[300px_minmax(0,1fr)]">
-                <SourceList sources={sources} selectedId={selected?.id || ""} onSelect={setSelectedId} onAdd={() => setPickerOpen(true)} />
+                <SourceList sources={sources} databaseSources={databaseSources} selectedId={selectedDatabase ? "" : selected?.id || ""} selectedDatabaseId={selectedDatabase?.id || ""} onSelect={selectConnectorSource} onSelectDatabase={selectDatabaseSource} onAdd={() => setPickerOpen(true)} />
                 <div className="min-w-0 overflow-hidden rounded-3xl border border-black/[0.06] bg-white shadow-sm">
-                  {selected && !selected.builtin ? <div className="flex h-[72px] items-center gap-3 border-b border-black/[0.055] px-5 sm:px-6"><SourceMark kind={selected.connector_key} /><div className="min-w-0"><h2 className="truncate text-lg font-semibold tracking-tight text-gray-950">{selected.name}</h2><div className="mt-1 flex items-center gap-2 text-[11px] text-gray-400"><span>可同步 Connector</span><span>·</span><span>{selected.item_count || 0} 项</span></div></div></div> : null}
+                  {selectedDatabase ? <div className="flex h-[72px] items-center gap-3 border-b border-black/[0.055] px-5 sm:px-6"><DatabaseSourceMark sourceType={selectedDatabase.source_type || selectedDatabase.type} /><div className="min-w-0"><h2 className="truncate text-lg font-semibold tracking-tight text-gray-950">{selectedDatabase.name}</h2><div className="mt-1 text-[11px] text-gray-400">数据库 Connector · 实时只读</div></div></div> : selected && !selected.builtin ? <div className="flex h-[72px] items-center gap-3 border-b border-black/[0.055] px-5 sm:px-6"><SourceMark kind={selected.connector_key} /><div className="min-w-0"><h2 className="truncate text-lg font-semibold tracking-tight text-gray-950">{selected.name}</h2><div className="mt-1 flex items-center gap-2 text-[11px] text-gray-400"><span>可同步 Connector</span><span>·</span><span>{selected.item_count || 0} 项</span></div></div></div> : null}
                   <div className="p-5 sm:p-6">
-                    {!selected ? <div className="grid min-h-[300px] place-items-center text-sm text-gray-400"><div className="text-center"><Unplug className="mx-auto mb-3 h-7 w-7" />还没有资料来源</div></div> : selected.connector_key === "local_upload" ? <LocalUploadPanel source={selected} items={items} onChanged={changed} onOpenDoc={(item) => openDocument(selected, item.document_id)} /> : selected.connector_key === "web_capture" ? <WebCapturePanel source={selected} onChanged={changed} onOpenDoc={(item) => openDocument(selected, item.document_id)} /> : <FeishuPanel source={selected} items={items} runs={runs} onChanged={changed} onReconnect={() => { setReconnectSource(selected); setWizardOpen(true); }} onOpenDoc={(item) => openDocument(selected, item.document_id)} onOpenBitable={(item) => setBitableDetail({ item, source: selected })} />}
+                    {selectedDatabase ? <DatabaseSourcePanel source={selectedDatabase} onEdit={() => openDatabaseWizard((selectedDatabase.source_type || selectedDatabase.type) === "mysql" ? "mysql" : "postgresql", selectedDatabase)} onDelete={() => void removeDatabaseSource(selectedDatabase)} /> : !selected ? <div className="grid min-h-[300px] place-items-center text-sm text-gray-400"><div className="text-center"><Unplug className="mx-auto mb-3 h-7 w-7" />还没有资料来源</div></div> : selected.connector_key === "local_upload" ? <LocalUploadPanel source={selected} items={items} onChanged={changed} onOpenDoc={(item) => openDocument(selected, item.document_id)} /> : selected.connector_key === "web_capture" ? <WebCapturePanel source={selected} onChanged={changed} onOpenDoc={(item) => openDocument(selected, item.document_id)} /> : <FeishuPanel source={selected} items={items} runs={runs} onChanged={changed} onReconnect={() => { setReconnectSource(selected); setWizardOpen(true); }} onOpenDoc={(item) => openDocument(selected, item.document_id)} onOpenBitable={(item) => setBitableDetail({ item, source: selected })} />}
                   </div>
                 </div>
               </section>
@@ -522,8 +613,9 @@ export default function KnowledgeSourcesPage() {
           </div>
         </main>
       </div>
-      <ConnectorPicker open={pickerOpen} onClose={() => setPickerOpen(false)} onPickFeishu={() => { setPickerOpen(false); setReconnectSource(null); setWizardOpen(true); }} />
+      <ConnectorPicker open={pickerOpen} onClose={() => setPickerOpen(false)} onPickFeishu={() => { setPickerOpen(false); setReconnectSource(null); setWizardOpen(true); }} onPickDatabase={(sourceType) => openDatabaseWizard(sourceType)} />
       <FeishuConnectionWizard open={wizardOpen} existingSource={reconnectSource} onClose={() => setWizardOpen(false)} onConnected={async (next) => { await refreshSources(); setSelectedId(next.id); }} />
+      <DatabaseConnectionWizard open={databaseWizardOpen} sourceType={databaseConnectorType} existingSource={editingDatabaseSource} onClose={() => setDatabaseWizardOpen(false)} onSaved={async (next) => { await refreshSources(); selectDatabaseSource(next.id); }} />
       {detail ? <DocumentDetailModal doc={detail.doc} kind={detail.kind} sourceName={detail.sourceName} onClose={() => setDetail(null)} /> : null}
       {bitableDetail ? <FeishuBitableDetailModal item={bitableDetail.item} source={bitableDetail.source} onClose={() => setBitableDetail(null)} /> : null}
     </div>

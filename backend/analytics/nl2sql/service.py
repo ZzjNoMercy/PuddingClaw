@@ -1367,9 +1367,10 @@ def _compose_sql_refinement_prompt(
             f"{correction_instruction.strip()}\n"
             "</required_correction>"
         )
+    sql_dialect = str(getattr(route, "dialect", "PostgreSQL") or "PostgreSQL")
     system_prompt = (
         "你是 NL2SQL 最终校正器。你的任务是基于候选 SQL、数据库证据和业务语义，"
-        "输出一条可独立执行的 PostgreSQL 只读 SQL。只输出 SQL，不要解释。\n\n"
+        f"输出一条可独立执行的 {sql_dialect} 只读 SQL。只输出 SQL，不要解释。\n\n"
         "必须遵守以下证据优先级：\n"
         "1. 用户问题决定要回答的业务目标；\n"
         "2. 数据库实体证据决定物理事实，包括真实表名、列名、EAV 配置名称和枚举标准值；\n"
@@ -1407,7 +1408,7 @@ def _compose_sql_refinement_prompt(
         "</vanna_candidate_sql>"
         f"{correction_block}\n\n"
         "生成 SQL 要求：\n"
-        "- 返回一条从 SELECT 或 WITH 开始、括号完整的 PostgreSQL 只读 SQL；\n"
+        f"- 返回一条从 SELECT 或 WITH 开始、括号完整的 {sql_dialect} 只读 SQL；\n"
         "- 汇总、趋势、占比和排名使用正确的聚合与 GROUP BY；\n"
         "- 不得用 LIMIT 近似聚合结果；只有用户明确要求 top-N 时才使用 LIMIT，明细结果由执行层分页；\n"
         "- 按月份查询 ISO 日期字符串时使用日期函数或 '-MM-' 形式，不要只匹配中文月份；\n"
@@ -2510,7 +2511,11 @@ async def _generate_grounded_sql(
     technical_repair_ms = 0.0
     for repair_attempt in range(2):
         try:
-            sql = validate_readonly_sql(sql, allowed_tables=route.table_names)
+            sql = validate_readonly_sql(
+                sql,
+                allowed_tables=route.table_names,
+                dialect="mysql" if str(route.dialect).lower() == "mysql" else "postgres",
+            )
             post_conflicts = _detect_sql_guardrail_conflicts(
                 sql,
                 source_name=route.source_name,

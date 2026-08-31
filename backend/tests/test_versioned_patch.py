@@ -316,7 +316,7 @@ def test_validation_obligations_do_not_supersede_other_validator_families() -> N
     assert blocking == []
 
 
-def test_only_controlled_single_command_validators_receive_commit_authority() -> None:
+def test_only_real_single_command_validators_receive_validation_receipts() -> None:
     from harness.verification_activations import _validation_receipt_for_result
 
     def build(command: str, call_id: str):
@@ -358,9 +358,9 @@ def test_only_controlled_single_command_validators_receive_commit_authority() ->
 
     assert direct is not None and direct.commit_authority is True
     assert direct.validator_version == "node-check/v1"
-    assert masked is not None and masked.commit_authority is False
-    assert noop is not None and noop.commit_authority is False
-    assert forced_success is not None and forced_success.commit_authority is False
+    assert masked is None
+    assert noop is None
+    assert forced_success is None
     assert html_diagnostic_wrapper is not None
     assert html_diagnostic_wrapper.commit_authority is True
     assert html_diagnostic_wrapper.validator_kind == "browser_runtime"
@@ -368,8 +368,7 @@ def test_only_controlled_single_command_validators_receive_commit_authority() ->
         "execute_external_directory",
         {"command": ("pwd && ls -la && node /opt/puddingclaw/bin/validate-html-report-e2e.mjs report.html")},
     ) == ["code"]
-    assert unregistered_wrapper is not None
-    assert unregistered_wrapper.commit_authority is False
+    assert unregistered_wrapper is None
 
 
 class _HtmlValidatorExecutionBackend:

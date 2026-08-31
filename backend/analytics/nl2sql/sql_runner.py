@@ -233,7 +233,12 @@ def _table_aliases(table_name: str, *, strict_schema: bool = False) -> set[str]:
     return {normalized, f"public.{normalized}"}
 
 
-def _referenced_tables(sql: str, *, allow_unregistered_functions: bool = False) -> set[str]:
+def _referenced_tables(
+    sql: str,
+    *,
+    dialect: str = "postgres",
+    allow_unregistered_functions: bool = False,
+) -> set[str]:
     """Return physical PostgreSQL tables referenced by a read-only query.
 
     Table scope is an authorization boundary, so derive it from SQL structure
@@ -246,7 +251,7 @@ def _referenced_tables(sql: str, *, allow_unregistered_functions: bool = False) 
 
     parse_sql = _strip_sql_comments(sql)
     try:
-        tree = sqlglot.parse_one(parse_sql, dialect="postgres")
+        tree = sqlglot.parse_one(parse_sql, dialect=dialect)
         root_scope = build_scope(tree)
     except ParseError as exc:
         raise SqlRunnerError(f"SQL 解析失败：{exc}", sql=sql) from exc
@@ -291,7 +296,7 @@ def _referenced_tables(sql: str, *, allow_unregistered_functions: bool = False) 
                 ):
                     continue
                 raise SqlRunnerError(
-                    f"SQL FROM/JOIN 包含未授权的表函数：{source.expression.sql(dialect='postgres')}",
+                    f"SQL FROM/JOIN 包含未授权的表函数：{source.expression.sql(dialect=dialect)}",
                     sql=sql,
                 )
             if not isinstance(source, exp.Table):
@@ -300,7 +305,7 @@ def _referenced_tables(sql: str, *, allow_unregistered_functions: bool = False) 
                 if allow_unregistered_functions and isinstance(source.this, exp.Func):
                     continue
                 raise SqlRunnerError(
-                    f"SQL FROM/JOIN 包含未授权的表函数：{source.this.sql(dialect='postgres')}",
+                    f"SQL FROM/JOIN 包含未授权的表函数：{source.this.sql(dialect=dialect)}",
                     sql=sql,
                 )
             parts = [source.catalog, source.db, source.name]
@@ -330,6 +335,7 @@ def validate_readonly_sql(
     allowed_tables: list[str],
     require_schema_qualified: bool = False,
     allow_unregistered_functions: bool = False,
+    dialect: str = "postgres",
 ) -> str:
     """Validate SQL safety and table scope before execution."""
 
@@ -355,6 +361,7 @@ def validate_readonly_sql(
 
     referenced = _referenced_tables(
         clean_sql,
+        dialect=dialect,
         allow_unregistered_functions=allow_unregistered_functions,
     )
     blocked = sorted(ref for ref in referenced if ref not in allowed_aliases)
@@ -535,17 +542,28 @@ async def run_readonly_sql(
     full_column_cap = int(config.get("full_rows_hard_column_cap") or 20)
     full_token_budget = int(config.get("full_rows_token_budget") or 10000)
     effective_timeout_ms = int(timeout_ms or config.get("query_timeout_ms") or 30000)
+    source_type = str(
+        source.source_type
+        if isinstance(source, KnowledgeDatabaseSource)
+        else source.get("source_type") or source.get("type") or "postgresql"
+    ).lower()
     clean_sql = validate_readonly_sql(
         sql,
         allowed_tables=allowed_tables,
         allow_unregistered_functions=allow_unregistered_functions,
+        dialect="mysql" if source_type == "mysql" else "postgres",
     )
     engine = create_async_engine(database_source_url(source), pool_pre_ping=True)
     try:
         async with engine.connect() as conn:
+            if source_type == "mysql":
+                await conn.execute(text("SET SESSION TRANSACTION READ ONLY"))
+                await conn.execute(text(f"SET SESSION MAX_EXECUTION_TIME = {effective_timeout_ms}"))
+                await conn.commit()
             async with conn.begin():
-                await conn.execute(text("SET TRANSACTION READ ONLY"))
-                await conn.execute(text(f"SET LOCAL statement_timeout = '{effective_timeout_ms}ms'"))
+                if source_type != "mysql":
+                    await conn.execute(text("SET TRANSACTION READ ONLY"))
+                    await conn.execute(text(f"SET LOCAL statement_timeout = '{effective_timeout_ms}ms'"))
                 result = await conn.execute(
                     text(f"SELECT * FROM ({clean_sql}) AS puddingclaw_result LIMIT :limit_value"),
                     {"limit_value": materialize_limit + 1},

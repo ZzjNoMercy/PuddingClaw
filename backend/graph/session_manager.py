@@ -303,11 +303,91 @@ class SessionManager:
                     "updated_at": now,  # 更新时间设为当前
                     "messages": data,  # 原始消息列表保留
                 }
-            if isinstance(data, dict) and self._migrate_legacy_traces(session_id, data):
-                self._write_file(session_id, data)
+            if isinstance(data, dict):
+                migrated = self._migrate_legacy_traces(session_id, data)
+                migrated = self._repair_legacy_model_call_counts(data) or migrated
+                if migrated:
+                    self._write_file(session_id, data)
             return data  # v2 格式直接返回
         except (json.JSONDecodeError, Exception):  # JSON 解析失败返回空
             return {}
+
+    @staticmethod
+    def _repair_legacy_model_call_counts(data: dict[str, Any]) -> bool:
+        """Recover terminal Run/Goal counts omitted by the old Rubric settlement path."""
+
+        harness = data.get("harness")
+        runs = harness.get("runs") if isinstance(harness, dict) else None
+        goals = harness.get("goals") if isinstance(harness, dict) else None
+        messages = data.get("messages")
+        if not isinstance(runs, dict) or not isinstance(messages, list):
+            return False
+
+        def count(value: Any) -> int:
+            try:
+                return max(0, int(value or 0))
+            except (TypeError, ValueError):
+                return 0
+
+        usage_by_query: dict[str, dict[str, Any]] = {}
+        for message in messages:
+            if not isinstance(message, dict) or message.get("role") != "assistant":
+                continue
+            query_id = str(message.get("query_id") or "")
+            usage = message.get("usage_summary")
+            if query_id and isinstance(usage, dict):
+                usage_by_query[query_id] = usage
+
+        changed = False
+        terminal_statuses = {
+            "completed",
+            "cancelled",
+            "failed",
+            "blocked",
+            "budget_exceeded",
+            "verification_failed",
+        }
+        for run_id, run in runs.items():
+            if (
+                not isinstance(run, dict)
+                or count(run.get("model_call_count")) > 0
+                or str(run.get("status") or "") not in terminal_statuses
+            ):
+                continue
+            usage = usage_by_query.get(str(run.get("query_id") or ""))
+            if not isinstance(usage, dict):
+                continue
+            usage_run_id = str(usage.get("run_id") or "")
+            if usage_run_id and usage_run_id != str(run_id):
+                continue
+            rounds = count(usage.get("rounds"))
+            observed = count(usage.get("observed_calls"))
+            # Older stream-span accounting could overstate rounds when a
+            # tool-call response was observed twice. Provider call events are
+            # a safe upper bound; auxiliary calls can only make it larger.
+            recovered = min(rounds, observed) if rounds and observed else max(rounds, observed)
+            if recovered <= 0:
+                continue
+            run["model_call_count"] = recovered
+            changed = True
+
+        if isinstance(goals, dict):
+            for goal in goals.values():
+                if (
+                    not isinstance(goal, dict)
+                    or str(goal.get("status") or "")
+                    not in {"completed", "cancelled", "budget_exceeded"}
+                ):
+                    continue
+                total = sum(
+                    count(runs.get(str(run_id), {}).get("model_call_count"))
+                    for run_id in goal.get("run_ids") or []
+                    if isinstance(runs.get(str(run_id)), dict)
+                )
+                if total > count(goal.get("model_call_count")):
+                    goal["model_call_count"] = total
+                    changed = True
+        return changed
 
     def _write_file(self, session_id: str, data: dict[str, Any]) -> None:
         """原子写入会话数据，避免读者观察到半截 JSON。"""
@@ -1135,6 +1215,21 @@ class SessionManager:
         validated_run = RunRecord.model_validate(run)
         if validated_run.session_id != session_id or validated_run.query_id != query_id:
             raise ValueError("Accepted completion identity does not match the Session query")
+        if isinstance(usage_summary, dict):
+            usage_run_id = str(usage_summary.get("run_id") or "")
+            usage_query_id = str(usage_summary.get("query_id") or "")
+            if usage_run_id and usage_run_id != validated_run.run_id:
+                raise ValueError("Usage summary Run identity does not match accepted completion")
+            if usage_query_id and usage_query_id != query_id:
+                raise ValueError("Usage summary query identity does not match accepted completion")
+            try:
+                usage_rounds = max(0, int(usage_summary.get("rounds") or 0))
+            except (TypeError, ValueError) as exc:
+                raise ValueError("Usage summary rounds must be a non-negative integer") from exc
+            # The assistant message and Harness overview are two projections of
+            # the same Run. Keep their main-Agent call count identical at the
+            # atomic publication boundary instead of trusting a stale Run copy.
+            validated_run.model_call_count = usage_rounds
         report = validated_run.verification_report
         if validated_run.outcome != RunOutcome.COMPLETED:
             raise ValueError("Only a completed Run may publish a final response")
@@ -1178,6 +1273,13 @@ class SessionManager:
                 raise ValueError("Goal completion state-safety check failed")
             if raw_goal.get("requested_status"):
                 raise ValueError("Goal completion is blocked by a pending control request")
+            # Aggregate from the still-active persisted Goal under this write
+            # lock. This prevents a stale in-memory Goal (or a policy-specific
+            # completion branch) from dropping the accepted Run's usage.
+            validated_goal.model_call_count = max(
+                0,
+                int(raw_goal.get("model_call_count") or 0),
+            ) + max(0, validated_run.model_call_count)
             # A staged external mutation is an unfinished operation, not
             # completion evidence. Refuse before changing any terminal state.
             for lease_collection, draft_statuses in (

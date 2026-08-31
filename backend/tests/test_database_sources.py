@@ -11,6 +11,27 @@ from knowledge.models import Base, KnowledgeBase, KnowledgeDatabaseSource
 from knowledge.service import DEFAULT_KNOWLEDGE_BASE_ID
 
 
+def test_database_source_payload_supports_postgresql_and_mysql_defaults() -> None:
+    postgres = database_sources._sanitize_payload({"type": "postgresql", "database": "app"})
+    mysql = database_sources._sanitize_payload({"type": "mysql", "database": "app"})
+
+    assert postgres["port"] == 5432
+    assert postgres["name"] == "PostgreSQL 数据源"
+    assert mysql["port"] == 3306
+    assert mysql["name"] == "MySQL 数据源"
+    assert database_sources._source_url({**postgres, "username": "reader", "password": "secret"}).startswith(
+        "postgresql+asyncpg://reader:secret@"
+    )
+    assert database_sources._source_url({**mysql, "username": "reader", "password": "secret"}).startswith(
+        "mysql+asyncmy://reader:secret@"
+    )
+
+
+def test_database_source_payload_rejects_unknown_connector() -> None:
+    with pytest.raises(KnowledgeDatabaseSourceError, match="暂不支持"):
+        database_sources._sanitize_payload({"type": "oracle", "database": "app"})
+
+
 def test_sqlite_core_hides_stale_project_postgres_source(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
     async def run() -> None:
         engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'catalog.db'}")

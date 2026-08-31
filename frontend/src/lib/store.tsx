@@ -71,6 +71,7 @@ import {
 } from "./api";
 import { getSubagentActivityIdentity } from "./subagentActivity";
 import { goalRemainsVisible } from "./goalControls";
+import { projectRunReviewState, visibleRunReviewStatus } from "./runReviewState";
 import { shouldApplyTodoSnapshot, TodoAuthority } from "./todoProjection";
 import {
   settleRunningVerificationActivities,
@@ -301,6 +302,7 @@ export interface ChatMessage {
   verificationSummary?: string;
   runReviewStatus?: RunReviewStatusResponse["status"];
   runReviewReport?: RunReviewReport;
+  runReviewEligible?: boolean;
   usageSummary?: UsageSummary;
   timestamp: number;
 }
@@ -732,6 +734,7 @@ function decorateRunReviews(
   messages: ChatMessage[],
   runs: Record<string, HarnessRun> | undefined,
   reports: Record<string, RunReviewReport> | undefined,
+  operations?: SessionHarnessState["verification_operations"],
 ): ChatMessage[] {
   const availableReports = reports || {};
   const decorated = messages.map((message) => {
@@ -744,30 +747,26 @@ function decorateRunReviews(
       ? availableReports[run.run_review_report_id]
       : Object.values(availableReports).find((candidate) => candidate.run_id === message.runId);
     if (!run && !report) return message;
-    const reviewExpected = Boolean(
-      run?.run_kind === "standalone"
-      && run.run_review_policy
-      && run.run_review_policy !== "off"
-    );
+    const projection = projectRunReviewState(run, report, operations);
     const nextRunId = message.runId || run?.run_id || report?.run_id;
-    const nextStatus = report?.status
-      || (reviewExpected ? message.runReviewStatus || "pending" : message.runReviewStatus);
-    const nextReport = report?.report_id === message.runReviewReport?.report_id
-      ? message.runReviewReport
-      : report || message.runReviewReport;
+    const nextStatus = projection.status;
+    const nextReport = projection.eligible
+      ? report?.report_id === message.runReviewReport?.report_id
+        ? message.runReviewReport
+        : report
+      : undefined;
     if (
       nextRunId === message.runId
       && nextStatus === message.runReviewStatus
       && nextReport === message.runReviewReport
+      && projection.eligible === message.runReviewEligible
     ) {
       return message;
     }
     return {
       ...message,
       runId: nextRunId,
-      // A shadow review starts after the Run is already terminal. Harness may
-      // therefore be read before its report is persisted; keep the pending
-      // state instead of making the action row look as if review were off.
+      runReviewEligible: projection.eligible,
       runReviewStatus: nextStatus,
       runReviewReport: nextReport,
     };
@@ -1570,6 +1569,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     latest: RunReviewStatusResponse,
   ): RunReviewStatusResponse => {
     const effectiveStatus = latest.report?.status || latest.status;
+    const visibleStatus = visibleRunReviewStatus(effectiveStatus);
     const matchesRun = (message: ChatMessage) =>
       message.runId === runId || message.segments?.some((segment) => segment.runId === runId);
     updateSessionMessages(sid, (prev) => {
@@ -1577,19 +1577,22 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         matchesRun(message)
           ? (() => {
               const nextReport = latest.report || (
-                effectiveStatus === "pending" || effectiveStatus === "running"
+                visibleStatus === "pending" || visibleStatus === "running"
                   ? undefined
-                  : message.runReviewReport
+                  : visibleStatus === undefined
+                    ? undefined
+                    : message.runReviewReport
               );
               if (
-                message.runReviewStatus === effectiveStatus
+                message.runReviewStatus === visibleStatus
                 && message.runReviewReport === nextReport
               ) {
                 return message;
               }
               return {
                 ...message,
-                runReviewStatus: effectiveStatus,
+                runReviewEligible: true,
+                runReviewStatus: visibleStatus,
                 runReviewReport: nextReport,
               };
             })()
@@ -2138,7 +2141,12 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             runReviewReportsMapRef.current[id] = hydratedRunReviewReports;
             const cachedHistory = messagesMapRef.current[id];
             if (cachedHistory) {
-              const decorated = decorateRunReviews(cachedHistory, data.runs, hydratedRunReviewReports);
+              const decorated = decorateRunReviews(
+                cachedHistory,
+                data.runs,
+                hydratedRunReviewReports,
+                data.verification_operations,
+              );
               messagesMapRef.current[id] = decorated;
               if (sessionIdRef.current === id) setMessages(decorated);
             }
@@ -2328,6 +2336,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           previous,
           data.runs,
           mergedRunReviewReports,
+          data.verification_operations,
         ));
         const active = runIsActive(latestRun);
         const nextRemote = new Set(remoteRunningSessionsRef.current);
@@ -2363,6 +2372,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             history.messages?.length ? parseHistoryMessages(history.messages) : [],
             data.runs,
             mergedRunReviewReports,
+            data.verification_operations,
           );
           messagesMapRef.current[sessionId] = loaded;
           if (sessionIdRef.current === sessionId) setMessages(loaded);
@@ -4109,7 +4119,6 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
                 return {
                   ...message,
                   runId: run.run_id,
-                  runReviewStatus: run.run_review_policy && run.run_review_policy !== "off" ? "pending" : message.runReviewStatus,
                   segments,
                 };
               }));
@@ -4127,7 +4136,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             });
             updateMsgs((prev) => prev.map((message) =>
               (!runId || message.runId === runId || message.queryId === String(event.data.query_id || ""))
-                ? { ...message, runReviewStatus: "pending" }
+                ? { ...message, runReviewEligible: true, runReviewStatus: "pending" }
                 : message
             ));
             if (runId) {
@@ -5323,6 +5332,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
               previous,
               state.runs,
               mergedRunReviewReports,
+              state.verification_operations,
             ));
             currentRunsMapRef.current[sendSessionId] = latestRun;
             if (reconciledGoal) {

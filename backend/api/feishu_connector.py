@@ -84,6 +84,15 @@ class FeishuBitableResolveRequest(BaseModel):
     url: str = Field(min_length=12, max_length=2_000)
 
 
+class FeishuDriveScopeRequest(BaseModel):
+    folder_token: str = Field(default="", max_length=220, pattern=r"^[A-Za-z0-9_-]*$")
+    folder_name: str = Field(default="我的云盘", max_length=500)
+    source_url: str = Field(default="", max_length=2_000)
+    publish_vector: bool = True
+    interval_minutes: int = Field(default=60, ge=0, le=43_200)
+    parser_id: str = Field(default="mineru_local", max_length=100)
+
+
 class FeishuBitableScopeRequest(BaseModel):
     url: str = Field(min_length=12, max_length=2_000)
     table_id: str = Field(default="", max_length=220)
@@ -539,6 +548,70 @@ async def configure_feishu_scope(
     source.schedule_json = {**(source.schedule_json or {}), "interval_minutes": request.interval_minutes}
     await session.commit()
     return {"source": source_to_dict(source)}
+
+
+@router.get("/sources/{source_id}/drive/files")
+async def list_feishu_drive_files(
+    source_id: str,
+    folder_token: str = "",
+    session: AsyncSession = Depends(get_db_session),
+):
+    source = await session.get(KnowledgeSourceConnection, source_id)
+    if source is None or source.connector_key != "feishu_wiki":
+        raise HTTPException(status_code=404, detail="飞书知识 Source 不存在。")
+    try:
+        items = await feishu_open_api.list_drive_files(
+            session,
+            source,
+            folder_token=folder_token.strip(),
+        )
+        return {"items": items}
+    except FeishuConnectorError as exc:
+        if exc.status_code in {401, 403}:
+            source.status = "needs_reauth"
+            await session.commit()
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.put("/sources/{source_id}/drive/scope")
+async def configure_feishu_drive_scope(
+    source_id: str,
+    request: FeishuDriveScopeRequest,
+    session: AsyncSession = Depends(get_db_session),
+):
+    source = await session.get(KnowledgeSourceConnection, source_id)
+    if source is None or source.connector_key != "feishu_wiki":
+        raise HTTPException(status_code=404, detail="飞书知识 Source 不存在。")
+    try:
+        folder_token = request.folder_token.strip()
+        # Listing the selected folder is both validation and an authorization
+        # check.  An empty token deliberately means the current identity's
+        # Drive root; it is not a missing form field.
+        await feishu_open_api.list_drive_files(
+            session,
+            source,
+            folder_token=folder_token,
+        )
+        source.config_json = {
+            **(source.config_json or {}),
+            "source_mode": "drive",
+            "drive_scope_configured": True,
+            "source_url": request.source_url.strip(),
+            "folder_token": folder_token,
+            "folder_name": request.folder_name.strip() or "我的云盘",
+            "publish_vector": request.publish_vector,
+            "parser_id": request.parser_id.strip() or "mineru_local",
+        }
+        source.schedule_json = {
+            **(source.schedule_json or {}),
+            "interval_minutes": request.interval_minutes,
+        }
+        source.status = "ready"
+        await session.commit()
+        return {"source": source_to_dict(source)}
+    except FeishuConnectorError as exc:
+        await session.rollback()
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.post("/sources/{source_id}/bitable/resolve")

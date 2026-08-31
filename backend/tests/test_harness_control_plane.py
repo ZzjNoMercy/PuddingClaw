@@ -962,7 +962,10 @@ def test_goal_inherits_authorized_external_artifact_across_runs(tmp_path):
             query_id=second.query_id,
             tool_call_id="call-test",
             tool_name="execute",
-            args={"command": f'python3 validate_report.py "{external}"'},
+            # A model-authored script name is not verifier authority. Use a
+            # recognized project-test runner, which the Harness can sign as a
+            # completion receipt without granting artifact commit authority.
+            args={"command": "pytest tests/test_report.py"},
             result=validation_result,
             session_id=second.session_id,
             workspace_path=str(workspace),
@@ -1339,6 +1342,8 @@ def test_explicit_goal_can_advance_across_runs(tmp_path):
         resumed_goal,
         _satisfied_final_state(tmp_path),
     )
+    coordinator.transition(second_run, RunStatus.EVALUATING)
+    second_run.model_call_count = 11
     second_run, achieved_goal, second_report = coordinator.complete_from_final_state(
         second_run,
         resumed_goal,
@@ -1349,6 +1354,7 @@ def test_explicit_goal_can_advance_across_runs(tmp_path):
     assert second_run.outcome == RunOutcome.COMPLETED
     assert achieved_goal is not None
     assert achieved_goal.status == GoalStatus.COMPLETED
+    assert achieved_goal.model_call_count == 11
     assert achieved_goal.run_ids == [first_run.run_id, second_run.run_id]
     assert second_report.accepted_for_goal_revision is None
     assert second_run.run_id in second_report.supporting_run_ids

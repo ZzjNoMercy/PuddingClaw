@@ -76,12 +76,17 @@ class FeishuWikiSync:
         if source.connector_key != "feishu_wiki":
             raise FeishuConnectorError("Sync run is not bound to a Feishu source.")
         config = dict(source.config_json or {})
-        if str(config.get("source_mode") or "wiki") == "bitable":
+        source_mode = str(config.get("source_mode") or "wiki")
+        if source_mode == "bitable":
             return await self._run_bitable_source(session, source=source, run=run)
         if run.mode == "reindex":
             return await self._run_local_reindex(session, source=source, run=run)
         space_id = str(config.get("space_id") or "").strip()
-        if not space_id:
+        folder_token = str(config.get("folder_token") or "").strip()
+        if source_mode == "drive":
+            if not bool(config.get("drive_scope_configured")) and not folder_token:
+                raise FeishuConnectorError("请先选择飞书云盘同步范围。")
+        elif not space_id:
             raise FeishuConnectorError("请先选择飞书知识空间。")
         run.status = "running"
         run.current_step = "discovering"
@@ -90,11 +95,15 @@ class FeishuWikiSync:
         source.status = "syncing"
         await session.commit()
 
-        nodes = await self._discover(
-            session,
-            source=source,
-            space_id=space_id,
-            root_node_token=str(config.get("root_node_token") or "").strip() or None,
+        nodes = (
+            await self._discover_drive(session, source=source, folder_token=folder_token)
+            if source_mode == "drive"
+            else await self._discover(
+                session,
+                source=source,
+                space_id=space_id,
+                root_node_token=str(config.get("root_node_token") or "").strip() or None,
+            )
         )
         # End the read transaction opened by discovery (credential lookups)
         # before writing run stats. Under SQLite WAL, upgrading a stale read
@@ -422,6 +431,58 @@ class FeishuWikiSync:
                     queue.append((token, path))
         return discovered
 
+    async def _discover_drive(
+        self,
+        session: AsyncSession,
+        *,
+        source: KnowledgeSourceConnection,
+        folder_token: str,
+    ) -> list[tuple[dict[str, Any], list[str]]]:
+        """Recursively discover Drive children while keeping the selected root as scope."""
+
+        discovered: list[tuple[dict[str, Any], list[str]]] = []
+        queue: deque[tuple[str, list[str]]] = deque([(folder_token, [])])
+        seen_folders: set[str] = {folder_token}
+        seen_items: set[str] = set()
+        while queue:
+            parent_token, parent_path = queue.popleft()
+            children = await self.api.list_drive_files(session, source, folder_token=parent_token)
+            for child in children:
+                token = str(child.get("token") or "")
+                if not token:
+                    continue
+                title = str(child.get("name") or "未命名")
+                child_type = str(child.get("type") or "").lower()
+                path = [*parent_path, title]
+                if child_type == "folder":
+                    if token not in seen_folders:
+                        seen_folders.add(token)
+                        queue.append((token, path))
+                    continue
+                if token in seen_items:
+                    continue
+                seen_items.add(token)
+                discovered.append(
+                    (
+                        {
+                            "node_token": token,
+                            "obj_token": token,
+                            "obj_type": child_type,
+                            "title": title,
+                            "parent_node_token": str(child.get("parent_token") or parent_token),
+                            "obj_create_time": child.get("created_time"),
+                            "obj_edit_time": child.get("modified_time"),
+                            "url": child.get("url"),
+                            "drive_file": True,
+                            "shortcut_info": child.get("shortcut_info"),
+                        },
+                        path,
+                    )
+                )
+                if len(discovered) > MAX_DISCOVERED_NODES:
+                    raise FeishuConnectorError("飞书云盘文件数超过单个 Source 的安全上限，请选择更小的根文件夹。")
+        return discovered
+
     async def _upsert_node_item(
         self,
         session: AsyncSession,
@@ -476,6 +537,16 @@ class FeishuWikiSync:
         # asset downloads stalled every other writer past busy_timeout, which
         # surfaced as "database is locked" on the queue claim path.
         existing = await self._item_for_node(session, source.id, node_token)
+        if obj_type == "file" and bool(node.get("drive_file")):
+            return await self._sync_drive_file(
+                session,
+                source=source,
+                run=run,
+                node=node,
+                path=path,
+                existing=existing,
+                source_url=source_url,
+            )
         if obj_type == "bitable" and obj_token:
             item = await self._upsert_node_item(
                 session,
@@ -490,7 +561,7 @@ class FeishuWikiSync:
             item.revision = str(node.get("obj_edit_time") or node.get("node_edit_time") or "")
             item.metadata_json = {
                 **(item.metadata_json or {}),
-                "entry_kind": "wiki_bitable",
+                "entry_kind": "drive_bitable" if bool(node.get("drive_file")) else "wiki_bitable",
                 "node_token": node_token,
                 "app_token": obj_token,
                 "storage_mode": "live",
@@ -627,15 +698,18 @@ class FeishuWikiSync:
             )
             return "unchanged"
         title = str(document_meta.get("title") or node.get("title") or "未命名")
+        source_mode = str((source.config_json or {}).get("source_mode") or "wiki")
+        path_key = "drive_path" if source_mode == "drive" else "wiki_path"
+        source_label = "feishu_drive" if source_mode == "drive" else "feishu_wiki"
         frontmatter = {
             "title": title,
-            "source": "feishu_wiki",
+            "source": source_label,
             "source_url": source_url or "",
             "space_id": str((source.config_json or {}).get("space_id") or ""),
             "node_token": node_token,
             "obj_token": obj_token,
             "revision_id": revision,
-            "wiki_path": path,
+            path_key: path,
             "synced_at": datetime.now(timezone.utc).isoformat(),
         }
         if author_name or author_id:
@@ -659,7 +733,7 @@ class FeishuWikiSync:
             origin_url=source_url,
             source_revision=revision,
         )
-        document.source_type = "feishu_docx"
+        document.source_type = "feishu_drive_docx" if source_mode == "drive" else "feishu_docx"
         document.doc_metadata = {
             **(document.doc_metadata or {}),
             "feishu": {
@@ -667,7 +741,8 @@ class FeishuWikiSync:
                 "node_token": node_token,
                 "obj_token": obj_token,
                 "revision_id": revision,
-                "wiki_path": path,
+                "source_mode": source_mode,
+                path_key: path,
                 "author_id": author_id,
                 "author_name": author_name,
                 "published_at": published_at,
@@ -695,6 +770,124 @@ class FeishuWikiSync:
                 path=path,
                 asset=pdf_asset,
             )
+        return "changed"
+
+    async def _sync_drive_file(
+        self,
+        session: AsyncSession,
+        *,
+        source: KnowledgeSourceConnection,
+        run: KnowledgeSyncRun,
+        node: dict[str, Any],
+        path: list[str],
+        existing: KnowledgeSourceItem | None,
+        source_url: str | None,
+    ) -> str:
+        token = str(node.get("obj_token") or node.get("node_token") or "")
+        title = str(node.get("title") or "未命名文件")
+        suffix = Path(title).suffix.lower()
+        supported = {".pdf", ".md", ".markdown", ".txt", ".xlsx", ".xls", ".csv", ".tsv", ".docx"}
+        item = await self._upsert_node_item(
+            session,
+            source=source,
+            run=run,
+            node=node,
+            path=path,
+            source_url=source_url,
+            existing=existing,
+        )
+        revision = str(node.get("obj_edit_time") or "")
+        if suffix not in supported:
+            item.status = "unsupported"
+            item.revision = revision
+            item.metadata_json = {**(item.metadata_json or {}), "drive_file": True, "file_suffix": suffix}
+            await session.flush()
+            return "unsupported"
+        if revision and run.mode == "incremental" and existing is not None and existing.revision == revision and existing.document_id:
+            item.status = "ready"
+            item.revision = revision
+            await session.flush()
+            return "unchanged"
+
+        # End the item write before the potentially slow remote download and parser call.
+        item.status = "processing"
+        await session.commit()
+        content, content_type, _disposition = await self.api.download_drive_file(
+            session,
+            source,
+            file_token=token,
+        )
+        content_hash = hashlib.sha256(content).hexdigest()
+        if run.mode != "reindex" and existing is not None and existing.content_sha256 == content_hash and existing.document_id:
+            item = await self._item_for_node(session, source.id, token) or item
+            item.status = "ready"
+            item.revision = revision
+            await session.flush()
+            return "unchanged"
+
+        if suffix == ".pdf":
+            document, _ingest = await self.service.ingest_pdf_upload(
+                session,
+                filename=title,
+                content=content,
+                title=Path(title).stem,
+                knowledge_base_id=source.knowledge_base_id,
+                publish_targets=["local_markdown", "vector", "feishu_drive"],
+                publish_vector_now=False,
+                parser_id=str((source.config_json or {}).get("parser_id") or "mineru_local"),
+                source_connection_id=source.id,
+                source_item_id=item.id,
+                origin_url=source_url,
+                source_revision=revision,
+            )
+        elif suffix in {".md", ".markdown", ".txt"}:
+            if suffix == ".txt":
+                text = content.decode("utf-8", errors="replace")
+                content = f"# {Path(title).stem}\n\n{text}".encode("utf-8")
+            document, _ingest = await self.service.ingest_markdown_upload(
+                session,
+                filename=f"{Path(title).stem}.md",
+                content=content,
+                title=Path(title).stem,
+                knowledge_base_id=source.knowledge_base_id,
+                publish_targets=["local_markdown", "vector", "feishu_drive"],
+                publish_vector_now=False,
+                source_connection_id=source.id,
+                source_item_id=item.id,
+                origin_url=source_url,
+                source_revision=revision,
+            )
+        else:
+            document, _ingest = await self.service.ingest_generic_upload(
+                session,
+                filename=title,
+                content=content,
+                title=Path(title).stem,
+                knowledge_base_id=source.knowledge_base_id,
+                publish_targets=["local_file", "feishu_drive"],
+                source_connection_id=source.id,
+                source_item_id=item.id,
+                origin_url=source_url,
+                source_revision=revision,
+            )
+        document.source_type = "feishu_drive_file"
+        document.doc_metadata = {
+            **(document.doc_metadata or {}),
+            "feishu": {
+                "source_mode": "drive",
+                "file_token": token,
+                "drive_path": path,
+                "content_type": content_type,
+                "revision_id": revision,
+            },
+        }
+        item = await self._item_for_node(session, source.id, token) or item
+        item.document_id = document.id
+        item.content_sha256 = content_hash
+        item.revision = revision
+        item.status = "ready"
+        item.metadata_json = {**(item.metadata_json or {}), "drive_file": True, "content_type": content_type}
+        await session.flush()
         return "changed"
 
     async def _run_local_reindex(
@@ -819,12 +1012,13 @@ class FeishuWikiSync:
         if document is None:
             return
         feishu_metadata = dict((document.doc_metadata or {}).get("feishu") or {})
+        path_key = "drive_path" if feishu_metadata.get("source_mode") == "drive" else "wiki_path"
         document.title = title.strip() or document.title
         document.origin_url = source_url
         document.source_revision = revision
         document.doc_metadata = {
             **(document.doc_metadata or {}),
-            "feishu": {**feishu_metadata, "wiki_path": list(path), "revision_id": revision},
+            "feishu": {**feishu_metadata, path_key: list(path), "revision_id": revision},
         }
 
     async def _materialize_assets(

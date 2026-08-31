@@ -739,6 +739,40 @@ def test_shadow_run_review_persists_report_without_changing_run_outcome(tmp_path
     assert sessions.get_harness_state("session-1").get("completion_requests", {}) == {}
 
 
+def test_cancelled_run_cannot_start_manual_or_shadow_review(tmp_path, monkeypatch) -> None:
+    import graph.deepagents_manager as manager_module
+
+    sessions = _sessions(tmp_path)
+    coordinator = HarnessRunCoordinator(sessions)
+    run, goal = coordinator.start_run(
+        session_id="session-1",
+        query_id="query-cancelled",
+        objective="partial work",
+        goal_mode=False,
+        verification_enabled=True,
+        run_review_policy=RunReviewPolicy.SHADOW,
+    )
+    assert goal is None
+    coordinator.transition(run, RunStatus.RUNNING)
+    run.finish(RunOutcome.CANCELLED, error="client_cancelled")
+    sessions.terminalize_run_state("session-1", run.run_id, run.model_dump(mode="json"))
+    monkeypatch.setattr(manager_module, "session_manager", sessions)
+    manager = manager_module.DeepAgentsAgentManager()
+
+    with pytest.raises(ValueError, match="completes successfully"):
+        asyncio.run(
+            manager.begin_run_review(
+                "session-1",
+                run.run_id,
+                manual=True,
+            )
+        )
+
+    harness = sessions.get_harness_state("session-1")
+    assert harness.get("evaluation_snapshots", {}) == {}
+    assert harness.get("verification_operations", {}) == {}
+
+
 def test_one_shot_review_recovers_complete_max_iteration_failure_as_needs_revision(
     tmp_path,
     monkeypatch,

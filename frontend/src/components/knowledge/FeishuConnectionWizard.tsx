@@ -22,9 +22,11 @@ import {
 import {
   bindFeishuTenantAuth,
   configureFeishuBitableScope,
+  configureFeishuDriveScope,
   configureFeishuScope,
   createFeishuApp,
   createKnowledgeSource,
+  listFeishuDriveFiles,
   listFeishuNodes,
   listFeishuSpaces,
   previewFeishuBitable,
@@ -37,6 +39,7 @@ import {
   type FeishuSpace,
   type FeishuBitablePreview,
   type FeishuBitableTable,
+  type FeishuDriveItem,
   type FeishuWikiNode,
   type KnowledgeSource,
 } from "@/lib/knowledgeSourcesApi";
@@ -129,6 +132,62 @@ function NodeRow({
   );
 }
 
+function DriveFolderRow({
+  folder,
+  depth,
+  selectedToken,
+  childrenByParent,
+  expanded,
+  loadingToken,
+  onToggle,
+  onSelect,
+}: {
+  folder: FeishuDriveItem;
+  depth: number;
+  selectedToken: string | null;
+  childrenByParent: Record<string, FeishuDriveItem[]>;
+  expanded: Set<string>;
+  loadingToken: string;
+  onToggle: (folder: FeishuDriveItem) => void;
+  onSelect: (folder: FeishuDriveItem) => void;
+}) {
+  const isExpanded = expanded.has(folder.token);
+  const children = (childrenByParent[folder.token] || []).filter((item) => item.type === "folder");
+  const isSelected = selectedToken === folder.token;
+  return (
+    <div>
+      <div
+        className={`flex min-h-11 items-center gap-2 rounded-xl px-2 transition ${isSelected ? "bg-[#002fa7]/[0.07] text-[#002fa7]" : "hover:bg-black/[0.025]"}`}
+        style={{ paddingLeft: `${8 + depth * 18}px` }}
+      >
+        <button type="button" className="grid h-7 w-7 shrink-0 place-items-center rounded-lg text-gray-400 hover:bg-white" onClick={() => onToggle(folder)} aria-label={isExpanded ? "折叠" : "展开"}>
+          {loadingToken === folder.token ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : isExpanded ? <ChevronDown className="h-4 w-4" /> : <ChevronRight className="h-4 w-4" />}
+        </button>
+        <button type="button" className="flex min-w-0 flex-1 items-center gap-3 text-left" onClick={() => onSelect(folder)}>
+          <span className={`grid h-5 w-5 shrink-0 place-items-center rounded-full border ${isSelected ? "border-[#002fa7] bg-[#002fa7] text-white" : "border-gray-300 bg-white"}`}>
+            {isSelected ? <Check className="h-3 w-3" /> : null}
+          </span>
+          <FolderTree className="h-4 w-4 shrink-0 text-[#002fa7]" />
+          <span className="truncate text-sm font-medium">{folder.name || "未命名文件夹"}</span>
+        </button>
+      </div>
+      {isExpanded ? children.map((child) => (
+        <DriveFolderRow
+          key={child.token}
+          folder={child}
+          depth={depth + 1}
+          selectedToken={selectedToken}
+          childrenByParent={childrenByParent}
+          expanded={expanded}
+          loadingToken={loadingToken}
+          onToggle={onToggle}
+          onSelect={onSelect}
+        />
+      )) : null}
+    </div>
+  );
+}
+
 export default function FeishuConnectionWizard({ open, existingSource = null, onClose, onConnected }: Props) {
   const [step, setStep] = useState<Step>("credential");
   const [appId, setAppId] = useState("");
@@ -140,7 +199,7 @@ export default function FeishuConnectionWizard({ open, existingSource = null, on
   const [appCredentialId, setAppCredentialId] = useState("");
   const [source, setSource] = useState<KnowledgeSource | null>(null);
   const [spaces, setSpaces] = useState<FeishuSpace[]>([]);
-  const [scopeMode, setScopeMode] = useState<"wiki" | "bitable">("wiki");
+  const [scopeMode, setScopeMode] = useState<"wiki" | "drive" | "bitable">("wiki");
   const [spaceId, setSpaceId] = useState("");
   const [nodes, setNodes] = useState<FeishuWikiNode[]>([]);
   const [childrenByParent, setChildrenByParent] = useState<Record<string, FeishuWikiNode[]>>({});
@@ -156,6 +215,14 @@ export default function FeishuConnectionWizard({ open, existingSource = null, on
   const [bitableViewId, setBitableViewId] = useState("");
   const [bitableResolved, setBitableResolved] = useState(false);
   const [bitablePreview, setBitablePreview] = useState<FeishuBitablePreview | null>(null);
+  const [driveRootItems, setDriveRootItems] = useState<FeishuDriveItem[]>([]);
+  const [driveChildrenByParent, setDriveChildrenByParent] = useState<Record<string, FeishuDriveItem[]>>({});
+  const [driveExpanded, setDriveExpanded] = useState<Set<string>>(new Set());
+  const [driveFolderToken, setDriveFolderToken] = useState<string | null>(null);
+  const [driveFolderName, setDriveFolderName] = useState("");
+  const [driveFolderUrl, setDriveFolderUrl] = useState("");
+  const [driveScopeSelected, setDriveScopeSelected] = useState(false);
+  const [driveLoadingToken, setDriveLoadingToken] = useState("");
   const [previewBusy, setPreviewBusy] = useState(false);
   const [busy, setBusy] = useState(false);
   const [loadingToken, setLoadingToken] = useState("");
@@ -170,7 +237,7 @@ export default function FeishuConnectionWizard({ open, existingSource = null, on
     const existingSpaceId = typeof existingSource?.config.space_id === "string" ? existingSource.config.space_id : "";
     const existingRootToken = typeof existingSource?.config.root_node_token === "string" ? existingSource.config.root_node_token : "";
     const existingInterval = Number(existingSource?.schedule?.interval_minutes || 0);
-    const existingMode = existingSource?.config.source_mode === "bitable" ? "bitable" : "wiki";
+    const existingMode = existingSource?.config.source_mode === "bitable" ? "bitable" : existingSource?.config.source_mode === "drive" ? "drive" : "wiki";
     setStep(existingAppId ? "authorization" : "credential");
     setAppId("");
     setAppSecret("");
@@ -201,6 +268,14 @@ export default function FeishuConnectionWizard({ open, existingSource = null, on
     setBitableViewId(typeof existingSource?.config.view_id === "string" ? existingSource.config.view_id : "");
     setBitableResolved(existingMode === "bitable" && Boolean(existingSource?.config.app_token));
     setBitablePreview(null);
+    setDriveRootItems([]);
+    setDriveChildrenByParent({});
+    setDriveExpanded(new Set());
+    setDriveFolderToken(existingMode === "drive" ? String(existingSource?.config.folder_token || "") : null);
+    setDriveFolderName(existingMode === "drive" ? String(existingSource?.config.folder_name || "我的云盘") : "");
+    setDriveFolderUrl(existingMode === "drive" ? String(existingSource?.config.source_url || "") : "");
+    setDriveScopeSelected(existingMode === "drive" && Boolean(existingSource?.config.drive_scope_configured || existingSource?.config.folder_token));
+    setDriveLoadingToken("");
     prevSpaceIdRef.current = existingSpaceId;
     setError("");
     setNameSaved(false);
@@ -229,11 +304,12 @@ export default function FeishuConnectionWizard({ open, existingSource = null, on
       oauthCompletedRef.current = true;
       setStep("scope");
       if (scopeMode === "bitable" && bitableUrl.trim()) void hydrateBitable(source.id, bitableUrl.trim());
-      else void loadSpaces(source.id);
+      else if (scopeMode === "drive") void loadDriveRoot(source.id);
+      else if (scopeMode === "wiki") void loadSpaces(source.id);
     };
     window.addEventListener("message", onMessage);
     return () => window.removeEventListener("message", onMessage);
-  }, [authType, open, source]);
+  }, [authType, open, scopeMode, source]);
 
   const stepIndex = step === "credential" ? 0 : step === "authorization" ? 1 : 2;
   const selectedSpace = useMemo(() => spaces.find((item) => item.space_id === spaceId), [spaceId, spaces]);
@@ -311,7 +387,8 @@ export default function FeishuConnectionWizard({ open, existingSource = null, on
         setSource(bound);
         setStep("scope");
         if (scopeMode === "bitable" && bitableUrl.trim()) await hydrateBitable(bound.id, bitableUrl.trim());
-        else await loadSpaces(bound.id);
+        else if (scopeMode === "drive") await loadDriveRoot(bound.id);
+        else if (scopeMode === "wiki") await loadSpaces(bound.id);
         return;
       }
       const oauth = await startFeishuUserOAuth(created.id, appCredentialId, redirectUri);
@@ -388,7 +465,16 @@ export default function FeishuConnectionWizard({ open, existingSource = null, on
             monitor_changes: false,
             interval_minutes: 0,
           })
-        : await configureFeishuScope(source.id, {
+        : scopeMode === "drive"
+          ? await configureFeishuDriveScope(source.id, {
+              folder_token: driveFolderToken || "",
+              folder_name: driveFolderName || "我的云盘",
+              source_url: driveFolderUrl,
+              publish_vector: publishVector,
+              interval_minutes: schedule === "manual" ? 0 : Number(schedule),
+              parser_id: "mineru_local",
+            })
+          : await configureFeishuScope(source.id, {
             space_id: spaceId,
             root_node_token: rootNodeToken,
             publish_vector: publishVector,
@@ -407,6 +493,55 @@ export default function FeishuConnectionWizard({ open, existingSource = null, on
   async function inspectBitableLink() {
     if (!source || !bitableUrl.trim()) return;
     await hydrateBitable(source.id, bitableUrl.trim());
+  }
+
+  async function loadDriveRoot(sourceId: string) {
+    setBusy(true);
+    setError("");
+    try {
+      const items = await listFeishuDriveFiles(sourceId);
+      setDriveRootItems(items.filter((item) => item.type === "folder"));
+      setStep("scope");
+    } catch (nextError) {
+      setDriveRootItems([]);
+      setError(messageOf(nextError));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function toggleDriveFolder(folder: FeishuDriveItem) {
+    const token = folder.token;
+    if (driveExpanded.has(token)) {
+      setDriveExpanded((current) => { const next = new Set(current); next.delete(token); return next; });
+      return;
+    }
+    setDriveExpanded((current) => new Set(current).add(token));
+    if (!source || driveChildrenByParent[token]) return;
+    setDriveLoadingToken(token);
+    try {
+      const children = await listFeishuDriveFiles(source.id, token);
+      setDriveChildrenByParent((current) => ({ ...current, [token]: children }));
+    } catch (nextError) {
+      setDriveExpanded((current) => { const next = new Set(current); next.delete(token); return next; });
+      setError(messageOf(nextError));
+    } finally {
+      setDriveLoadingToken("");
+    }
+  }
+
+  function selectDriveFolder(folder: FeishuDriveItem) {
+    setDriveFolderToken(folder.token);
+    setDriveFolderName(folder.name || "未命名文件夹");
+    setDriveFolderUrl(folder.url || "");
+    setDriveScopeSelected(true);
+  }
+
+  function selectDriveRoot() {
+    setDriveFolderToken("");
+    setDriveFolderName("我的云盘");
+    setDriveFolderUrl("");
+    setDriveScopeSelected(true);
   }
 
   async function loadBitablePreview(sourceId: string, url: string, tableId: string, viewId: string) {
@@ -459,11 +594,11 @@ export default function FeishuConnectionWizard({ open, existingSource = null, on
   if (!open) return null;
 
   return (
-    <div className="fixed inset-0 z-[120] grid place-items-center bg-slate-950/30 p-4 backdrop-blur-[2px]" role="dialog" aria-modal="true" aria-label="连接飞书知识库">
+    <div className="fixed inset-0 z-[120] grid place-items-center bg-slate-950/30 p-4 backdrop-blur-[2px]" role="dialog" aria-modal="true" aria-label="连接飞书知识来源">
       <div className="flex max-h-[92vh] w-full max-w-4xl flex-col overflow-hidden rounded-[28px] border border-white/70 bg-white shadow-2xl shadow-slate-950/15">
         <div className="flex items-start justify-between border-b border-black/[0.06] px-6 py-5 sm:px-8">
           <div>
-            <h2 className="text-xl font-semibold tracking-tight text-gray-950">{existingSource ? "编辑飞书连接" : "连接飞书知识库"}</h2>
+            <h2 className="text-xl font-semibold tracking-tight text-gray-950">{existingSource ? "编辑飞书连接" : "连接飞书知识来源"}</h2>
             <div className="mt-4 flex items-center gap-2">
               {["应用凭据", "授权身份", "同步范围"].map((label, index) => (
                 <div key={label} className="flex items-center gap-2">
@@ -531,9 +666,12 @@ export default function FeishuConnectionWizard({ open, existingSource = null, on
 
           {step === "scope" ? (
             <div>
-              <div className="mb-6 grid gap-3 sm:grid-cols-2">
+              <div className="mb-6 grid gap-3 sm:grid-cols-3">
                 <button type="button" onClick={() => { setScopeMode("wiki"); if (source && !spaces.length) void loadSpaces(source.id); }} className={`rounded-2xl border p-4 text-left transition ${scopeMode === "wiki" ? "border-[#002fa7]/30 bg-[#002fa7]/[0.045] ring-2 ring-[#002fa7]/10" : "border-black/[0.07] hover:border-[#002fa7]/20"}`}>
                   <div className="flex items-center gap-3"><FolderTree className="h-5 w-5 text-[#002fa7]" /><div><div className="text-sm font-semibold">Wiki 文档同步</div><p className="mt-1 text-xs text-gray-500">选择空间或根节点，Docx 转为 Markdown 并进入资料库。</p></div></div>
+                </button>
+                <button type="button" onClick={() => { setScopeMode("drive"); setError(""); if (source && !driveRootItems.length) void loadDriveRoot(source.id); }} className={`rounded-2xl border p-4 text-left transition ${scopeMode === "drive" ? "border-[#002fa7]/30 bg-[#002fa7]/[0.045] ring-2 ring-[#002fa7]/10" : "border-black/[0.07] hover:border-[#002fa7]/20"}`}>
+                  <div className="flex items-center gap-3"><FolderTree className="h-5 w-5 text-[#002fa7]" /><div><div className="text-sm font-semibold">云盘文件夹同步</div><p className="mt-1 text-xs text-gray-500">从当前身份可见的云盘目录中选择，并递归同步文件。</p></div></div>
                 </button>
                 <button type="button" onClick={() => { setScopeMode("bitable"); setError(""); }} className={`rounded-2xl border p-4 text-left transition ${scopeMode === "bitable" ? "border-[#002fa7]/30 bg-[#002fa7]/[0.045] ring-2 ring-[#002fa7]/10" : "border-black/[0.07] hover:border-[#002fa7]/20"}`}>
                   <div className="flex items-center gap-3"><Database className="h-5 w-5 text-[#002fa7]" /><div><div className="text-sm font-semibold">多维表格实时连接</div><p className="mt-1 text-xs text-gray-500">只保存链接与 Schema，Agent 按需实时读取，不复制行数据。</p></div></div>
@@ -564,6 +702,33 @@ export default function FeishuConnectionWizard({ open, existingSource = null, on
                       )) : <div className="grid min-h-[220px] place-items-center text-xs text-gray-400">这个空间没有可读取的 Wiki 节点。</div>}
                     </div>
                     <div className="mt-3 flex flex-wrap items-center justify-between gap-3 rounded-xl bg-gray-50 px-4 py-3 text-xs"><span className="text-gray-500">同步范围：<strong className="text-gray-800">{selectedSpace?.name || (spaceId ? "已保存空间" : "未选择")}{rootNodeToken ? ` / ${rootNodeTitle || "指定根节点"}` : spaceId ? " / 整个空间" : ""}</strong></span><label className="flex items-center gap-2 font-medium text-gray-700"><input type="checkbox" checked={publishVector} onChange={(event) => setPublishVector(event.target.checked)} className="accent-[#002fa7]" />同步后写入向量索引</label></div>
+                  </div>
+                </div>
+              ) : scopeMode === "drive" ? (
+                <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_260px]">
+                  <div className="min-w-0">
+                    <div className="flex items-end justify-between gap-3">
+                      <div><div className="text-xs font-semibold text-gray-700">选择云盘同步范围</div><p className="mt-1 text-xs text-gray-400">直接读取当前身份可见的云盘目录。可选择整个“我的云盘”，也可展开并选择一个文件夹。</p></div>
+                      <button type="button" disabled={busy || !source} onClick={() => source && void loadDriveRoot(source.id)} className="shrink-0 text-xs font-semibold text-[#002fa7] disabled:opacity-40">刷新目录</button>
+                    </div>
+                    <div className="mt-3 max-h-[390px] min-h-[280px] overflow-y-auto rounded-2xl border border-black/[0.07] p-2">
+                      <div className={`flex min-h-11 items-center gap-2 rounded-xl px-2 transition ${driveScopeSelected && driveFolderToken === "" ? "bg-[#002fa7]/[0.07] text-[#002fa7]" : "hover:bg-black/[0.025]"}`}>
+                        <span className="h-7 w-7 shrink-0" />
+                        <button type="button" className="flex min-w-0 flex-1 items-center gap-3 text-left" onClick={selectDriveRoot}>
+                          <span className={`grid h-5 w-5 shrink-0 place-items-center rounded-full border ${driveScopeSelected && driveFolderToken === "" ? "border-[#002fa7] bg-[#002fa7] text-white" : "border-gray-300 bg-white"}`}>{driveScopeSelected && driveFolderToken === "" ? <Check className="h-3 w-3" /> : null}</span>
+                          <FolderTree className="h-4 w-4 shrink-0 text-[#002fa7]" /><span className="truncate text-sm font-semibold">我的云盘（根目录）</span>
+                        </button>
+                      </div>
+                      {busy && !driveRootItems.length ? <div className="grid min-h-[210px] place-items-center"><Loader2 className="h-5 w-5 animate-spin text-[#002fa7]" /></div> : driveRootItems.length ? driveRootItems.map((folder) => (
+                        <DriveFolderRow key={folder.token} folder={folder} depth={0} selectedToken={driveScopeSelected ? driveFolderToken : null} childrenByParent={driveChildrenByParent} expanded={driveExpanded} loadingToken={driveLoadingToken} onToggle={toggleDriveFolder} onSelect={selectDriveFolder} />
+                      )) : <div className="grid min-h-[210px] place-items-center px-6 text-center text-xs leading-5 text-gray-400">当前身份的云盘根目录没有可见文件夹。应用身份只能看到应用自己的根目录；需要浏览个人云盘时请改用用户身份授权。</div>}
+                    </div>
+                  </div>
+                  <div className="space-y-4">
+                    <div className="rounded-2xl border border-[#002fa7]/10 bg-[#002fa7]/[0.035] p-4 text-xs leading-5 text-gray-600"><div className="flex items-center gap-2 font-semibold text-gray-900"><FolderTree className="h-4 w-4 text-[#002fa7]" />递归同步</div><p className="mt-1">选中范围后递归扫描子文件夹；原生 Docx 转 Markdown，PDF 进入解析器，常见 Office 与文本文件进入资料库。</p><p className="mt-2 font-medium text-[#002fa7]">应用身份只显示应用可见目录；用户身份显示该用户“我的云盘”。</p></div>
+                    <div className="rounded-xl bg-gray-50 px-4 py-3 text-xs text-gray-500">当前范围：<strong className="text-gray-800">{driveScopeSelected ? driveFolderName || "我的云盘" : "未选择"}</strong></div>
+                    <label className="block text-xs font-semibold text-gray-700">自动同步<select value={schedule} onChange={(event) => { setSchedule(event.target.value); event.currentTarget.blur(); }} className="mt-2 h-10 w-full rounded-xl border border-black/10 bg-white px-3 text-sm font-normal outline-none"><option value="manual">仅手动</option><option value="15">每 15 分钟</option><option value="60">每小时</option><option value="360">每 6 小时</option><option value="1440">每天</option></select></label>
+                    <label className="flex items-center gap-2 rounded-xl bg-gray-50 px-4 py-3 text-xs font-medium text-gray-700"><input type="checkbox" checked={publishVector} onChange={(event) => setPublishVector(event.target.checked)} className="accent-[#002fa7]" />同步后写入向量索引</label>
                   </div>
                 </div>
               ) : (
@@ -611,7 +776,7 @@ export default function FeishuConnectionWizard({ open, existingSource = null, on
           <button type="button" onClick={step === "credential" || step === "scope" ? onClose : () => setStep("credential")} className="h-10 rounded-xl border border-black/10 px-4 text-sm font-semibold text-gray-600 hover:bg-gray-50">{step === "credential" ? "取消" : step === "scope" ? "稍后设置" : "上一步"}</button>
           {step === "credential" ? <button type="button" disabled={busy || !appId.trim() || appSecret.length < 8} onClick={() => void saveCredential()} className="inline-flex h-10 items-center gap-2 rounded-xl bg-[#002fa7] px-5 text-sm font-semibold text-white disabled:opacity-40">{busy ? <Loader2 className="h-4 w-4 animate-spin" /> : null}验证并继续</button> : null}
           {step === "authorization" ? <button type="button" disabled={busy} onClick={() => void authorize()} className="inline-flex h-10 items-center gap-2 rounded-xl bg-[#002fa7] px-5 text-sm font-semibold text-white disabled:opacity-40">{busy ? <Loader2 className="h-4 w-4 animate-spin" /> : authType === "user" ? <ExternalLink className="h-4 w-4" /> : null}{authType === "tenant" ? "验证应用身份" : "打开飞书授权"}</button> : null}
-          {step === "scope" ? <button type="button" disabled={busy || (scopeMode === "wiki" ? !spaceId : !bitableResolved)} onClick={() => void finish()} className="inline-flex h-10 items-center gap-2 rounded-xl bg-[#002fa7] px-5 text-sm font-semibold text-white disabled:opacity-40">{busy ? <Loader2 className="h-4 w-4 animate-spin" /> : null}{scopeMode === "wiki" ? "保存并开始同步" : bitableSelectedTableIds.length ? "保存授权范围" : "保存（不授权数据表）"}</button> : null}
+          {step === "scope" ? <button type="button" disabled={busy || (scopeMode === "wiki" ? !spaceId : scopeMode === "drive" ? !driveScopeSelected : !bitableResolved)} onClick={() => void finish()} className="inline-flex h-10 items-center gap-2 rounded-xl bg-[#002fa7] px-5 text-sm font-semibold text-white disabled:opacity-40">{busy ? <Loader2 className="h-4 w-4 animate-spin" /> : null}{scopeMode === "bitable" ? bitableSelectedTableIds.length ? "保存授权范围" : "保存（不授权数据表）" : "保存并开始同步"}</button> : null}
         </div>
       </div>
     </div>

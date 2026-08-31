@@ -67,6 +67,12 @@ postgres = [
     "asyncpg>=0.29.0",
 ]
 
+# MySQL knowledge/analytics connector. Kept optional so installations that do
+# not use a live MySQL source do not carry an additional database driver.
+mysql = [
+    "asyncmy>=0.2.10",
+]
+
 evaluation = [
     # Official SWE-bench Docker verifier. Keep this exact and resolved through
     # uv.lock; evaluation workers never download Python code at run time.
@@ -105,6 +111,7 @@ analytics = [
     "tabulate>=0.9.0",
     "plotly>=6.0.0",
     "sqlglot>=30.0",
+    "asyncmy>=0.2.10",
 ]
 
 # PDF rich parsing via MinerU (base package, no vllm/lmdeploy GPU backends).

@@ -1495,6 +1495,7 @@ class HarnessRunCoordinator:
             report.supporting_run_ids = list(dict.fromkeys([*goal.run_ids, run.run_id]))
             run.verification_report = report
             run.finish(outcome)
+            goal.model_call_count += max(0, run.model_call_count)
             goal.latest_verification_report_id = report.report_id
             goal.transition(GoalStatus.COMPLETED)
             return run, goal, report

@@ -164,6 +164,22 @@ def test_strict_schema_scope_does_not_authorize_private_table_by_bare_name() -> 
         )
 
 
+def test_mysql_readonly_scope_accepts_backtick_identifiers() -> None:
+    sql = "SELECT `order_id`, COUNT(*) AS total FROM `orders` GROUP BY `order_id`"
+
+    assert validate_readonly_sql(
+        sql,
+        allowed_tables=["orders"],
+        dialect="mysql",
+    ) == sql
+    with pytest.raises(SqlRunnerError, match="未授权数据表"):
+        validate_readonly_sql(
+            "SELECT * FROM `users`",
+            allowed_tables=["orders"],
+            dialect="mysql",
+        )
+
+
 def test_agent_parser_defers_unregistered_scalar_function_while_legacy_remains_strict() -> None:
     sql = "SELECT regexp_split_to_table(type_value, ',') FROM vehicle_params"
 

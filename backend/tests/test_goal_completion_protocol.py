@@ -227,7 +227,53 @@ def test_rubric_acceptance_remains_atomic_until_candidate_message(tmp_path) -> N
         goal=goal.model_dump(mode="json"),
         query_id="query-1",
         content="已通过复核。",
+        usage_summary={
+            "run_id": run.run_id,
+            "query_id": run.query_id,
+            "rounds": 7,
+        },
     )
     saved = sessions.get_harness_state("session-1")
     assert saved["goals"][goal.goal_id]["status"] == "completed"
+    assert saved["runs"][run.run_id]["model_call_count"] == 7
+    assert saved["goals"][goal.goal_id]["model_call_count"] == 7
     assert saved["completion_requests"][request["request_id"]]["status"] == "accepted"
+
+
+def test_legacy_rubric_session_recovers_run_and_goal_model_calls() -> None:
+    data = {
+        "messages": [
+            {
+                "role": "assistant",
+                "query_id": "query-1",
+                "usage_summary": {
+                    "run_id": "run-1",
+                    "query_id": "query-1",
+                    "rounds": 20,
+                    "observed_calls": 11,
+                },
+            }
+        ],
+        "harness": {
+            "runs": {
+                "run-1": {
+                    "run_id": "run-1",
+                    "query_id": "query-1",
+                    "status": "completed",
+                    "model_call_count": 0,
+                }
+            },
+            "goals": {
+                "goal-1": {
+                    "goal_id": "goal-1",
+                    "status": "completed",
+                    "run_ids": ["run-1"],
+                    "model_call_count": 0,
+                }
+            },
+        },
+    }
+
+    assert SessionManager._repair_legacy_model_call_counts(data) is True
+    assert data["harness"]["runs"]["run-1"]["model_call_count"] == 11
+    assert data["harness"]["goals"]["goal-1"]["model_call_count"] == 11

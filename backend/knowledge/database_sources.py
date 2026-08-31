@@ -37,7 +37,13 @@ class KnowledgeDatabaseSourceError(RuntimeError):
 
 
 _SOURCE_ID_RE = re.compile(r"^[a-zA-Z0-9_-]{3,80}$")
-_SUPPORTED_TYPES = {"postgresql"}
+_SUPPORTED_TYPES = {"postgresql", "mysql"}
+
+
+def _source_type(source: KnowledgeDatabaseSource | dict[str, Any]) -> str:
+    if isinstance(source, KnowledgeDatabaseSource):
+        return str(source.source_type or "postgresql").strip().lower()
+    return str(source.get("source_type") or source.get("type") or "postgresql").strip().lower()
 
 
 def _project_postgres_enabled() -> bool:
@@ -70,14 +76,16 @@ def _sanitize_payload(raw: dict[str, Any], *, fallback_id: str | None = None) ->
     source_id = str(raw.get("id") or fallback_id or f"dbs_{uuid.uuid4().hex[:18]}").strip()
     if not _SOURCE_ID_RE.match(source_id):
         source_id = f"dbs_{uuid.uuid4().hex[:18]}"
+    default_port = 3306 if source_type == "mysql" else 5432
+    default_name = "MySQL 数据源" if source_type == "mysql" else "PostgreSQL 数据源"
     try:
-        port = int(raw.get("port") or 5432)
+        port = int(raw.get("port") or default_port)
     except (TypeError, ValueError):
-        port = 5432
+        port = default_port
     return {
         "id": source_id,
         "source_type": source_type,
-        "name": str(raw.get("name") or "PostgreSQL 数据源").strip(),
+        "name": str(raw.get("name") or default_name).strip(),
         "description": str(raw.get("description") or "").strip(),
         "host": str(raw.get("host") or "127.0.0.1").strip(),
         "port": port,
@@ -209,8 +217,10 @@ def _source_url(source: dict[str, Any]) -> str:
     username = str(source.get("username") or "")
     password = str(source.get("password") or "")
     host = str(source.get("host") or "127.0.0.1")
-    port = int(source.get("port") or 5432)
-    return f"postgresql+asyncpg://{quote(username)}:{quote(password)}@{host}:{port}/{quote(database)}"
+    source_type = _source_type(source)
+    port = int(source.get("port") or (3306 if source_type == "mysql" else 5432))
+    driver = "mysql+asyncmy" if source_type == "mysql" else "postgresql+asyncpg"
+    return f"{driver}://{quote(username, safe='')}:{quote(password, safe='')}@{host}:{port}/{quote(database, safe='')}"
 
 
 def database_source_url(source: KnowledgeDatabaseSource | dict[str, Any]) -> str:
@@ -366,6 +376,21 @@ async def list_database_tables(source: KnowledgeDatabaseSource | dict[str, Any])
     engine = create_async_engine(_source_url(_connection_source(source)), pool_pre_ping=True)
     try:
         async with engine.connect() as conn:
+            if _source_type(source) == "mysql":
+                database = str(_connection_source(source).get("database") or "")
+                result = await conn.execute(
+                    text(
+                        """
+                        SELECT table_name
+                        FROM information_schema.tables
+                        WHERE table_type = 'BASE TABLE'
+                          AND table_schema = :database
+                        ORDER BY table_name
+                        """
+                    ),
+                    {"database": database},
+                )
+                return [str(row[0]) for row in result]
             result = await conn.execute(
                 text(
                     """
@@ -397,10 +422,12 @@ async def list_database_table_columns(
     if normalized_table not in selected_tables:
         raise KnowledgeDatabaseSourceError("只能读取数据源已登记表的字段。")
 
+    source_type = _source_type(source)
     if "." in normalized_table:
         schema, table = normalized_table.split(".", 1)
     else:
-        schema, table = "public", normalized_table
+        connection = _connection_source(source)
+        schema, table = (str(connection.get("database") or ""), normalized_table) if source_type == "mysql" else ("public", normalized_table)
     if not schema or not table:
         raise KnowledgeDatabaseSourceError("表名无效。")
 
@@ -439,10 +466,12 @@ async def list_database_table_column_values(
     if normalized_table not in selected_tables:
         raise KnowledgeDatabaseSourceError("只能读取数据源已登记表的字段值。")
 
+    source_type = _source_type(source)
     if "." in normalized_table:
         schema, table = normalized_table.split(".", 1)
     else:
-        schema, table = "public", normalized_table
+        connection = _connection_source(source)
+        schema, table = (str(connection.get("database") or ""), normalized_table) if source_type == "mysql" else ("public", normalized_table)
     normalized_column = str(column or "").strip()
     if not schema or not table or not normalized_column:
         raise KnowledgeDatabaseSourceError("表名或字段名无效。")
@@ -452,7 +481,8 @@ async def list_database_table_column_values(
     engine = create_async_engine(_source_url(_connection_source(source)), pool_pre_ping=True)
     try:
         async with engine.connect() as conn:
-            await conn.execute(text("SET LOCAL statement_timeout = '15s'"))
+            if source_type == "postgresql":
+                await conn.execute(text("SET LOCAL statement_timeout = '15s'"))
             column_result = await conn.execute(
                 text(
                     """
@@ -468,21 +498,23 @@ async def list_database_table_column_values(
             if column_result.scalar_one_or_none() is None:
                 raise KnowledgeDatabaseSourceError("筛选字段不存在。")
 
-            quoted_schema = '"' + schema.replace('"', '""') + '"'
-            quoted_table = '"' + table.replace('"', '""') + '"'
-            quoted_column = '"' + normalized_column.replace('"', '""') + '"'
+            quote_char = "`" if source_type == "mysql" else '"'
+            quoted_schema = quote_char + schema.replace(quote_char, quote_char * 2) + quote_char
+            quoted_table = quote_char + table.replace(quote_char, quote_char * 2) + quote_char
+            quoted_column = quote_char + normalized_column.replace(quote_char, quote_char * 2) + quote_char
+            text_value = f"CAST({quoted_column} AS CHAR)" if source_type == "mysql" else f"{quoted_column}::text"
             search_clause = ""
             params: dict[str, Any] = {"limit": clean_limit + 1}
             if clean_search:
-                search_clause = f"AND {quoted_column}::text ILIKE :search"
+                search_clause = f"AND LOWER({text_value}) LIKE LOWER(:search)"
                 params["search"] = f"%{clean_search}%"
             result = await conn.execute(
                 text(
                     f"""
-                    SELECT DISTINCT BTRIM({quoted_column}::text) AS value
+                    SELECT DISTINCT TRIM({text_value}) AS value
                     FROM {quoted_schema}.{quoted_table}
                     WHERE {quoted_column} IS NOT NULL
-                      AND BTRIM({quoted_column}::text) <> ''
+                      AND TRIM({text_value}) <> ''
                       {search_clause}
                     ORDER BY value
                     LIMIT :limit

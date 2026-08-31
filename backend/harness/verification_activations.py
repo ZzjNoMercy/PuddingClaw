@@ -1145,6 +1145,41 @@ def _controlled_validator_spec(command: str) -> tuple[str, str] | None:
     return None
 
 
+def _project_validator_spec(command: str) -> tuple[str, str] | None:
+    """Recognize one unmasked, executable test command.
+
+    These receipts may close a Todo or support the Rubric, but unlike the
+    registered validators above they never authorize artifact publication.
+    """
+
+    try:
+        segments = ShellPolicyAnalyzer.parse_segments(command)
+    except ValueError:
+        return None
+    if len(segments) != 1:
+        return None
+    tokens = ShellPolicyAnalyzer.unwrap_command(segments[0])
+    if not tokens:
+        return None
+    executable = tokens[0].rsplit("/", 1)[-1].lower()
+    if executable == "pytest" and len(tokens) >= 1:
+        return "project_test", "pytest/v1"
+    if (
+        executable in {"python", "python3"}
+        and len(tokens) >= 3
+        and tokens[1:3] == ["-m", "pytest"]
+    ):
+        return "project_test", "pytest/v1"
+    if executable in {"npm", "pnpm", "yarn"} and (
+        len(tokens) >= 2
+        and (tokens[1] == "test" or tokens[1:3] == ["run", "test"])
+    ):
+        return "project_test", f"{executable}-test/v1"
+    if executable in {"cargo", "go"} and len(tokens) >= 2 and tokens[1] == "test":
+        return "project_test", f"{executable}-test/v1"
+    return None
+
+
 def _file_identity(path: Path) -> tuple[str, int] | None:
     try:
         if not path.is_file():
@@ -1670,19 +1705,15 @@ def _validation_receipt_for_result(
         if tool_name == "validate_html_report"
         else _controlled_validator_spec(command)
     )
-    lowered = command.lower()
+    project_spec = None if controlled_spec is not None else _project_validator_spec(command)
+    if controlled_spec is None and project_spec is None:
+        # Generic shell success, read_file output and model prose are not
+        # validators and therefore cannot mint a ValidationReceipt.
+        return None
     if controlled_spec is not None:
         validator_kind, validator_version = controlled_spec
-    elif re.search(r"(?:^|\s)node\s+(?:--check|-c)(?:\s|$)", lowered):
-        validator_kind = "javascript_syntax"
-    elif re.search(r"(?:pytest|\btest\b|npm\s+(?:run\s+)?test)", lowered):
-        validator_kind = "project_test"
-    elif ".html" in lowered and re.search(r"validate|validator|check", lowered):
-        validator_kind = "html_structure"
     else:
-        validator_kind = "static_check"
-    if controlled_spec is None:
-        validator_version = "command-receipt/v1"
+        validator_kind, validator_version = project_spec
 
     output_ref = _command_result_ref(
         result,

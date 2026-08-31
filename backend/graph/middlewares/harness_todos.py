@@ -1,7 +1,9 @@
 """Stable-ID, incremental Todo control for Harness Runs and Goals."""
 
 import hashlib
+import re
 import time
+from collections.abc import Callable
 from typing import Annotated, Any, Literal, NotRequired
 
 from deepagents.middleware._utils import append_to_system_message
@@ -14,6 +16,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from graph.prompt_cache import reorder_system_prompt_sections
 from graph.session_manager import session_manager
+from harness.models import ValidationReceipt
 
 
 class HarnessTodoState(AgentState):
@@ -76,36 +79,12 @@ class CreateTodoOperation(_ToolTodoOperation):
     action: Literal["create"]
     content: str = Field(min_length=1)
     status: Literal["pending", "in_progress"] = "pending"
-    completion_contract: Literal[
-        "validation_receipt",
-        "artifact_receipt",
-        "query_result",
-        "delivery_bundle",
-    ] | None = None
-    evidence_refs: list[str] = Field(default_factory=list)
 
 
 class UpdateTodoOperation(_ToolTodoOperation):
     action: Literal["update"]
     todo_id: str = Field(min_length=1)
-    content: str | None = None
-    completion_contract: Literal[
-        "validation_receipt",
-        "artifact_receipt",
-        "query_result",
-        "delivery_bundle",
-    ] | None = None
-    evidence_refs: list[str] = Field(default_factory=list)
-
-    @model_validator(mode="after")
-    def require_update(self) -> "UpdateTodoOperation":
-        if (
-            self.content is None
-            and self.completion_contract is None
-            and not self.evidence_refs
-        ):
-            raise ValueError("update requires content, completion_contract, or evidence_refs")
-        return self
+    content: str = Field(min_length=1)
 
 
 class StartTodoOperation(_ToolTodoOperation):
@@ -162,14 +141,13 @@ Never replace the whole list and never reuse an ID for a different task.
 - `start`, `complete`, `cancel`, `reopen`: change lifecycle explicitly.
 - `reorder`: change display order only; it never changes identity or status.
 
-For validation, artifact delivery, or query-result work, set a
-`completion_contract` when creating the Todo. Completing such a Todo requires
-the corresponding structured IDs in `evidence_refs`; prose claims are not
-evidence. Use validation_receipt, artifact_receipt, or query_result.
-For a report/dashboard/chart Todo that combines refreshed source data, a
-written artifact, and rendered or executable validation, use delivery_bundle.
-It requires at least one query_result, artifact_receipt, and validation_receipt
-ID before completion. Do not create such delivery Todos without this contract.
+Todos describe work and progress only. Harness assigns any completion contract
+from the immutable Run task profile; never invent, select, weaken, or rewrite an
+evidence type. File delivery is closed by an ArtifactReceipt. A
+ValidationReceipt is accepted only when a real Harness validator issued it;
+reading a file or claiming that you checked it is not validation. Content-level
+questions such as whether all requested sections are present belong to the
+final Rubric grader unless a dedicated structural validator produced a receipt.
 
 Do not mark a Todo complete until its result is actually produced and verified.
 Create new Todos as pending or in_progress; `create` with status=completed is
@@ -198,6 +176,52 @@ def _normalized_todo_content(value: str) -> str:
     """Canonical identity used to suppress cross-Run duplicate creates."""
 
     return " ".join(str(value or "").strip().casefold().split())
+
+
+_ARTIFACT_WORK_RE = re.compile(
+    r"(?:生成|创建|编写|写入|更新|修改|交付|导出|保存|产出).{0,18}"
+    r"(?:文件|报告|文档|页面|网页|图表|仪表盘|dashboard|report|document|file|html|markdown|csv|xlsx|代码|code)",
+    re.IGNORECASE,
+)
+_VALIDATOR_WORK_RE = re.compile(
+    r"(?:运行|执行|run).{0,18}"
+    r"(?:测试|构建|静态检查|语法检查|端到端|e2e|pytest|ruff|lint|build|typecheck|test)"
+    r"|(?:浏览器|browser|html|javascript|js).{0,12}(?:验证器|validator|结构验证|运行时验证)",
+    re.IGNORECASE,
+)
+_QUERY_WORK_RE = re.compile(
+    r"(?:查询|检索|拉取|获取|刷新|执行).{0,18}"
+    r"(?:数据|指标|数据库|sql|query|dataset|metric|analytics)",
+    re.IGNORECASE,
+)
+
+
+def _control_plane_completion_contract(
+    content: str,
+    run: dict[str, Any] | None,
+) -> str | None:
+    """Assign one non-downgradable evidence boundary from trusted Run policy.
+
+    A Todo is not a verifier.  This deterministic classifier therefore covers
+    only concrete production/query/validator actions; semantic review remains
+    owned by the final Rubric grader.
+    """
+
+    if not isinstance(run, dict):
+        return None
+    contract = run.get("declared_verification_contract") or run.get(
+        "verification_contract"
+    )
+    contract = contract if isinstance(contract, dict) else {}
+    packs = {str(item) for item in contract.get("verification_packs") or []}
+    normalized = " ".join(str(content or "").strip().split())
+    if "code" in packs and _VALIDATOR_WORK_RE.search(normalized):
+        return "validation_receipt"
+    if "analytics" in packs and _QUERY_WORK_RE.search(normalized):
+        return "query_result"
+    if "artifact" in packs and _ARTIFACT_WORK_RE.search(normalized):
+        return "artifact_receipt"
+    return None
 
 
 def _completion_evidence_error(
@@ -240,6 +264,7 @@ def _apply_operations(
     run_id: str,
     query_id: str,
     available_evidence: dict[str, set[str]] | None = None,
+    completion_contract_resolver: Callable[[str], str | None] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     now = time.time()
     result = [dict(item) for item in todos if isinstance(item, dict)]
@@ -265,6 +290,16 @@ def _apply_operations(
             normalized_content = _normalized_todo_content(str(operation.content or ""))
             duplicate = by_content.get(normalized_content)
             if duplicate is not None:
+                if (
+                    completion_contract_resolver is not None
+                    and not duplicate.get("completion_contract")
+                ):
+                    assigned_contract = completion_contract_resolver(
+                        str(duplicate.get("content") or "")
+                    )
+                    if assigned_contract:
+                        duplicate["completion_contract"] = assigned_contract
+                        duplicate["updated_at"] = now
                 applied.append(
                     {
                         "action": "create",
@@ -276,6 +311,11 @@ def _apply_operations(
             todo_id = _stable_created_id(tool_call_id, index)
             existing = by_id.get(todo_id)
             if existing is None:
+                assigned_contract = (
+                    completion_contract_resolver(str(operation.content or ""))
+                    if completion_contract_resolver is not None
+                    else operation_contract
+                )
                 if operation_status == "completed" and operation_contract:
                     evidence_error = _completion_evidence_error(
                         todo_id=todo_id,
@@ -294,7 +334,7 @@ def _apply_operations(
                     "created_run_id": run_id or None,
                     "last_changed_run_id": run_id or None,
                     "last_changed_query_id": query_id or None,
-                    "completion_contract": operation_contract,
+                    "completion_contract": assigned_contract,
                     "evidence_refs": list(dict.fromkeys(operation_evidence_refs)),
                 }
                 result.append(item)
@@ -324,12 +364,21 @@ def _apply_operations(
             raise ValueError(f"Unknown todo_id: {todo_id}")
         prior_normalized_content = _normalized_todo_content(str(item.get("content") or ""))
         if operation.action == "update":
+            existing_contract = str(item.get("completion_contract") or "") or None
+            if operation_contract is not None and operation_contract != existing_contract:
+                raise ValueError(
+                    f"Todo {todo_id} completion_contract is control-plane owned and immutable"
+                )
             if operation.content is not None:
                 item["content"] = operation.content.strip()
+            if completion_contract_resolver is not None and not existing_contract:
+                assigned_contract = completion_contract_resolver(
+                    str(item.get("content") or "")
+                )
+                if assigned_contract:
+                    item["completion_contract"] = assigned_contract
             if operation_status is not None:
                 item["status"] = operation_status
-            if operation_contract is not None:
-                item["completion_contract"] = operation_contract
             if operation_evidence_refs:
                 item["evidence_refs"] = list(
                     dict.fromkeys([*(item.get("evidence_refs") or []), *operation_evidence_refs])
@@ -346,6 +395,15 @@ def _apply_operations(
                 if evidence_error:
                     raise ValueError(evidence_error)
         else:
+            if (
+                completion_contract_resolver is not None
+                and not item.get("completion_contract")
+            ):
+                assigned_contract = completion_contract_resolver(
+                    str(item.get("content") or "")
+                )
+                if assigned_contract:
+                    item["completion_contract"] = assigned_contract
             if operation.action == "complete":
                 contract = str(item.get("completion_contract") or "")
                 refs = list(
@@ -409,6 +467,12 @@ def _update_todos(
     )
     goal_id = str(context.get("goal_id") or "") or None
     goal_revision = context.get("goal_revision")
+    run_id = str(context.get("run_id") or "")
+    persisted_run = (
+        session_manager.get_run_state(str(context.get("session_id") or ""), run_id)
+        if str(context.get("session_id") or "") and run_id
+        else None
+    )
 
     def mutate_authoritative(
         authoritative_todos: list[dict[str, Any]],
@@ -420,6 +484,10 @@ def _update_todos(
             run_id=str(context.get("run_id") or ""),
             query_id=str(context.get("query_id") or ""),
             available_evidence=available_evidence,
+            completion_contract_resolver=lambda content: _control_plane_completion_contract(
+                content,
+                persisted_run,
+            ),
         )
         for item in next_items:
             item["goal_id"] = goal_id
@@ -436,10 +504,12 @@ def _update_todos(
                 list(runtime.state.get("todos") or [])
             )
         except ValueError as exc:
+            current_ledger = list(runtime.state.get("todos") or [])
             return ToolMessage(
-                content=(
-                    f"Todo update rejected: {exc}. "
-                    + _todo_recovery_guidance(available_evidence)
+                content=_todo_rejection_message(
+                    exc,
+                    available=available_evidence,
+                    current_ledger=current_ledger,
                 ),
                 tool_call_id=runtime.tool_call_id,
                 name="update_todos",
@@ -468,10 +538,17 @@ def _update_todos(
             # A stale model-visible ID must not abort the entire Run. Returning a
             # tool error lets the model reconcile against the authoritative ledger
             # and recreate genuinely missing work with a fresh stable ID.
+            current_ledger = session_manager.get_todos(
+                session_id,
+                goal_id=goal_id,
+                goal_revision=goal_revision,
+                run_id=(None if goal_id else run_id or None),
+            )
             return ToolMessage(
-                content=(
-                    f"Todo update rejected: {exc}. "
-                    + _todo_recovery_guidance(available_evidence)
+                content=_todo_rejection_message(
+                    exc,
+                    available=available_evidence,
+                    current_ledger=current_ledger,
                 ),
                 tool_call_id=runtime.tool_call_id,
                 name="update_todos",
@@ -515,6 +592,19 @@ def _todo_recovery_guidance(available: dict[str, set[str]]) -> str:
     )
 
 
+def _todo_rejection_message(
+    error: Exception,
+    *,
+    available: dict[str, set[str]],
+    current_ledger: list[dict[str, Any]],
+) -> str:
+    return (
+        f"Todo update rejected: {error}. 本批操作全部未提交。"
+        f"Current ledger: {current_ledger}. "
+        + _todo_recovery_guidance(available)
+    )
+
+
 _QUERY_RESULT_TOOLS = {
     "database_sql_execute",
     "database_knowledge_query",
@@ -522,6 +612,36 @@ _QUERY_RESULT_TOOLS = {
     "execute",
     "python_repl",
 }
+
+
+def _accepted_validation_receipt(
+    payload: dict[str, Any],
+    *,
+    receipt_id: str,
+    run_id: str,
+    goal_id: str,
+    goal_revision: int | None,
+) -> bool:
+    """Accept only a complete, passing receipt minted by the Harness ledger."""
+
+    try:
+        receipt = ValidationReceipt.model_validate(payload)
+    except (TypeError, ValueError):
+        return False
+    if receipt.validation_receipt_id != receipt_id:
+        return False
+    if receipt.status != "passed" or receipt.exit_code != 0 or receipt.checks_failed != 0:
+        return False
+    if not receipt.command_evidence_ref:
+        return False
+    if run_id and receipt.run_id != run_id and not goal_id:
+        return False
+    if goal_id:
+        if receipt.goal_id != goal_id:
+            return False
+        if goal_revision is not None and receipt.goal_revision != int(goal_revision):
+            return False
+    return True
 
 
 def _available_todo_evidence(
@@ -545,7 +665,15 @@ def _available_todo_evidence(
             if not isinstance(ref, dict) or ref.get("material") is not True:
                 continue
             if ref.get("kind") == "validation_receipt" and ref.get("validation_receipt_id"):
-                available["validation_receipt"].add(str(ref["validation_receipt_id"]))
+                receipt_id = str(ref["validation_receipt_id"])
+                if _accepted_validation_receipt(
+                    ref,
+                    receipt_id=receipt_id,
+                    run_id=run_id,
+                    goal_id=goal_id,
+                    goal_revision=goal_revision,
+                ):
+                    available["validation_receipt"].add(receipt_id)
             if ref.get("kind") == "artifact_write" and ref.get("artifact_id"):
                 available["artifact_receipt"].add(str(ref["artifact_id"]))
             if ref.get("kind") == "analytics_result" or (
@@ -574,7 +702,13 @@ def _available_todo_evidence(
             evidence_id = str(resolved.get("id") or "")
             payload = resolved.get("payload")
             payload = payload if isinstance(payload, dict) else {}
-            if kind == "validation_receipt" and evidence_id:
+            if kind == "validation_receipt" and evidence_id and _accepted_validation_receipt(
+                payload,
+                receipt_id=evidence_id,
+                run_id="",
+                goal_id=goal_id,
+                goal_revision=goal_revision,
+            ):
                 available["validation_receipt"].add(evidence_id)
             elif kind == "artifact" and evidence_id:
                 available["artifact_receipt"].add(evidence_id)

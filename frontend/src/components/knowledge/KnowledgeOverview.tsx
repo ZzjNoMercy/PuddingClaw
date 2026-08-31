@@ -163,12 +163,11 @@ export default function KnowledgeOverview({ documents, jobs, loading, onRefresh 
   const latestJobs = useMemo(() => jobs.slice(0, 3), [jobs]);
   const pendingRaw = useMemo(() => workspace?.raw.filter((item) => !item.compiled) ?? [], [workspace]);
 
-  const feishuSourceName = sources.find((item) => item.connector_key === "feishu_wiki")?.name || "飞书";
   const sourceColumns = useMemo(() => ([
     { kind: "local" as SourceKind, title: "本地上传", hint: "PDF、Markdown 与 Office 文件" },
     { kind: "web" as SourceKind, title: "稍后读", hint: `${unreadCount} 篇未读` },
-    { kind: "feishu" as SourceKind, title: feishuSourceName, hint: "飞书 Wiki 同步" },
-  ]), [feishuSourceName, unreadCount]);
+    { kind: "feishu" as SourceKind, title: "飞书", hint: "Wiki、云盘与多维表格" },
+  ]), [unreadCount]);
 
   const sourceGroups = useMemo(() => {
     const groups: Record<SourceKind, KnowledgeDocument[]> = { local: [], web: [], feishu: [] };
@@ -188,7 +187,7 @@ export default function KnowledgeOverview({ documents, jobs, loading, onRefresh 
   }, [documents, readLater]);
 
   function sourceNameOf(kind: SourceKind): string {
-    if (kind === "feishu") return feishuSourceName;
+    if (kind === "feishu") return "飞书";
     if (kind === "web") return "稍后读";
     return "本地上传";
   }

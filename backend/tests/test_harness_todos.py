@@ -1,10 +1,10 @@
 import pytest
-from pydantic import ValidationError
 from langchain_core.messages import AIMessage, ToolMessage
 from langgraph.graph import END, START, StateGraph
 from langgraph.prebuilt import ToolNode
 from langgraph.prebuilt.tool_node import ToolRuntime
 from langgraph.types import Command
+from pydantic import ValidationError
 
 from graph.middlewares import harness_todos as harness_todos_module
 from graph.middlewares.harness_todos import (
@@ -12,8 +12,10 @@ from graph.middlewares.harness_todos import (
     HarnessTodoState,
     TodoPatchOperation,
     UpdateTodosInput,
+    _accepted_validation_receipt,
     _apply_operations,
     _available_todo_evidence,
+    _control_plane_completion_contract,
 )
 
 
@@ -26,6 +28,11 @@ def test_update_todos_tool_schema_makes_create_completed_unrepresentable():
         "pending",
         "in_progress",
     ]
+    assert "completion_contract" not in create_schema["properties"]
+    assert "evidence_refs" not in create_schema["properties"]
+    update_schema = schema["$defs"]["UpdateTodoOperation"]
+    assert "completion_contract" not in update_schema["properties"]
+    assert "evidence_refs" not in update_schema["properties"]
     with pytest.raises(ValidationError):
         UpdateTodosInput.model_validate(
             {
@@ -38,6 +45,88 @@ def test_update_todos_tool_schema_makes_create_completed_unrepresentable():
                 ]
             }
         )
+
+
+def test_control_plane_assigns_only_concrete_task_evidence_contracts():
+    run = {
+        "verification_contract": {
+            "verification_packs": ["core", "analytics", "artifact", "code"]
+        }
+    }
+
+    assert (
+        _control_plane_completion_contract("生成并交付最终报告文件", run)
+        == "artifact_receipt"
+    )
+    assert (
+        _control_plane_completion_contract("查询数据库并刷新指标数据", run)
+        == "query_result"
+    )
+    assert (
+        _control_plane_completion_contract("运行 pytest 测试", run)
+        == "validation_receipt"
+    )
+    assert _control_plane_completion_contract("核对五部分是否齐全", run) is None
+
+
+def test_control_plane_contract_is_immutable_after_todo_creation():
+    original = [
+        {
+            "id": "todo-file",
+            "content": "交付最终文件",
+            "status": "pending",
+            "completion_contract": "artifact_receipt",
+        }
+    ]
+
+    with pytest.raises(ValueError, match="control-plane owned and immutable"):
+        _apply_operations(
+            original,
+            [
+                TodoPatchOperation(
+                    action="update",
+                    todo_id="todo-file",
+                    content="口头检查文件",
+                    completion_contract="validation_receipt",
+                )
+            ],
+            tool_call_id="call-downgrade",
+            run_id="run-1",
+            query_id="query-1",
+        )
+
+
+def test_control_plane_monotonically_upgrades_legacy_uncontracted_todo():
+    original = [
+        {
+            "id": "todo-legacy",
+            "content": "生成并交付最终报告文件",
+            "status": "in_progress",
+        }
+    ]
+    def resolver(_content: str) -> str:
+        return "artifact_receipt"
+
+    with pytest.raises(ValueError, match="requires artifact_receipt evidence"):
+        _apply_operations(
+            original,
+            [TodoPatchOperation(action="complete", todo_id="todo-legacy")],
+            tool_call_id="call-legacy-complete",
+            run_id="run-1",
+            query_id="query-1",
+            available_evidence={"artifact_receipt": set()},
+            completion_contract_resolver=resolver,
+        )
+
+    upgraded, _ = _apply_operations(
+        original,
+        [TodoPatchOperation(action="start", todo_id="todo-legacy")],
+        tool_call_id="call-legacy-start",
+        run_id="run-1",
+        query_id="query-1",
+        completion_contract_resolver=resolver,
+    )
+    assert upgraded[0]["completion_contract"] == "artifact_receipt"
 
 
 def test_harness_todo_ledger_remains_in_compiled_agent_input_schema():
@@ -164,7 +253,20 @@ def test_goal_continuation_reuses_prior_run_evidence(monkeypatch):
             {
                 "kind": "validation_receipt",
                 "id": "validation-prior",
-                "payload": {},
+                "payload": {
+                    "validation_receipt_id": "validation-prior",
+                    "run_id": "run-prior",
+                    "goal_id": "goal-1",
+                    "goal_revision": 2,
+                    "validator_kind": "project_test",
+                    "validator_version": "pytest/v1",
+                    "artifact_refs": [],
+                    "command_evidence_ref": "sha256:command-output",
+                    "exit_code": 0,
+                    "checks_passed": 3,
+                    "checks_failed": 0,
+                    "status": "passed",
+                },
             },
             {
                 "kind": "tool_result",
@@ -186,6 +288,42 @@ def test_goal_continuation_reuses_prior_run_evidence(monkeypatch):
         "artifact_receipt": {"artifact-prior"},
         "validation_receipt": {"validation-prior"},
     }
+
+
+def test_only_passing_server_receipt_is_accepted_as_validation_evidence():
+    base = {
+        "validation_receipt_id": "validation-1",
+        "run_id": "run-1",
+        "validator_kind": "project_test",
+        "artifact_refs": [],
+        "command_evidence_ref": "sha256:result",
+        "exit_code": 0,
+        "checks_passed": 2,
+        "checks_failed": 0,
+        "status": "passed",
+    }
+
+    assert _accepted_validation_receipt(
+        base,
+        receipt_id="validation-1",
+        run_id="run-1",
+        goal_id="",
+        goal_revision=None,
+    )
+    assert not _accepted_validation_receipt(
+        {**base, "status": "failed", "exit_code": 1, "checks_failed": 1},
+        receipt_id="validation-1",
+        run_id="run-1",
+        goal_id="",
+        goal_revision=None,
+    )
+    assert not _accepted_validation_receipt(
+        {"validation_receipt_id": "validation-1", "status": "passed"},
+        receipt_id="validation-1",
+        run_id="run-1",
+        goal_id="",
+        goal_revision=None,
+    )
 
 
 def test_todo_cancel_is_tombstone_not_deletion():
@@ -474,3 +612,43 @@ async def test_unknown_todo_id_returns_recoverable_tool_error():
     assert isinstance(result, ToolMessage)
     assert result.status == "error"
     assert "Unknown todo_id: todo_missing" in str(result.content)
+    assert "本批操作全部未提交" in str(result.content)
+    assert "Current ledger: []" in str(result.content)
+
+
+@pytest.mark.asyncio
+async def test_rejected_todo_batch_reports_unchanged_current_ledger():
+    tool = HarnessTodoMiddleware().tools[0]
+    node = ToolNode([tool])
+    original = [{"id": "todo-a", "content": "原始内容", "status": "pending"}]
+    runtime = ToolRuntime(
+        state={"messages": [], "todos": original},
+        context={"run_id": "run-atomic", "query_id": "query-atomic"},
+        config={},
+        stream_writer=lambda _: None,
+        tool_call_id="call-atomic",
+        store=None,
+        tools=[tool],
+    )
+
+    result = await node._arun_one(
+        {
+            "name": "update_todos",
+            "args": {
+                "operations": [
+                    {"action": "update", "todo_id": "todo-a", "content": "不应提交"},
+                    {"action": "complete", "todo_id": "todo-missing"},
+                ]
+            },
+            "id": "call-atomic",
+            "type": "tool_call",
+        },
+        "dict",
+        runtime,
+    )
+
+    assert isinstance(result, ToolMessage)
+    assert result.status == "error"
+    assert "本批操作全部未提交" in str(result.content)
+    assert "原始内容" in str(result.content)
+    assert "不应提交" not in str(result.content)

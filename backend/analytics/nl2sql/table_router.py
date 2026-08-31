@@ -306,13 +306,15 @@ async def _load_columns(
     if not table_names:
         return {}
 
+    source_type = str(_source_value(source, "source_type", _source_value(source, "type", "postgresql")) or "postgresql").lower()
+    default_schema = str(_source_value(source, "database", "") or "") if source_type == "mysql" else "public"
     parsed: list[tuple[str, str, str]] = []
     for table_name in table_names:
         normalized = _normalize_table_name(table_name)
         if "." in normalized:
             schema, table = normalized.split(".", 1)
         else:
-            schema, table = "public", normalized
+            schema, table = default_schema, normalized
         if table:
             parsed.append((table_name, schema, table))
     if not parsed:
@@ -572,11 +574,12 @@ async def route_database_tables(session: AsyncSession, request: DatabaseQueryReq
 
             source_name = str(_source_value(source, "name", source_id) or source_id)
             database = str(_source_value(source, "database", "") or "")
+            source_type = str(_source_value(source, "source_type", _source_value(source, "type", "postgresql")) or "postgresql").lower()
             route = TableRoute(
                 database_source_id=source_id,
                 source_name=source_name,
                 database=database,
-                dialect="PostgreSQL",
+                dialect="MySQL" if source_type == "mysql" else "PostgreSQL",
                 table_names=table_names,
                 available_tables=routable_tables,
                 candidates=_route_candidates_for_prompt(candidates, table_names),

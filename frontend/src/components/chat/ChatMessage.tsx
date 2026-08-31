@@ -2204,7 +2204,16 @@ function AssistantMessageActions({ message, isStreaming }: { message: ChatMessag
   const detailsContainerRef = useRef<HTMLDivElement | null>(null);
   const runId = message.runId || message.segments?.findLast((segment) => segment.runId)?.runId;
   const isGoalRun = Boolean(message.segments?.some((segment) => segment.goalId));
-  const supportsReview = Boolean(runId && !isGoalRun);
+  const supportsReview = Boolean(
+    runId
+    && !isGoalRun
+    && !message.interrupted
+    && (
+      message.runReviewEligible === true
+      || message.runReviewStatus
+      || message.runReviewReport
+    )
+  );
   const copyText = stripModelCallLimitNotice(
     message.content.trim()
       || message.segments?.map((segment) => segment.content.trim()).filter(Boolean).join("\n\n")

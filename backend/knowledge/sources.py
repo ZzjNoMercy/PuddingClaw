@@ -44,10 +44,10 @@ BUILTIN_CONNECTORS: tuple[dict[str, Any], ...] = (
     },
     {
         "key": "feishu_wiki",
-        "name": "飞书 Wiki / 多维表格",
-        "description": "同步 Wiki 文档，或登记一个多维表格供 Agent 实时只读查询",
+        "name": "飞书 Wiki / 云盘 / 多维表格",
+        "description": "同步 Wiki 或云盘文件夹，或登记一个多维表格供 Agent 实时只读查询",
         "auth_types": ["tenant", "user"],
-        "capabilities": ["discover", "incremental_sync", "full_scan", "docx", "attachments", "bitable_live_query"],
+        "capabilities": ["discover", "incremental_sync", "full_scan", "docx", "drive_folder", "attachments", "bitable_live_query"],
         "builtin": False,
     },
 )
@@ -319,7 +319,15 @@ async def enqueue_due_feishu_sync_runs(
     queued: list[KnowledgeSyncRun] = []
     for source in sources:
         config = dict(source.config_json or {})
-        if source.id in active_source_ids or not str(config.get("space_id") or "").strip():
+        source_mode = str(config.get("source_mode") or "wiki")
+        configured = (
+            bool(str(config.get("app_token") or "").strip())
+            if source_mode == "bitable"
+            else bool(config.get("drive_scope_configured") or str(config.get("folder_token") or "").strip())
+            if source_mode == "drive"
+            else bool(str(config.get("space_id") or "").strip())
+        )
+        if source.id in active_source_ids or not configured:
             continue
         try:
             interval_minutes = int((source.schedule_json or {}).get("interval_minutes") or 0)

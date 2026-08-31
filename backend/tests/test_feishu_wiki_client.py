@@ -15,6 +15,63 @@ from knowledge.models import Base, FeishuAppCredential, KnowledgeDocument, Knowl
 from knowledge.sources import create_source_connection, create_sync_run, upsert_source_item
 
 
+def test_drive_source_recursively_syncs_markdown_files(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("PUDDINGCLAW_KNOWLEDGE_DIR", str(tmp_path / "knowledge"))
+
+    async def run() -> None:
+        class FakeApi:
+            async def list_drive_files(self, _session, _source, *, folder_token):
+                if folder_token == "root-folder":
+                    return [
+                        {"token": "nested-folder", "name": "手册", "type": "folder", "parent_token": folder_token},
+                        {"token": "root-note", "name": "总览.md", "type": "file", "parent_token": folder_token, "modified_time": "1700000000", "url": "https://example.feishu.cn/file/root-note"},
+                    ]
+                assert folder_token == "nested-folder"
+                return [
+                    {"token": "nested-note", "name": "安装.md", "type": "file", "parent_token": folder_token, "modified_time": "1700000001", "url": "https://example.feishu.cn/file/nested-note"},
+                ]
+
+            async def download_drive_file(self, _session, _source, *, file_token, max_bytes=200 * 1024 * 1024):
+                assert max_bytes > 0
+                return f"# {file_token}\n\n正文".encode(), "text/markdown", ""
+
+        engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'drive-sync.db'}")
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+        sessions = async_sessionmaker(engine, expire_on_commit=False)
+        async with sessions() as session:
+            source = await create_source_connection(
+                session,
+                connector_key="feishu_wiki",
+                name="产品云盘",
+                auth_type="tenant",
+                config={
+                    "source_mode": "drive",
+                    "folder_token": "root-folder",
+                    "source_url": "https://example.feishu.cn/drive/folder/root-folder",
+                    "publish_vector": False,
+                },
+            )
+            source.status = "ready"
+            sync_run = await create_sync_run(session, source=source, mode="incremental")
+            await session.commit()
+            await process_feishu_sync_run(session, base_dir=tmp_path, run=sync_run, api=FakeApi())
+
+            items = (await session.execute(select(KnowledgeSourceItem).order_by(KnowledgeSourceItem.title))).scalars().all()
+            assert [(item.title, item.path_json, item.status) for item in items] == [
+                ("安装.md", ["手册", "安装.md"], "ready"),
+                ("总览.md", ["总览.md"], "ready"),
+            ]
+            documents = (await session.execute(select(KnowledgeDocument).order_by(KnowledgeDocument.title))).scalars().all()
+            assert len(documents) == 2
+            assert all(document.source_type == "feishu_drive_file" for document in documents)
+            assert sync_run.stats_json["discovered"] == 2
+            assert sync_run.stats_json["changed"] == 2
+        await engine.dispose()
+
+    asyncio.run(run())
+
+
 def test_bitable_links_normalize_direct_and_wiki_entries() -> None:
     direct = parse_feishu_bitable_url(
         "https://example.feishu.cn/base/bascnExample123?table=tblExample123&view=vewExample123"
@@ -354,6 +411,73 @@ def test_feishu_open_api_refreshes_once_and_paginates_empty_filtered_pages(tmp_p
             assert spaces == [{"space_id": "space-1", "name": "产品知识库"}]
             assert broker.calls == [False, True, False]
             assert requests == 3
+        await engine.dispose()
+
+    asyncio.run(run())
+
+
+def test_feishu_open_api_discovers_drive_root_and_uses_drive_cursor(tmp_path) -> None:
+    async def run() -> None:
+        observed: list[dict[str, str]] = []
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            observed.append(dict(request.url.params))
+            if not request.url.params.get("page_token"):
+                return httpx.Response(
+                    200,
+                    json={
+                        "code": 0,
+                        "data": {
+                            "files": [{"token": "fld-one", "name": "产品", "type": "folder"}],
+                            "has_more": True,
+                            "next_page_token": "drive-next",
+                        },
+                    },
+                )
+            return httpx.Response(
+                200,
+                json={
+                    "code": 0,
+                    "data": {
+                        "files": [{"token": "fld-two", "name": "研发", "type": "folder"}],
+                        "has_more": False,
+                    },
+                },
+            )
+
+        class StubTenantBroker:
+            async def get(self, _session, _app, *, force_refresh: bool = False):
+                return "token"
+
+        engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'drive-discovery.db'}")
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+        sessions = async_sessionmaker(engine, expire_on_commit=False)
+        api = FeishuOpenApi(
+            http_client=FeishuHttpClient(transport=httpx.MockTransport(handler)),
+            tenant_broker=StubTenantBroker(),
+        )
+        async with sessions() as session:
+            app = FeishuAppCredential(
+                id="fapp-drive",
+                app_id_masked="cli_••••drive",
+                credential_ref="unused",
+                api_base_url="https://open.feishu.cn",
+            )
+            session.add(app)
+            source = await create_source_connection(
+                session,
+                connector_key="feishu_wiki",
+                name="云盘",
+                auth_type="tenant",
+                config={"app_credential_id": app.id},
+            )
+            source.status = "ready"
+            await session.commit()
+            items = await api.list_drive_files(session, source)
+            assert [item["token"] for item in items] == ["fld-one", "fld-two"]
+            assert observed[0]["folder_token"] == ""
+            assert observed[1]["page_token"] == "drive-next"
         await engine.dispose()
 
     asyncio.run(run())
