@@ -6059,21 +6059,24 @@ class DeepAgentsAgentManager:
                     for interrupted_type, interrupted_request, _interrupt_id in pending_interrupts
                 ]
             elif interaction_mode == "external":
-                # Headless consumers can explicitly approve permissions through
-                # the Resume API. Business confirmations remain unattended and
-                # therefore keep the existing deterministic fail-closed policy.
+                # Headless consumers can explicitly resolve permissions and
+                # structured business questions through the Resume API. Keep
+                # both on the original graph invocation so the answer resumes
+                # the exact suspended Run instead of starting a replacement.
                 resolver = HeadlessInterruptResolver(context=context)
                 decisions: list[dict[str, Any] | None] = []
                 decision_tasks: list[tuple[int, asyncio.Task[Any]]] = []
                 for interrupted_type, interrupted_request, _interrupt_id in pending_interrupts:
-                    if interrupted_type == "permission_request":
+                    if interrupted_type in {"permission_request", "user_input_request"}:
                         index = len(decisions)
                         decisions.append(None)
                         decision_tasks.append(
                             (
                                 index,
                                 asyncio.create_task(
-                                    permission_resume_registry.wait(str(interrupted_request.get("id") or ""))
+                                    resume_registries[interrupted_type].wait(
+                                        str(interrupted_request.get("id") or "")
+                                    )
                                 ),
                             )
                         )

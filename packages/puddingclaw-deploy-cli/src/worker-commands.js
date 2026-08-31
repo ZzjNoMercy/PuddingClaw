@@ -422,10 +422,14 @@ async function respondCommand(args, flags, paths) {
     throw new WorkerClientError("decisions must be a non-empty array", { code: "protocol_error" });
   }
   for (const decision of input.decisions) {
-    if (!decision || typeof decision !== "object" || typeof decision.request_id !== "string"
-      || !["approve", "reject"].includes(String(decision.decision))
-      || !["once", "session"].includes(String(decision.scope || "once"))) {
-      throw new WorkerClientError("decisions must contain request_id, decision and scope", { code: "protocol_error" });
+    const permission = decision && typeof decision === "object"
+      && ["approve", "reject"].includes(String(decision.decision))
+      && ["once", "session"].includes(String(decision.scope || "once"));
+    const userInput = decision && typeof decision === "object"
+      && ["submit", "cancel"].includes(String(decision.action))
+      && Array.isArray(decision.answers || []);
+    if (typeof decision?.request_id !== "string" || permission === userInput) {
+      throw new WorkerClientError("each decision must be either a permission decision or a user-input answer", { code: "protocol_error" });
     }
   }
   const workspacePath = await ensureWorkspace(paths, input.workspace_path);

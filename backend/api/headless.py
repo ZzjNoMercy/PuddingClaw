@@ -29,6 +29,7 @@ from graph.deepagents_manager import deepagents_agent_manager
 from graph.headless_resolver import headless_authority_from_environment
 from graph.permission_resume import permission_resume_registry
 from graph.session_manager import session_manager
+from graph.user_input_resume import user_input_resume_registry
 from headless_session_lifecycle import (
     TERMINAL_RUN_STATUSES,
     cleanup_stale_headless_sessions,
@@ -80,6 +81,8 @@ _HEADLESS_PUBLIC_EVENTS = frozenset(
         "tool_end",
         "permission_required",
         "permission_resolved",
+        "user_input_required",
+        "user_input_resolved",
         "final_response",
         "done",
         "error",
@@ -167,9 +170,21 @@ class HeadlessResumeDecision(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     request_id: str = Field(min_length=1, max_length=200)
-    decision: str = Field(pattern="^(approve|reject)$")
+    decision: str | None = Field(default=None, pattern="^(approve|reject)$")
     scope: str = Field(default="once", pattern="^(once|session)$")
+    action: str | None = Field(default=None, pattern="^(submit|cancel)$")
+    answers: list[dict[str, Any]] = Field(default_factory=list, max_length=3)
     message: str | None = Field(default=None, max_length=2_000)
+
+    @model_validator(mode="after")
+    def validate_decision_shape(self):
+        if bool(self.decision) == bool(self.action):
+            raise ValueError("exactly one of decision or action is required")
+        if self.decision and self.answers:
+            raise ValueError("permission decisions cannot contain answers")
+        if self.action != "submit" and self.answers:
+            raise ValueError("answers are only valid for action=submit")
+        return self
 
 
 class HeadlessResumeRequest(BaseModel):
@@ -402,17 +417,15 @@ class _HeadlessExecution:
                 elif name == "done":
                     self.final_content = str(payload.get("content") or "")
                     self.final_response = str(payload.get("final_response") or self.final_response)
-                elif name == "permission_required":
+                elif name in {"permission_required", "user_input_required"}:
                     pending = _needs_input(name, payload)
                     if pending is not None and pending.get("request_id"):
                         self.pending_inputs[str(pending["request_id"])] = pending
                         self._persist_pending_state("pending")
                         boundary_signal = True
                 elif name.endswith("_required"):
-                    # External Headless continuation is deliberately limited
-                    # to permissions. The graph auto-resolves other business
-                    # HITL fail-closed, but retain its structured explanation
-                    # on the eventual terminal response.
+                    # Unsupported external interrupts remain terminal rather
+                    # than being presented as resumable by this protocol.
                     self.terminal_needs_input = _needs_input(name, payload) or self.terminal_needs_input
                 elif name.endswith("_resolved"):
                     request_id = str(payload.get("request_id") or "")
@@ -452,7 +465,7 @@ class _HeadlessExecution:
                 {
                     **{
                         "id": request.get("request_id"),
-                        "type": request.get("permission_type") or "permission",
+                        "type": request.get("type") or request.get("permission_type") or "permission",
                         "session_id": self.session_id,
                         "query_id": self.query_id or None,
                         "status": "pending",
@@ -471,6 +484,8 @@ class _HeadlessExecution:
                             "risk",
                             "reason",
                             "options",
+                            "prompt",
+                            "questions",
                         )
                         if request.get(key) is not None
                     },
@@ -1025,7 +1040,7 @@ async def _stream_headless_execution(
                 break
             yield {"event": envelope["event"], "data": envelope["data"]}
             if (
-                envelope["event"] == "permission_required"
+                envelope["event"] in {"permission_required", "user_input_required"}
                 and execution.pending_inputs
                 and not execution.done
             ):
@@ -1140,6 +1155,32 @@ async def _resolve_external_permission(
     raise HTTPException(status_code=422, detail=f"Unsupported permission request type: {request_type}")
 
 
+def _resolve_external_user_input(
+    *,
+    session_id: str,
+    decision: HeadlessResumeDecision,
+) -> None:
+    """Apply one structured business answer to the live user-input registry."""
+
+    pending = user_input_resume_registry.get(decision.request_id)
+    if pending is None:
+        raise HTTPException(status_code=404, detail="User input request not found")
+    if str(pending.get("session_id") or "") != session_id:
+        raise HTTPException(status_code=400, detail="User input request belongs to another Session")
+    try:
+        user_input_resume_registry.resolve(
+            decision.request_id,
+            {
+                "action": decision.action,
+                "answers": decision.answers,
+            },
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
 @router.get("/health")
 async def worker_health(request: Request):
     _require_loopback_request(request)
@@ -1160,7 +1201,7 @@ async def worker_health(request: Request):
         "workspace_ready": path.is_dir(),
         "capabilities": ["data.query", "data.analysis", "data.nl2sql", "knowledge.query"],
         "operations": {"run": True, "continue": True, "respond": True, "cancel": True},
-        "interaction_kinds": ["permission_request"],
+        "interaction_kinds": ["permission_request", "user_input"],
         "progress": "jsonl",
         "transport_scope": "local_loopback",
         "cli": cli_status,
@@ -1502,12 +1543,12 @@ async def resume_headless_run(
     unsupported = [
         request_id
         for request_id in pending_ids
-        if execution.pending_inputs[request_id].get("type") != "permission_request"
+        if execution.pending_inputs[request_id].get("type") not in {"permission_request", "user_input"}
     ]
     if unsupported:
         raise HTTPException(
             status_code=422,
-            detail="This CLI version can only resume permission requests",
+            detail="This CLI version cannot resume the current input type",
         )
 
     if not _claim_headless_session(execution.session_id):
@@ -1517,10 +1558,21 @@ async def resume_headless_run(
         previous_revision = execution.revision
         previous_sequence = execution.event_sequence
         for decision in request.decisions:
-            await _resolve_external_permission(
-                session_id=execution.session_id,
-                decision=decision,
-            )
+            pending_type = execution.pending_inputs[decision.request_id].get("type")
+            if pending_type == "permission_request":
+                if not decision.decision:
+                    raise HTTPException(status_code=422, detail="Permission input requires decision")
+                await _resolve_external_permission(
+                    session_id=execution.session_id,
+                    decision=decision,
+                )
+            else:
+                if not decision.action:
+                    raise HTTPException(status_code=422, detail="User input requires action")
+                _resolve_external_user_input(
+                    session_id=execution.session_id,
+                    decision=decision,
+                )
         if stream is True:
             streaming_lifecycle = True
 

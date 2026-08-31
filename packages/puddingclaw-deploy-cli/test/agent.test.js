@@ -127,6 +127,21 @@ test("merged respond and cancel preserve lifecycle protocol", async () => {
   assert.equal(JSON.parse(cancelled.stdout).outcome, "cancelled");
 });
 
+test("merged respond accepts structured user-input answers", async () => {
+  const responded = await runAgent(["respond", "run-respond", "--input-json", "-", "--json"], {
+    input: {
+      continuation_token: "continuation-token-long-enough",
+      decisions: [{
+        request_id: "user-input-1",
+        action: "submit",
+        answers: [{ question_id: "choice", option_ids: ["B"], text: "" }],
+      }],
+    },
+  });
+  assert.equal(responded.code, 0, responded.stderr);
+  assert.equal(JSON.parse(responded.stdout).final_response, "responded");
+});
+
 test("merged respond forwards resumed Run progress as JSONL", async () => {
   const responded = await runAgent(["respond", "run-respond", "--input-json", "-", "--jsonl"], {
     input: {

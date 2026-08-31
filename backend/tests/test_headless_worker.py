@@ -32,6 +32,7 @@ from api.headless import (
 from graph.headless_resolver import HeadlessInterruptResolver, headless_authority_from_environment
 from graph.permission_resume import permission_resume_registry
 from graph.session_manager import session_manager
+from graph.user_input_resume import user_input_resume_registry
 from headless_session_lifecycle import cleanup_stale_headless_sessions
 from knowledge.models import WorkerAccessLog
 from projects.registry import project_registry
@@ -986,6 +987,109 @@ async def test_headless_permission_pauses_and_resume_continues_same_run(tmp_path
             http_request=_request_from("127.0.0.1"),
         )
     assert conflict.value.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_headless_user_input_pauses_and_resume_continues_same_run(tmp_path: Path, monkeypatch):
+    session_id = "worker-session-external-user-input"
+    session_manager.initialize(tmp_path)
+    session_manager.create_session(
+        session_id,
+        metadata={
+            "runtime_mode": "headless_worker",
+            "headless_enabled": True,
+            "worker_key_id": "key-owner",
+        },
+    )
+    user_request = user_input_resume_registry.create(
+        session_id=session_id,
+        query_id="query-user-input",
+        run_id="run-user-input",
+        goal_id="",
+        goal_revision=None,
+        tool_call_id="call-user-input",
+        payload={
+            "questions": [{
+                "id": "choice",
+                "prompt": "请选择 A 或 B",
+                "type": "single_select",
+                "required": True,
+                "allow_other": False,
+                "options": [{"id": "A", "label": "方案 A"}, {"id": "B", "label": "方案 B"}],
+            }],
+            "allow_agent_decide": True,
+        },
+    )
+
+    async def fake_stream(**kwargs):
+        assert kwargs["interaction_mode"] == "external"
+        yield {
+            "event": "run_started",
+            "data": json.dumps({
+                "session_id": session_id,
+                "query_id": "query-user-input",
+                "run_id": "run-user-input",
+            }),
+        }
+        yield {"event": "user_input_required", "data": json.dumps(user_request)}
+        decision = await user_input_resume_registry.wait(user_request["id"])
+        yield {
+            "event": "user_input_resolved",
+            "data": json.dumps({"request_id": user_request["id"], "decision": decision}),
+        }
+        yield {
+            "event": "run_outcome",
+            "data": json.dumps({
+                "session_id": session_id,
+                "query_id": "query-user-input",
+                "run_id": "run-user-input",
+                "status": "completed",
+                "outcome": "completed",
+            }),
+        }
+        yield {"event": "done", "data": json.dumps({"content": "选择 B 后完成", "final_response": "选择 B 后完成"})}
+
+    monkeypatch.setattr(headless_api.deepagents_agent_manager, "astream", fake_stream)
+    monkeypatch.setattr(headless_api, "_model_binding", lambda model_id: {"id": model_id})
+
+    paused = await _consume_run(
+        request=HeadlessRunRequest(message="询问后继续"),
+        session_id=session_id,
+        project_id="project-test",
+        approval_mode="smart",
+        authority={"profile": "smart"},
+        request_received_at=1234.5,
+        analytics_model_id="analysis",
+        analytics_model_match={"status": "matched", "selected_id": "analysis"},
+    )
+
+    assert paused["status"] == "needs_input"
+    assert paused["run_id"] == "run-user-input"
+    assert paused["needs_input"]["type"] == "user_input"
+    assert paused["needs_input"]["request_id"] == user_request["id"]
+    assert paused["needs_input"]["questions"][0]["id"] == "choice"
+
+    completed = await resume_headless_run(
+        "run-user-input",
+        HeadlessResumeRequest(
+            continuation_token=paused["continuation_token"],
+            request_id="response-user-input",
+            decisions=[HeadlessResumeDecision(
+                request_id=user_request["id"],
+                action="submit",
+                answers=[{"question_id": "choice", "option_ids": ["B"], "text": ""}],
+            )],
+        ),
+        http_request=_request_from("127.0.0.1"),
+    )
+
+    assert completed["status"] == "completed"
+    assert completed["run_id"] == "run-user-input"
+    assert completed["final_response"] == "选择 B 后完成"
+    assert user_input_resume_registry.get(user_request["id"])["decision"] == {
+        "action": "submit",
+        "answers": [{"question_id": "choice", "option_ids": ["B"], "text": ""}],
+    }
 
 
 @pytest.mark.asyncio
